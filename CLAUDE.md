@@ -608,9 +608,11 @@ gate works, its exemption categories, and the unit rules for size bounds:
   reviewer's review at the exact head stand in for Codex (any GitHub App reviewer,
   such as Devin or CodeRabbit, except a bot the PR's own workflow drives and CodeQL)
   — ask the user in conversation each time; the sigil records the yes.
-  Maintainer-replied findings and findings on files outside the PR diff do not
-  score; under the shipped `doc_findings: skip`, documentation findings do not
-  score either. `codex-at-head: ok` is not "review is clear": read the
+  A maintainer reply clears a below-floor finding. A floor finding clears only on a
+  reply saying `Fixed in <sha>` for a later PR commit touching its file, or on the
+  user's `# floor-accept=<id>`; `# review-override` does not cover it. Findings on files
+  outside the PR diff do not score; under the shipped `doc_findings: skip`,
+  documentation findings do not score either. `codex-at-head: ok` is not "review is clear": read the
   `inline-findings` row, not just the Codex row.
   **A review also comes before the PR.** `gh pr create` on the public repo is refused
   until a reviewer agent or `/code-review` of the branch has finished in this session;

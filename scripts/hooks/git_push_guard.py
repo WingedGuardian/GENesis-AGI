@@ -37,7 +37,9 @@ cluster-safe ``--match-head-commit`` parse + fail-closed shadow-flag belt alread
 exceed the model (defense-in-depth), which is fine; they are not an invitation to
 chase every argv-shaping edge. Conscious escapes are split by boundary so one
 waiver cannot silently disarm an unrelated gate: ``# review-override`` waives the
-FINDING scans (review-body + inline P1s), ``# stale-review-override`` waives the
+FINDING scans (the review-body verdict, an unreadable inline scan and the P2 score, but
+never a floor finding the inline scan can read), ``# floor-accept=<id>[,<id>]`` records
+the owner's yes for named floor findings, ``# stale-review-override`` waives the
 review-CONTEXT gates (Codex-at-head freshness + base-is-default),
 ``# scheduled-review-override`` waives the SCHEDULED-Claude-review-at-head gate, and
 ``# ci-override`` waives the CI gate — red/pending everywhere, plus (canonical repo
@@ -381,6 +383,7 @@ try:
         mentions,
         push_arg_stream,
         split_segments,
+        trailing_sigil_ids,
         unresolved_verb_programs,
     )
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
@@ -1928,13 +1931,13 @@ _CR_BLOCKING_WEIGHT = 1.0
 _DEVIN_SEVERITY_RANK: dict[str | None, int] = {"floor": 3, "minor": 2, "analysis": 1, None: 0}
 # Devin may WITHDRAW its own finding: a reply from the SAME bot login, in that
 # finding's thread, whose first line starts with this marker clears it (owner
-# ruling, 2026-09-24). Consulted for DEVIN findings only — Codex and CodeRabbit
-# findings still clear on a maintainer reply alone. MEASURED on the open queue in a
+# ruling, 2026-09-24). Consulted for DEVIN findings only. On a floor finding the
+# marker is not enough by itself: see `_floor_cleared` (#4933). MEASURED on the open queue in a
 # later snapshot than the 166-comment count above (so the denominators differ): 50
 # of 167 Devin finding groups carried Devin's own "resolved" reply and no
 # maintainer reply. Only
-# this exact lead counts — Devin also posts builder-style prose ("Fixed in …"),
-# which is a claim about work, not the reviewer's verdict — and no bot can clear
+# this exact lead withdraws a finding — Devin's builder-style prose ("Fixed in …")
+# supplies a commit to test only on a thread carrying this marker — and no bot can clear
 # ANOTHER reviewer's finding.
 _BOT_SELF_RESOLVED_LEAD = "✅ **Resolved**"
 # Weighted review score for inline findings: a P1 is a full blocker (1.0), a P2
@@ -3455,10 +3458,161 @@ def _findings_distribution(
     return "\n".join(lines)
 
 
+#: The one form of reply that claims a fix: "Fixed in/at/by <sha>". A bare commit id
+#: is not a claim. MEASURED over 739 floor findings: 8 of 73 replies that did not fix
+#: their finding still cited a real later commit on the file ("Documented in <sha>",
+#: "verified at <sha>", "Partly fixed in <sha>"). With this form, none of them clears.
+_FIX_CLAIM_RE = re.compile(
+    r"(?<![a-z])fixe[ds] (?:in|at|by) (?:commit )?`?((?-i:[0-9a-f]{7,40}))(?![0-9A-Za-z])",
+    re.IGNORECASE,
+)
+#: A word that turns the claim after it into something else ("will be fixed in",
+#: "not yet fixed in"), looked for earlier in the same sentence.
+_FIX_HEDGE_RE = re.compile(
+    r"\b(?:not|never|yet|will|would|should|could|might|may|once|when|if|until|partly"
+    r"|partially|planned|pending|to be|cannot|hasnt|havent|isnt|wasnt|arent)\b|n't\b",
+    re.IGNORECASE,
+)
+_FIX_HEDGE_WINDOW = 40
+#: A closing fence is at least as long as its opener and carries no info string.
+_FENCED_BLOCK_RE = re.compile(
+    r"^ {0,3}(`{3,}|~{3,})[^\n]*\n.*?(?:^ {0,3}\1[`~]*[ \t]*$|\Z)", re.M | re.S
+)
+_QUOTED_LINE_RE = re.compile(r"^ {0,3}>.*$", re.M)
+_INDENTED_CODE_RE = re.compile(r"^(?: {4}|\t).*$", re.M)
+_HTML_COMMENT_RE = re.compile(r"<!--.*?(?:-->|\Z)", re.S)
+#: Distinct ids one finding's replies may cite. The most measured on a PR is 5; this
+#: bounds the CPU a crafted reply can spend on the merge path.
+_FIX_CHECK_MAX_CITED = 64
+
+
+def _fix_claims(body: str) -> list[str]:
+    """The commit ids a reply claims as fixes. Text a reader sees as a quote or as
+    code, or does not see at all, claims nothing."""
+    body = body.replace("\r\n", "\n").replace("\r", "\n")  # the web editor writes CRLF
+    text = _FENCED_BLOCK_RE.sub("", _HTML_COMMENT_RE.sub("", body))
+    text = _INDENTED_CODE_RE.sub("", _QUOTED_LINE_RE.sub("", text)).replace("\u2019", "'")
+    claims = []
+    for match in _FIX_CLAIM_RE.finditer(text):
+        before = re.split(r"[.!?;:\n]", text[max(0, match.start() - _FIX_HEDGE_WINDOW) : match.start()])[-1]
+        if not _FIX_HEDGE_RE.search(before) and text[match.end() :].lstrip("`")[:1] != "?":
+            claims.append(match.group(1))
+    return claims
+
+
+#: GitHub returns at most this many commits from ``pulls/N/commits``.
+_PR_COMMITS_API_CAP = 250
+#: Distinct commits whose file lists one scan may read. Each is at least one API call
+#: on the merge path's 45s budget, and a reply can cite any number of ids.
+_FIX_CHECK_MAX_COMMITS = 20
+
+
+class _FixEvidence:
+    """Whether a reply's cited commit is a fix for one floor finding (#4933).
+
+    Evidence is a single-parent commit of THIS PR, later than the head the finding
+    was posted on, that touches the finding's file. It proves provenance, not that
+    the change is correct. Every read failure means "not verified": the finding
+    stays blocked and the reason says why, so ``# floor-accept`` is the way through.
+    """
+
+    def __init__(self, pr_num: str, repo: str | None) -> None:
+        self._pr_num = pr_num
+        self._repo = repo
+        self._commits: tuple[list[dict] | None, bool] | None = None
+        self._files: dict[str, set[str] | None] = {}
+
+    def _commit_list(self) -> tuple[list[dict] | None, bool]:
+        if self._commits is None:
+            self._commits = _fetch_comments_paged(
+                f"pulls/{self._pr_num}/commits",
+                self._pr_num,
+                self._repo,
+                ".[] | {sha: .sha, parents: (.parents | length)}",
+            )
+        return self._commits
+
+    def _touched(self, sha: str) -> set[str] | None:
+        if sha not in self._files:
+            rows, complete = _fetch_comments_paged(
+                f"commits/{sha}",
+                self._pr_num,
+                self._repo,
+                ".files[]? | {f: .filename, p: .previous_filename}",
+            )
+            self._files[sha] = (
+                {name for r in rows for name in (r.get("f"), r.get("p")) if name}
+                if rows is not None and complete
+                else None
+            )
+        return self._files[sha]
+
+    def verify(self, path: str | None, origs: list, bodies: list[str]) -> str | None:
+        """None when a cited commit is a fix, otherwise why none is.
+
+        ``origs`` holds the head of every copy of the finding on ``path``: the fix has
+        to be later than all of them.
+        """
+        if not path:
+            return "the finding names no file, so only the sigil can clear it"
+        cited = list(dict.fromkeys(t for b in bodies for t in _fix_claims(b)))
+        if not cited:
+            return "no reply says 'Fixed in <sha>'"
+        if len(cited) > _FIX_CHECK_MAX_CITED:
+            return f"replies cite more than {_FIX_CHECK_MAX_CITED} commits"
+        rows, complete = self._commit_list()
+        if rows is None or not complete:
+            return "fix could not be verified (PR commit list unreadable)"
+        rows = [r for r in rows if isinstance(r.get("sha"), str)]
+        position = {r["sha"]: i for i, r in enumerate(rows)}
+        clipped = f"commit list clipped at {_PR_COMMITS_API_CAP} (GitHub cap); fix could not be verified"
+        if not origs or any(not isinstance(o, str) or o not in position for o in origs):
+            if len(rows) >= _PR_COMMITS_API_CAP:
+                return clipped
+            # A rebase refreshes every committer date, so a date cannot stand in for
+            # the order this list no longer shows.
+            return "the head this finding was posted on is gone, so a later fix cannot be proven"
+        latest_head = max(position[o] for o in origs)
+        why = ""
+        for token in cited:
+            if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
+                return "fix could not be verified (merge deadline reached)"
+            hits = [i for i, r in enumerate(rows) if r["sha"].startswith(token)]
+            if len(hits) != 1:
+                if hits:
+                    why = f"cited id {token} is ambiguous"
+                elif len(rows) >= _PR_COMMITS_API_CAP:
+                    why = clipped
+                else:
+                    why = f"cited id {token} is not among the PR's commits (rebased?)"
+                continue
+            row = rows[hits[0]]
+            if row.get("parents") != 1:
+                why = f"cited commit {token} is a merge commit; cite the commit that made the fix"
+                continue
+            if hits[0] <= latest_head:
+                why = f"cited commit {token} predates the finding"
+                continue
+            sha = str(row["sha"])
+            if sha not in self._files and len(self._files) >= _FIX_CHECK_MAX_COMMITS:
+                why = f"fix-check cap reached ({_FIX_CHECK_MAX_COMMITS} commits read)"
+                continue
+            touched = self._touched(sha)
+            if touched is None:
+                why = f"fix could not be verified (file list of {token} unreadable)"
+                continue
+            if path in touched:
+                return None
+            why = f"cited commit {token} does not touch {path}"
+        return why
+
+
 def _check_inline_review_findings(
     pr_num: str,
     *,
     force: bool = False,
+    floor_accept: frozenset[int] = frozenset(),
+    floor_accept_used: set[int] | None = None,
     repo: str | None = None,
     uncounted_out: list[dict[str, int]] | None = None,
 ) -> tuple[bool, str]:
@@ -3489,8 +3643,10 @@ def _check_inline_review_findings(
     threshold FOR THIS PR'S LANE (`_INLINE_SCORE_BLOCK_THRESHOLDS`): critical 1.0,
     standard 2.0, light 3.0. So two P2s stop a consequence surface, four ordinary
     code, six prose-and-tests. A P1 blocks in EVERY lane via the always-fix floor,
-    before the score is consulted at all. A finding is EXCLUDED from the score when its thread has a MAINTAINER
-    reply (engagement = consciously accepted), its path is documentation
+    before the score is consulted at all. A BELOW-FLOOR finding is EXCLUDED from the score when its thread has a
+    MAINTAINER reply (engagement = consciously accepted). A FLOOR finding is not: it
+    clears only on a reply citing a verified fix commit (``_FixEvidence``) or on the
+    owner's ``# floor-accept=<id>`` (#4933). Any finding is also excluded when its path is documentation
     (``_is_doc_path``), or its path is OUTSIDE the PR's diff (issue #1728: a
     merge of main stamps base-branch findings onto the PR; scoring them makes
     the gate demand base-branch fixes as this PR's price — reconciliation must
@@ -3510,13 +3666,23 @@ def _check_inline_review_findings(
     what still needs attention, not what a maintainer already handled (re-listing every
     replied finding on each check would bury the live ones). An UNREADABLE or
     INCOMPLETE scan (gh error/timeout/malformed/clipped budget) ALWAYS blocks
-    (fail-closed — see ``_scan_unreadable``); '# review-override' waives the whole scan.
+    (fail-closed — see ``_scan_unreadable``). '# review-override' (``force``) waives an
+    unreadable scan and the P2 score, never a floor finding this scan can see.
     """
-    if force:
-        return False, ""  # override NOTE already printed by the body gate
+
+    def _waived_unread(what: str) -> tuple[bool, str]:
+        """'# review-override' over a scan that did not read everything: allowed, never silent."""
+        print(
+            f"NOTE: PR #{pr_num} — '# review-override' waived {what}: a floor finding "
+            f"there was not seen and is not covered by this merge.",
+            file=sys.stderr,
+        )
+        _amend_note("review-override", waived="review-body+inline-scan-unread")
+        return False, ""
+
     scanner_sets, table_block = _enforced_logins_or_block()
     if table_block:
-        return True, table_block
+        return _waived_unread("an unusable reviewer table") if force else (True, table_block)
     # Paginate via the shared helper (findings beyond the first REST page must still
     # gate); it accumulates ALL pages as parsed dicts, NEL-safe. ``raw is None`` = the
     # first page was unreadable; ``complete`` False = a later page failed. Fetch in the
@@ -3530,9 +3696,11 @@ def _check_inline_review_findings(
         repo,
         ".[] | {id: .id, reply_to: .in_reply_to_id, login: .user.login, "
         "type: .user.type, assoc: .author_association, path: .path, body: .body, "
-        "review_id: .pull_request_review_id}",
+        "review_id: .pull_request_review_id, orig: .original_commit_id}",
     )
     if raw is None:
+        if force:
+            return _waived_unread("an unreadable inline scan")
         return _scan_unreadable("inline review comments")
 
     # Build replied_to over ALL accumulated pages BEFORE classifying, so a P1 on an
@@ -3601,6 +3769,103 @@ def _check_inline_review_findings(
     devin_self_withdrawn: list[str] = []  # cleared by Devin's own reply only — surfaced
     devin_doc_skipped: list[str] = []  # scoring Devin findings on a doc path
     devin_off_diff: list[tuple[str, str]] = []  # scoring Devin findings outside the diff
+    evidence = _FixEvidence(pr_num, repo)
+    floor_verdicts: dict[tuple, bool] = {}
+    floor_unmet: list[tuple[int, str]] = []  # (finding id, why it is still open)
+    floor_fixed: set[int] = set()
+    floor_refused: set[int] = set()  # named by the sigil in a dispatched session
+    floor_devin_only: set[tuple] = set()  # cleared only with Devin's own reply
+    replies_to: dict[object, list[dict]] = {}
+    for r in raw:
+        if r.get("reply_to"):
+            replies_to.setdefault(r.get("reply_to"), []).append(r)
+    used_ids = floor_accept_used if floor_accept_used is not None else set()
+
+    def _floor_cleared(group: list[dict], paths: list | None = None) -> bool:
+        """Whether a floor finding (one comment, or a Devin group) is cleared.
+
+        A fix is tried first, so an id named in ``# floor-accept`` is only spent on a
+        finding that is really still open. Devin's ``Resolved`` marker never cites a
+        commit (MEASURED 0 of 23), so on a thread carrying it Devin's own replies may
+        supply the id; the id still has to pass the whole test. ``paths`` names the
+        files a duplicated finding scored on: each one needs its own fix.
+        """
+        key = tuple(cp.get("id") for cp in group)
+        if key in floor_verdicts:
+            return floor_verdicts[key]
+        why = "no reply"
+        wanted = list(dict.fromkeys(cp.get("path") for cp in group) if paths is None else dict.fromkeys(paths))
+        sources = []
+        for cp in group:
+            cid = cp.get("id")
+            thread = replies_to.get(cid, [])
+            sources.append(
+                (
+                    cp,
+                    [
+                        r.get("body") or ""
+                        for r in thread
+                        if r.get("assoc") in _MAINTAINER_ASSOCIATIONS
+                    ],
+                    False,
+                )
+            )
+            if cid in self_withdrawn and cp.get("login") in devin_logins:
+                own = [
+                    r.get("body") or ""
+                    for r in thread
+                    if r.get("type") == "Bot" and r.get("login") == cp.get("login")
+                ]
+                sources.append((cp, own, True))
+        rested_on_devin = False
+        cleared = bool(wanted)
+        for path in wanted:
+            covered = False
+            origs = [cp.get("orig") for cp in group if cp.get("path") == path]
+            for _cp, bodies, devin_only in sources:
+                if not bodies:
+                    continue
+                verdict = evidence.verify(path, origs, bodies)
+                if verdict is None:
+                    covered = True
+                    rested_on_devin = rested_on_devin or devin_only
+                    break
+                why = verdict
+            if not covered:
+                cleared = False
+                break
+        if cleared:
+            floor_fixed.update(i for i in key if isinstance(i, int))
+            if rested_on_devin:
+                floor_devin_only.add(key)
+        if not cleared:
+            named = {i for i in key if i in floor_accept}
+            if named and _is_dispatched():
+                floor_refused.update(named)
+                why = "'# floor-accept' records the owner's yes, and a dispatched session has no owner present"
+            elif named:
+                used_ids.update(named)
+                cleared = True
+        if not cleared:
+            floor_unmet.append((group[0].get("id"), why))
+        floor_verdicts[key] = cleared
+        return cleared
+
+    def _list_self_withdrawn(
+        dkey: tuple[str, str], group: list[dict], *, always: bool = False
+    ) -> None:
+        if always or dkey not in devin_maint_cleared:
+            devin_self_withdrawn.append(
+                next(
+                    (
+                        _inline_title(cp.get("body") or "")
+                        for cp in group
+                        if _devin_finding(cp.get("body") or "")[1] is not None
+                    ),
+                    _inline_title(group[0].get("body") or ""),
+                )
+            )
+
     p1: list[str] = []
     p2: list[str] = []
     # (severity, path) for every finding that SCORES, kept alongside the title
@@ -3749,8 +4014,7 @@ def _check_inline_review_findings(
             # the same id, and before clearing, for the reason given above.
             # This is the parser alone. The per-copy SCOPE judgement below
             # reads the PR's changed files, so it must stay AFTER the clearing
-            # check: an answered finding never pays for that read, exactly as
-            # the Codex and CodeRabbit branches check `replied_to` first.
+            # check: a finding answered below the floor never pays for that read.
             has_readable = any(_devin_finding(cp.get("body") or "")[1] is not None for cp in copies)
             for cp in copies:
                 if _devin_finding(cp.get("body") or "")[1] is None:
@@ -3758,20 +4022,13 @@ def _check_inline_review_findings(
                     if has_readable:
                         drift_title += " (a copy of a finding classified by its readable copy)"
                     devin_unknown.append(drift_title)
-            if dkey in devin_cleared:
-                # Answered: a maintainer reply, or Devin withdrew it. The second
-                # is listed, from the parser alone (no file-list read).
-                if dkey not in devin_maint_cleared:
-                    devin_self_withdrawn.append(
-                        next(
-                            (
-                                _inline_title(cp.get("body") or "")
-                                for cp in copies
-                                if _devin_finding(cp.get("body") or "")[1] is not None
-                            ),
-                            _inline_title(copies[0].get("body") or ""),
-                        )
-                    )
+            answered = dkey in devin_cleared
+            if answered and not any(
+                _devin_finding(cp.get("body") or "")[1] == "floor" for cp in copies
+            ):
+                # Answered below the floor: a maintainer reply, or Devin withdrew
+                # it. The second is listed, from the parser alone (no file read).
+                _list_self_withdrawn(dkey, copies)
                 continue
             judged = [(cp, *_devin_disposition(cp)) for cp in copies]
             # The group SCORES on its strongest copy that is eligible to score.
@@ -3788,6 +4045,9 @@ def _check_inline_review_findings(
                 continue  # every copy was drift, reported above
             eligible = [t for t in readable if t[1] == "scored"]
             best, disp, sev = eligible[0] if eligible else readable[0]
+            if answered and not (disp == "scored" and sev == "floor"):
+                _list_self_withdrawn(dkey, copies)
+                continue
             title = _inline_title(best.get("body") or "")
             dv_path = best.get("path")
             # A stronger copy that could not score is not dropped silently: the
@@ -3805,6 +4065,10 @@ def _check_inline_review_findings(
             elif disp == "doc":
                 devin_doc_skipped.append(title)
             elif sev == "floor":
+                if _floor_cleared(copies, [t[0].get("path") for t in eligible if t[2] == "floor"]):
+                    if tuple(cp.get("id") for cp in copies) in floor_devin_only:
+                        _list_self_withdrawn(dkey, copies, always=True)
+                    continue
                 devin_block.append(title)
                 scored_at.append(("DV", dv_path or ""))
             else:
@@ -3812,20 +4076,15 @@ def _check_inline_review_findings(
                 scored_at.append(("DVm", dv_path or ""))
             continue
         if login in coderabbit_logins:
-            # Engagement is checked ONCE, for the whole comment, BEFORE severity —
-            # not per-severity below. It used to sit inside the blocking branch, so
-            # only Critical/Major honoured a maintainer reply while every Minor,
-            # Trivial, Info and unknown-severity finding was re-reported on every
-            # run no matter how many times it had been consciously answered. That
-            # contradicted the promise made two comments down ("the same engagement
-            # treatment the Codex path gets"), and a growing list of already-settled
-            # advisories is how a genuinely unresolved one gets buried.
+            # Engagement is read ONCE, for the whole comment. A reply silences every
+            # segment below the floor, because a growing list of already-settled
+            # advisories is how a genuinely unresolved one gets buried. A
+            # Critical/Major segment needs a verified fix or the sigil (#4933).
             #
             # Comment-level granularity is the only granularity GitHub offers — a
             # reply attaches to the comment, not to one finding inside a bundle —
-            # and it matches what the Codex P1/P2 paths already do.
-            if c.get("id") in replied_to:
-                continue
+            # so one fix or one sigil id covers every blocking segment of it.
+            cr_replied = c.get("id") in replied_to
             # ONE COMMENT CAN CARRY SEVERAL FINDINGS — see _cr_findings. Scoring
             # the comment rather than each finding undercounts, and a Major
             # bundled after a Minor disappears entirely.
@@ -3836,6 +4095,8 @@ def _check_inline_review_findings(
                 # would still block.
                 severity, _header_seen = _cr_severity(seg)
                 if severity not in _CR_BLOCKING_SEVERITIES:
+                    if cr_replied:
+                        continue
                     title = _coderabbit_title(seg)
                     if severity is None:
                         # No recognised severity — whether the header names a
@@ -3856,7 +4117,8 @@ def _check_inline_review_findings(
                     # answer whatever the file type), and unlike doc-skipping it
                     # is not mode-gated — it enforces ratified policy (#1728),
                     # not a per-install preference.
-                    cr_off_diff.append((_coderabbit_title(seg), c.get("path") or ""))
+                    if not cr_replied:
+                        cr_off_diff.append((_coderabbit_title(seg), c.get("path") or ""))
                     continue
                 if _is_doc_path(c.get("path") or "") and _doc_findings_mode() == "skip":
                     # Its OWN list, not the Codex `doc_skipped` one — landing a
@@ -3867,28 +4129,34 @@ def _check_inline_review_findings(
                     # weight, so under `p1_only` or `score` this falls through
                     # and DOES block — otherwise the stricter setting silently
                     # enforced one reviewer and not the other (Codex P2, #1677).
-                    cr_doc_skipped.append(_coderabbit_title(seg))
+                    if not cr_replied:
+                        cr_doc_skipped.append(_coderabbit_title(seg))
+                    continue
+                if _floor_cleared([c]):
                     continue
                 cr_block.append(_coderabbit_title(seg))
                 scored_at.append(("CR", c.get("path") or ""))
             continue
         if parseable and _INLINE_P1_RE.search(body):
-            if c.get("id") in replied_to:
-                continue  # thread engaged — treated as acknowledged
+            p1_replied = c.get("id") in replied_to
             if _off_diff(c.get("path")):
                 # Same scoping the CodeRabbit branch gets above — the stale-
                 # anchor mechanism (#1728) is reviewer-agnostic, and enforcing
                 # it for one reviewer only would be an asymmetry with no
                 # stated reason (the #1677 class).
-                off_diff_p1.append((_inline_title(body), c.get("path") or ""))
+                if not p1_replied:
+                    off_diff_p1.append((_inline_title(body), c.get("path") or ""))
                 continue
             if _is_doc_path(c.get("path") or "") and _doc_findings_mode() == "skip":
                 # A P1 on a documentation file (ledger 54eb3752) is surfaced but
                 # does NOT block; a code file (incl. code under docs/) still does.
                 # Under `p1_only` or `score` this falls through and DOES block —
                 # a doc-path P1 is the one a reader most often wants enforced.
-                doc_skipped.append(_inline_title(body))
+                if not p1_replied:
+                    doc_skipped.append(_inline_title(body))
                 continue
+            if _floor_cleared([c]):
+                continue  # a verified fix, or the owner's sigil (#4933)
             p1.append(_inline_title(body))
             scored_at.append(("P1", c.get("path") or ""))
         elif parseable and _INLINE_P2_RE.search(body):
@@ -4379,7 +4647,8 @@ def _check_inline_review_findings(
     if devin_self_withdrawn:
         print(
             f"NOTE: PR #{pr_num} — {len(devin_self_withdrawn)} Devin finding(s) "
-            f"cleared by Devin's own '✅ Resolved' reply, with no maintainer reply. "
+            f"cleared on Devin's own '✅ Resolved' reply, with no maintainer reply "
+            f"that clears it. "
             f"Devin's reviewer and builder share one login, so check the fix "
             f"really landed before relying on it:",
             file=sys.stderr,
@@ -4486,8 +4755,8 @@ def _check_inline_review_findings(
     # them. Recording at each return instead would be a convention four sites had
     # to remember, which is the shape that produces "the fifth return forgot".
     #
-    # The two EARLY returns above (`force`, and an unreadable first page) are
-    # deliberately NOT recorded: they exit before these lists exist, so the
+    # The EARLY return above (an unreadable first page) is
+    # deliberately NOT recorded: it exits before these lists exist, so the
     # caller sees an EMPTY out-param and must render UNKNOWN rather than zero.
     # "0 uncounted" on a path that counted nothing is the false confidence this
     # gate exists to remove, and reproducing it one field over would be worse
@@ -4593,6 +4862,18 @@ def _check_inline_review_findings(
     # so a CodeRabbit MINOR naming a fail-open scores 0.0 and passes here. The
     # mechanical floor is the labelled subset; the rest still rests on somebody
     # reading the report.
+    for unused in sorted(floor_accept - used_ids):
+        state = (
+            "was refused in a dispatched session"
+            if unused in floor_refused
+            else "already cleared by a fix"
+            if unused in floor_fixed
+            else "names no open floor finding"
+        )
+        print(
+            f"NOTE: PR #{pr_num} — '# floor-accept' id {unused} {state} on this PR; it waived nothing.",
+            file=sys.stderr,
+        )
     floor_hits = len(p1) + len(cr_block) + len(devin_block)
     if floor_hits:
         listing = "\n".join(
@@ -4600,18 +4881,26 @@ def _check_inline_review_findings(
             + [f"  [CodeRabbit Critical/Major] {t}" for t in cr_block[:5]]
             + [f"  [Devin severe] {t}" for t in devin_block[:5]]
         )
+        reasons = "\n".join(
+            f"  finding {fid}: {_one_safe_line(why)}" for fid, why in floor_unmet[:10]
+        )
+        if len(floor_unmet) > 10:
+            reasons += f"\n  ... and {len(floor_unmet) - 10} more"
         return True, (
             f"always-fix floor: {len(p1)} unresolved [P1] + {len(cr_block)} "
             f"CodeRabbit Critical/Major + {len(devin_block)} Devin severe "
-            f"finding(s), none cleared (a maintainer reply, or Devin's own "
-            f"'Resolved' reply to a Devin finding) "
+            f"finding(s), none cleared by a 'Fixed in <sha>' reply naming a later PR "
+            f"commit that touches the finding's file "
             f"(review score {score:.1f}). Severity blocks in EVERY lane (this "
             f"change is {lane.upper()}); the per-lane score threshold "
             f"({threshold:.1f} here) governs how many P2s may accumulate, never "
-            f"whether a P1 counts:\n{listing}\n"
-            f"Fix and reply in-thread, or append '# review-override' "
-            f"to the merge command to acknowledge and proceed."
+            f"whether a P1 counts:\n{listing}\n{reasons}\n"
+            f"Fix it and reply in-thread with 'Fixed in <sha>'. Otherwise ask the owner, "
+            f"and on their yes append '# floor-accept=<id>[,<id>]' to the merge command."
         )
+    if force:
+        # '# review-override': no floor finding this scan read is open.
+        return _waived_unread("an incomplete inline scan") if not complete else (False, "")
     if score >= threshold:
         # Floor findings cannot reach here — the floor above returned on any of
         # them — so this branch is purely an accumulation of 0.5-weight findings
@@ -16769,6 +17058,11 @@ def _run_merge_and_push_gates() -> int:
                 # has_trailing_override — which is why enumerating that helper's
                 # call sites missed the one sigil SKILL.md documents as logged.
                 force_override = merge_seg.override
+                # Per-finding owner acceptance of floor findings (#4933).
+                floor_accept_present = has_trailing_override(merge_seg.raw, "floor-accept")
+                floor_accept_ids, floor_accept_bad = trailing_sigil_ids(
+                    merge_seg.raw, "floor-accept"
+                )
                 for _sigil, _present, _waives in (
                     ("ci-override", ci_override, "ci-status"),
                     ("stale-review-override", stale_override, "codex-freshness+base-invariant"),
@@ -16780,6 +17074,7 @@ def _run_merge_and_push_gates() -> int:
                         "codex-freshness",
                     ),
                     ("rework-override", rework_override, "rework-contract"),
+                    ("floor-accept", floor_accept_present, "floor-findings"),
                 ):
                     if _present:
                         # `repo` is BLANK on one path, deliberately: a legacy
@@ -17269,11 +17564,36 @@ def _run_merge_and_push_gates() -> int:
                 # endpoint, separate check. Weighted score: P1=1.0, P2=0.5;
                 # blocks at the LANE's threshold (critical 1.0 / standard 2.0 /
                 # light 3.0), with any P1 blocking in every lane via the floor.
+                if floor_accept_bad:
+                    print(
+                        f"NOTE: PR #{pr_num} — '# floor-accept' needs the exact form "
+                        f"floor-accept=<id>[,<id>] with no spaces; this one waives nothing.",
+                        file=sys.stderr,
+                    )
+                floor_accept_used: set[int] = set()
+                floor_kwargs: dict = {}
+                if floor_accept_ids:
+                    floor_kwargs = {
+                        "floor_accept": floor_accept_ids,
+                        "floor_accept_used": floor_accept_used,
+                    }
                 should_block, inline_msg = _check_inline_review_findings(
                     pr_num,
                     force=force_override,
                     repo=merge_repo,
+                    **floor_kwargs,
                 )
+                if floor_accept_used:
+                    _ids = "+".join(str(i) for i in sorted(floor_accept_used))
+                    _waived = f"floor-findings:used:{_ids}"
+                    _amend_note(
+                        "floor-accept",
+                        waived=_waived
+                        if len(_waived) <= 64
+                        else f"floor-findings:used:n{len(floor_accept_used)}",
+                    )
+                elif floor_accept_present:
+                    _amend_note("floor-accept", waived="floor-findings:unused")
                 if should_block:
                     print(
                         f"BLOCKED: PR #{pr_num} — inline review gate did not pass.",
@@ -17786,7 +18106,26 @@ def _print_gate_detail(msg: str) -> None:
         print("  " + line)
 
 
-def check_pr_report(pr_num: str, repo: str | None = None) -> int:
+def _parse_check_pr_floor_accept(argv: list[str]) -> frozenset[int] | None:
+    """A ``--check-pr`` run's ``--floor-accept <id>[,<id>]``; None when it is malformed."""
+    import argparse
+
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--floor-accept", action="append", default=[])
+    try:
+        values = parser.parse_known_args(argv)[0].floor_accept
+    except SystemExit:
+        return None
+    if not values:
+        return frozenset()
+    if len(values) > 1 or re.fullmatch(r"[0-9]{1,20}(?:,[0-9]{1,20})*", values[0]) is None:
+        return None
+    return frozenset(int(i) for i in values[0].split(","))
+
+
+def check_pr_report(
+    pr_num: str, repo: str | None = None, floor_accept: frozenset[int] = frozenset()
+) -> int:
     """CANONICAL pre-merge report: run the SAME checks the merge gate enforces.
 
     This exists so sessions never hand-roll the review check with ad-hoc
@@ -17981,7 +18320,13 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     # VERDICT, not on the text, which is what makes an informational tail safe here
     # while a verdict flip would not be.
     uncounted: list[dict[str, int]] = []
-    blocked, msg = _check_inline_review_findings(pr_num, repo=repo, uncounted_out=uncounted)
+    floor_used: set[int] = set()
+    floor_kwargs: dict = (
+        {"floor_accept": floor_accept, "floor_accept_used": floor_used} if floor_accept else {}
+    )
+    blocked, msg = _check_inline_review_findings(
+        pr_num, repo=repo, uncounted_out=uncounted, **floor_kwargs
+    )
     inline_state = (
         "BLOCK — " + msg.splitlines()[0]
         if blocked
@@ -18066,6 +18411,8 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
                 f"line below merges without the Squashed-From trailer.",
                 file=sys.stderr,
             )
+        if floor_used:
+            merge_cmd += "  # floor-accept=" + ",".join(str(i) for i in sorted(floor_used))
         print("merge-with     : " + merge_cmd)
     print(
         "verdict        :",
@@ -18087,5 +18434,12 @@ if __name__ == "__main__":
                 file=sys.stderr,
             )
             sys.exit(2)
-        sys.exit(check_pr_report(sys.argv[2], repo=_repo))
+        _floor_accept = _parse_check_pr_floor_accept(sys.argv[3:])
+        if _floor_accept is None:
+            print(
+                "ERROR: --floor-accept takes one value, <id>[,<id>] in decimal with no spaces.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        sys.exit(check_pr_report(sys.argv[2], repo=_repo, floor_accept=_floor_accept))
     run_guard(_main_with_note, "git_push_guard")

@@ -748,7 +748,9 @@ words: "You don't block on the things that aren't blocking."
 
 **Reply in-thread to every finding, including the ones you reject.** An
 unanswered finding blocks the gate even when the code is already fixed —
-observed on PR #1541. A reasoned rejection is a valid resolution; silence is not.
+observed on PR #1541. Below the floor, a reasoned rejection is a valid resolution;
+silence is not. **A floor finding clears only on a reply saying `Fixed in <sha>`
+(or `at`/`by`), or on the owner's `# floor-accept=<id>`** (the Pre-Merge Gate, (a)).
 The gate clears a finding from the score only when a MAINTAINER account replied
 IN ITS THREAD: it reads `in_reply_to_id` from `pulls/N/comments`.
 `gh pr comment N --body ...` creates an ISSUE comment, which has no
@@ -2345,7 +2347,10 @@ findings below, a gated `gh pr merge`:
   or a differently-named suite). Waive with `# ci-override`
   (never `--admin`).
 - **Override sigils are split by boundary** — `# review-override` waives ONLY the
-  finding scans (review-body + inline P1s); `# scheduled-review-override` waives
+  finding scans (the review-body verdict, an unreadable inline scan and the P2
+  score), and **never an inline floor finding it can read** (#4933; whether the
+  body verdict should survive it is #4994); `# floor-accept=<id>[,<id>]` accepts
+  named floor findings on the owner's yes; `# scheduled-review-override` waives
   ONLY the scheduled-Claude-review gate; CI is `# ci-override`. Append several in
   one trailing comment when several waivers are genuinely intended.
   **`# stale-review-override` is the EXCEPTION and is wider than its name.**
@@ -2391,7 +2396,21 @@ The review-findings gate specifically:
    merge outright — whatever the change is. This is
    `floor_hits = len(p1) + len(cr_block) + len(devin_block)` in
    `_check_inline_review_findings`.
-   The doctrinal floor is wider than this check: a P1, a security defect, anything destructive or fail-open is fixed, never accepted, whatever label a reviewer attached.
+   The doctrinal floor is wider than this check: a P1, a security defect, anything destructive or fail-open is fixed, never accepted by a session, whatever label a reviewer attached; only the owner accepts one, through `# floor-accept`.
+   **What clears a floor finding (#4933).** Only one of two things:
+   - An in-thread maintainer reply saying `Fixed in <sha>` (or `at`/`by`), where the
+     sha is one of the PR's own single-parent commits, later than the head the finding
+     was posted on (if a force-push removed that head, order cannot be proven and only
+     a new review or the sigil clears it), and touching the finding's file. Quoted or
+     hedged text ("will be fixed in") claims nothing. Cite the commit that made the fix,
+     never a merge of main. A reply that defers, accepts, disputes or says "partly
+     fixed" clears nothing.
+   - The owner's `# floor-accept=<id>[,<id>]` on the merge command, for a fix in another
+     file or a finding the owner accepts. **Ask the owner first, every time**; the sigil
+     records that yes, is logged, and is refused in a dispatched session.
+     `--check-pr <N> --floor-accept <ids>` previews it and prints the merge-with line.
+
+   The gate prints each open finding's id and why it is still open.
    It is a RULE because it used to be an ACCIDENT: before the lanes existed the
    single threshold was 1.0 and a P1 scores exactly 1.0, so the floor held by
    arithmetic, unnamed and untested — and raising any threshold would have
@@ -2440,6 +2459,7 @@ The review-findings gate specifically:
    to merge unreviewed — re-trigger and check the INLINE endpoint.
 5. **Override**: Append `# review-override` to the merge command to
    bypass the gate (e.g., `gh pr merge 123 --squash --admin  # review-override`).
+   It does not cover a floor finding: see (a) above.
    The override is logged: `.claude/skills/genesis-development/references/merge-gate-findings.md`, "Override log".
 6. **Read the PR's warning comments before merging — not just the hard gate.**
    Beyond Codex, a structural-review bot posts under the repo-owner account

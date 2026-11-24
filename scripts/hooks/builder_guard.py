@@ -33,8 +33,8 @@ Paths are compared the way GitHub reads them: percent-decoded, case-insensitive,
 with repeated slashes and ``./`` segments collapsed (``gh_merge``'s own rule).
 
 Why a block and not an advisory (the hooks axiom needs a measured reason):
-a reply under the owner's login clears even a Codex P1 from the merge gate
-(``git_push_guard``'s replied-to rule, #4434), and a builder carries no
+a ``Fixed in <sha>`` reply under the owner's login clears even a Codex P1 from the
+merge gate (``git_push_guard``, #4434, #4933), and a builder carries no
 dispatched marker, so the merge arm lets it merge once every machine gate is
 green (#1672, #4524). A builder in its own slot has no owner watching the
 command. Everything else (``gh pr create``, ``gh pr comment``, ``gh pr view``,
