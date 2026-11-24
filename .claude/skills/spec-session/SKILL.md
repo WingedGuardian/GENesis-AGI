@@ -93,8 +93,8 @@ commit; a change that has outgrown the entry stops and goes to the owner.
    approval the spec changes only through its `## Amendments` section, the
    file's last section, headed exactly so. A CRITICAL or HIGH finding in this
    run goes to the owner through `AskUserQuestion`, and the answer is recorded
-   as an amendment. When the
-   handoff is an issue, post the report as a comment on it instead, after the
+   as an amendment. When the handoff is an issue, save the report beside the
+   spec all the same, and also post a verbatim copy as a comment on the issue, after the
    privacy scrub every public text gets (CLAUDE.md, "Public-Artifact Privacy").
 8. **Write intent scenarios, when the install keeps a holdout.** If
    `.venv/bin/python scripts/holdout_runner.py --has-holdout` (from the main

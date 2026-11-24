@@ -31,7 +31,9 @@ the spec's `spec-analyze` report only when its Index line still matches the
 spec word for word; otherwise match earlier items by their first words, since
 an inserted requirement renumbers everything after it (`spec-analyze.md`,
 Step 4). Once the spec has a `<spec stem>.approved.analysis.md`, take the ids
-from it instead, and apply each `## Amendments` entry to the item it names:
+from it instead (a builder that has only the issue takes them from the
+approval report's verbatim copy posted there, which carries the same Index
+line), and apply each `## Amendments` entry to the item it names:
 that item is judged by the amendment's new text. Add each plan decision that
 obliges the build to something, and each ticket. Record the line each comes
 from. `V-n` items (the spec's `Definition of Verified`) are checked after

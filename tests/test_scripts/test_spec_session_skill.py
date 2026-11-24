@@ -116,3 +116,14 @@ def test_hash_ignores_frontmatter_and_a_first_amendment(tmp_path):
 def test_hash_changes_when_the_body_changes(tmp_path):
     base = _hash(tmp_path, _SPEC)
     assert _hash(tmp_path, _SPEC.replace("30 days", "31 days")) != base
+
+
+def test_approval_report_is_saved_for_every_handoff():
+    """Every reader of frozen ids keys on <stem>.approved.analysis.md existing, so an
+    issue handoff saves it too and posts a copy, never instead of saving it."""
+    body = " ".join(SKILL.read_text(encoding="utf-8").split())
+    step7 = body[body.index("7. **Save the final analysis report**") : body.index("8. **Write intent")]
+    assert "approved.analysis.md" in step7
+    assert "save the report beside the spec all the same" in step7
+    assert "post a verbatim copy as a comment on the issue" in step7
+    assert "instead" not in step7
