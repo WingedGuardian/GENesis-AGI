@@ -415,7 +415,7 @@ async def _ingest_once(
             # lands, masked against the others.
             fresh = await _name_entries(db, project, domain, name_read, insert_only=insert_only)
             if await plan.changed(db, fresh, project=project, domain=domain, keyed=keyed is not None):
-                plan = await build(fresh)
+                plan = await build(fresh, prior=plan)
                 (
                     content, secret_value, secret_detail, secret_meta, observed, concept, name,
                     write_identity, tags_json,
@@ -676,6 +676,10 @@ class _CredentialPlan(NamedTuple):
     name: str | None = None
     write_identity: tuple | None = None
     tags_json: str | None = None
+    #: The stored headers this plan recognises as a read-back body's first
+    #: line, and the secrets it masks: a rebuild under the lock keeps both.
+    headers: tuple = ()
+    also: tuple = ()
 
     def fields(self) -> tuple:
         return (
@@ -703,21 +707,25 @@ async def _credential_plan(
     header: str, split, split_large: bool, held: tuple, flat: str, carded: bool,
     insert_only: bool, keyed: knowledge_crud.KeyObservation | None, entry_key: str | None,
     prose: bool, nameless: bool, meta: dict, tags_json: str | None,
+    prior: _CredentialPlan | None = None,
 ) -> _CredentialPlan:
     """The part of a credential write built from ``resolution`` (``_name_entries``:
     the target, the name's hash, the entries the name resolves to), from the
     caller's input as split (``held``: content, value, description) and its
     ``meta`` and ``tags_json`` as given, never as a previous build left them,
-    so it can run again under the writer lock (``ingest_knowledge_unit``)."""
+    so it can run again under the writer lock (``ingest_knowledge_unit``).
+    Run again, it is given the plan it replaces (``prior``): a header and a
+    secret that read recognised stay recognised (Devin 4682745904, 4682746508)."""
     from genesis.memory import reference_ops
 
     target, identity, entries = resolution
     content, secret_value, secret_detail = held
     meta = dict(meta)
     first, sep, _ = given.partition("\n")
-    if sep and first != header and any(
-        first == (entry.body or "").partition("\n")[0] for entry in entries
-    ):
+    headers = tuple(dict.fromkeys([
+        *(prior.headers if prior else ()), *((entry.body or "").partition("\n")[0] for entry in entries),
+    ]))
+    if sep and first != header and first in headers:
         # A body read back and saved again starts with the header STORED
         # for the entry its name resolves to (its name masked): that line
         # is the header, never description text (comment 4579950912). The
@@ -733,7 +741,7 @@ async def _credential_plan(
             # An untrusted write of the credential an untrusted entry already
             # holds (a re-upload) is that entry: the one sameness rule.
             if knowledge_crud.same_untrusted(entry, stored_value, secret_detail, json.dumps({"identifier": flat})):
-                return _CredentialPlan(_stored(entry.id, entry.concept), tuple(entries))
+                return _CredentialPlan(_stored(entry.id, entry.concept), tuple(entries), headers=headers)
     if keyed is not None:
         concept, observed = entry_key, keyed
     elif target is not None:
@@ -769,6 +777,12 @@ async def _credential_plan(
     # masked with it. The pure-Python work runs off the event loop when any
     # value it reads is large.
     also = _secrets_of(observed, entries, known_secret, value_prose)
+    if prior is not None:
+        # Every secret the plan this one replaces masked stays masked, even
+        # one this read no longer holds (rotated away in between).
+        also = tuple(dict.fromkeys([
+            *also, *(t for t in prior.also if t[0] != known_secret or bool(t[2]) != bool(value_prose)),
+        ]))
     # Every probe of the value and of the secrets the capture rules find in
     # it and in the description, built ONCE for the identifier and the tags.
     large = (
@@ -811,7 +825,10 @@ async def _credential_plan(
     tags_json, content = await asyncio.to_thread(mask_tags) if large else mask_tags()
     return _CredentialPlan(
         None, tuple(entries), observed, content, secret_value, secret_detail, secret_meta,
-        concept, name, write_identity, tags_json,
+        concept, name, write_identity, tags_json, headers,
+        # The value masked as this write's own is a secret a rebuild masks
+        # too: it is dropped there again only if it is still the write's own.
+        tuple(dict.fromkeys([*also, *([(known_secret, known_detail, value_prose)] if known_secret else [])])),
     )
 
 

@@ -491,3 +491,75 @@ async def test_h1_twenty_four_concurrent_uploads_of_one_name_all_land(db, truste
         for value in held:
             if value != "Fake9pwx" or trusted_first:
                 assert not re.search(rf"(?<![0-9]){value}", text), (value, text)
+
+
+async def test_b11_a_resaved_body_racing_a_rotation_keeps_the_rotated_description(db, monkeypatch):
+    """Devin 4682745904: a body read back and saved again, with a rotation in
+    its window that masks a word of the stored header. The rebuild under the
+    lock still treats the read-back first line as the header the first read
+    recognised, so the description stays and is never header text."""
+    from tests.test_memory.test_reference_opaque_identity import _held_save
+
+    name = "Example portal Old1!Fake0 Next!Fake2"
+    store = _PointStore()
+    unit = await _held_save(db, store, name, "Old1!Fake0")
+    stored = (await kc.get(db, unit))["body"]
+    # The stored header masks the old value, so it is not the caller's name.
+    assert stored.startswith("[reference.credentials] Example portal [held] Next!Fake2\n")
+    gate = _pause_at(monkeypatch, "lock")
+    first, second = await _race(
+        gate,
+        lambda: _ingest(db, store, stored, concept=name),
+        lambda: _ingest(
+            db, store, _body(name, "Next!Fake2"), concept=name,
+            held_value="Next!Fake2", held_detail="rotated note",
+        ),
+    )
+    assert first == second == unit
+    assert await ro.reveal_reference(db, await kc.get(db, unit)) == ("Next!Fake2", "rotated note")
+    for text in await _all_indexed(db, store):
+        assert "Next!Fake2" not in text and "Old1!Fake0" not in text, text
+
+
+async def test_b12_an_upload_racing_a_rotation_keeps_the_old_value_masked(db, monkeypatch):
+    """Devin 4682746508: an upload read the name's entries while they held a
+    value that a trusted save then rotated away. The rebuild under the lock
+    still masks every secret the first read masked, so the old value never
+    reaches the upload's tags or name."""
+    from tests.test_memory.test_reference_opaque_identity import _held_save, _untrusted
+
+    name = "Example portal login"
+    store = _PointStore()
+    await _held_save(db, store, name, "Old1!Fake0")
+    tags = json.dumps(["reference", "credentials", "tag Old1!Fake0"])
+    gate = _pause_at(monkeypatch, "lock")
+    await _race(
+        gate,
+        lambda: _untrusted(db, store, name, "upload body Up1!Fake5", tags_json=tags),
+        lambda: _held_save(db, store, name, "New2!Fake3"),
+    )
+    for text in await _all_indexed(db, store):
+        assert "Old1!Fake0" not in text, text
+        assert "New2!Fake3" not in text, text
+
+
+async def test_b13_a_value_less_save_racing_a_rotation_keeps_the_old_value_masked(db, monkeypatch):
+    """Security review of the b11/b12 fix: a save with no value of its own (a
+    placeholder value line) masks the stored value as its own; a rotation in
+    its window must not leave that value visible in its tags."""
+    from tests.test_memory.test_reference_opaque_identity import _held_save
+
+    name = "Example portal login"
+    store = _PointStore()
+    unit = await _held_save(db, store, name, "Old1!Fake0")
+    tags = json.dumps(["reference", "credentials", "tag Old1!Fake0"])
+    gate = _pause_at(monkeypatch, "lock")
+    first, second = await _race(
+        gate,
+        lambda: _ingest(db, store, _body(name, ro.SECRET_PLACEHOLDER), concept=name, tags_json=tags),
+        lambda: _held_save(db, store, name, "New2!Fake3"),
+    )
+    assert first == second == unit
+    for text in await _all_indexed(db, store):
+        assert "Old1!Fake0" not in text, text
+        assert "New2!Fake3" not in text, text
