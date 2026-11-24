@@ -749,6 +749,18 @@ async def test_research_routing_nudge_uses_delivery_model():
     assert 'profile="research"' in _BG_RESEARCH_ROUTING
 
 
+def test_research_routing_puts_the_answer_to_a_specific_ask_first():
+    """A specific ask gets its answer from the obvious source as the turn's first
+    text, before any further tool call; more digging comes after, announced (#4852)."""
+    from genesis.cc.conversation import _BG_RESEARCH_ROUTING
+
+    block = _BG_RESEARCH_ROUTING
+    assert "## Answer first" in block
+    assert "before any further tool call" in block
+    assert "obvious source" in block
+    assert "say what you are still checking" in block
+
+
 @pytest.mark.asyncio
 async def test_build_fresh_invocation_applies_routing_for_channel(loop):
     """Stale-resume recovery rebuilds the prompt from scratch — the routing nudge

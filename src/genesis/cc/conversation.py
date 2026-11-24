@@ -290,6 +290,12 @@ _BG_RESEARCH_ROUTING = (
     "That background session runs to completion and delivers the finished outcome — "
     "success or failure — back to this exact conversation. Keep quick answers and short "
     "tool use inline as usual."
+    "\n\n## Answer first\n"
+    "The user is often waiting on the answer. When they ask for a specific fact (what "
+    "was said, what a value is, what happened when), read the obvious source and write "
+    "the direct answer before any further tool call. Then stop, or say what you are "
+    "still checking and continue briefly; anything long goes to the background lane "
+    "above. Do not hold the answer back to search wider or to polish it first."
 )
 
 
@@ -2359,6 +2365,9 @@ class ConversationLoop:
                 chat_id,
                 thread_id=int(thread_id) if thread_id else None,
                 limit=self.RECOVERY_CONTEXT_MESSAGES,
+                # Interim progress rows are narration around the turn, not its
+                # answer; leaving them out keeps the budget on the turns (#4849).
+                exclude_senders=("genesis-progress",),
             )
             if not messages:
                 return ""

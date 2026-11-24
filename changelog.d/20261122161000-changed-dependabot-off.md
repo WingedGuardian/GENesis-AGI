@@ -1,0 +1,1 @@
+- Dependabot no longer opens pull requests: its version-update configuration is removed and its automated security fixes are switched off. Dependency and GitHub Actions bumps are now deliberate changes that check the new release first. Dependabot security alerts stay on.

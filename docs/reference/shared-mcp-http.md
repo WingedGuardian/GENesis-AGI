@@ -148,5 +148,30 @@ before the listener-ready flag. HTTP grace and resource grace are separate waits
 using the configured value; expiry permits cancellation, never premature resource
 closure. A nonterminating physical worker can still require operator intervention.
 
-Bind-before-READY notification, inert service templates, thin client forwarding,
-local capability union and matched measurements remain separate rollout steps.
+## Readiness and rendered service units
+
+The four `scripts/systemd/genesis-mcp-*.service.template` files use `Type=notify`
+and `NotifyAccess=main`. Their fixed shell wrapper executes the configured Python
+and explicit shared launcher as the same main process, preserving literal path
+arguments. Both ordinary renderers substitute and stamp them through their
+existing managed-unit paths. Rendering does not enable or start these services;
+existing edited/masked units retain the normal keep/take policy. Bootstrap's
+explicit named take can replace a mask after backup; blanket take cannot.
+
+`shared_notify.notify_ready` sends the fixed `READY=1` datagram only after the
+qualified Uvicorn startup completes its actual bind, and skips it if shutdown
+was requested during startup. It accepts an absolute local `NOTIFY_SOCKET` path
+or the `@` abstract form. Unset/empty means manual CLI operation. A malformed
+address or failed/short send fails startup; after a completed bind, the existing
+runner stops the listener and settles SDK/registered work before resource
+retirement. Successful queueing alone does not prove a manager accepted the
+message: the actual manager/P7 state remains the readiness consumer.
+
+The templates load no environment file before launcher preflight. Existing
+credentials, all explicit budgets, the enabled flag and the qualified SDK set
+are still required. They set no startup/stop timeouts, so manager defaults apply.
+Before enabling a unit, qualify and select measured start/stop settings against
+the configured grace and actual physical settlement behavior; no portable
+hard-stop budget is established here. Do not enable services merely because a
+template exists. Shared routing remains off while thin forwarding, the local
+capability/bookmark union and matched measurements are completed.

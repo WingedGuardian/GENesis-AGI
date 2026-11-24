@@ -6,11 +6,15 @@ from tests.shared_mcp_qualification import QUALIFIED_TEST_STACK as QUALIFIED_TES
 import asyncio
 import json
 import os
+import select
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
+import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import aiosqlite
 import httpx
@@ -35,9 +39,18 @@ def result(response):
     return message.result
 
 
-@pytest.mark.parametrize("service,tool", [("health", "health_status"), ("memory", "observation_query"),
-                                          ("outreach", "outreach_pending"), ("recon", "recon_findings")])
-async def test_real_shared_cli_preserves_catalog_calls_and_resource_shutdown(tmp_path, service, tool):
+@pytest.fixture
+def notify_receiver(tmp_path, notify_kind):
+    # Keep the socket name short even with a descriptive test node directory.
+    with tempfile.TemporaryDirectory(prefix="n", dir=tmp_path.parent) as directory:
+        address = str(Path(directory) / "n") if notify_kind == "path" else "@genesis-" + uuid.uuid4().hex
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as receiver:
+            receiver.bind(address if notify_kind == "path" else "\0" + address[1:])
+            yield SimpleNamespace(socket=receiver, address=address, directory=Path(directory))
+
+
+@pytest.fixture
+async def shared_install(tmp_path, service):
     home = tmp_path / "home"
     state = home / ".genesis"
     (state / "config").mkdir(parents=True)
@@ -78,10 +91,24 @@ async def test_real_shared_cli_preserves_catalog_calls_and_resource_shutdown(tmp
     if source := os.environ.get("GENESIS_SHARED_CLI_SERVER_SOURCE"):
         env["GENESIS_SHARED_CLI_SERVER_SOURCE"] = source
     events = tmp_path / "events.jsonl"
+    return SimpleNamespace(env=env, port=port, events=events, observation=observation)
+
+
+@pytest.mark.parametrize("service,tool,notify_kind", [
+    ("health", "health_status", "path"), ("memory", "observation_query", "path"),
+    ("outreach", "outreach_pending", "path"), ("recon", "recon_findings", "path"),
+    ("health", "health_status", "abstract"),
+], ids=["health-health_status", "memory-observation_query", "outreach-outreach_pending",
+        "recon-recon_findings", "health-abstract"])
+async def test_real_shared_cli_preserves_catalog_calls_and_resource_shutdown(
+    tmp_path, service, tool, notify_kind, shared_install, notify_receiver,
+):
+    env = dict(shared_install.env, NOTIFY_SOCKET=notify_receiver.address)
+    port, events, observation = shared_install.port, shared_install.events, shared_install.observation
     child_script = Path(__file__).with_name("shared_cli_lifecycle_child.py")
     with (tmp_path / "stdout.log").open("w") as out, (tmp_path / "stderr.log").open("w") as err:
         child = subprocess.Popen([sys.executable, str(child_script), service, str(port), str(events)],
-                                 cwd=ROOT, env=env, stdout=out, stderr=err)
+                                 cwd="/", env=env, stdout=out, stderr=err)
         try:
             # Existing disposable CLI samples start in ~12s; 60s also covers the
             # observed17.841s cold fixture. No native/model/provider turn runs.
@@ -138,20 +165,83 @@ async def test_real_shared_cli_preserves_catalog_calls_and_resource_shutdown(tmp
                         "created_at": "2026-01-01", "message_preview": "Fixture message"}],
                         "total": 1, "offset": 0, "limit": 50, "truncated": False}, payload
                 assert (await client.get("/status", headers={"Authorization": "Bearer invalid"})).status_code == 401
+            assert select.select([notify_receiver.socket], [], [], 0)[0], "No READY after usable listener"
+            assert notify_receiver.socket.recv(64) == b"READY=1"
+            ready_events = [json.loads(line) for line in events.read_text().splitlines()]
+            assert ready_events.index("bound") < ready_events.index("ready-sent"), ready_events
+            assert ready_events.count("ready-sent") == 1
             child.send_signal(signal.SIGTERM)
             assert child.wait(timeout=20) == -signal.SIGTERM
             observed = [json.loads(line) for line in events.read_text().splitlines()]
             (tmp_path / "receipt.json").write_text(json.dumps({"service": service, "requests_passed": True,
                 "tools": len(actual), "events": observed, "returncode": child.returncode}, indent=2))
-            assert "factory-exited" in observed, observed
-            assert observed.index("lifespan-stopped") < observed.index("factory-exited")
-            assert observed.index("drain-confirmed") < observed.index("factory-exited")
+            assert "resources-closed" in observed, observed
+            assert observed.index("lifespan-stopped") < observed.index("resources-closed")
+            assert observed.index("drain-confirmed") < observed.index("resources-closed")
             if service == "memory":
                 assert observed.count("reranker-closed") == observed.count("qdrant-closed") == 1
                 assert observed.count("cache-closed") == 2
                 for event in ("reranker-closed", "cache-closed", "qdrant-closed"):
-                    assert observed.index("lifespan-stopped") < observed.index(event) < observed.index("factory-exited")
+                    assert observed.index("lifespan-stopped") < observed.index(event) < observed.index("resources-closed")
                     assert observed.index("drain-confirmed") < observed.index(event)
+                for index, event in enumerate(observed):
+                    if event == "qdrant-finalizer-closed":
+                        assert observed.index("resources-closed") < index
+        finally:
+            if child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=10)
+
+
+@pytest.mark.parametrize("case,service,notify_kind", [
+    ("notify-missing", "health", "path"), ("stopping-during-bind", "health", "path"),
+    ("bind-error", "health", "path"), ("notify-missing", "memory", "path"),
+])
+async def test_shared_cli_failed_or_stopping_startup_never_ready(
+    tmp_path, service, notify_kind, case, shared_install, notify_receiver,
+):
+    address = str(notify_receiver.directory / "missing") if case == "notify-missing" else notify_receiver.address
+    env = dict(shared_install.env, NOTIFY_SOCKET=address)
+    port, events = shared_install.port, shared_install.events
+    helper = Path(__file__).with_name("shared_cli_lifecycle_child.py")
+    with socket.socket() as occupied, (tmp_path / "stdout.log").open("w") as out, (
+        tmp_path / "stderr.log"
+    ).open("w") as err:
+        if case == "bind-error":
+            occupied.bind(("127.0.0.1", port))
+            occupied.listen()
+        child = subprocess.Popen([sys.executable, str(helper), service, str(port), str(events), case],
+                                 cwd="/", env=env, stdout=out, stderr=err)
+        try:
+            # Same observed startup envelope as the successful CLI cases.
+            code = child.wait(timeout=60)
+            observed = [json.loads(line) for line in events.read_text().splitlines()]
+            (tmp_path / "receipt.json").write_text(json.dumps({"case": case, "events": observed,
+                "returncode": code}, indent=2))
+            assert code == 0 if case == "stopping-during-bind" else code != 0
+            assert ("bound" in observed) == (case != "bind-error"), observed
+            if case == "notify-missing":
+                assert "FileNotFoundError" in (tmp_path / "stderr.log").read_text()
+            assert "ready-sent" not in observed, observed
+            assert not select.select([notify_receiver.socket], [], [], 0)[0]
+            assert observed.index("lifespan-stopped") < observed.index("resources-closed"), observed
+            assert observed.index("drain-confirmed") < observed.index("resources-closed"), observed
+            if service == "memory":
+                assert observed.count("reranker-closed") == observed.count("qdrant-closed") == 1
+                assert observed.count("cache-closed") == 2
+                for index, event in enumerate(observed):
+                    if event in {"reranker-closed", "cache-closed", "qdrant-closed"}:
+                        assert max(observed.index("lifespan-stopped"), observed.index("drain-confirmed")) < index
+                        assert index < observed.index("resources-closed")
+                    elif event == "qdrant-finalizer-closed":
+                        assert observed.index("resources-closed") < index
+            if case != "bind-error":
+                with pytest.raises(OSError), socket.create_connection(("127.0.0.1", port)):
+                    pytest.fail("Startup left its listener open")
         finally:
             if child.poll() is None:
                 child.terminate()

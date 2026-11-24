@@ -549,13 +549,15 @@ def _coverage_details(
             passed = True
             for context in contexts:
                 if (sha, context) not in checked and context.round_number == 0:
-                    # Round 0 owes the grammar only, plus the past-round-4
-                    # rules about the whole PR (no round of its own to judge).
+                    # Round 0 owes the grammar only, a fix-now's Alternative
+                    # line, and the past-round-4 rules about the whole PR (no
+                    # round of its own to judge).
                     import review_past_terminal as pt  # noqa: PLC0415
 
                     checked[(sha, context)] = (
                         parsed.ok
                         and not parsed.escalate
+                        and rr.alternative_problem(parsed, made_at) is None
                         and not pt.problems(
                             parsed, None, records, gate_lane=gate_lane, made_at=made_at
                         )

@@ -383,6 +383,9 @@ async def _ingest_entry(
         "source_doc": "reference_store:migrate_reference_data",
         "source_pipeline": "migrate_reference_data",
         "platform": "migrate_reference_data",
+        # The file it came from: a credential's held provenance keeps it (its
+        # rebuilt body carries no Captured line).
+        **({"source_file": entry.source_file} if entry.source_file else {}),
     }
 
     unit_id = await ingest_knowledge_unit(
@@ -396,6 +399,8 @@ async def _ingest_entry(
         memory_class="fact",  # bypass 0.7x auto-reference penalty
         concept=entry.identifier,
         tags_json=tags_json,
+        # A credential's value and description, as given, so its Tags line is not held as part of the value.
+        **({"held_value": entry.value, "held_detail": entry.description} if entry.kind == "credentials" else {}),
         # References live in episodic_memory alongside other personal data —
         # match reference_store's invariant (mcp/memory/knowledge.py). Without
         # this, ingest defaults to collection="knowledge_base", stranding

@@ -9,6 +9,7 @@ non-zero exit, a call whose result has not arrived, and a subagent call.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -20,6 +21,14 @@ from genesis.learning.procedural.struggle_detector import (
 )
 
 SID = "11111111-2222-3333-4444-555555555555"
+
+
+def _day():
+    """Yesterday's date: fixture calls dated then are never dropped by the
+    retention horizons. Read where used, never at import (frozen-clock check)."""
+    return (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
 # A synthetic credential shape the shared scrubber redacts; not a real key.
 FAKE_KEY = "sk-ant-api03-" + "Q" * 40
 
@@ -56,34 +65,37 @@ HOOK_TEXT = (
     f"token={FAKE_KEY}"
 )
 
-RECORDS = [
-    _use("toolu_ok", "Bash", {"command": "ls"}, ts="2026-11-01T10:00:00Z"),
-    _result("toolu_ok", "a\nb", ts="2026-11-01T10:00:01Z"),
-    _use("toolu_hook", "Bash", {"command": "cat <<EOF"}, ts="2026-11-01T10:01:00Z"),
-    _result("toolu_hook", HOOK_TEXT, ts="2026-11-01T10:01:01Z", is_error=True),
-    _use("toolu_reject", "ExitPlanMode", {"plan": "x"}, ts="2026-11-01T10:02:00Z"),
-    _result(
-        "toolu_reject",
-        "The user doesn't want to proceed with this tool use.",
-        ts="2026-11-01T10:02:01Z",
-        is_error=True,
-        denial="user-rejected",
-    ),
-    _use("toolu_exit", "Bash", {"command": "false"}, ts="2026-11-01T10:03:00Z"),
-    _result("toolu_exit", "Exit code 1", ts="2026-11-01T10:03:01Z", is_error=True),
-    _use("toolu_edit", "Edit", {"file_path": "/x/y.py"}, ts="2026-11-01T10:04:00Z"),
-    _result("toolu_edit", "The file has been updated.", ts="2026-11-01T10:04:01Z"),
-    _use("toolu_side", "Bash", {"command": "pwd"}, ts="2026-11-01T10:05:00Z", sidechain=True),
-    _result("toolu_side", "Exit code 2", ts="2026-11-01T10:05:01Z", is_error=True, sidechain=True),
-    # Still running when the transcript is read: no result record yet.
-    _use("toolu_pending", "Bash", {"command": "sleep 600"}, ts="2026-11-01T10:06:00Z"),
-]
+
+def _records():
+    day = _day()  # one read, so a transcript never straddles midnight
+    return [
+        _use("toolu_ok", "Bash", {"command": "ls"}, ts=f"{day}T10:00:00Z"),
+        _result("toolu_ok", "a\nb", ts=f"{day}T10:00:01Z"),
+        _use("toolu_hook", "Bash", {"command": "cat <<EOF"}, ts=f"{day}T10:01:00Z"),
+        _result("toolu_hook", HOOK_TEXT, ts=f"{day}T10:01:01Z", is_error=True),
+        _use("toolu_reject", "ExitPlanMode", {"plan": "x"}, ts=f"{day}T10:02:00Z"),
+        _result(
+            "toolu_reject",
+            "The user doesn't want to proceed with this tool use.",
+            ts=f"{day}T10:02:01Z",
+            is_error=True,
+            denial="user-rejected",
+        ),
+        _use("toolu_exit", "Bash", {"command": "false"}, ts=f"{day}T10:03:00Z"),
+        _result("toolu_exit", "Exit code 1", ts=f"{day}T10:03:01Z", is_error=True),
+        _use("toolu_edit", "Edit", {"file_path": "/x/y.py"}, ts=f"{day}T10:04:00Z"),
+        _result("toolu_edit", "The file has been updated.", ts=f"{day}T10:04:01Z"),
+        _use("toolu_side", "Bash", {"command": "pwd"}, ts=f"{day}T10:05:00Z", sidechain=True),
+        _result("toolu_side", "Exit code 2", ts=f"{day}T10:05:01Z", is_error=True, sidechain=True),
+        # Still running when the transcript is read: no result record yet.
+        _use("toolu_pending", "Bash", {"command": "sleep 600"}, ts=f"{day}T10:06:00Z"),
+    ]
 
 
 @pytest.fixture
 def transcript(tmp_path):
     path = tmp_path / f"{SID}.jsonl"
-    path.write_text("\n".join(json.dumps(r) for r in RECORDS) + "\n")
+    path.write_text("\n".join(json.dumps(r) for r in _records()) + "\n")
     return path
 
 
@@ -105,8 +117,47 @@ def test_rows_are_exactly_the_recordable_calls(transcript):
         "toolu_exit": 0,
     }
     assert rows["toolu_ok"][0] == SID  # the record's own sessionId
-    assert rows["toolu_hook"][5] == "2026-11-01T10:01:01Z"  # the result's timestamp
+    assert rows["toolu_hook"][5] == f"{_day()}T10:01:01+00:00"  # the result's time, normalised
     assert rows["toolu_ok"][4] is None  # no snippet on a success
+    kinds = {tid: row[7] for tid, row in rows.items()}
+    assert kinds == {
+        "toolu_ok": None,
+        "toolu_hook": "hook_block",
+        "toolu_reject": "user_rejected",
+        "toolu_exit": "exit_nonzero",
+    }
+
+
+def test_the_stored_class_holds_what_the_row_alone_could_not_rebuild(tmp_path):
+    """The two cases #4722 exists for: a class that comes from toolDenialKind,
+    which no column keeps, and a hook refusal whose prefix closes past the
+    400-character snippet."""
+    long_hook = (
+        "PreToolUse:Bash hook error: [bash -c '" + "x" * 600 + "']: BLOCKED: refused."
+    )
+    records = [
+        _use("toolu_denied", "Bash", {"command": "x"}, ts=f"{_day()}T10:00:00Z"),
+        _result(
+            "toolu_denied", "Not run.", ts=f"{_day()}T10:00:01Z",
+            is_error=True, denial="permission-denied",
+        ),
+        _use("toolu_longhook", "Bash", {"command": "y"}, ts=f"{_day()}T10:01:00Z"),
+        _result("toolu_longhook", long_hook, ts=f"{_day()}T10:01:01Z", is_error=True),
+    ]
+    path = tmp_path / f"{SID}.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    _, rows = _rows(path)
+    assert rows["toolu_denied"][7] == "denied_permission-denied"
+    assert rows["toolu_longhook"][7] == "hook_block"
+    # Neither is recoverable from what the row stores.
+    from genesis.transcript_analytics.classify import classify
+
+    assert classify(rows["toolu_denied"][4] or "", is_error=True, denial_kind=None)[0] != (
+        "denied_permission-denied"
+    )
+    assert classify(rows["toolu_longhook"][4] or "", is_error=True, denial_kind=None)[0] != (
+        "hook_block"
+    )
 
 
 def test_a_call_with_no_result_is_never_a_row_but_still_scores_as_an_error(transcript):
@@ -145,10 +196,10 @@ def test_no_failures_means_only_success_rows(tmp_path):
         "\n".join(
             json.dumps(r)
             for r in (
-                _use("toolu_a", "Read", {"file_path": "/a"}, ts="2026-11-01T11:00:00Z"),
-                _result("toolu_a", "contents", ts="2026-11-01T11:00:01Z"),
-                _use("toolu_b", "Grep", {"pattern": "x"}, ts="2026-11-01T11:01:00Z"),
-                _result("toolu_b", "No matches", ts="2026-11-01T11:01:01Z", is_error=False),
+                _use("toolu_a", "Read", {"file_path": "/a"}, ts=f"{_day()}T11:00:00Z"),
+                _result("toolu_a", "contents", ts=f"{_day()}T11:00:01Z"),
+                _use("toolu_b", "Grep", {"pattern": "x"}, ts=f"{_day()}T11:01:00Z"),
+                _result("toolu_b", "No matches", ts=f"{_day()}T11:01:01Z", is_error=False),
             )
         )
         + "\n"
@@ -246,10 +297,10 @@ async def test_prune_drops_old_rows_and_old_failure_text_only(db):
         return ts.replace("+00:00", "Z") if z else ts
 
     rows = [
-        ("s", "Bash", None, 0, "old text", ago(200), "t_old"),
-        ("s", "Bash", None, 0, "mid text", ago(120, z=True), "t_mid"),
-        ("s", "Bash", None, 0, "new text", ago(10, z=True), "t_new"),
-        ("s", "Read", None, 1, None, ago(179), "t_keep"),
+        ("s", "Bash", None, 0, "old text", ago(200), "t_old", "other"),
+        ("s", "Bash", None, 0, "mid text", ago(120, z=True), "t_mid", "other"),
+        ("s", "Bash", None, 0, "new text", ago(10, z=True), "t_new", "other"),
+        ("s", "Read", None, 1, None, ago(179), "t_keep", None),
     ]
     await tco.insert_outcomes(db, rows)
     removed, cleared = await tco.prune(db, now=now)
@@ -281,7 +332,7 @@ async def test_an_extraction_cycle_records_tool_outcomes(db, tmp_path, monkeypat
     )
     text = {"type": "user", "message": {"content": "please list"}}
     path = tmp_path / f"{SID}.jsonl"
-    path.write_text("\n".join(json.dumps(r) for r in [text, *RECORDS]) + "\n")
+    path.write_text("\n".join(json.dumps(r) for r in [text, *_records()]) + "\n")
 
     async def fake_extract(**_kwargs):
         return SimpleNamespace(
@@ -299,6 +350,20 @@ async def test_an_extraction_cycle_records_tool_outcomes(db, tmp_path, monkeypat
         "toolu_ok",
         "toolu_reject",
     ]
+    cur = await db.execute(
+        "SELECT tool_use_id, error_class FROM tool_call_outcomes"
+        " WHERE tool_use_id IN ('toolu_ok', 'toolu_reject')"
+    )
+    assert dict(await cur.fetchall()) == {"toolu_ok": None, "toolu_reject": "user_rejected"}
+    cur = await db.execute(
+        "SELECT COUNT(*), COUNT(recorded_at), MIN(recorded_at) > MAX(timestamp)"
+        " FROM tool_call_outcomes"
+    )
+    total, stamped, later = await cur.fetchone()
+    # Every writer row carries its insert time, which postdates these calls.
+    assert total == stamped == 4 and later == 1
+
+
 def _ago(days):
     from datetime import UTC, datetime, timedelta
 
@@ -333,8 +398,8 @@ def test_failure_text_over_the_cap_is_withheld_not_cut(tmp_path):
 
     long_text = "Exit code 1 " + "p" * (sd._FAILURE_TEXT_CAP + 10)
     records = [
-        _use("toolu_long", "Bash", {"command": "x"}, ts="2026-11-01T10:00:00Z"),
-        _result("toolu_long", long_text, ts="2026-11-01T10:00:01Z", is_error=True),
+        _use("toolu_long", "Bash", {"command": "x"}, ts=f"{_day()}T10:00:00Z"),
+        _result("toolu_long", long_text, ts=f"{_day()}T10:00:01Z", is_error=True),
     ]
     path = tmp_path / f"{SID}.jsonl"
     path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
@@ -357,6 +422,28 @@ def test_an_escaped_credential_in_an_unclosed_quote_is_never_stored():
 def test_a_harmless_escape_keeps_its_snippet():
     text = 'Error: "caf\\u00e9 not found'
     assert tool_outcomes._snippet(text) == text
+
+
+async def test_a_compact_timestamp_is_stored_in_a_form_the_prune_can_read(db):
+    """Python parses 20261101T100001Z; SQLite datetime() does not. Stored raw,
+    such a row would never be pruned."""
+    compact = _day().replace("-", "") + "T100001Z"
+    spine = [{
+        "type": "tool", "tool": "Bash", "tool_use_id": "toolu_compact", "has_result": True,
+        "is_sidechain": False, "session_id": SID, "timestamp": compact,
+        "failure_class": None, "failure_text": None, "file_path": None,
+    }]
+    offset = dict(spine[0], tool_use_id="toolu_offset", timestamp=f"{_day()}T15:30:16+05:30:15")
+    rows = tool_outcomes.outcome_rows([*spine, offset], fallback_session_id="fb")
+    await tco.insert_outcomes(db, rows)
+    cur = await db.execute(
+        "SELECT tool_use_id, datetime(timestamp) FROM tool_call_outcomes ORDER BY tool_use_id"
+    )
+    # The offset with seconds is converted to UTC, not kept in a form datetime() rejects.
+    assert [tuple(r) for r in await cur.fetchall()] == [
+        ("toolu_compact", f"{_day()} 10:00:01"),
+        ("toolu_offset", f"{_day()} 10:00:01"),
+    ]
 
 
 def test_an_unparseable_timestamp_is_stored_as_now_so_the_prune_can_reach_it():
@@ -391,7 +478,7 @@ async def test_a_result_appended_without_new_text_is_recorded(db, tmp_path, monk
         status="active",
     )
     text = {"type": "user", "message": {"content": "please list"}}
-    first = [text, _use("toolu_late", "Bash", {"command": "sleep 1"}, ts="2026-11-01T10:00:00Z")]
+    first = [text, _use("toolu_late", "Bash", {"command": "sleep 1"}, ts=f"{_day()}T10:00:00Z")]
     path = tmp_path / f"{SID}.jsonl"
     path.write_text("\n".join(json.dumps(r) for r in first) + "\n")
 
@@ -414,6 +501,38 @@ async def test_a_result_appended_without_new_text_is_recorded(db, tmp_path, monk
     await cycle()
     assert await recorded() == []  # still running: no result yet
     with path.open("a") as f:
-        f.write(json.dumps(_result("toolu_late", "done", ts="2026-11-01T10:00:05Z")) + "\n")
+        f.write(json.dumps(_result("toolu_late", "done", ts=f"{_day()}T10:00:05Z")) + "\n")
     await cycle()
     assert await recorded() == ["toolu_late"]
+def test_a_replayed_call_is_not_a_second_call(tmp_path):
+    """api-request-blob records replay earlier calls with the same ids (#4812).
+    Kept twice, a replayed call had no result, scored as a crash, and gave
+    readers that cut the spine by tool_use_id the same id at two positions."""
+    replay = {
+        "type": "api-request-blob",
+        "sessionId": SID,
+        "timestamp": "2026-11-01T10:00:09Z",
+        "message": {
+            "content": [
+                {"type": "tool_use", "id": "toolu_a", "name": "Bash", "input": {"command": "ls"}},
+                {"type": "tool_use", "id": "toolu_b", "name": "Bash", "input": {"command": "pwd"}},
+            ]
+        },
+    }
+    records = [
+        _use("toolu_a", "Bash", {"command": "ls"}, ts="2026-11-01T10:00:00Z"),
+        _result("toolu_a", "ok", ts="2026-11-01T10:00:01Z"),
+        _use("toolu_b", "Bash", {"command": "pwd"}, ts="2026-11-01T10:00:02Z"),
+        _result("toolu_b", "ok", ts="2026-11-01T10:00:03Z"),
+        replay,
+        _use("toolu_c", "Bash", {"command": "id"}, ts="2026-11-01T10:00:10Z"),
+        _result("toolu_c", "ok", ts="2026-11-01T10:00:11Z"),
+    ]
+    path = tmp_path / "replay.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    spine, haystack = build_spine_and_haystack(path)
+    tools = [e for e in spine if e["type"] == "tool"]
+    assert [e["tool_use_id"] for e in tools] == ["toolu_a", "toolu_b", "toolu_c"]
+    assert all(e["has_result"] and e["outcome"] == "ok" for e in tools)
+    assert [e["turn"] for e in tools] == [1, 2, 3]
+    assert haystack.count('"command": "ls"') == 1

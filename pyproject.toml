@@ -119,6 +119,9 @@ transcript-analytics = ["duckdb==1.5.6", "pyarrow==24.0.0"]
 # the list is INSTALL_EXTRAS in scripts/lib/venv_matches_pyproject.py): an install
 # runs its own test suite, and the card vault needs the payments packages.
 test = [
+    # Offline artifact tests invoke the declared build backend directly.
+    "setuptools>=64",
+    "wheel",
     "pytest>=8.0",
     "pytest-asyncio",
     "pytest-timeout",
@@ -127,12 +130,12 @@ test = [
     # does before any job passes `-n`.
     "pytest-xdist",
     # Property tests exercise hook-output budget invariants across Unicode edges.
-    "hypothesis>=6.0",
+    "hypothesis>=6.152.0",
     "aioresponses>=0.7.7",
     # tests/test_hooks/test_edit_verify_advisory.py executes the real hook,
     # which shells out to the venv's ruff — CI's test job installs only this
     # extra, so ruff must be here (the lint job installs its own copy).
-    "ruff>=0.5",
+    "ruff==0.17.5",  # Keep the required CI lint job on this same qualified version.
     # tests/test_dashboard/test_dashboard_css_isolation.py parses the shipped
     # stylesheets. A hand-rolled CSS parser inside that guard failed OPEN twice —
     # once on a brace inside a `url()`, once on a rule nested in `@media` — so
@@ -245,6 +248,9 @@ quote-style = "double"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Pytest bootstraps a fresh cache beside cache_dir. Nest it so those transient
+# files also stay inside the existing test-owned .pytest_cache directory.
+cache_dir = ".pytest_cache/pytest"
 asyncio_mode = "auto"
 # Explicit, so pytest-asyncio stops warning that it is unset (pytest 9.2 prints
 # that warning ahead of everything, including tests/conftest.py's own first

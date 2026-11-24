@@ -1,0 +1,1 @@
+- The closing-session skill now reads whether a PR delivers what its linked issue asks (each acceptance point, the warned-against fix, any "fixed" claim) before moving it, and records the result in a marker comment on the PR; build-session records the author's own outcome as the first such read.
