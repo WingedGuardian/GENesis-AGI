@@ -2,7 +2,8 @@
 
 With ``recovery.live_engine`` on, an approved REVERT_CODE on `live` is ONE call
 to the engine's guarded drop (`drop <branch> --expect-branch live --expect-head
-<tip> --expect-candidate <pinned> --restart-server --wait 0`), which drops,
+<tip> --expect-candidate <pinned> --expect-leaving <json> --restart-server --wait
+0`), which drops,
 confirms and queues the restart under one update.lock hold. The Guardian only
 judges the outcome: the action succeeds when genesis-server booted from
 `live`'s new tip (scripts/lib/serving_commit.py, as deploy_code_only.sh status
@@ -16,7 +17,7 @@ import json
 import logging
 import shlex
 from dataclasses import replace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -31,7 +32,7 @@ TIP = "a" * 40
 NEW_TIP = "c" * 40
 HEAD_A, HEAD_B = "1" * 40, "2" * 40
 PIN_A, PIN_B = "3" * 40, "4" * 40
-TARGET = ("feat/b", PIN_B, HEAD_B, TIP)
+TARGET = ("feat/b", PIN_B, HEAD_B, TIP, ())
 
 
 def _view(listed, holds, tip, checkout_head=None) -> dict:
@@ -155,14 +156,22 @@ async def test_the_drop_is_one_call_to_the_engines_guarded_form():
     await _drop(box)
     assert box.dropped == [
         "cd ~/genesis && scripts/deploy_candidates drop feat/b --expect-branch live "
-        f"--expect-head {TIP} --expect-candidate {PIN_B} --restart-server --wait 0"
+        f"--expect-head {TIP} --expect-candidate {PIN_B} --expect-leaving '[]' "
+        "--restart-server --wait 0"
     ]
     assert box.drop_timeout == _DROP_TIMEOUT_S == 120.0
 
 
+async def test_the_drop_passes_the_leaving_set_gate_2_showed():
+    """The engine refuses, nothing changed, when its plan takes out another set."""
+    box = Box()
+    await _drop(box, target=(*TARGET[:4], ("feat/a", "feat/it's")))
+    assert "--expect-leaving " + shlex.quote(json.dumps(["feat/a", "feat/it's"])) in box.dropped[0]
+
+
 async def test_a_branch_name_reaches_the_shell_quoted():
     box = Box()
-    await _drop(box, target=("feat/it's", PIN_B, HEAD_B, TIP))
+    await _drop(box, target=("feat/it's", PIN_B, HEAD_B, TIP, ()))
     assert f"drop {shlex.quote(chr(39).join(['feat/it', 's']))} --expect-branch" in box.dropped[0]
 
 
@@ -219,7 +228,53 @@ async def test_an_approved_drop_skips_the_30s_probe_and_leaves_health_to_the_nex
     assert result.success and "dropped feat/b" in result.detail
     probes.assert_not_awaited()
     assert engine._sm.current_state == GuardianState.RECOVERED
-    assert engine._sm.state.live_drop_followup is True  # a still-sick server is diagnosed again
+
+
+def _drop_diagnosis(action=RecoveryAction.REVERT_CODE) -> DiagnosisResult:
+    return DiagnosisResult(
+        likely_cause="crash loop",
+        confidence_pct=80,
+        evidence=[],
+        recommended_action=action,
+        drop_candidate=TARGET,
+    )
+
+
+@pytest.mark.parametrize(
+    "drop,state",
+    [
+        ((-1, "", "timeout"), GuardianState.RECOVERED),  # an attempt is recorded
+        ((1, "", "ERROR: x\nThe manifest change WAS saved"), GuardianState.RECOVERED),
+        ((200, "", ""), GuardianState.CONFIRMED_DEAD),  # a clean refusal arms nothing
+    ],
+)
+async def test_an_action_that_ran_after_a_drop_attempt_ends_in_recovered(drop, state):
+    """Round-2 premise check, class A: RECOVERED's one transition to
+    CONFIRMED_DEAD is what reopens the next diagnosis past the latch."""
+    engine = _engine()
+    sent = AsyncMock()
+    with _patched(Box(drop=drop, views=(HALF,))), patch.object(engine._dispatcher, "send", sent):
+        result = await engine.execute(_drop_diagnosis())
+    assert not result.success and engine._sm.current_state == state
+    assert sent.await_args.args[0].title == "Recovery failed: REVERT_CODE"  # alerts unchanged
+
+
+async def test_a_restart_after_a_drop_attempt_that_leaves_genesis_down_is_judged_again():
+    """The RESTART_SERVICES the proposal offers after a drop can boot the new tip
+    and fail its probes: it must reach the next diagnosis too."""
+    engine = _engine()
+    engine._sm.state.live_drop_attempt = {"branch": "feat/b", "pinned_head": PIN_B, "tip": TIP, "at": "t"}
+    probes = AsyncMock(return_value=MagicMock(all_alive=False, failed_signals=[]))
+    with _patched(Box()), patch("genesis.guardian.recovery.collect_all_signals", probes):
+        result = await engine.execute(_drop_diagnosis(RecoveryAction.RESTART_SERVICES))
+    assert not result.success and engine._sm.current_state == GuardianState.RECOVERED
+
+
+async def test_a_deferred_action_says_so_in_its_result():
+    engine = _engine()
+    engine._sm.record_recovery_attempt("RESTART_SERVICES")
+    result = await engine.execute(_drop_diagnosis(RecoveryAction.RESTART_SERVICES))
+    assert result.deferred and "backoff" in result.detail and "remaining" in result.detail
 
 
 async def test_empty_tip_and_boot_reads_are_not_a_boot_from_the_new_tip():

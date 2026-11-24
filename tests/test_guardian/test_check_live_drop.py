@@ -9,22 +9,20 @@ The container is a fake that answers each command by what it contains."""
 
 from __future__ import annotations
 
-import contextlib
+import html
 import json
 import logging
+import re
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from genesis.guardian import live_drop
+from genesis.guardian.alert.base import AlertSeverity
 from genesis.guardian.alert.telegram import _utf16_units
-from genesis.guardian.check import (
-    _execute_recovery_with_approval,
-    _gate2_cause,
-    _handle_confirmed_dead,
-)
+from genesis.guardian.check import _check_cycle, _execute_recovery_with_approval
 from genesis.guardian.collector import DiagnosticSnapshot, collect_diagnostics
 from genesis.guardian.config import GuardianConfig, RecoveryConfig, load_config
 from genesis.guardian.diagnosis import (
@@ -34,6 +32,7 @@ from genesis.guardian.diagnosis import (
     _build_diagnosis_prompt,
 )
 from genesis.guardian.health_signals import HealthSnapshot, PauseState, SignalResult
+from genesis.guardian.recovery import RecoveryEngine
 from genesis.guardian.state_machine import ConfirmationStateMachine, GuardianState, StateData
 
 TIP = "a" * 40
@@ -50,7 +49,11 @@ def _view(
     tip=TIP,
     refusals=(),
     checkout=("refs/heads/live", TIP),
+    preview="auto",
 ) -> dict:
+    if preview == "auto":  # the engine's plan for the newest: nothing else leaves
+        held = [b for b, _ in holds or () if b in dict(listed)]
+        preview = {"branch": held[-1], "leaving": []} if held else None
     return {
         "version": 1,
         "manifest": {"state": "ok", "reason": None},
@@ -63,6 +66,7 @@ def _view(
         },
         "checkout": None if checkout is None else {"branch_ref": checkout[0], "head": checkout[1]},
         "move_refusals": list(refusals),
+        "drop_preview": preview,
     }
 
 
@@ -217,8 +221,9 @@ def test_the_record_ends_with_the_episode():
 async def test_the_newest_candidate_is_the_last_held_that_is_listed():
     got = await _propose(Container(_view()))
     assert got.recommended_action == RecoveryAction.REVERT_CODE
-    assert got.drop_candidate == ("feat/b", PIN_B, HEAD_B, TIP)
-    assert "drop the newest candidate feat/b" in got.likely_cause
+    assert got.drop_candidate == ("feat/b", PIN_B, HEAD_B, TIP, ())
+    assert "drops the newest candidate" in got.likely_cause
+    assert "Drops feat/b" in got.gate2_identity and "No other candidate" in got.gate2_identity
 
 
 async def test_a_half_done_drop_escalates_to_rebuild():
@@ -249,13 +254,13 @@ async def test_a_listed_row_without_a_head_is_not_a_view():
 
 async def test_differing_pinned_and_held_heads_are_both_named():
     got = await _propose(Container(_view()))
-    assert PIN_B[:12] in got.likely_cause and HEAD_B[:12] in got.likely_cause
+    assert all(c in got.gate2_identity for c in (PIN_B, HEAD_B, TIP))
 
 
 async def test_an_attempt_still_pinned_and_newest_reruns_the_same_drop():
     got = await _propose(Container(_view()), _attempt())
-    assert got.drop_candidate == ("feat/b", PIN_B, HEAD_B, TIP)
-    assert "re-runs the drop attempted at 2026-11-20T10:00:00" in got.likely_cause
+    assert got.drop_candidate == ("feat/b", PIN_B, HEAD_B, TIP, ())
+    assert "re-runs the drop attempted at 2026-11-20T10:00:00" in got.gate2_identity
 
 
 async def test_a_finished_drop_the_server_has_not_booted_onto_proposes_a_restart():
@@ -277,8 +282,8 @@ async def test_a_finished_drop_the_server_booted_onto_proposes_the_next_candidat
     next drop, approved at its own Gate 2."""
     box = Container(AFTER, boot=_boot(NEW_TIP, NEW_TIP))
     got = await _propose(box, _attempt())
-    assert got.drop_candidate == ("feat/a", PIN_A, HEAD_A, NEW_TIP)
-    assert "feat/b" in got.likely_cause  # the earlier drop is named
+    assert got.drop_candidate == ("feat/a", PIN_A, HEAD_A, NEW_TIP, ())
+    assert "feat/b" in got.gate2_identity  # the earlier drop is named
 
 
 @pytest.mark.parametrize("state", ["failed", "activating", "inactive"])
@@ -287,7 +292,7 @@ async def test_a_crash_loop_on_the_new_tip_still_reaches_the_next_candidate(stat
     drop took and the next candidate is the suspect, not a missing restart."""
     box = Container(AFTER, boot=_boot(NEW_TIP, NEW_TIP, state=state))
     got = await _propose(box, _attempt())
-    assert got.drop_candidate == ("feat/a", PIN_A, HEAD_A, NEW_TIP)
+    assert got.drop_candidate == ("feat/a", PIN_A, HEAD_A, NEW_TIP, ())
 
 
 async def test_a_half_done_view_after_an_attempt_says_the_drop_may_still_be_running():
@@ -298,26 +303,31 @@ async def test_a_half_done_view_after_an_attempt_says_the_drop_may_still_be_runn
     assert "may still be running" in got.likely_cause and "update.lock" in got.likely_cause
 
 
-async def test_an_unreadable_view_after_an_attempt_names_the_drop_in_the_restart():
-    got = await _propose(Container(None), _attempt())
-    assert got.recommended_action == RecoveryAction.RESTART_CONTAINER
-    assert "feat/b" in got.likely_cause and "may still be running" in got.likely_cause
+async def test_gate_2_names_every_candidate_the_drops_own_plan_takes_out():
+    view = _view(preview={"branch": "feat/b", "leaving": ["feat/a"]})
+    got = await _propose(Container(view))
+    assert got.drop_candidate == ("feat/b", PIN_B, HEAD_B, TIP, ("feat/a",))
+    assert "Also leaving `live` with it: feat/a" in got.gate2_identity
+
+
+#: Round-2 premise check, class B rule 4: no drop unless every candidate it
+#: removes can be listed in full.
+_HUGE = [f"feat/{'n' * 240}-{i:02d}" for i in range(15)]  # 15 x 249 characters
 
 
 @pytest.mark.parametrize(
-    "shared,needle",
+    "preview,needle",
     [
-        ({"feat/b": ["feat/a"], "feat/a": ["feat/b"]}, "leave `live` with it: feat/a"),
-        ({}, "No other candidate on `live` shares its commits"),
-        (None, "could not list"),
+        (None, "could not plan which candidates leave"),
+        ({"branch": "feat/a", "leaving": []}, "planned the drop of feat/a, not of feat/b"),
+        ({"branch": "feat/b", "leaving": ["bad name"]}, "could not plan which candidates leave"),
+        ({"branch": "feat/b", "leaving": _HUGE}, "the 15 candidates leaving `live` with feat/b"),
     ],
 )
-async def test_gate_2_names_every_candidate_that_leaves_with_the_drop(shared, needle):
-    view = _view()
-    if shared is not None:
-        view["shared"] = shared
-    got = await _propose(Container(view))
-    assert got.drop_candidate is not None and needle in got.likely_cause
+async def test_no_drop_is_proposed_unless_gate_2_can_list_all_it_removes(preview, needle):
+    got = await _propose(Container(_view(preview=preview)))
+    assert got.recommended_action == RecoveryAction.RESTART_CONTAINER and got.drop_candidate is None
+    assert needle in got.likely_cause and not got.gate2_identity
 
 
 @pytest.mark.parametrize("state", ["error", "foreign"])
@@ -331,60 +341,23 @@ async def test_an_unread_manifest_is_never_read_as_an_empty_one(state):
     assert got.drop_candidate is None and "could not be read" in got.likely_cause
 
 
-async def test_a_sick_server_after_a_drop_gets_exactly_one_more_diagnosis():
-    """The episode's one-alert latch would otherwise keep the next-candidate
-    proposal from ever running."""
-    config = _armed()
-    sm = ConfirmationStateMachine(config)
-    sm.mark_down_alert_sent()
-    sm.mark_live_drop_followup()
-    assert StateData.from_dict(sm.state.to_dict()).live_drop_followup is True
-    collect = AsyncMock(side_effect=RuntimeError("stop here"))
-
-    async def run() -> None:
-        with (
-            patch("genesis.guardian.check.collect_diagnostics", collect),
-            contextlib.suppress(RuntimeError),
-        ):
-            await _handle_confirmed_dead(config, sm, AsyncMock(), AsyncMock(), AsyncMock())
-
-    await run()
-    assert collect.await_count == 1 and sm.state.live_drop_followup is False
-    sm.mark_down_alert_sent()
-    await run()
-    assert collect.await_count == 1  # the latch holds again
-
-
-def test_a_genuine_recovery_clears_the_follow_up():
-    sm = ConfirmationStateMachine(_armed())
-    sm.mark_live_drop_followup()
-    sm.clear_down_alert_sent()
-    assert sm.state.live_drop_followup is False
-
-
-def test_the_gate_2_cause_stays_deliverable_and_keeps_what_runs():
-    """Telegram refuses a message over 4,096 units, and a refused Gate 2 runs no
-    recovery. The drop clause is at the END of the cause, so the end is kept."""
-    cause = "x" * 9000 + " — On `live`, REVERT_CODE means: drop the newest candidate feat/b"
-    got = _gate2_cause(cause)
-    assert _utf16_units(got) < 3100 and got.endswith("candidate feat/b")
-    assert _gate2_cause("short") == "short"
-
-
 async def test_an_unsettled_checkout_after_an_attempt_proposes_nothing():
     """A drop that timed out may still be moving the tree: neither the pre-drop
-    tip nor a settled `live`. Nothing runs (B2's lock checkpoint owns waiting)."""
+    tip nor a settled `live`. Nothing runs (B2's lock checkpoint owns waiting),
+    and the text promises no later look that never comes (SHOULD-FIX 5)."""
     mid = _view(checkout=("refs/heads/live", "d" * 40))
     got = await _propose(Container(mid), _attempt())
     assert got.recommended_action == RecoveryAction.ESCALATE and got.drop_candidate is None
     assert "may still be running" in got.likely_cause
+    assert "looks again" not in got.likely_cause
+    assert "asks again only if this episode auto-resets" in got.likely_cause
 
 
 async def test_an_attempted_branch_repinned_at_a_new_head_proposes_the_current_newest():
     view = _view(listed=(("feat/a", PIN_A), ("feat/b", "5" * 40)))
     got = await _propose(Container(view), _attempt())
-    assert got.drop_candidate == ("feat/b", "5" * 40, HEAD_B, TIP)
-    assert "re-pinned" in got.likely_cause
+    assert got.drop_candidate == ("feat/b", "5" * 40, HEAD_B, TIP, ())
+    assert "re-pinned" in got.gate2_identity
 
 
 async def test_an_attempted_branch_no_longer_newest_proposes_the_current_newest():
@@ -393,8 +366,8 @@ async def test_an_attempted_branch_no_longer_newest_proposes_the_current_newest(
         holds=(("feat/b", HEAD_B), ("feat/a", HEAD_A)),
     )
     got = await _propose(Container(view), _attempt())
-    assert got.drop_candidate == ("feat/a", PIN_A, HEAD_A, TIP)
-    assert "no longer the newest" in got.likely_cause
+    assert got.drop_candidate == ("feat/a", PIN_A, HEAD_A, TIP, ())
+    assert "no longer the newest" in got.gate2_identity
 
 
 # ── check.py wiring ──────────────────────────────────────────────────────────
@@ -415,10 +388,13 @@ def _dead_sm(config: GuardianConfig) -> ConfirmationStateMachine:
     return sm
 
 
-async def _run_gates(config, box, sm=None, diagnosis=None):
+async def _run_gates(config, box, sm=None, diagnosis=None, engine=None):
     channel = _gate_channel()
-    engine = MagicMock()
-    engine.execute = AsyncMock()
+    if engine is None:
+        engine = MagicMock()
+        engine.execute = AsyncMock()
+    else:
+        engine.execute = AsyncMock(wraps=engine.execute)
     collect = AsyncMock(return_value={})
     with (
         patch("genesis.guardian.check._find_telegram_channel", return_value=channel),
@@ -458,7 +434,7 @@ async def test_flag_off_on_live_is_main_restart_container_and_reads_no_candidate
 async def test_armed_on_live_the_owner_approves_the_named_drop():
     executed, texts, _ = await _run_gates(_armed(), Container(_view()))
     assert executed.recommended_action == RecoveryAction.REVERT_CODE
-    assert executed.drop_candidate == ("feat/b", PIN_B, HEAD_B, TIP)
+    assert executed.drop_candidate == ("feat/b", PIN_B, HEAD_B, TIP, ())
     gate2 = next(t for t in texts if "Proposed:" in t)
     assert "feat/b" in gate2
 
@@ -475,7 +451,7 @@ async def test_armed_the_attempt_record_reaches_the_proposal():
     sm = _dead_sm(config)
     sm.state.live_drop_attempt = _attempt()
     executed, _, collect = await _run_gates(config, Container(_view()), sm=sm)
-    assert "re-runs the drop attempted at" in executed.likely_cause
+    assert "re-runs the drop attempted at" in executed.gate2_identity
     assert collect.await_args.args[1] == _attempt()
 
 
@@ -540,3 +516,246 @@ def test_the_inventory_names_the_drop_only_when_armed():
 def test_a_drop_candidate_survives_replace():
     d = replace(_diagnosis(), drop_candidate=("feat/b", PIN_B, HEAD_B, TIP))
     assert d.drop_candidate[1] == PIN_B and d.escalation == ""
+
+
+# ── Gate 2: what the approval removes, never cut ─────────────────────────────
+
+
+def _gate2(texts: list[str]) -> str:
+    return next(t for t in texts if "Proposed:" in t)
+
+
+def _parsed_units(text: str) -> int:
+    """What Telegram counts: the parsed text, tags gone and entities one character."""
+    return _utf16_units(html.unescape(re.sub(r"<[^>]+>", "", text)))
+
+
+_MANY = [f"feat/{'n' * 30}-{i:02d}" for i in range(40)]
+
+
+async def test_gate_2_keeps_every_identifier_with_a_long_diagnosis_and_many_leaving():
+    """Round-2 premise check, class B rules 2 and 3: the identity section is never
+    cut; the diagnosis takes what remains of 4,096 units and says it was cut."""
+    view = _view(preview={"branch": "feat/b", "leaving": _MANY})
+    long = replace(_diagnosis(), likely_cause="x" * 9000)
+    executed, texts, _ = await _run_gates(_armed(), Container(view), diagnosis=long)
+    assert executed.drop_candidate == ("feat/b", PIN_B, HEAD_B, TIP, tuple(_MANY))
+    gate2 = _gate2(texts)
+    for ident in [*_MANY, PIN_B, HEAD_B, TIP, "scripts/deploy_candidates add feat/b --owner"]:
+        assert ident in gate2, ident
+    assert "(cut)" in gate2 and _parsed_units(gate2) <= 4096
+
+
+async def test_a_short_gate_2_is_not_cut():
+    _, texts, _ = await _run_gates(_armed(), Container(_view()))
+    gate2 = _gate2(texts)
+    assert "(cut)" not in gate2 and "server crash loop after a deploy" in gate2
+
+
+# ── SHOULD-FIX 6: a container-wide action while a drop may run ───────────────
+
+
+@pytest.mark.parametrize(
+    "action,view",
+    [
+        (RecoveryAction.RESTART_CONTAINER, _view(checkout=("refs/heads/live", "d" * 40))),
+        (RecoveryAction.SNAPSHOT_ROLLBACK, None),
+        (RecoveryAction.REVERT_CODE, None),  # an unreadable view falls back to the restart
+    ],
+)
+async def test_a_container_action_while_a_drop_may_run_says_it_would_interrupt_it(action, view):
+    config = _armed()
+    sm = _dead_sm(config)
+    sm.state.live_drop_attempt = _attempt()
+    executed, texts, _ = await _run_gates(
+        config, Container(view), sm=sm, diagnosis=_diagnosis(action)
+    )
+    assert executed.recommended_action != RecoveryAction.REVERT_CODE
+    gate2 = _gate2(texts)
+    assert "a drop attempted at 2026-11-20T10:00:00+00:00 may still be running" in gate2
+    assert "this action would interrupt it" in gate2
+
+
+async def test_a_container_restart_after_a_settled_drop_has_no_warning():
+    config = _armed()
+    sm = _dead_sm(config)
+    sm.state.live_drop_attempt = _attempt()
+    _, texts, _ = await _run_gates(
+        config, Container(_view()), sm=sm, diagnosis=_diagnosis(RecoveryAction.RESTART_CONTAINER)
+    )
+    assert "would interrupt it" not in _gate2(texts)
+
+
+# ── S3 / SHOULD-FIX 4: an approved action that is deferred says so ───────────
+
+
+async def test_s3_an_approved_action_that_is_deferred_says_so():
+    """Both gates approved, and the action does not run: the owner is told."""
+    config = _armed()
+    sm = _dead_sm(config)
+    sm.record_recovery_attempt("RESTART_SERVICES")  # 100 s of backoff from now
+    engine = RecoveryEngine(config, sm, MagicMock(), MagicMock(send=AsyncMock()))
+    _, texts, _ = await _run_gates(
+        config,
+        Container(_view(), on_live=False),
+        sm=sm,
+        diagnosis=_diagnosis(RecoveryAction.RESTART_SERVICES),
+        engine=engine,
+    )
+    assert any(
+        t.startswith("Approved RESTART_SERVICES did not run: backoff") and "s remaining" in t
+        for t in texts
+    ), texts
+
+
+# ── class A: the drop's outcome reaches the next decision ────────────────────
+
+
+def _ago(seconds: float) -> str:
+    return (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat()
+
+
+class Episode:
+    """Ticks 30 s apart through the real state machine, _check_cycle and
+    RecoveryEngine.execute, the state round-tripped through JSON each tick (each
+    tick is a fresh oneshot process). Both gates approve at once; the drop is a
+    fake that records an attempt (unless ``records`` is false) and fails."""
+
+    def __init__(self, resets_left: bool = False, records: bool = True):
+        self.config = _armed()
+        self.sm = ConfirmationStateMachine(self.config)
+        st = self.sm.state
+        st.current_state = GuardianState.CONFIRMED_DEAD
+        st.first_failure_at = _ago(3600)
+        st.auto_reset_count = 0 if resets_left else self.config.confirmation.max_auto_resets
+        self.dispatcher = MagicMock(send=AsyncMock())
+        self.snaps = MagicMock(safe_to_snapshot=AsyncMock(return_value=False))
+        self.engine = RecoveryEngine(self.config, self.sm, self.snaps, self.dispatcher)
+        self.records = records
+        self.approved: list[str] = []
+        self.ran = 0
+        self.approve = self._approve
+
+    async def _approve(self, config, sm, dispatcher, engine, diagnosis):
+        self.approved.append(str(diagnosis.recommended_action))
+        await engine.execute(diagnosis)
+
+    async def _action(self, action, diagnosis=None):
+        self.ran += 1
+        if self.records:
+            self.sm.state.live_drop_attempt = _attempt()
+        return False, "the drop of feat/b: outcome was not seen"
+
+    def alerts(self, severity=None) -> list:
+        sent = [c.args[0] for c in self.dispatcher.send.await_args_list]
+        return [a for a in sent if severity is None or a.severity == severity]
+
+    async def tick(self, n: int = 1) -> None:
+        for _ in range(n):
+            st = self.sm.state
+            for key in ("first_failure_at", "last_recovery_at"):
+                try:  # a deliberately unreadable stamp stays as it is
+                    when = datetime.fromisoformat(getattr(st, key) or "")
+                except ValueError:
+                    continue
+                setattr(st, key, (when - timedelta(seconds=30)).isoformat())
+            self.sm._state = StateData.from_dict(json.loads(json.dumps(st.to_dict())))
+            found = replace(_diagnosis(), drop_candidate=("feat/b", PIN_B, HEAD_B, TIP, ()))
+            with (
+                patch(
+                    "genesis.guardian.check.collect_all_signals",
+                    AsyncMock(return_value=_snapshot(alive=False)),
+                ),
+                patch(
+                    "genesis.guardian.check.collect_diagnostics",
+                    AsyncMock(return_value=DiagnosticSnapshot(collected_at="t")),
+                ),
+                patch("genesis.guardian.check.write_diagnosis_result"),
+                patch("genesis.guardian.check._execute_recovery_with_approval", self.approve),
+                patch("genesis.guardian.check._handle_healthy", AsyncMock()),
+                patch("genesis.guardian.check._handle_confirming", AsyncMock()),
+                patch("genesis.guardian.check._handle_surveying", AsyncMock()),
+                patch.object(self.engine, "_execute_action", self._action),
+            ):
+                await _check_cycle(
+                    self.config,
+                    self.sm,
+                    self.dispatcher,
+                    self.snaps,
+                    MagicMock(diagnose=AsyncMock(return_value=found)),
+                    self.engine,
+                )
+
+
+async def test_s2_a_failed_drop_with_resets_exhausted_reaches_every_next_decision():
+    """Measured silent for 2 h at round 2: the latch held after the first drop."""
+    ep = Episode()
+    await ep.tick(240)
+    assert ep.approved == ["REVERT_CODE"] * 3 + ["ESCALATE"] and ep.ran == 3
+    assert len(ep.alerts(AlertSeverity.EMERGENCY)) == 1
+
+
+async def test_s4_a_failed_drop_waits_out_its_backoff_then_is_diagnosed_not_auto_reset():
+    """An auto-reset while the outcome is pending would route the episode away
+    from the next decision; RECOVERED holds it through the backoff instead."""
+    ep = Episode(resets_left=True)
+    ep.sm.state.first_failure_at = _ago(550)  # the 600 s auto-reset passes during the backoff
+    await ep.tick(1)
+    assert ep.ran == 1 and ep.sm.current_state == GuardianState.RECOVERED
+    await ep.tick(5)  # 100 s of backoff, then the one transition
+    assert ep.sm.state.auto_reset_count == 0
+    assert ep.approved == ["REVERT_CODE", "REVERT_CODE"]
+
+
+async def test_s5_an_exception_after_an_action_alerts_once_and_keeps_the_latch():
+    ep = Episode()
+    await ep.tick(1)
+
+    async def broken(*_a):
+        raise RuntimeError("the approval flow broke")
+
+    ep.approve = broken
+    with pytest.raises(RuntimeError):
+        await ep.tick(5)
+    assert ep.sm.state.down_alert_sent is True
+    said = [a for a in ep.alerts(AlertSeverity.CRITICAL) if "after a recovery action" in a.title]
+    await ep.tick(10)  # never a prompt or an alert every tick
+    assert len(said) == 1
+    assert len([a for a in ep.alerts() if "after a recovery action" in a.title]) == 1
+
+
+async def test_s6_at_max_escalations_the_drop_outcome_reaches_the_escalation():
+    """Backoff is infinite there: holding for it would never end, so the one
+    transition goes straight to the EMERGENCY escalation."""
+    ep = Episode()
+    st = ep.sm.state
+    st.current_state = GuardianState.RECOVERED
+    st.recovery_attempts = ep.config.recovery.max_escalations
+    st.last_recovery_at = _ago(0)
+    st.live_drop_attempt = _attempt()
+    st.down_alert_sent = True
+    await ep.tick(1)
+    assert ep.approved == ["ESCALATE"] and len(ep.alerts(AlertSeverity.EMERGENCY)) == 1
+
+
+@pytest.mark.parametrize("stamp", [None, "not a time", "2999-01-01T00:00:00+00:00"])
+async def test_an_unreadable_or_future_recovery_stamp_never_holds_recovered(stamp):
+    """RECOVERED has no auto-reset: a hold keyed on a stamp that is missing,
+    unparsable or in the future would last forever with no alert."""
+    ep = Episode()
+    st = ep.sm.state
+    st.current_state = GuardianState.RECOVERED
+    st.recovery_attempts = 1
+    st.last_recovery_at = stamp
+    st.live_drop_attempt = _attempt()
+    st.down_alert_sent = True
+    await ep.tick(1)
+    assert ep.approved, "held in RECOVERED: the next decision never came"
+
+
+async def test_a_failure_with_no_drop_attempt_keeps_the_latch_as_before():
+    """Control: a clean refusal (rc 200) records nothing and arms nothing (B2
+    owns the lock wait)."""
+    ep = Episode(records=False)
+    await ep.tick(60)
+    assert ep.approved == ["REVERT_CODE"] and ep.sm.current_state == GuardianState.CONFIRMED_DEAD

@@ -157,20 +157,28 @@ def _moves(w: World, dc, capsys) -> dict:
     return json.loads(capsys.readouterr().out)
 
 
-def test_move_view_names_the_held_candidates_that_share_commits(dc, dc_ready, capsys):
-    """A drop takes these out of `live` too, so the approval must name them."""
+def test_move_view_previews_what_the_newest_drop_takes_out(dc, dc_ready, capsys):
+    """A drop takes the candidates sharing its commits out of `live` too, so
+    the approval must name them: from the drop's own plan."""
     w = dc_ready
     w.candidate("feat/a", {"x.txt": "x\n"})
     w.candidate("feat/b", {"y.txt": "y\n"}, base="feat/a")
     w.write_manifest([w.entry("feat/b")])
     assert w.run(dc, "rebuild") == 0
     w.write_manifest([w.entry("feat/a"), w.entry("feat/b")])  # both now held
-    assert _moves(w, dc, capsys)["shared"] == {"feat/a": ["feat/b"], "feat/b": ["feat/a"]}
+    assert _moves(w, dc, capsys)["drop_preview"] == {"branch": "feat/b", "leaving": ["feat/a"]}
 
 
-def test_move_view_with_no_sharing_says_so(dc, dc_ready, capsys):
+def test_move_view_with_nothing_else_leaving_says_so(dc, dc_ready, capsys):
     _two_live(dc_ready, dc)
-    assert _moves(dc_ready, dc, capsys)["shared"] == {}
+    assert _moves(dc_ready, dc, capsys)["drop_preview"] == {"branch": "feat/b", "leaving": []}
+
+
+def test_move_view_with_no_live_previews_null(dc, dc_ready, capsys):
+    w = dc_ready
+    w.candidate("feat/a", {"x.txt": "x\n"})
+    w.write_manifest([w.entry("feat/a")])
+    assert _moves(w, dc, capsys)["drop_preview"] is None
 
 
 def test_without_the_flag_there_is_no_move_key(dc, dc_ready, capsys):

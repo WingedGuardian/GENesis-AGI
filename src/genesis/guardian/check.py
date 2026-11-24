@@ -692,8 +692,16 @@ async def _check_cycle(
 
     elif state == GuardianState.CONFIRMED_DEAD:
         if transition.action_needed:
+            # RECOVERED's one transition here, after an action that ran with a
+            # `live` drop attempt this episode (#2978): its outcome still needs
+            # a decision, so it passes the episode's alert latch once.
+            after_action = (
+                transition.old_state == GuardianState.RECOVERED
+                and _drop_attempt(config, sm) is not None
+            )
             await _handle_confirmed_dead(
                 config, sm, dispatcher, diagnosis_engine, recovery_engine,
+                after_action=after_action,
             )
 
     elif state == GuardianState.PAUSED:
@@ -1813,6 +1821,7 @@ async def _handle_confirmed_dead(
     dispatcher: AlertDispatcher,
     diagnosis_engine: DiagnosisEngine,
     recovery_engine: RecoveryEngine,
+    after_action: bool = False,
 ) -> None:
     """Handle confirmed dead state — re-diagnose and attempt recovery."""
     # GUARD-R2-01: alert once per down-episode. If we already notified the user
@@ -1820,9 +1829,9 @@ async def _handle_confirmed_dead(
     # recovery retry, no re-alert — until genuine recovery (which clears the flag
     # and sends a single "restored" ping). Recovery detection is unaffected: it
     # happens in state_machine.process() via the cheap signal probes, not here.
-    # One exception: a `live` drop that took and left Genesis down gets one new
-    # diagnosis, so the next candidate can reach its own Gate 2.
-    if sm.state.down_alert_sent and not sm.take_live_drop_followup():
+    # One exception: ``after_action``, the next decision after an action that
+    # ran with a `live` drop attempt (#2978), so a drop's outcome never goes silent.
+    if sm.state.down_alert_sent and not after_action:
         logger.info(
             "Down alert already sent this episode — staying quiet until recovery "
             "(no re-diagnosis/re-alert)",
@@ -1888,9 +1897,24 @@ async def _handle_confirmed_dead(
             cc_failure_reason=diagnosis.cc_failure_reason,
         )
 
-    await _execute_recovery_with_approval(
-        config, sm, dispatcher, recovery_engine, diagnosis,
-    )
+    try:
+        await _execute_recovery_with_approval(
+            config, sm, dispatcher, recovery_engine, diagnosis,
+        )
+    except Exception:
+        # The latch stays set (clearing it would re-prompt every tick), so this
+        # is the owner's one word that the decision after the action broke.
+        if after_action:
+            await dispatcher.send(Alert(
+                severity=AlertSeverity.CRITICAL,
+                title="Genesis down — the decision after a recovery action failed",
+                body=(
+                    "The Guardian's approval flow raised after a recovery action on `live`; "
+                    "it prompts nothing more this episode unless the episode auto-resets. "
+                    "See the Guardian log."
+                ),
+            ))
+        raise
 
 
 def _find_telegram_channel(
@@ -1996,22 +2020,34 @@ async def _wait_for_gate_keyword(
             last_liveness_log = waited_s
 
 
-_GATE2_CAUSE_HALF = 1500
+#: Telegram refuses a message over 4,096 UTF-16 units of parsed text, and an
+#: undelivered Gate 2 runs no recovery.
+_GATE2_LIMIT = 4096
+_SNAPSHOT_WARNING = (
+    "Snapshot rollback also restores saved peer permissions, jobs and consent. "
+    "APPROVE explicitly reauthorizes those saved peers."
+)
 
 
-def _gate2_cause(cause: str) -> str:
-    """The cause, bounded so Gate 2 can be delivered: Telegram refuses a message
-    over 4,096 UTF-16 units, and an undelivered prompt runs no recovery. Keeps
-    both ends, because what the approval will run is stated at the end."""
-    if _utf16_units(cause) <= _GATE2_CAUSE_HALF * 2:
-        return cause
-    tail, used = [], 0
-    for ch in reversed(cause):
-        used += _utf16_units(ch)
-        if used > _GATE2_CAUSE_HALF:
-            break
-        tail.append(ch)
-    return f"{_cut(cause, _GATE2_CAUSE_HALF)} {''.join(reversed(tail))}"
+def _gate2_text(diagnosis: object, snapshot: bool) -> str:
+    """Gate 2, deliverable: the identity section (what the approval acts on,
+    #2978) whole, and the diagnosis in what remains, marked when cut. Counted on
+    the parsed text, where tags drop out and each escape is one character."""
+    action = diagnosis.recommended_action.value
+    identity = f"{diagnosis.gate2_identity}\n\n" if diagnosis.gate2_identity else ""
+    warning = f"{_SNAPSHOT_WARNING}\n\n" if snapshot else ""
+    rest = (
+        f" ({diagnosis.confidence_pct}%).\nProposed: {action}.\n\n{identity}{warning}"
+        "Reply APPROVE to execute, or DENY."
+    )
+    room = _GATE2_LIMIT - _utf16_units("Diagnosed: " + rest + " … (cut)")
+    cause = _cut(diagnosis.likely_cause, max(room, 0))
+    return (
+        f"Diagnosed: {html_escape(cause)} ({diagnosis.confidence_pct}%).\n"
+        f"Proposed: <b>{html_escape(action)}</b>.\n\n{html_escape(identity)}"
+        + (f"<b>{_SNAPSHOT_WARNING}</b>\n\n" if snapshot else "")
+        + "<b>Reply</b> APPROVE to execute, or DENY."
+    )
 
 
 async def _execute_recovery_with_approval(
@@ -2201,6 +2237,10 @@ async def _execute_recovery_with_approval(
     except (ValueError, TypeError):
         outage_s = 0.0
     write_diagnosis_result(diagnosis, config, outage_duration_s=outage_s)
+    # A container restart or rollback while a drop may still run says so (#2978).
+    diagnosis = await live_drop.interrupt_warning(
+        config.container_name, diagnosis, _drop_attempt(config, sm),
+    )
 
     if diagnosis.recommended_action == RecoveryAction.ESCALATE:
         if diagnosis.escalation == live_drop.HALF_DONE_DROP:  # (#2978)
@@ -2220,17 +2260,8 @@ async def _execute_recovery_with_approval(
         return
 
     # ── Gate 2: authorize the specific action ─────────────────────────────
-    snapshot_warning = (
-        "<b>Snapshot rollback also restores saved peer permissions, jobs and consent. "
-        "APPROVE explicitly reauthorizes those saved peers.</b>\n\n"
-        if diagnosis.recommended_action == RecoveryAction.SNAPSHOT_ROLLBACK else ""
-    )
-    gate2_text = (
-        f"Diagnosed: {html_escape(_gate2_cause(diagnosis.likely_cause))} "
-        f"({diagnosis.confidence_pct}%).\n"
-        f"Proposed: <b>{html_escape(diagnosis.recommended_action.value)}</b>.\n\n"
-        f"{snapshot_warning}"
-        "<b>Reply</b> APPROVE to execute, or DENY."
+    gate2_text = _gate2_text(
+        diagnosis, diagnosis.recommended_action == RecoveryAction.SNAPSHOT_ROLLBACK,
     )
     gate2_msg_id = await telegram_channel.send_text(gate2_text)
     if gate2_msg_id is None:
@@ -2277,4 +2308,8 @@ async def _execute_recovery_with_approval(
         "Gate-2 approved — executing recovery action %s",
         diagnosis.recommended_action.value,
     )
-    await recovery_engine.execute(diagnosis)
+    result = await recovery_engine.execute(diagnosis)
+    if getattr(result, "deferred", False) is True:  # both gates approved, nothing ran
+        await telegram_channel.send_text(
+            f"Approved {diagnosis.recommended_action.value} did not run: {result.detail}"
+        )

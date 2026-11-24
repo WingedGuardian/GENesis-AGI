@@ -94,11 +94,10 @@ class StateData:
     # The Guardian's last drop on `live` this episode (#2978): branch,
     # pinned_head, tip (`live` before it) and at. Read only with
     # recovery.live_engine on; kept through the auto-reset, a DENY and a failed
-    # send; cleared when the episode ends (a healthy snapshot).
+    # send; cleared when the episode ends (a healthy snapshot). While it is set,
+    # an action that ran ends in RECOVERED, whose one transition to
+    # CONFIRMED_DEAD lets the next diagnosis past the down-alert latch.
     live_drop_attempt: dict | None = None
-    # A drop took: if Genesis is still down, ONE new diagnosis may pass the
-    # down-alert latch, so the next candidate can reach its own Gate 2.
-    live_drop_followup: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -127,7 +126,6 @@ class StateData:
             "boot_id": self.boot_id,
             "rebooted_at": self.rebooted_at,
             "live_drop_attempt": self.live_drop_attempt,
-            "live_drop_followup": self.live_drop_followup,
         }
 
     @classmethod
@@ -162,7 +160,6 @@ class StateData:
             boot_id=str(data.get("boot_id") or ""),
             rebooted_at=data.get("rebooted_at") or None,
             live_drop_attempt=_drop_attempt(data.get("live_drop_attempt")),
-            live_drop_followup=data.get("live_drop_followup") is True,
         )
 
 
@@ -258,6 +255,14 @@ class ConfirmationStateMachine:
         except (ValueError, TypeError):
             return backoff_s
 
+    def _recovery_stamp_is_past(self) -> bool:
+        """Whether last_recovery_at parses and is not in the future."""
+        try:
+            last = datetime.fromisoformat(self._state.last_recovery_at or "")
+            return last.tzinfo is not None and last <= datetime.now(UTC)
+        except (ValueError, TypeError):
+            return False
+
     def record_recovery_attempt(self, action: str = "") -> None:
         """Record that a recovery attempt was made (for backoff tracking).
 
@@ -290,7 +295,6 @@ class ConfirmationStateMachine:
         self._state.signal_history = self._state.signal_history[-20:]
         if snapshot.all_alive:  # the episode is over: its drop needs no naming
             self._state.live_drop_attempt = None
-            self._state.live_drop_followup = False
 
         old_state = self._state.current_state
 
@@ -623,6 +627,19 @@ class ConfirmationStateMachine:
                 reason="recovery verified — all probes healthy",
             )
 
+        # After a `live` drop attempt (#2978) the next decision waits out the
+        # backoff here: CONFIRMED_DEAD would auto-reset, or stay latched. At
+        # max_escalations the backoff never ends, so it goes on to the escalation.
+        # The hold needs a readable, past last_recovery_at: RECOVERED has no
+        # auto-reset, so a missing or future stamp would hold it forever.
+        backoff = self.recovery_backoff_remaining_s()
+        drop = self._config.recovery.live_engine and self._state.live_drop_attempt
+        if drop and 0 < backoff < float("inf") and self._recovery_stamp_is_past():
+            return Transition(
+                old_state=GuardianState.RECOVERED,
+                new_state=GuardianState.RECOVERED,
+                reason=f"after a drop attempt: {backoff:.0f}s of backoff before the next decision",
+            )
         # Recovery failed — back to CONFIRMED_DEAD for escalation.
         # recovery_attempts already incremented by record_recovery_attempt().
         self._state.current_state = GuardianState.CONFIRMED_DEAD
@@ -844,16 +861,6 @@ class ConfirmationStateMachine:
     def clear_down_alert_sent(self) -> None:
         """Clear the down-alert flag — called by check.py on genuine recovery only."""
         self._state.down_alert_sent = False
-        self._state.live_drop_followup = False
-
-    def mark_live_drop_followup(self) -> None:
-        """A drop took: let one new diagnosis past the latch if Genesis stays down."""
-        self._state.live_drop_followup = True
-
-    def take_live_drop_followup(self) -> bool:
-        """Whether a follow-up is owed, spending it."""
-        owed, self._state.live_drop_followup = self._state.live_drop_followup, False
-        return owed
 
     def should_escalate(self) -> bool:
         """Check if we've exceeded max recovery attempts."""

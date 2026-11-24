@@ -204,9 +204,13 @@ class DiagnosisResult:
     source: str = "cc"  # "cc" or "cc_unavailable"
     cc_failure_reason: str = ""  # Why CC was unavailable (empty = CC succeeded)
     # On `live`, with recovery.live_engine on: (branch, the head the manifest
-    # pins, the head `live` holds for it, `live` tip) of the candidate an
-    # approved REVERT_CODE drops; set by check.py before Gate 2 (#2978).
-    drop_candidate: tuple[str, str, str, str] | None = None
+    # pins, the head `live` holds for it, `live` tip, the other candidates the
+    # drop's plan takes out) of the candidate an approved REVERT_CODE drops;
+    # set by check.py before Gate 2 (#2978).
+    drop_candidate: tuple[str, str, str, str, tuple[str, ...]] | None = None
+    # What Gate 2 shows in full, never cut: the names an approval removes, or a
+    # warning that a drop may still be running; "" when there is none.
+    gate2_identity: str = ""
     # Why check.py made this an ESCALATE on `live` (live_drop.HALF_DONE_DROP),
     # so the alert says what happened; "" otherwise.
     escalation: str = ""

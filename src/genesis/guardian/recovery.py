@@ -18,6 +18,7 @@ Each step: pre-alert → pre-snapshot → execute → wait → verify → post-a
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shlex
 from dataclasses import dataclass
@@ -104,9 +105,12 @@ async def container_on_live(container: str) -> bool:
 #: The Guardian's drop on `live` (#2978): ONE engine call that drops, confirms
 #: and queues the restart under one update.lock hold; --wait 0, so a held lock
 #: is exit 200 at once and a second call can never queue behind a first.
+#: --expect-leaving: the other candidates Gate 2 named; the engine refuses,
+#: nothing changed, when its plan takes out any other set.
 _DROP_CMD = (
     "cd ~/genesis && scripts/deploy_candidates drop {branch} --expect-branch live "
-    "--expect-head {tip} --expect-candidate {pinned} --restart-server --wait 0"
+    "--expect-head {tip} --expect-candidate {pinned} --expect-leaving {leaving} "
+    "--restart-server --wait 0"
 )
 #: Failure mode: an `incus exec` into the container under diagnosis that never
 #: returns, holding the whole tick. 120 s (owner ruling): PR A measured
@@ -124,6 +128,7 @@ class RecoveryResult:
     success: bool
     detail: str
     duration_s: float
+    deferred: bool = False  # approved, but held back by the backoff: nothing ran
 
 
 class RecoveryEngine:
@@ -164,8 +169,9 @@ class RecoveryEngine:
             return RecoveryResult(
                 action=action,
                 success=False,
-                detail=f"Recovery deferred: {backoff_s:.0f}s backoff remaining",
+                detail=f"backoff {backoff_s:.0f}s remaining",
                 duration_s=0.0,
+                deferred=True,
             )
 
         # Pre-recovery alert
@@ -207,14 +213,21 @@ class RecoveryEngine:
         self._sm.record_recovery_attempt(action.value)
 
         duration = (datetime.now(UTC) - t0).total_seconds()
+        # After a drop on `live` (#2978) every outcome ends in RECOVERED: its one
+        # transition to CONFIRMED_DEAD (state_machine._from_recovered) lets the
+        # next diagnosis past the episode's alert latch, so a drop whose outcome
+        # still needs a decision never goes silent.
+        not_back = (
+            self._sm.set_recovered
+            if self._config.recovery.live_engine and self._sm.state.live_drop_attempt
+            else self._sm.set_confirmed_dead
+        )
 
         if success and self._approved_drop(diagnosis):
             # No 30 s probe after a drop (owner ruling, #2978): it succeeded when
             # genesis-server booted from `live`'s new tip; the next check judges
-            # health (RECOVERED -> healthy, or back to CONFIRMED_DEAD, where the
-            # follow-up lets one new diagnosis past the episode's alert latch).
+            # health (RECOVERED -> healthy, or on to the next diagnosis).
             self._sm.set_recovered()
-            self._sm.mark_live_drop_followup()
             await self._dispatcher.send(Alert(
                 severity=AlertSeverity.INFO,
                 title=f"Recovery action done: {action.value} on `live`",
@@ -241,10 +254,10 @@ class RecoveryEngine:
                 failed = [s.name for s in snapshot.failed_signals]
                 detail = f"Action completed but probes still failing: {', '.join(failed)}"
                 success = False
-                self._sm.set_confirmed_dead()
+                not_back()
                 logger.warning("Recovery verification failed: %s", detail)
         else:
-            self._sm.set_confirmed_dead()
+            not_back()
             await self._dispatcher.send(Alert(
                 severity=AlertSeverity.CRITICAL,
                 title=f"Recovery failed: {action.value}",
@@ -449,7 +462,7 @@ class RecoveryEngine:
         return await self._restart_services(container)
 
     async def _revert_code(
-        self, container: str, drop: tuple[str, str, str, str] | None = None,
+        self, container: str, drop: tuple | None = None,
     ) -> tuple[bool, str]:
         """Stash uncommitted changes and revert last commit, then restart. With
         ``drop`` (on `live`, recovery.live_engine on): drop that candidate."""
@@ -514,6 +527,7 @@ class RecoveryEngine:
 
     async def _drop_candidate(
         self, container: str, branch: str, pinned: str, held: str, tip: str,
+        leaving: tuple[str, ...] = (),
     ) -> tuple[bool, str]:
         """The approved drop as ONE call to the engine's guarded drop (#4911),
         then the outcome judged: success only once genesis-server booted from
@@ -523,7 +537,10 @@ class RecoveryEngine:
         still runs (exit 5). An outcome it could not see restarts nothing and is
         recorded (state live_drop_attempt) for the next diagnosis."""
         before = booted_from(await server_boot(container))
-        cmd = _DROP_CMD.format(branch=shlex.quote(branch), tip=tip, pinned=pinned)
+        cmd = _DROP_CMD.format(
+            branch=shlex.quote(branch), tip=tip, pinned=pinned,
+            leaving=shlex.quote(json.dumps(list(leaving))),
+        )
         rc, stdout, stderr = await _run_subprocess(
             "incus", "exec", container, "--", "su", "-", "ubuntu", "-c", cmd,
             timeout=_DROP_TIMEOUT_S,

@@ -2845,9 +2845,16 @@ verified: 0aa0bf9f2 2026-11-10
   `check.py` reads the engine's `list --json --move-refusals` and proposes the
   drop of the newest candidate (the last one `live` holds that the manifest
   lists), an ESCALATE to `rebuild` when a drop is half-done, or
-  `RESTART_CONTAINER` when no drop can run. The approved drop is ONE call to
+  `RESTART_CONTAINER` when no drop can run. A drop is proposed only when the
+  view's `drop_preview` (that drop's own plan, computed lockless; it writes
+  only unreachable git objects) names the same branch and every other
+  candidate it takes out, and Gate 2's identity section, never cut and at
+  most 3,000 UTF-16 units, lists them all; otherwise the proposal is
+  `RESTART_CONTAINER`, naming why. The approved drop is ONE call to
   the engine's guarded form (`--expect-branch live --expect-head
-  --expect-candidate --restart-server --wait 0`, 120 s client timeout), which
+  --expect-candidate --expect-leaving <the list Gate 2 showed>
+  --restart-server --wait 0`, 120 s client timeout; a plan that takes out a
+  different set refuses, nothing changed), which
   drops, confirms and queues the restart under one update.lock hold; the
   Guardian then judges only whether genesis-server booted from `live`'s new
   tip (`scripts/lib/serving_commit.py`, as `deploy_code_only.sh status` reads
@@ -2858,7 +2865,14 @@ verified: 0aa0bf9f2 2026-11-10
   the attempt in the Guardian state, which names it in the next diagnosis:
   while the checkout has not settled since, nothing is proposed; once the
   drop finished, a server not booted from `live`'s tip is offered a restart
-  before any further drop. The record lasts until a healthy snapshot. Off, the
+  before any further drop. The record lasts until a healthy snapshot. While
+  it is set, any action that ran ends in RECOVERED, which waits out the
+  backoff and then moves once to CONFIRMED_DEAD; that one transition passes
+  the episode's alert latch, so the next diagnosis always comes (the
+  escalation, at max_escalations). A container restart or rollback proposed
+  while that drop may still be running says at Gate 2 that it would interrupt
+  it, and an approved action held back by the backoff says it did not run.
+  Off, the
   behaviour above is unchanged and no candidate is read. The diagnosis
   snapshot carries the boot repair's
   `live-move repair:` journal lines and a summary of the newest

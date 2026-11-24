@@ -9,7 +9,9 @@ genesis-server booted from, and turns a diagnosis into what the owner approves
 at Gate 2. recovery.py runs the approved drop as ONE engine call.
 
 Everything read from the container is untrusted: the view is size-capped,
-validated, and every string from it that reaches a message is cleaned and cut.
+validated, and every string from it that reaches a message is cleaned and cut,
+except the names Gate 2 approves, which must match _BRANCH_RE and are shown
+in full.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import re
 from dataclasses import replace
 
 from genesis.guardian._subprocess import run_subprocess as _run_subprocess
+from genesis.guardian.alert.telegram import _utf16_units
 from genesis.guardian.diagnosis import DiagnosisResult, RecoveryAction
 
 logger = logging.getLogger(__name__)
@@ -68,6 +71,11 @@ _BOOT_PROBE = (
 _BRANCH_RE = re.compile(r"[^\x00-\x20\x7f-][^\x00-\x20\x7f]{0,249}")
 _OID_RE = re.compile(r"[0-9a-f]{40}")
 _SHOWN_CAP = 200
+#: A name in Gate 2's identity section is never cut: _BRANCH_RE's maximum.
+_NAME_CAP = 250
+#: Gate 2's identity section, in UTF-16 units; the diagnosis gets what
+#: remains of Telegram's 4,096. Over it, no drop is proposed.
+_IDENTITY_CAP = 3000
 
 #: DiagnosisResult.escalation: a drop saved the manifest and did not move `live`.
 HALF_DONE_DROP = "half_done_drop"
@@ -276,19 +284,37 @@ def _escalation(diagnosis: DiagnosisResult, kind: str, why: str) -> DiagnosisRes
     )
 
 
-def _leaving_with(data: dict, branch: str) -> str:
-    """Which other held candidates leave `live` with ``branch``, for Gate 2."""
-    shared = data.get("shared")
-    others = shared.get(branch) if isinstance(shared, dict) else None
-    if others is None and not isinstance(shared, dict):
-        return (
-            "The engine could not list which candidates share its unmerged commits; "
-            "any that do leave `live` with it"
-        )
-    if not others:
-        return "No other candidate on `live` shares its commits"
-    names = ", ".join(shown(b) for b in others if isinstance(b, str))
-    return f"These share its unmerged commits and leave `live` with it: {names}"
+def _leaving(data: dict, branch: str) -> tuple[tuple[str, ...] | None, str]:
+    """The other candidates the engine's own plan of this drop takes out of
+    `live` (its drop_preview), or (None, why) when they are not known in full:
+    no drop is proposed then, never one with a partial list."""
+    preview = data.get("drop_preview")
+    leaving = preview.get("leaving") if isinstance(preview, dict) else None
+    if not (
+        isinstance(leaving, list)
+        and all(isinstance(b, str) and _BRANCH_RE.fullmatch(b) for b in leaving)
+    ):
+        return None, f"the engine could not plan which candidates leave `live` with {branch}"
+    if preview.get("branch") != branch:
+        was = shown(preview.get("branch"), _NAME_CAP)
+        return None, f"the engine planned the drop of {was}, not of {branch}"
+    return tuple(leaving), ""
+
+
+def _identity(target: tuple[str, str, str, str], leaving: tuple[str, ...], note: str) -> str:
+    """Gate 2's section that is never cut: every name and commit the approval acts on."""
+    branch, pinned, head, tip = target
+    code = f"its code at {head}" + (f", pinned at {pinned}" if pinned != head else "")
+    others = (
+        f"Also leaving `live` with it: {', '.join(leaving)}."
+        if leaving
+        else "No other candidate leaves `live` with it."
+    )
+    return (
+        f"Drops {branch} ({code}) from the deploy manifest and rebuilds `live` without it "
+        f"(`live` runs {tip} now), re-syncs the git hooks, then restarts genesis-server. "
+        f"{others} `scripts/deploy_candidates add {branch} --owner <who>` puts it back{note}."
+    )
 
 
 def _since(attempt: dict | None, target: tuple[str, str, str, str]) -> str:
@@ -296,11 +322,11 @@ def _since(attempt: dict | None, target: tuple[str, str, str, str]) -> str:
     if not attempt:
         return ""
     branch, pinned = target[0], target[1]
-    was, at = shown(attempt["branch"]), shown(attempt["at"], 40)
+    was, at = shown(attempt["branch"], _NAME_CAP), shown(attempt["at"], 40)
     if branch == attempt["branch"] and pinned == attempt["pinned_head"]:
         return f". This re-runs the drop attempted at {at}, whose outcome was not seen"
     if branch == attempt["branch"]:
-        return f". {was} was re-pinned at {pinned[:12]} since the drop attempted at {at}"
+        return f". {was} was re-pinned at {pinned} since the drop attempted at {at}"
     return f". The drop of {was} attempted at {at}: {was} is no longer the newest candidate"
 
 
@@ -310,12 +336,13 @@ async def live_revert_proposal(
     attempt: dict | None = None,
 ) -> DiagnosisResult:
     """REVERT_CODE on `live`: the drop of the newest candidate when the engine
-    says a drop can run; ESCALATE after a drop that did not finish; else the
-    container restart. Decided BEFORE Gate 2, so the owner approves exactly what
-    runs. ``attempt`` is the state's record of the last drop this episode:
-    while the checkout has not settled since, nothing is proposed (that drop
-    may still be running), and once it finished, a server that has not booted
-    from `live`'s tip gets a restart before any further drop."""
+    says a drop can run and Gate 2 can name everything it removes; ESCALATE
+    after a drop that did not finish; else the container restart. Decided
+    BEFORE Gate 2, so the owner approves exactly what runs. ``attempt`` is the
+    state's record of the last drop this episode: while the checkout has not
+    settled since, nothing is proposed (that drop may still be running), and
+    once it finished, a server that has not booted from `live`'s tip gets a
+    restart before any further drop."""
     data = await live_candidates(container)
     unfinished = half_done(data)
     if unfinished:
@@ -328,14 +355,14 @@ async def live_revert_proposal(
         return _escalation(diagnosis, HALF_DONE_DROP, unfinished)
     note = ""
     if attempt and data is not None:
-        was = shown(attempt["branch"])
+        was = shown(attempt["branch"], _NAME_CAP)
         if not settled(data):
             return _escalation(
                 diagnosis,
                 "",
                 f"the checkout is not on `live` at its tip since the drop of {was} attempted at "
-                f"{shown(attempt['at'], 40)}, which may still be running. Nothing is proposed; "
-                "the Guardian looks again at the next diagnosis",
+                f"{shown(attempt['at'], 40)}, which may still be running. Nothing is proposed "
+                "now; the Guardian asks again only if this episode auto-resets",
             )
         if gone(data, attempt["branch"]):
             unit = await server_boot(container)
@@ -366,29 +393,25 @@ async def live_revert_proposal(
         )
     )
     if target is not None:
-        branch, pinned, head, tip = target
+        leaving, why = _leaving(data, target[0])
         note = note or _since(attempt, target)
-        code = f"its code at {head[:12]}" + (f", pinned at {pinned[:12]}" if pinned != head else "")
-        logger.warning("REVERT_CODE proposed on `live` — proposing the drop of %s", branch)
-        return replace(
-            diagnosis,
-            drop_candidate=target,
-            likely_cause=(
-                diagnosis.likely_cause
-                + f" — On `live`, REVERT_CODE means: drop the newest candidate {branch} "
-                f"({code}) from the deploy manifest and rebuild `live` "
-                f"without it (`live` runs {tip[:12]} now), re-sync the git hooks, then "
-                f"restart genesis-server. {_leaving_with(data, branch)}. "
-                f"`scripts/deploy_candidates add {branch} --owner <who>` puts it back{note}"
-            ),
-        )
+        identity = "" if leaving is None else _identity(target, leaving, note)
+        if identity and _utf16_units(identity) > _IDENTITY_CAP:
+            why = (
+                f"the {len(leaving)} candidates leaving `live` with {target[0]} are too many "
+                "to list in one approval"
+            )
+        elif identity:
+            logger.warning("REVERT_CODE proposed on `live` — proposing the drop of %s", target[0])
+            return replace(
+                diagnosis,
+                drop_candidate=(*target, leaving),
+                gate2_identity=identity,
+                likely_cause=diagnosis.likely_cause
+                + f" — on `live`, REVERT_CODE drops the newest candidate "
+                f"{shown(target[0], _NAME_CAP)}; the approval lists everything it removes",
+            )
     logger.warning("REVERT_CODE proposed on `live` — proposing RESTART_CONTAINER (%s)", why)
-    running = (
-        f". The drop of {shown(attempt['branch'])} attempted at {shown(attempt['at'], 40)} may "
-        "still be running, and a container restart would kill it mid-move"
-        if attempt and data is None
-        else ""
-    )
     return replace(
         diagnosis,
         recommended_action=RecoveryAction.RESTART_CONTAINER,
@@ -398,6 +421,29 @@ async def live_revert_proposal(
             f"a code revert never runs, and no candidate can be dropped now ({why}). "
             "Proposing a container restart: it lets a boot repair run where one is "
             "installed. A bad candidate is removed with "
-            f"`scripts/deploy_candidates drop <branch>`{running}"
+            "`scripts/deploy_candidates drop <branch>`"
         ),
+    )
+
+
+async def interrupt_warning(
+    container: str, diagnosis: DiagnosisResult, attempt: dict | None
+) -> DiagnosisResult:
+    """A container restart or rollback while the last drop may still be moving
+    `live`: Gate 2 says the action would interrupt it. A warning, not a block:
+    the boot repair exists for an interrupted move, and B2 owns the wait."""
+    if not attempt or diagnosis.recommended_action not in (
+        RecoveryAction.RESTART_CONTAINER,
+        RecoveryAction.SNAPSHOT_ROLLBACK,
+    ):
+        return diagnosis
+    view = await live_candidates(container)
+    if view is not None and settled(view):
+        return diagnosis
+    warn = (
+        f"Warning: a drop attempted at {shown(attempt['at'], 40)} may still be running; "
+        "this action would interrupt it."
+    )
+    return replace(
+        diagnosis, gate2_identity=" ".join(t for t in (diagnosis.gate2_identity, warn) if t)
     )

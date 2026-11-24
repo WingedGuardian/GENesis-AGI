@@ -13,6 +13,7 @@ tests/test_scripts/_deploy_candidates_world.py.
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import shutil
 import signal
@@ -369,6 +370,74 @@ def test_another_candidate_changed_before_the_write_is_refused(
     assert _calls(stub) == []
 
 
+def _preview(w: World, dc, capsys) -> dict | None:
+    capsys.readouterr()
+    assert w.run(dc, "list", "--json", "--move-refusals") == 0
+    return json.loads(capsys.readouterr().out)["drop_preview"]
+
+
+def test_a_leaving_set_changed_since_the_view_is_refused_and_nothing_changes(
+    dc, dc_ready, stub, capsys
+):
+    """Round-2 premise check E6: an ordinary re-add of a hook candidate at a new
+    approved head changes what a drop takes out of `live`, with `live`'s tip and
+    the dropped pin unchanged. --expect-leaving binds the approval to the set
+    Gate 2 showed: a different planned set refuses before any write."""
+    w = dc_ready
+    hook = "scripts/hooks/pre-commit"
+    w.candidate("feat/h", {hook: "#!/bin/sh\n# one\nexit 0\n"})
+    w.candidate("feat/y", {"y.txt": "y\n"})
+    assert w.add(dc, "feat/h", "--approve-hooks", "owner, in chat") == 0
+    assert w.add(dc, "feat/y") == 0
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    assert _preview(w, dc, capsys) == {"branch": "feat/y", "leaving": []}
+    tip, pinned = w.rev("refs/heads/live"), w.rev("refs/heads/feat/y")
+    w.candidate("feat/h", {hook: "#!/bin/sh\n# two\nexit 0\n"})
+    assert w.add(dc, "feat/h", "--approve-hooks", "owner, in chat") == 0
+    assert w.rev("refs/heads/live") == tip
+    argv = [
+        "drop", "feat/y", "--expect-branch", "live", "--expect-head", tip,
+        "--expect-candidate", pinned, "--expect-leaving",
+    ]  # fmt: skip
+    before = _snapshot(w)
+    capsys.readouterr()
+    assert w.run(dc, *argv, "[]") == 1
+    err = capsys.readouterr().err
+    assert "nothing changed" in err and "feat/h" in err, err
+    assert _snapshot(w) == before and _calls(stub) == []
+    # Control: the set the plan names now is accepted, and feat/h does leave.
+    assert w.run(dc, *argv, '["feat/h"]') == 0, capsys.readouterr()
+    assert [b for b, _ in w.live_merges()] == []
+
+
+def test_a_merge_conflict_in_the_drop_plan_is_in_the_preview(dc, dc_ready, capsys, monkeypatch):
+    """The leaving set is everything the drop's own plan excludes, so a
+    candidate that conflicts once the dropped one is gone is named too."""
+    w = dc_ready
+    _two_live(w, dc)
+    head_a = w.rev("refs/heads/feat/a")
+    real = dc.Engine.git
+
+    def git(self, *args, **kw):
+        if "merge-tree" in args and args[-1] == head_a:
+            return subprocess.CompletedProcess(args, 1, "0" * 40 + "\nx.txt\n", "")
+        return real(self, *args, **kw)
+
+    monkeypatch.setattr(dc.Engine, "git", git)
+    assert _preview(w, dc, capsys) == {"branch": "feat/b", "leaving": ["feat/a"]}
+
+
+def test_an_unplannable_drop_previews_null(dc, dc_ready, capsys, monkeypatch):
+    w = dc_ready
+    _two_live(w, dc)
+
+    def boom(*_a, **_k):
+        raise dc.Refusal("git merge-tree could not merge")
+
+    monkeypatch.setattr(dc.plan, "build_plan", boom)
+    assert _preview(w, dc, capsys) is None
+
+
 def test_the_header_names_a_restart_check_that_exists():
     """CodeRabbit c4637258286: the engine view records no restart; the header
     names the status command, which prints what the server runs."""
@@ -504,7 +573,17 @@ def test_the_wait_and_the_fault_marker_texts_stay_distinct():
 
 
 @pytest.mark.parametrize(
-    "case", ["restart alone", "no expect", "expect main", "no-rebuild", "empty"]
+    "case",
+    [
+        "restart alone",
+        "no expect",
+        "expect main",
+        "no-rebuild",
+        "empty",
+        "leaving alone",
+        "leaving not a list",
+        "leaving not json",
+    ],
 )
 def test_the_guarded_flags_go_together(dc, dc_ready, stub, capsys, case):
     w = dc_ready
@@ -516,6 +595,9 @@ def test_the_guarded_flags_go_together(dc, dc_ready, stub, capsys, case):
         "expect main": _guarded(w)[:3] + ["main", "--expect-head", tip, "--expect-candidate", head],
         "no-rebuild": [*_guarded(w), "--no-rebuild"],
         "empty": [*_guarded(w)[:-1], ""],
+        "leaving alone": ["drop", "feat/b", "--expect-leaving", "[]"],
+        "leaving not a list": [*_guarded(w), "--expect-leaving", '{"feat/a": 1}'],
+        "leaving not json": [*_guarded(w), "--expect-leaving", "feat/a"],
     }[case]
     before = _snapshot(w)
     capsys.readouterr()
