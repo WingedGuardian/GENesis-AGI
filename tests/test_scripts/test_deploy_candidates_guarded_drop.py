@@ -30,6 +30,7 @@ d='@D@'
     printf 'argv:'; printf ' %s' "$@"; printf '\n'
     for f in /proc/$$/fd/*; do printf 'fd %s\n' "$(readlink "$f")"; done
     printf 'head %s\n' "$(git -C '@ROOT@' rev-parse HEAD)"
+    printf 'at %s\n' "$(date +%s)"
     flock -n -E 75 '@LOCK@' true; printf 'lock %s\n' "$?"
 } >> "$d/log"
 case " $* " in
@@ -156,6 +157,51 @@ def test_the_restart_is_queued_after_the_confirmation_under_the_lock_with_no_loc
     finally:
         os.close(fd)
     assert not (w.home / ".genesis" / "update_in_progress.pid").exists()
+
+
+def test_the_restart_is_queued_in_a_later_second_than_the_move(dc, dc_ready, stub):
+    """serving_commit.py cannot name the boot commit when the unit started in the
+    second HEAD moved, so a down server's immediate start would read as a failed drop."""
+    w = dc_ready
+    _two_live(w, dc)
+    w.install_engine()
+    (stub / "state").write_text("failed\n")
+    res = _shell(w, stub, *_guarded(w, None, "--restart-server"), "--wait", "0")
+    assert res.returncode == 0, res.stdout + res.stderr
+    moved = w.git(w.root, "log", "-g", "-1", "--format=%gd", "--date=unix", "HEAD").stdout
+    moved_at = int(moved.strip().removeprefix("HEAD@{").removesuffix("}"))
+    assert int(_records(stub)[1]["at"]) > moved_at
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_a_closed_output_pipe_does_not_stop_the_engine(stream, tmp_path):
+    """When the Guardian's incus client is killed at its timeout, the command in
+    the container keeps running with its output pipe gone. Past the commit point,
+    a write that raised would leave a half-done drop."""
+    say = (
+        "core.out('one'); core.out('two')"
+        if stream == "stdout"
+        else ("dc._err('one'); dc._err('two')")
+    )
+    code = (
+        "import sys; sys.path.insert(0, 'scripts'); "
+        "import deploy_candidates as dc; core = dc.core; "
+        f"{say}; open(sys.argv[1], 'w').write('survived')"
+    )
+    r, w = os.pipe()
+    os.close(r)
+    mark = tmp_path / "survived"
+    try:
+        kwargs = {stream: w, "stdout" if stream == "stderr" else "stderr": subprocess.PIPE}
+        p = subprocess.run(
+            ["python3", "-I", "-S", "-c", code, str(mark)],
+            cwd=Path(__file__).resolve().parents[2],
+            timeout=30,
+            **kwargs,
+        )
+        assert p.returncode == 0 and mark.read_text() == "survived"
+    finally:
+        os.close(w)
 
 
 def test_the_fd_probe_sees_an_inherited_lock_fd(dc_ready, stub):

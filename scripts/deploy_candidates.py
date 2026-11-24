@@ -232,6 +232,7 @@ import datetime  # noqa: E402
 import fcntl  # noqa: E402
 import json  # noqa: E402
 import subprocess  # noqa: E402
+import time  # noqa: E402
 from collections.abc import Callable, Mapping  # noqa: E402
 from pathlib import Path  # noqa: E402
 
@@ -282,7 +283,7 @@ def _replace_json(path: Path, data: dict, durable: bool) -> None:
 
 
 def _err(msg: str) -> None:
-    print(msg, file=sys.stderr, flush=True)
+    core.say(sys.stderr, msg)
 
 
 def _restart_advice(moved: plan.Move) -> None:
@@ -701,12 +702,26 @@ class Engine(Repo):
         """`list --json --move-refusals`, for the Guardian's drop (#2978): the
         checkout drop would judge and every reason it would refuse to move it,
         from the one function drop refuses with. Lockless and read-only, like
-        observe(). A read that fails is a reason, never an empty list."""
+        observe(). A read that fails is a reason, never an empty list. drop also
+        refuses a `live` holding foreign commits (refuse_foreign, against the
+        local origin/main it walks from), so that is a reason here too, as in
+        status."""
         try:
             source = plan.read_source(self)
+            refusals = self._move_refusals(source)
+            base = self.resolve(BASE_REF)
+            if not base:
+                refusals.append(f"{BASE_REF} does not resolve.")
+            else:
+                foreign = self.foreign_commits(base)
+                if foreign:
+                    refusals.append(
+                        "`live` holds commits that are neither a rebuild merge nor a candidate's: "
+                        + ", ".join(c[:12] for c in foreign)
+                    )
             return {
                 "checkout": {"branch_ref": source.branch_ref, "head": source.head},
-                "move_refusals": self._move_refusals(source),
+                "move_refusals": refusals,
             }
         except (Refusal, Unknown) as exc:
             return {"checkout": None, "move_refusals": [f"could not judge: {exc}"]}
@@ -1086,6 +1101,10 @@ class Engine(Repo):
         inheritable. Exit 4 when it was not queued (the read failed, or the
         enqueue failed with an answer), exit 5 when the enqueue got no answer
         and may have been queued: the drop stays done either way."""
+        # serving_commit.py cannot name the boot commit of a start in the second
+        # HEAD moved, and a down server starts with no stop phase. Before the
+        # state read, so a start that begins meanwhile is seen and left alone.
+        time.sleep(1.01 - time.time() % 1)
         show = _systemctl(self.env, "show", "-p", "ActiveState", gate.SERVER_UNIT)
         state = show.stdout.strip().removeprefix("ActiveState=") if show.returncode == 0 else None
         if state == "activating":

@@ -23,9 +23,11 @@ import json
 import os
 import re
 import subprocess
+import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TextIO
 
 LIVE_BRANCH = "live"
 LIVE_REF = "refs/heads/live"
@@ -140,8 +142,21 @@ class Plan:
     contained: list[str] = field(default_factory=list)  # already in origin/main: nothing to merge
 
 
+def say(stream: TextIO, msg: str) -> None:
+    """Print one line. A reader that went away must not stop the engine: when
+    the Guardian's incus client is killed at its timeout, the command keeps
+    running with its output pipe gone, and past the commit point a write that
+    raised would leave a half-done move. The rest of the output is discarded."""
+    try:
+        print(msg, file=stream, flush=True)
+    except BrokenPipeError:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, stream.fileno())
+        os.close(devnull)
+
+
 def out(msg: str = "") -> None:
-    print(msg, flush=True)
+    say(sys.stdout, msg)
 
 
 def after_move(state: str, what: str, fn: Callable[[], object]) -> object:

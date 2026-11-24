@@ -188,6 +188,29 @@ def test_a_guarding_update_state_is_a_move_refusal(dc, dc_ready, capsys):
     assert "update_state.json" in why
 
 
+def test_a_hand_commit_on_live_is_a_move_refusal(dc, dc_ready, capsys):
+    """drop refuses a `live` holding a commit that is neither a rebuild merge
+    nor a candidate's (refuse_foreign), so the list says so, as status does."""
+    w = dc_ready
+    _two_live(w, dc)
+    w.commit(w.root, {"hand.txt": "made on live\n"}, "a commit made by hand on live")
+    hand = w.rev("refs/heads/live")
+    [why] = _moves(w, dc, capsys)["move_refusals"]
+    assert "neither a rebuild merge nor a candidate's" in why and hand[:12] in why
+    # Control: the drop the list describes does refuse.
+    capsys.readouterr()
+    assert w.run(dc, "drop", "feat/b") == 1
+    assert "neither a rebuild merge nor a candidate's" in capsys.readouterr().err
+
+
+def test_an_unresolvable_main_is_a_move_refusal(dc, dc_ready, capsys):
+    w = dc_ready
+    _two_live(w, dc)
+    w.git(w.root, "update-ref", "-d", "refs/remotes/origin/main")
+    got = _moves(w, dc, capsys)["move_refusals"]
+    assert any("origin/main" in why and "does not resolve" in why for why in got), got
+
+
 def test_a_checkout_that_cannot_be_read_is_a_reason_not_none(dc, dc_ready, capsys, monkeypatch):
     """A read failure never reads as "nothing refuses"."""
     w = dc_ready
