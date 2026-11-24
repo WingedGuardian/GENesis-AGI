@@ -389,8 +389,9 @@ def _mark_off_diff(events: Sequence[dict[str, Any]], changed: set[str]) -> None:
     hold for an issue-comment key: the merge gate does not score a Codex
     findings issue comment at all (its badge form matches none of the verdict
     channel's patterns). And off the diff is the ONE merge-gate exclusion
-    stated here: a maintainer reply and a documentation path also keep a
-    finding out of the merge gate's score, and neither is in the budget."""
+    stated here: a documentation path, a maintainer reply to a below-floor
+    finding and a verified fix reply to a floor finding also keep a finding out of
+    the merge gate's score, and none of them is in the budget."""
     for event in events:
         flags = event["source"].get("blocking")
         if not isinstance(flags, list):
