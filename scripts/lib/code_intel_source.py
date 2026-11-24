@@ -438,6 +438,10 @@ def restore(fd, entry_bytes, expected_sha256):
         raise ValueError("invalid source capsule") from error
 
 
+class RunnerLockBusy(BlockingIOError):
+    """The canonical runner lock is held by a different open description."""
+
+
 def _runner_lock_fds():
     """Keep only the canonical inherited runner lock in its entry handoff."""
     base = Path(os.environ.get("GENESIS_HOME") or str(Path.home() / ".genesis"))
@@ -450,7 +454,10 @@ def _runner_lock_fds():
         raise ValueError("captured runner lock identity differs")
     # Same inherited open-file description preserves the existing lock; an
     # unlocked legitimate descriptor may acquire it, but a competitor refuses.
-    fcntl.flock(8, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        fcntl.flock(8, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        raise RunnerLockBusy("canonical runner lock is busy") from error
     return (8,)
 
 
@@ -508,7 +515,9 @@ def main(argv=None):
         try:
             supervisor = modules['supervisor'].Supervisor(captured, modules, _runner_lock_fds)
             return modules["queue"].main(args.arguments, supervisor=supervisor)
-        except Exception:
+        except Exception as error:
+            if isinstance(error, RunnerLockBusy) and args.arguments == ["reconcile-orphans"]:
+                return modules["queue"].BUSY_STATUS
             import traceback
 
             traceback.print_exc()

@@ -18,7 +18,7 @@ import contextlib
 import logging
 import os
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -277,6 +277,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
 
         self._bootstrap_manifest: dict[str, str] = {}
         self._job_health: dict[str, dict] = {}
+        self._last_job_reflex: dict[str, str] = {}
         self._job_retry_registry = None
 
     # ── Core properties ───────────────────────────────────────
@@ -322,6 +323,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         exc: BaseException | None = None,
         error_type: str | None = None,
         emit_event: bool = True,
+        retry: bool = True,
     ) -> None:
         record_job_failure(
             self,
@@ -330,6 +332,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
             exc=exc,
             error_type=error_type,
             emit_event=emit_event,
+            retry=retry,
         )
 
     async def _load_persisted_job_health(self) -> None:
@@ -364,10 +367,13 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         except Exception:
             logger.error("Failed to wire JobRetryRegistry", exc_info=True)
 
-    def _persist_job_health(self, job_name: str, entry: dict, now: str) -> None:
+    def _persist_job_health(
+        self, job_name: str, entry: dict, now: str,
+        *, run_status: Literal["success", "failed"] | None = None,
+    ) -> None:
         # Thin wrapper: preserves the class-level patch surface for tests
         # that mock this method via patch("genesis.runtime.GenesisRuntime._persist_job_health").
-        persist_job_health(self, job_name, entry, now)
+        persist_job_health(self, job_name, entry, now, run_status=run_status)
 
     def register_channel(self, name: str, adapter: object, *, recipient: str | None = None) -> None:
         register_channel(self, name, adapter, recipient=recipient)

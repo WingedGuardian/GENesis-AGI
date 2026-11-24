@@ -1,0 +1,1 @@
+- Add read-only Codex MCP lifecycle diagnostics showing loaded threads, tool-process counts, and memory totals so operators can compare active work with tool processes remaining after threads close.

@@ -34,6 +34,7 @@ class _Result:
     # its first rung.
     provider_used: str | None = "openrouter-deepseek-v4"
     model_id: str | None = "deepseek/deepseek-v4-pro"
+    served_model: str | None = "deepseek/deepseek-v4-pro"
 
 
 def _vec(i: int) -> list[float]:
@@ -59,6 +60,7 @@ def _router_38a(
             content=json.dumps({"redundant_with": redundant_with}),
             provider_used=provider,
             model_id=model,
+            served_model=model,
         ),
     )
     return r
@@ -277,3 +279,107 @@ async def test_cross_type_proceeds_when_call_site_absent(db):
     assert is_novel is True
     r.route_call.assert_awaited_once()  # guard skipped -> normal call fired
     r.breakers.chain_has_available.assert_not_called()  # short-circuit on _chain None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["extractor", "judge"])
+@pytest.mark.parametrize(
+    ("alias", "configured", "served", "target", "should_store"),
+    [
+        pytest.param("openrouter-deepseek-v4", "deepseek/deepseek-v4-pro",
+                     "deepseek/deepseek-v4-pro", 1, False, id="matching"),
+        pytest.param("openrouter-deepseek-v4", "deepseek/deepseek-v4-pro",
+                     "openrouter/deepseek/deepseek-v4-pro", 1, False, id="canonical"),
+        pytest.param("openrouter-deepseek-v4", "deepseek/deepseek-v4-pro",
+                     "deepinfra/deepseek/deepseek-v4-pro", 1, True, id="cross-transport"),
+        pytest.param("openrouter-deepseek-v4", "deepseek/deepseek-v4-pro",
+                     "openrouter/openrouter/deepseek/deepseek-v4-pro", 1, True, id="nested"),
+        pytest.param("openrouter-deepseek-v4", "deepseek/deepseek-v4-pro",
+                     "deepseek/deepseek-v4-pro-20261121", 1, True, id="dated"),
+        pytest.param("openrouter-deepseek-v4", "deepseek/deepseek-v4-pro",
+                     "other/model", 1, True, id="mismatch"),
+        pytest.param("openrouter-deepseek-v4", "deepseek/deepseek-v4-pro",
+                     None, 1, True, id="missing"),
+        pytest.param("openrouter-deepseek-v4", "deepseek/deepseek-v4-pro",
+                     "  ", 1, True, id="blank"),
+        pytest.param("openrouter-deepseek-v4", "deepseek/deepseek-v4-pro",
+                     "deepseek/deepseek-v4-pro:free", 1, True, id="unverified-variant"),
+        pytest.param("openrouter-deepseek-v4", "other/model",
+                     "deepseek/deepseek-v4-pro", 1, True, id="configured-repoint"),
+        pytest.param("fallback", "deepseek/deepseek-v4-pro",
+                     "deepseek/deepseek-v4-pro", 1, True, id="fallback-alias"),
+        pytest.param("openrouter-deepseek-v4", "deepseek/deepseek-v4-pro",
+                     "deepseek/deepseek-v4-pro", None, True, id="distinct"),
+    ],
+)
+async def test_routed_served_model_controls_storage(
+    db, monkeypatch, path, alias, configured, served, target, should_store,
+):
+    from genesis.learning.procedural import extractor, judge
+    from genesis.routing.circuit_breaker import CircuitBreakerRegistry
+    from genesis.routing.cost_tracker import CostTracker
+    from genesis.routing.degradation import DegradationTracker
+    from genesis.routing.router import Router
+    from genesis.routing.types import (
+        CallResult,
+        CallSiteConfig,
+        ProviderConfig,
+        RetryPolicy,
+        RoutingConfig,
+    )
+
+    prior_id = await _seed(db, "prior-recipe", _vec(0))
+    data = {
+        "task_type": "new-recipe",
+        "principle": "Check the archive revision before extracting.",
+        "steps": ["Check revision.", "Extract."],
+        "tools_used": ["Bash"],
+        "context_tags": ["new-recipe"],
+    }
+    scope_site = "38_procedure_extraction"
+    novelty_site = "38a_procedure_novelty_llm"
+    primary = "openrouter-deepseek-v4"
+    chain = [primary, alias] if alias != primary else [alias]
+    providers = {
+        name: ProviderConfig(name, "openrouter", configured, True, None, 60)
+        for name in chain
+    }
+    config = RoutingConfig(
+        providers,
+        {site: CallSiteConfig(site, chain) for site in (scope_site, novelty_site)},
+        {"default": RetryPolicy(max_retries=0)},
+    )
+
+    async def call(provider, model_id, messages, **kwargs):
+        if provider != alias:
+            return CallResult(success=False, status_code=400, error="Synthetic rejection")
+        if "redundant_with" in messages[0]["content"]:
+            content = json.dumps({"redundant_with": target})
+        else:
+            content = json.dumps({**data, "procedure_type": "task_procedure"})
+        return CallResult(success=True, content=content, served_model=served)
+
+    delegate = MagicMock()
+    delegate.call = AsyncMock(side_effect=call)
+    router = Router(config, CircuitBreakerRegistry(providers), CostTracker(db),
+                    DegradationTracker(), delegate)
+    route = AsyncMock(wraps=router.route_call)
+    monkeypatch.setattr(router, "route_call", route)
+    embedder = _embedder_returning(_vec(0))
+    if path == "extractor":
+        stored = await extractor.extract_procedure(
+            db, summary_text="Extract the archive.", outcome="success",
+            router=router, embedding_provider=embedder,
+        )
+    else:
+        monkeypatch.setattr(judge, "get_embedding_provider", lambda: embedder)
+        stored = await judge._store_judged_procedure(db, data, router, source_type="test")
+
+    assert any(c.kwargs.get("call_site_id", c.args[0] if c.args else None) == novelty_site
+               for c in route.await_args_list)
+    assert delegate.call.await_args.args[:2] == (alias, configured)
+    assert (stored is not None) == should_store
+    async with db.execute("SELECT id FROM procedural_memory") as cursor:
+        assert {row["id"] for row in await cursor.fetchall()} == (
+            {prior_id, stored} if should_store else {prior_id}
+        )

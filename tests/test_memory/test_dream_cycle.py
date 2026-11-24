@@ -269,7 +269,7 @@ class TestDryRun:
              patch(
                  "genesis.memory.dream_cycle._persist_worklist",
                  new_callable=AsyncMock,
-                 return_value={"enqueued": 1, "oversize_flagged": 0, "superseded": 0},
+                 return_value={"enqueued": 1, "enqueue_failed": 0, "oversize_flagged": 0, "superseded": 0},
              ) as mock_persist:
             mock_scroll.return_value = (
                 [
@@ -341,7 +341,7 @@ class TestWorklist:
         result = await _persist_worklist(
             db, _clusters_of_sizes(2, 5, 3), weekly_run_id="week-1",
         )
-        assert result == {"enqueued": 3, "oversize_flagged": 0, "superseded": 0}
+        assert result == {"enqueued": 3, "enqueue_failed": 0, "oversize_flagged": 0, "superseded": 0}
         assert await queue.count_pending(work_type=WORKLIST_WORK_TYPE) == 3
 
         # FIFO-within-priority == enqueue order == size desc
@@ -1388,7 +1388,7 @@ class TestShieldRunWiring:
              patch(_BATCH_VEC) as mock_vec, patch(
                  "genesis.memory.dream_cycle._persist_worklist",
                  new_callable=AsyncMock,
-                 return_value={"enqueued": 0, "oversize_flagged": 0, "superseded": 0},
+                 return_value={"enqueued": 0, "enqueue_failed": 0, "oversize_flagged": 0, "superseded": 0},
              ) as mock_persist:
             mock_scroll.return_value = (
                 [

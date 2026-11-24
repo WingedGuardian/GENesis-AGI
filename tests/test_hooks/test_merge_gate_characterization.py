@@ -1565,6 +1565,35 @@ def test_the_no_change_note_is_wired_and_never_moves_the_verdict(
     assert rc == 0, out
 
 
+@pytest.mark.parametrize("row_behaviour", ["advisory", "ok", "raises"])
+def test_the_delivery_row_is_advisory_and_never_moves_the_verdict(
+    monkeypatch, capsys, row_behaviour
+):
+    """Whatever the delivery row says, or if its read raises, the verdict and the
+    merge-with line are the ones a report without the row prints (spec acceptance 3)."""
+    _report_env(monkeypatch, scheduled=_scheduled_marker(HEAD))
+    rc_pinned = _mod.check_pr_report("100", repo=REPO)
+    pinned = capsys.readouterr().out
+    monkeypatch.delenv("_TEST_DELIVERY_ROW", raising=False)
+    monkeypatch.setattr(_mod, "_scheduled_gate_applies", lambda repo: True)
+
+    def fake_text(pr_num, repo, head):
+        if row_behaviour == "raises":
+            raise RuntimeError("boom")
+        return "ok (DELIVERS at head)" if row_behaviour == "ok" else "advisory — PARTIAL at head"
+
+    monkeypatch.setattr(_mod, "_delivery_row_text", fake_text)
+    rc = _mod.check_pr_report("100", repo=REPO)
+    out = capsys.readouterr().out
+    row = next(ln for ln in out.splitlines() if ln.startswith("delivery"))
+    shown = {"raises": "could not check", "ok": "ok (DELIVERS", "advisory": "advisory — PARTIAL"}
+    assert shown[row_behaviour] in row
+    assert rc == rc_pinned == 0, out
+    merge_with = [ln for ln in out.splitlines() if ln.startswith("merge-with")]
+    assert merge_with, out  # else the comparison below compares nothing
+    assert merge_with == [ln for ln in pinned.splitlines() if ln.startswith("merge-with")]
+
+
 def test_check_pr_report_scheduled_absent_fails_verdict(monkeypatch, capsys):
     """An absent scheduled review is a FAILURE line and flips the report's verdict —
     the report must not diverge from the always-fail-closed enforcement gate."""

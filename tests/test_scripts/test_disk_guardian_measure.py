@@ -22,6 +22,7 @@ import pytest
 _LIB = Path(__file__).resolve().parents[2] / "scripts" / "lib" / "disk_guardian.sh"
 UUID = "0f0f0f0f-1111-2222-3333-444444444444"
 MIB = 1024 * 1024
+SLACK_MIB = 16  # free space shifts under parallel tests; see test_a_roomier_quota_does_not_bind
 
 
 def _mount_point(p: Path) -> str:
@@ -122,9 +123,11 @@ def test_no_quota_reports_statvfs(tmp_path):
     target, mi, sy = _fixture(tmp_path)
     sv_free, sv_total = _statvfs_mb(target)
     free, total, quota, *_ = _measure(target, mi, sy, tmp_path)
+    after_free, _ = _statvfs_mb(target)
     assert quota == 0
     assert total == sv_total
-    assert abs(free - sv_free) <= 2  # the real fs may move by a block between reads
+    # Parallel tests write to this disk: the value lies between the two reads.
+    assert min(sv_free, after_free) - SLACK_MIB <= free <= max(sv_free, after_free) + SLACK_MIB
 
 
 def test_quota_larger_than_the_disk_does_not_inflate(tmp_path):
@@ -132,8 +135,9 @@ def test_quota_larger_than_the_disk_does_not_inflate(tmp_path):
     target, mi, sy = _fixture(tmp_path, quota=(10**15, 0))
     sv_free, sv_total = _statvfs_mb(target)
     free, total, *_ = _measure(target, mi, sy, tmp_path)
+    after_free, _ = _statvfs_mb(target)
     assert total == sv_total
-    assert free <= sv_free + 2
+    assert free <= max(sv_free, after_free) + SLACK_MIB
 
 
 def test_exceeded_quota_reads_zero_not_negative(tmp_path):
@@ -405,12 +409,21 @@ def test_a_roomier_quota_does_not_bind(tmp_path):
     _write(q / "max_referenced", lim)
     _write(q / "referenced", 10 * MIB)
     _write(q / "limit_flags", 1)
+    # The suite runs in parallel and other tests write to this disk, so free
+    # space moves while dg_measure runs. Read statvfs on both sides of the call
+    # and require the measured value to fall between the two readings, plus a
+    # slack for writes that come and go inside the call. The slack stays far
+    # below the 1 GiB gap between the pool's figure and the quota's.
+    before_free, _ = _statvfs_mb(target)
     out = _run(f"dg_measure '{target}'", mi, sy, tmp_path).split()
+    after_free, _ = _statvfs_mb(target)
     free, total, quota, used = int(out[0]), int(out[1]), int(out[2]), int(out[6])
     assert quota == 0, "the pool binds, not the quota"
     assert total == sv_total
-    assert abs(free - sv_free) <= 2
-    assert abs(used - (sv_total - sv_free)) <= 2, "rate input is the pool's usage, not the qgroup's 10 MiB"
+    lo, hi = min(before_free, after_free), max(before_free, after_free)
+    assert lo - SLACK_MIB <= free <= hi + SLACK_MIB
+    # used = total - free, so it falls between the matching bounds.
+    assert sv_total - hi - SLACK_MIB <= used <= sv_total - lo + SLACK_MIB, "rate input is the pool's usage, not the qgroup's 10 MiB"
 
 
 def test_a_tighter_quota_supplies_every_figure(tmp_path):

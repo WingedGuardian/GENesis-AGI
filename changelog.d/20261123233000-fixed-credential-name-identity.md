@@ -1,0 +1,1 @@
+- Two long auto-captured account names now stay two entries. Uploading a placeholder-only credential file again keeps one entry, the incomplete-upload notice says when no unit was stored, and the reference migration keeps a credential's source file.

@@ -39,7 +39,9 @@ _SAFETY_NUDGE = (
     "typing a password, code or card number, follow the Safety gates in the "
     "browser-automation skill (`src/genesis/skills/browser-automation/SKILL.md`): "
     "explicit approval for each transaction, never type a card number, never "
-    "type a password or code pasted into chat, credentials for agent-owned "
+    "type a password pasted into chat (a one-time code the user themselves "
+    "sends in chat, for the flow they are waiting on, may be typed), "
+    "credentials for agent-owned "
     "accounts only from reference_lookup, and banking is handed to the user."
 )
 

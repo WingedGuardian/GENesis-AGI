@@ -208,8 +208,11 @@ async def _case(name, case, router, sandbox):
         from genesis.eval.qualification.storage import replay
 
         mapping = contracts.candidate_mapping(case, messages, result["candidate_ids"])
+        attempt = router.campaign.attempt(router.served[case["id"]])
+        observation, = attempt["observations"]
         result["storage"] = await replay(
-            case, messages, mapping, content, sandbox, router.alias, router.cfg.model_id
+            case, messages, mapping, content, sandbox, router.alias, router.cfg.model_id,
+            served_model=observation.get("response_model"),
         )
     return result
 
