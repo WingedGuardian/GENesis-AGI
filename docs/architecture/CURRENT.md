@@ -237,6 +237,12 @@ Easy-to-forget mechanisms:
   in another process that commits in between makes it write nothing
   (`CredentialKeyChanged`); the ingest then re-reads and runs again, up to five
   times, so every writer in a race lands, and a sixth change reaches the caller.
+  The write's plan (its masks, target entry, sameness and a new entry's
+  candidates) is built from a read of the name's entries before the knowledge
+  writer lock, a file lock every ingest takes, and read again under it; when
+  those entries or the key changed, the plan is built again under the lock
+  (`_credential_plan`), so the value of a same-name write that committed in
+  between is masked in this write's name and tags.
   Only `reference_ops` reads the secret row: `compose_body` puts the value and
   the description back for `reference_lookup` (behind its audit log),
   `reveal_reference` returns both for the dashboard's reveal, and
