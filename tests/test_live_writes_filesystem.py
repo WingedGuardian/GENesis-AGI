@@ -71,7 +71,8 @@ def test_fd_exclusive_wrapper_still_records_real_write(home):
 
 
 @pytest.mark.parametrize("kind", ["exclusive", "nofollow"])
-def test_relative_raw_open_cannot_use_cwd_entry_for_suppression(home, monkeypatch, kind):
+@pytest.mark.parametrize("witnessed", [False, True])
+def test_relative_open_cannot_use_cwd_entry_for_suppression(home, monkeypatch, kind, witnessed):
     guessed = home / ".genesis"
     actual = home.parent / "allowed"
     if kind == "exclusive":
@@ -85,13 +86,17 @@ def test_relative_raw_open_cannot_use_cwd_entry_for_suppression(home, monkeypatc
     monkeypatch.chdir(guessed)
     try:
         audit._S.hits.clear()
-        descriptor = os.open("entry", flags, dir_fd=directory)
+        opener = os.open if witnessed else getattr(os.open, "__wrapped__", os.open)
+        descriptor = opener("entry", flags, dir_fd=directory)
         os.write(descriptor, b"changed")
         os.close(descriptor)
     finally:
         os.close(directory)
     assert (actual / "entry").read_bytes() == b"changed"
-    assert any(label.startswith("relative os.open") for label, _, _ in _hits())
+    if witnessed:
+        assert not _hits()  # successful FD proves the write landed in the owned directory
+    else:
+        assert any(label.startswith("relative os.open") for label, _, _ in _hits())
     assert audit._S.faults == 0
 
 

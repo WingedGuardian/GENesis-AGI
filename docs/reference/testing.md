@@ -457,26 +457,54 @@ It also reports reads of the real credential files (the deployed `secrets.env`,
   box lock file, `/dev`, and `__pycache__` / `.pytest_cache` directories.
 - Each write is classed by where it lands (the deployed checkout, this checkout,
   `~/.genesis`, `~/.claude`, elsewhere in the home) and attributed to the test.
-- The run summary counts tests per class under "writes outside the test's temp
-  dirs"; `GENESIS_LIVE_WRITES_REPORT=<file>` writes one tab-separated line per
+- The run summary counts tests per class under "audit observations";
+  `GENESIS_LIVE_WRITES_REPORT=<file>` writes one escaped tab-separated line per
   (test, class, operation, path), on every run.
-- Hits are pre-operation classifications of audit events, not proof that a
-  syscall completed. Simple known no-ops (`mkdir(exist_ok=True)` on an existing
-  directory, `unlink` of a missing file, reopening an existing file without
-  writing) are filtered, but an operation the kernel refuses can still be
-  reported, and some aliases can be missed (tracked in #4193). A relative
-  `os.open` is judged against the cwd and labelled so (its audit event carries no
-  `dir_fd`). Writes during collection count as "outside any test".
+- An observation records a pre-operation event, not successful completion.
+  Established no-effect cases (`mkdir(exist_ok=True)` on an existing directory,
+  `unlink` of a missing file, reopening an existing file without writing) are
+  filtered; other refused operations can still be reported, and some aliases can
+  be missed (tracked in #4193). Relative `os.open`
+  events omit `dir_fd`. On Linux/CPython, `tests/_live_writes_fd.py` corrects a
+  supported successful call using its returned descriptor, one observed native
+  event and matching unchanged parent/target metadata. This applies to exact
+  string/bytes leaf names, explicit nonnegative integer directory descriptors
+  and write flags with `O_NOFOLLOW` or `O_CREAT|O_EXCL`, excluding `O_PATH`.
+  Failed, unsupported, saved-native-alias and ambiguous calls retain the primary
+  observer's explicitly labelled cwd guess. Existing credential observations
+  and every fault count remain; published evidence is never subtracted.
+  Writes during collection count as "outside any test".
+- The test-process wrapper changes `os.open` identity and builtin status;
+  signatures, pickling and directory-FD feature membership are preserved. It
+  restores only its own callable/member at unconfigure. Fork children bypass
+  refinement. This does not extend the child-process coverage below.
+- Report capture temporarily disables new refinement while sealing pending
+  calls and copying both observations and status. A pending call makes the
+  census incomplete even if it later succeeds. Calls entering during capture
+  use primary observation; later independent calls can refine again. Ordinary
+  writes after the snapshot retain the existing documented coverage limit.
+- An `observer fault` row identifies the test and the audit event/stage/fixed
+  builtin error category. Its path field is the literal `<not captured>`;
+  exception messages, filenames, custom type names and tracebacks are not
+  included. Failed test attribution uses `<attribution unavailable>`.
+  Identical diagnostic rows deduplicate, while the fault count includes every
+  judging failure. If diagnostic capture itself fails, the count still makes
+  the census incomplete. Older count-only reports cannot recover fault causes.
 - Not covered: writes made by child processes, writes without an audit event,
   metadata changes (`chmod`, `utime`, `setxattr`, `touch` of an existing file),
   `mkfifo`/`mknod`, SQLite writes through an already-open connection, and
   `file://localhost` or percent-encoded SQLite URIs. The OS-level sandbox is the
   boundary there.
 
-The list it produces is the to-do list for moving each such test under its own
-`tmp_path`. Keep it report-only while the #4193 accuracy gaps are corrected:
-enforcement requires a corrected audit and a complete empty CI census, which a
-selected local run cannot establish.
+The observations identify tests to investigate and move under their own
+`tmp_path`. Enforcement requires a successful complete census on corrected
+main, with an empty report, zero faults, an installed observer and no missing
+or disarmed workers. An empty TSV alone does not establish this: CI also checks
+the fresh run identity, test outcome, report digest/count and worker coverage.
+Both reliable write detection and credential-read coverage are prerequisites.
+The audit remains report-only while ambiguous observations and unknown faults
+remain unresolved; correcting successful destinations does not exempt denied
+reads or qualify enforcement by itself.
 
 Generated session MCP configs are isolated by the function-scoped autouse fixture
 in `tests/_session_config.py`, registered by the root conftest. It redirects only

@@ -73,11 +73,12 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 5a3de4eee 2026-11-07
+verified: 273642a5e 2026-11-22
 ```
 
-The 2026-11-07 verification covers the request-owned memory thread boundaries
-below; other memory descriptions retain their individually cited verification dates.
+The 2026-11-22 verification covers weekly dream centrality. The 2026-11-07
+verification covers the request-owned memory thread boundaries below.
+Other memory descriptions retain their individually cited verification dates.
 
 **Shared-owner prerequisite (not activated):** nine thread boundaries in
 `memory/store.py`, `retrieval.py`, `intent.py` and `proactive.py` retain actual
@@ -336,7 +337,17 @@ weekly clustering (Sun 4am) persists a value-ranked worklist to
 **shadow-hardwired** (`dry_run=True`) — the live flip is a separate user-gated
 change (#892). `_CapacityBreaker` aborts on consecutive provider exhaustion.
 `_cross_wing_scan` writes `memory_links` even under dry_run — intentional
-additive layer, not a leak.
+additive layer, not a leak. Weekly betweenness scoring also runs in dry runs.
+`dream_centrality_worker.py` snapshots the primary database in one admitted
+read-only transaction, closes it, then builds and scores the NetworkX graph
+in a separate user scope. The worker budget is 5% of effective memory and
+half the effective CPU capacity, up to one core and 80% of the configured
+resource-budget CPU allowance. A two-hour deadline bounds a hung worker.
+The worker verifies its own kernel limits before reading the database. The
+parent publishes the full nonzero ranking in an owned transaction after
+validating the complete result. Failure before commit leaves the last good
+cache available to the importance shield. `GENESIS_DREAM_CENTRALITY_DISABLED=1`
+skips the worker and records the phase as unavailable.
 
 **Importance shield (Phase 2c)** — `memory/dream_shield.py` +
 `memory/dream_shield_config.py` (config: `config/dream_shield.yaml` + local
@@ -349,11 +360,11 @@ centrality ≥ the nonzero percentile. Thresholds freeze into each slice; the
 drain re-checks live members via `shield_filter_live` (catches salience that
 rose mid-week) and counts `shield_missing_thresholds` — which must be 0 before
 any live flip. Centrality persistence widened from top-500 to all-nonzero
-(`dream_centrality.py`, `graph.centrality_scores(top_n=None)`) so the shield has
+(`dream_centrality.py`) so the shield has
 a real bridge-node population; `centrality_cache` gains its first reader.
 
-**Graph backend is a SEAM (`memory/graphstore.py`)** — traversal and centrality
-run through a `GraphStore` protocol with two implementations: the default
+**Graph backend is a SEAM (`memory/graphstore.py`)** — interactive traversal and
+centrality run through a `GraphStore` protocol with two implementations: the default
 `NetworkxGraphStore` (the in-process MultiDiGraph projection of `memory_links`)
 and `FalkorGraphStore` (below);
 opt-in `RequestDatabase` traversal declines NetworkX before projection and uses
@@ -2197,9 +2208,10 @@ the shared banner is not an assertion about all concurrent sessions.
   orphaned uncertainty, original physical obligations and one-time accounting.
   Matching terminal leader states alone do not prove controller process end.
   The same-connection final drain observes callback-created evidence before
-  commit. The acknowledgement grants no retry or acceptance. The automatic
-  reconciliation caller remains separate (#3728); cutover,
-  native qualification and production capacity remain separate gates.
+  commit. The acknowledgement grants no retry or acceptance. The captured runner
+  sweeps unresolved original owners before claiming after strict readiness.
+  Unproved ownership stays held. Cutover, native qualification and production
+  capacity remain separate gates.
   Explicit request/revoke/status operations use the existing provider-state
   grant and bind actual work, retained debt, evidence, provider and runner/
   watchdog source, policy, boot and bounded dual-clock deadlines. Invalid grant
@@ -2699,7 +2711,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 273642a5e 2026-11-22
+verified: 204c69c1f 2026-11-22
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -3051,6 +3063,12 @@ verified: 273642a5e 2026-11-22
   The shared approval gate can reconcile persisted requests while the model
   router is down if the approval database is available. A declined dispatch or
   action is quiet for 24 h through `handle_approval_resolution` (every pattern).
+- **sentinel/codex_mcp_inventory.py** reads the managed daemon's loaded thread
+  inventory and MCP groups once per minute while the learning scheduler runs.
+  Daily pruning applies a 72-hour cutoff to aggregate `codex.mcp_inventory`
+  events. Thread and process group identifiers used for comparisons stay in
+  memory. See the [MCP process report](../reference/mcp-process-report.md) for
+  limitations and the collection switch.
 - **sentinel/process_stop.py** (`python -m genesis.sentinel.process_stop`):
   the Failure Inventory remedy for ONE runaway process. Dry-run by default;
   `--execute` only inside an approved action. Resolves targets when it runs:
@@ -4790,7 +4808,9 @@ CLI. Its `codex_exec_argv`/`codex_child_env` give every Codex run Genesis
 starts unattended (the executor's adversarial verifier, the contribution
 reviewer) a child environment from `caller_context.dispatched_child_env`:
 `GENESIS_CC_SESSION=1`, supervised marker dropped, origin kept.
-`tests/test_codex_dispatch_marker.py` fails on a `codex` literal anywhere else.
+`tests/test_codex_dispatch_marker.py` checks other `codex` literals and allows
+known read-only references, including the inventory socket path and event
+metadata. The inventory event's keyword details still go through the scan.
 The marker is inert until the Codex project config forwards it to the Genesis
 MCP launcher; it exists so an unmarked Codex run can mean the owner's own
 client, as an unmarked Claude Code session does.

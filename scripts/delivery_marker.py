@@ -276,7 +276,7 @@ def basis_from_body(body: str | None, *, linked: Callable[[], list[dict]], repo:
     return f"issue:{issue['number']}"
 
 
-def linked_issues(repo: str, pr: int) -> list[dict]:
+def linked_issues(repo: str, pr: int, *, timeout: float | None = None) -> list[dict]:
     """GitHub's ``closingIssuesReferences`` for the PR, as ``[{"number", "repo"}]``."""
     raw = _gh(
         [
@@ -290,7 +290,8 @@ def linked_issues(repo: str, pr: int) -> list[dict]:
             "--jq",
             '.closingIssuesReferences[] | {number, repo: (.repository.owner.login + "/"'
             " + .repository.name)} | @json",
-        ]
+        ],
+        timeout=timeout,
     )
     rows = _jsonl(raw)  # MEASURED: gh prints each @json result as one plain object line
     for row in rows:
@@ -401,12 +402,16 @@ def _pr(repo: str, pr: int, *, timeout: float | None = None) -> dict:
 _ROW = "{id, login: .user.login, author_association, body, stamp: %s}"
 
 
-def _comments(repo: str, pr: int, *, reviews: bool = False) -> list[dict]:
+def _comments(
+    repo: str, pr: int, *, reviews: bool = False, timeout: float | None = None
+) -> list[dict]:
     if reviews:
         path, stamp = f"repos/{repo}/pulls/{pr}/reviews", ".submitted_at"
     else:
         path, stamp = f"repos/{repo}/issues/{pr}/comments", ".updated_at"
-    rows = _jsonl(_gh(["api", path, "--paginate", "--jq", ".[] | " + _ROW % stamp]))
+    rows = _jsonl(
+        _gh(["api", path, "--paginate", "--jq", ".[] | " + _ROW % stamp], timeout=timeout)
+    )
     for row in rows:
         # The id goes into a printed API path: only GitHub's integer ids are accepted.
         cid = row.get("id") if isinstance(row, dict) else None
@@ -485,6 +490,152 @@ def select(comments: list[dict], reviews: list[dict], owner: str, head: str) -> 
     governing = max(pool, key=_order) if pool else None
     later = [b for b in unusable if governing is None or _order(b) > _order(governing)]
     return {"governing": governing, "later_unusable": later, "blocks": blocks, "notes": notes}
+
+
+#: One read for everything that may void a delivery read since it was made: the read's
+#: head commit time; the PR's base retargets and retitles and its body's last edit; and,
+#: on an issue basis, the issue's edit, retitles, closures, reopenings and comments.
+#: ``filteredCount`` counts the matching events; ``totalCount`` on the timeline counts
+#: every item (MEASURED on #4611: 27 against 0 matching), so nodes are compared with
+#: ``filteredCount``. ``committedDate`` is the committer date (MEASURED: it equals REST
+#: ``commit.committer.date`` on 1430e874).
+_CHANGES_Q = (
+    "query($o:String!,$r:String!,$pr:Int!,$issue:Int!,$has:Boolean!,$head:GitObjectID!)"
+    "{repository(owner:$o,name:$r){object(oid:$head){... on Commit{committedDate}}"
+    " pullRequest(number:$pr){lastEditedAt timelineItems(itemTypes:[BASE_REF_CHANGED_EVENT,"
+    "RENAMED_TITLE_EVENT],last:100){filteredCount nodes{__typename"
+    " ... on BaseRefChangedEvent{createdAt} ... on RenamedTitleEvent{createdAt}}}}"
+    " issueOrPullRequest(number:$issue) @include(if:$has){__typename ... on Issue{"
+    "lastEditedAt comments(last:100){totalCount nodes{createdAt lastEditedAt}}"
+    " timelineItems(itemTypes:[RENAMED_TITLE_EVENT,CLOSED_EVENT,REOPENED_EVENT],last:100)"
+    "{filteredCount nodes{__typename ... on RenamedTitleEvent{createdAt}"
+    " ... on ClosedEvent{createdAt stateReason} ... on ReopenedEvent{createdAt}}}}}}}"
+)
+
+#: A basis whose source is not on GitHub, so nothing here can see it change.
+_UNCHECKED_SOURCE = {
+    "ledger": "the ledger row",
+    "follow-up": "the follow-up",
+    "spec": "the spec",
+    "plan": "the plan",
+}
+
+
+def _after(nodes: list, stamp: str, key: str = "createdAt") -> list:
+    return [n for n in nodes if str((n or {}).get(key) or "") > stamp]
+
+
+def changes_since(
+    repo: str, pr: int, basis: str, head: str, read_at: str, *, timeout: float | None = None
+) -> list[tuple[str, bool]]:
+    """What happened since a delivery read that a re-read should see, as
+    ``[(line, voids)]``: ``voids`` is True for a change or a failed read (the read is no
+    longer settled) and False for a note (a source nothing here can check).
+
+    Two clocks, both owner rulings of 2026-11-18. Base and issue changes are judged
+    against the read's head commit time, because a re-edited marker (a carry
+    re-recorded) would move its own time past a change the read never saw; a change
+    between the commit and the read is reported too, which costs one re-read. On a claim
+    basis the PR's body and title ARE the basis, and ``compose`` reads the body when it
+    writes the marker, so those are judged against ``read_at``, the marker comment's
+    edit time; judged by the commit they would flag almost every PR forever, since bots
+    rewrite PR bodies after each push (MEASURED: 34 of the last 40 PRs). That time is
+    when the marker was last posted or edited, not when ``compose`` ran, so a claim edit
+    between the two, or a hand edit of the marker after a claim edit, goes unseen.
+
+    A read that fails or comes back cut short is a voiding line, never silence. GitHub
+    fails the whole query when the issue does not exist (MEASURED: exit 1, "Could not
+    resolve to an issue"), so that case reads as the whole read failing.
+    """
+    kind = basis.split(":", 1)[0]
+    out: list[tuple[str, bool]] = []
+    if kind in _UNCHECKED_SOURCE:
+        out.append((f"changes to {_UNCHECKED_SOURCE[kind]} since the read: not checked", False))
+    try:
+        owner, name = repo.split("/", 1)
+        issue = int(basis.split(":", 1)[1]) if kind == "issue" else 0
+        data = json.loads(
+            _gh(
+                [
+                    "api",
+                    "graphql",
+                    "-f",
+                    f"query={_CHANGES_Q}",
+                    "-F",
+                    f"o={owner}",
+                    "-F",
+                    f"r={name}",
+                    "-F",
+                    f"pr={pr}",
+                    "-F",
+                    f"issue={issue}",
+                    "-F",
+                    f"has={'true' if issue else 'false'}",
+                    "-f",
+                    f"head={head}",
+                ],
+                timeout=timeout,
+            )
+        )["data"]["repository"]
+        stamp = data["object"]["committedDate"]
+        pull = data["pullRequest"]
+    except (Refused, ValueError, KeyError, TypeError):
+        return out + [("base and issue changes: could not check", True)]
+    if not isinstance(stamp, str) or not stamp or not isinstance(pull, dict):
+        return out + [("base and issue changes: could not check", True)]
+    events = pull.get("timelineItems") or {}
+    nodes = events.get("nodes")
+    if not isinstance(nodes, list) or events.get("filteredCount") != len(nodes):
+        out.append(("base changes: could not check", True))
+    else:
+        if _after(
+            [n for n in nodes if (n or {}).get("__typename") == "BaseRefChangedEvent"], stamp
+        ):
+            out.append(("base changed since the check", True))
+        renamed = [n for n in nodes if (n or {}).get("__typename") == "RenamedTitleEvent"]
+        if kind == "claim" and _after(renamed, read_at):
+            out.append(("the PR title (part of its claim) changed since the check", True))
+    if kind == "claim" and str(pull.get("lastEditedAt") or "") > read_at:
+        out.append(("the PR body (its claim) was edited since the check", True))
+    if kind == "issue":
+        out += _issue_changes(data.get("issueOrPullRequest"), issue, stamp)
+    return out
+
+
+def _issue_changes(got: object, issue: int, stamp: str) -> list[tuple[str, bool]]:
+    if not isinstance(got, dict) or got.get("__typename") != "Issue":
+        return [(f"issue #{str(issue)[:20]} unreadable", True)]
+    out = []
+    if str(got.get("lastEditedAt") or "") > stamp:
+        out.append(("the issue was edited since the check", True))
+    comments = got.get("comments") or {}
+    rows = comments.get("nodes")
+    if not isinstance(rows, list):
+        out.append(("issue comments: could not check", True))
+    else:
+        if _after(rows, stamp):
+            out.append(("the issue has new comments since the check", True))
+        if _after(rows, stamp, "lastEditedAt"):
+            out.append(("an issue comment was edited since the check", True))
+        if comments.get("totalCount") != len(rows):
+            # Named, not voiding: no re-read could ever clear it on a long thread.
+            out.append(("older issue comments: edits not checked", False))
+    timeline = got.get("timelineItems") or {}
+    events = timeline.get("nodes")
+    if not isinstance(events, list) or timeline.get("filteredCount") != len(events):
+        out.append(("issue retitles and closures: could not check", True))
+        return out
+    late = _after(events, stamp)
+    if any((n or {}).get("__typename") == "RenamedTitleEvent" for n in late):
+        out.append(("the issue was retitled since the check", True))
+    for n in late:
+        if (n or {}).get("__typename") == "ClosedEvent":
+            why = str((n or {}).get("stateReason") or "").lower().replace("_", " ")[:20]
+            out.append((f"the issue was closed{' as ' + why if why else ''} since the check", True))
+            break
+    if any((n or {}).get("__typename") == "ReopenedEvent" for n in late):
+        out.append(("the issue was reopened since the check", True))
+    return out
 
 
 # ── commands ─────────────────────────────────────────────────────────────────

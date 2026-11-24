@@ -118,6 +118,9 @@ HOOK_SURFACE_FILES = frozenset(
         # The issue premise gate: an Action script that hooks/issue_premise_gate.py
         # imports, so its rule decides a block.
         "scripts/premise_gate.py",
+        # The delivery marker's parser and selection: the --check-pr delivery row
+        # imports them, so a change to either changes what that row reports.
+        "scripts/delivery_marker.py",
         ".claude/settings.json",
         "scripts/behavioral_linter.py",
         "scripts/check_stale_pending.py",

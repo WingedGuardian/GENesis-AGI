@@ -33,9 +33,18 @@ and attributed to the running test.
 
 Output: a terminal-summary section, and, with ``GENESIS_LIVE_WRITES_REPORT=<file>``,
 one tab-separated line per (test, class, operation, path), written on every run.
+Each field escapes backslash/tab/LF/CR; tests._live_writes_report.decode reads
+the reversible bytes. Empty/parseable TSV alone never establishes completeness.
+Judging failures increment the fault count and add ``observer fault`` rows:
+operation is event/stage/fixed-builtin-error-category, path is ``<not captured>``.
+No exception message, filename or traceback is retained. Identical rows deduplicate;
+fault counts do not. Failed attribution uses ``<attribution unavailable>``; failed
+diagnostic retention still leaves a nonzero fault count (unknown, not clean).
 Under xdist each worker hands its hits to the controller at session end
 (``workeroutput``, as the live fence does), and only the controller reports; a
-worker that never reported is named in the summary.
+worker that never reported is named in the summary. The ordinary trylast worker
+snapshot includes default/tryfirst sessionfinish hooks, but not later same-priority
+hooks, wrapper teardown, unconfigure or writes after the snapshot.
 
 Hits classify pre-operation events, not syscall completion. Known no-ops such
 as an existing ``mkdir``, missing ``unlink``, non-empty ``rmdir``, or an
@@ -47,8 +56,12 @@ sources, occupied link destinations and same-inode renames are also filtered.
 Protected hardlink sources are observed as ``os.link source`` exposure, even
 without a later content write. Source symlink targets are checked conservatively
 because the link event omits follow_symlinks. No alias history is maintained.
-``os.open`` of a relative name is judged against the cwd and labelled so (its
-audit event omits ``dir_fd``).
+Relative ``os.open`` events omit ``dir_fd``. On Linux/CPython the FD witness
+corrects supported successful calls using the returned descriptor; other calls
+retain the explicitly labelled cwd guess. Failed/ambiguous calls and every
+credential-read fault remain conservative; no published evidence is removed.
+Pending calls are sealed across report capture. Callable identity/builtin type
+change under instrumentation; signature/pickle/dir_fd metadata are preserved.
 Attribution is by ``PYTEST_CURRENT_TEST``: a write during collection or a
 session fixture's teardown counts as "outside any test", and a background
 thread an earlier test left running is charged to the test running now.
@@ -79,7 +92,7 @@ from types import ModuleType
 import pytest
 
 from genesis.secrets_location import home_config_location
-from tests import _live_writes_fs
+from tests import _live_writes_fd, _live_writes_fs, _live_writes_report
 
 
 def _observer_os():
@@ -141,11 +154,16 @@ class _State:
     merged_workers: set[str] = set()  # xdist workers whose hits were merged
     unreported: list[str] = []  # xdist workers whose hits never arrived
     faults = 0  # unknown classifications must not look like a clean census
+    census_id: str | None = None
+    exitstatus: int | None = None
+    expected_workers: set[str] = set()
+    worker_status: dict[str, dict | None] = {}
 
 
 _S = _State()
 _busy = threading.local()
 _fault_lock = threading.Lock()
+_W = _live_writes_fd.Witness(sys.modules[__name__])
 
 
 def _under(path: str, root: str) -> bool:
@@ -225,7 +243,16 @@ def _node() -> str:
 
 
 def _record(label: str, op: str, path: str) -> None:
-    _S.hits[(_node(), label, op, path)] = None
+    key = (_node(), label, op, path)
+    try:
+        if _W.defer(key):
+            return
+    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+        raise
+    except BaseException as error:
+        _W.invalidate()
+        _unknown("open", "fd-witness", error)
+    _S.hits[key] = None
 
 
 def _sqlite_target(database) -> str | None:
@@ -320,16 +347,36 @@ def _judge(event: str, args: tuple) -> None:
             _record(label, event, target)
 
 
-def _unknown():
+def _unknown(event, stage, error):
     with _fault_lock:
         _S.faults += 1
+    try:
+        try:
+            node = _node()
+        except (KeyboardInterrupt, SystemExit, GeneratorExit):
+            raise
+        except BaseException:
+            node = "<attribution unavailable>"
+        # Only names of these builtin classes, never the exception's own type
+        # name or values. Keep this best-effort evidence behind the count above.
+        reason = next(kind.__name__ for kind in (
+            FileNotFoundError, NotADirectoryError, PermissionError, OSError,
+            ValueError, TypeError, RuntimeError, AssertionError, Exception, BaseException,
+        ) if isinstance(error, kind))
+        _S.hits[(node, "observer fault", f"{event}/{stage}/{reason}", "<not captured>")] = None
+    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+        raise
+    except BaseException:
+        # Diagnostic failure must neither escape into the observed operation
+        # nor recursively count itself. The existing count invalidates the census.
+        pass
 
 
 def _judge_names(event, args):
     try:
         effects = _live_writes_fs.name_effects(os, _absolute, event, args)
-    except (OSError, ValueError):
-        _unknown()
+    except (OSError, ValueError) as error:
+        _unknown(event, "name-effects", error)
         # Metadata uncertainty must not erase an established destination hit.
         effects = _live_writes_fs.uncertain_name_effects(_absolute, event, args)
     for target, operation in effects:
@@ -434,34 +481,43 @@ def _ordinary_read(args: tuple) -> bool:
 
 
 def _hook(event: str, args: tuple) -> None:
-    if event not in _EVENTS or getattr(_busy, "on", False):
+    if event not in _EVENTS:
         return
     # Everything past the event check runs under the guard and the exception
     # boundary, the read-side credential lookup included: its os.stat can raise
     # (a test that patches it) and is itself an audited open.
+    was_busy = getattr(_busy, "on", False)
     _busy.on = True
+    stage = "fd-witness"
     try:
+        _W.note(event, args)
+        if was_busy:
+            return
         if event == "open":
+            stage = "open-no-effect"
             try:
                 if _live_writes_fs.open_no_effect(os, _absolute, args):
                     return
-            except (OSError, ValueError):
-                _unknown()  # retain conservative observations as well
-        if event == "open" and _ordinary_read(args):
-            return
+            except (OSError, ValueError) as error:
+                _unknown(event, stage, error)  # retain conservative observations as well
+            stage = "ordinary-read"
+            if _ordinary_read(args):
+                return
+        stage = "judge"
         _judge(event, args)
     except (KeyboardInterrupt, SystemExit, GeneratorExit):
         raise
-    except BaseException:  # pytest outcomes also must not escape an observer
-        _unknown()
+    except BaseException as error:  # pytest outcomes also must not escape an observer
+        _unknown(event, stage, error)
     finally:
-        _busy.on = False
+        _busy.on = was_busy
 
 
 def install(config) -> None:
     """Arm the write audit. Idempotent: an audit hook cannot be removed."""
     if _S.installed:
         return
+    _S.census_id = os.environ.get("GENESIS_LIVE_WRITES_RUN_ID")
     from tests import _live_closure, _live_fence
 
     # The fence (installed first in the suite) owns the real home. Without it
@@ -528,22 +584,38 @@ def install(config) -> None:
     _S.credential_inodes = frozenset(inodes)
     sys.addaudithook(_hook)
     _S.installed = True
+    _W.install()
 
 
+@pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session, exitstatus):
     # An xdist worker's terminal summary never reaches the run, so it hands its
     # hits to the controller (pytest_testnodedown), as the live fence does.
+    # Earlier ordinary hooks may update Session after the argument was copied.
+    _S.exitstatus = int(getattr(session, "exitstatus", exitstatus))
     if hasattr(session.config, "workeroutput"):
+        hits, state = _W.capture(_live_writes_report.observation_state)
         session.config.workeroutput["genesis_live_writes"] = {
             # As bytes: xdist's channel refuses a str it cannot encode as UTF-8
             # (MEASURED: execnet DumpError), which an undecodable path is.
             "hits": [
                 [field.encode("utf-8", "surrogateescape") for field in key]
-                for key in dict.copy(_S.hits)
+                for key in hits
             ],
-            "disarmed": _S.disarmed,
-            "faults": _S.faults,
+            "disarmed": state["disarmed"],
+            "faults": state["faults"],
         }
+        if _S.census_id:
+            session.config.workeroutput["genesis_live_writes"]["census"] = state
+
+
+def _worker_id(node):
+    return (getattr(node, "gateway", None) and getattr(node.gateway, "id", None)) or "a worker"
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_configure_node(node):
+    _S.expected_workers.add(_worker_id(node))
 
 
 @pytest.hookimpl(optionalhook=True)
@@ -551,7 +623,7 @@ def pytest_testnodedown(node, error):
     """The controller merges each worker's hits, so an xdist run reports what a
     serial one would. A worker that went down without reporting is named in the
     summary: its writes are unknown, not absent."""
-    worker = (getattr(node, "gateway", None) and getattr(node.gateway, "id", None)) or "a worker"
+    worker = _worker_id(node)
     if worker in _S.merged_workers:
         return  # xdist can report one worker down twice (an interrupted run)
     _S.merged_workers.add(worker)
@@ -559,6 +631,8 @@ def pytest_testnodedown(node, error):
     if got is None:
         _S.unreported.append(f"{worker} ({error})" if error else worker)
         return
+    census = got.get("census")
+    _S.worker_status[worker] = dict.copy(census) if isinstance(census, dict) else None
     for key in got["hits"]:
         _S.hits[tuple(field.decode("utf-8", "surrogateescape") for field in key)] = None
     if got["disarmed"]:
@@ -570,22 +644,25 @@ def pytest_testnodedown(node, error):
 def pytest_terminal_summary(terminalreporter):
     if hasattr(terminalreporter.config, "workeroutput"):
         return  # a worker: its hits go to the controller, which reports once
+    hits, state = _W.capture(_live_writes_report.census_state)
     if not _S.installed:
         if _S.disarmed:
             terminalreporter.write_line(f"live writes: disarmed ({_S.disarmed})", yellow=True)
-        return
+        else:
+            terminalreporter.write_line("live writes: not installed (unknown, not clean)", yellow=True)
     tr = terminalreporter
-    if _S.faults:
-        tr.write_line(f"live writes: {_S.faults} events could not be classified (unknown, not clean)", yellow=True)
+    # The captured census, not the live count: a thread the run left behind can
+    # still record a fault after the capture, and the receipt cannot hold it.
+    if state["faults"]:
+        tr.write_line(f"live writes: {state['faults']} events could not be classified (unknown, not clean)", yellow=True)
     # One snapshot: a thread the run left behind can still record while this runs,
     # and iterating the live dict would raise and fail a run this only reports on.
     # dict.copy() takes it in one step under the GIL, without iterating the dict.
-    hits = list(dict.copy(_S.hits))
     if hits:
         by_class: dict[str, set[str]] = {}
         for node, label, _op, _path in hits:
             by_class.setdefault(label, set()).add(node)
-        tr.section("live writes: writes outside the test's temp dirs (reported, not failed)")
+        tr.section("live writes: audit observations (reported, not failed)")
         for label, nodes in sorted(by_class.items()):
             outside = "<outside a test>" in nodes
             count = len(nodes) - outside
@@ -597,7 +674,10 @@ def pytest_terminal_summary(terminalreporter):
         try:
             # surrogateescape: a path os.fsdecode() could not decode is written back
             # as its original bytes instead of failing the run.
-            text = "".join("\t".join(key) + "\n" for key in hits)
-            Path(report).write_bytes(text.encode("utf-8", "surrogateescape"))
+            _live_writes_report.publish(report, hits, state)
         except (OSError, UnicodeError) as exc:  # report-only: never fails a run
             tr.write_line(f"live writes: could not write the report {report}: {exc}", yellow=True)
+
+
+def pytest_unconfigure(config):
+    _W.close()

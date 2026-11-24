@@ -312,12 +312,15 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
             from datetime import timedelta
 
             from genesis.db.crud import events as _ev
+            from genesis.sentinel.codex_mcp_inventory import EVENT_TYPE, EVIDENCE_HOURS
 
             cutoff = (datetime.now(UTC) - timedelta(days=90)).isoformat()
             removed = await _ev.prune(rt._db, older_than=cutoff)
+            inventory_cutoff = (datetime.now(UTC) - timedelta(hours=EVIDENCE_HOURS)).isoformat()
+            removed += await _ev.prune(rt._db, older_than=inventory_cutoff, event_type=EVENT_TYPE)
             rt.record_job_success("events_prune")
             if removed:
-                logger.info("events prune: removed %d rows (>90d)", removed)
+                logger.info("events prune: removed %d expired rows", removed)
         except Exception as exc:
             rt.record_job_failure("events_prune", exc=exc)
             logger.exception("events prune failed")
@@ -613,6 +616,15 @@ async def init(rt: GenesisRuntime) -> None:
         )
 
         rt._learning_scheduler = AsyncIOScheduler()
+
+        if rt._event_bus is not None:
+            from genesis.sentinel import codex_mcp_inventory
+
+            rt._learning_scheduler.add_job(
+                codex_mcp_inventory.sample,
+                IntervalTrigger(seconds=codex_mcp_inventory.SAMPLE_INTERVAL_S),
+                args=[rt._event_bus], id="codex_mcp_inventory", max_instances=1, coalesce=True,
+            )
 
         _original_calibration = calibrator.run_daily_calibration
 
