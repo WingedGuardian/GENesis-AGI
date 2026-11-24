@@ -1,6 +1,7 @@
 """Native managed receipts: persisted ownership before hooks and effects."""
 
 import asyncio
+import contextlib
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -1461,6 +1462,10 @@ async def test_a_failed_run_with_only_reads_still_warns_it_may_have_acted(db, na
     }
 
     async def execute(invocation, on_event=None):
+        # As the invoker does: a failing spawn hook is logged, not raised. Here its
+        # marker write fails (no database file), which must not hide the launch.
+        with contextlib.suppress(Exception):
+            await invocation.on_spawn(4242)
         await on_event(StreamEvent.from_raw(raw))
         raise RuntimeError("synthetic invocation failure")
 
@@ -1607,6 +1612,10 @@ async def test_a_cancelled_launched_run_with_only_reads_warns_it_may_have_acted(
     }
 
     async def execute(invocation, on_event=None):
+        # As the invoker does: a failing spawn hook is logged, not raised. Here its
+        # marker write fails (no database file), which must not hide the launch.
+        with contextlib.suppress(Exception):
+            await invocation.on_spawn(4242)
         await on_event(StreamEvent.from_raw(raw))
         entered.set()
         await asyncio.Event().wait()
@@ -1650,3 +1659,22 @@ async def test_a_relayed_session_cancelled_before_launch_sends_no_owner_alert(db
     invoker.run_streaming.assert_not_awaited()
     rows = await (await db.execute("SELECT message FROM pending_outreach")).fetchall()
     assert rows == []
+
+
+async def test_a_relayed_run_that_failed_before_its_child_spawned_sends_no_alert(db, native):
+    """Admitted, but refused before the process started (capacity, provider):
+    nothing ran, so no "may have acted" alert (#4905 review)."""
+    runner, _, invoker = native
+
+    async def execute(invocation, on_event=None):
+        raise RuntimeError("synthetic refusal before spawn")
+
+    invoker.run_streaming.side_effect = execute
+    req = request()
+    sid = await prepare(db, req, peer_id="alpha", owner_relay=True)
+    await runner.adopt(sid, req)
+    await settled(runner, sid)
+    assert (await cc_sessions.get_by_id(db, sid))["status"] == "failed"
+    rows = await (await db.execute("SELECT message FROM pending_outreach")).fetchall()
+    assert rows == []
+

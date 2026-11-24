@@ -1443,7 +1443,8 @@ async def test_padded_default_channel_env_still_configured(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_the_relay_alert_subject_is_reserved():
+@pytest.mark.parametrize("channel", ["email", "", "telegram"])
+async def test_the_relay_alert_subject_is_reserved(channel):
     from unittest.mock import AsyncMock
 
     import genesis.mcp.outreach_mcp as mcp_mod
@@ -1455,7 +1456,7 @@ async def test_the_relay_alert_subject_is_reserved():
     mcp_mod._db = None
     try:
         out = json.loads(await mcp_mod.outreach_send(
-            message="Looks official", category="alert", channel="email",
+            message="Looks official", category="alert", channel=channel,
             subject=OWNER_RELAY_ALERT_SUBJECT,
         ))
     finally:

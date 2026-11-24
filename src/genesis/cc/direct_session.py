@@ -31,6 +31,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from genesis.caller_context import OWNER_RELAY_ENV
 from genesis.cc import final_status, rate_limit_park, roster
 from genesis.cc.exceptions import CCMemoryPressureError, CCQuotaExhaustedError, CCRateLimitError
 from genesis.cc.session_config import _USER_SCOPED_MCP_WILDCARDS
@@ -888,8 +889,15 @@ class DirectSessionRequest:
     # Server-owned prepared receipt mode, never reconstructed from queue payloads.
     managed: bool = False
     contained_peer: bool = False
+    # Answers a same-owner peer holding owner_relay: the browser tools refuse
+    # purchase-like controls. Managed and same-owner only.
+    owner_relay: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.owner_relay) is not bool or self.owner_relay and (
+            not self.managed or self.contained_peer
+        ):
+            raise ValueError("Invalid owner relay request")
         if type(self.contained_peer) is not bool or self.contained_peer and (
             not self.managed or self.profile != "observe" or self.skills
             or self.planning_instruction or not isinstance(self.system_prompt, str)
@@ -1026,6 +1034,9 @@ class DirectSessionRunner:
         self._closing = False
         # Managed sessions whose runner slot is held through finalization.
         self._managed_slots: set[str] = set()
+        # Managed runs whose child process spawned, kept in memory so a failed
+        # execution_started write cannot hide a launch from _finalize.
+        self._spawned_sessions: set[str] = set()
         self._protected_paths: object | None = None
         self._auditor: object | None = None
 
@@ -1315,6 +1326,7 @@ class DirectSessionRunner:
 
     def release_managed_slot(self, session_id: str) -> None:
         """Free the slot a managed run took, once its receipt is persisted."""
+        self._spawned_sessions.discard(session_id)
         if session_id in self._managed_slots:
             self._managed_slots.discard(session_id)
             self._semaphore.release()
@@ -2152,6 +2164,9 @@ class DirectSessionRunner:
             bash_allowlist=_PROFILE_BASH_ALLOWLIST.get(request.profile, ()),
             roster_eligible=roster_eligible,
             caller_tag=f"direct_session.{request.profile}",
+            # Read by the browser tools through caller_context; stdio MCP
+            # servers inherit the session's environment.
+            env_overrides={OWNER_RELAY_ENV: "1"} if request.owner_relay else None,
             **routing,
         )
 

@@ -764,3 +764,34 @@ async def test_drain_does_not_send_a_row_cancelled_after_the_snapshot(config, db
         "contradictory record this guard exists to prevent"
     )
     assert first  # the id is used only to distinguish the two rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured", "subject", "channel", "text"),
+    [
+        ({"email"}, "relay", "email", "a & b"),
+        ({"telegram", "email"}, "relay", "telegram", "a &amp; b"),
+        ({"email"}, "Weekly", "telegram", "a &amp; b"),
+        (set(), "relay", "telegram", "a &amp; b"),
+    ],
+)
+async def test_drain_sends_a_relay_alert_by_email_where_telegram_is_absent(
+    config, db, configured, subject, channel, text
+):
+    from genesis.db.crud import pending_outreach
+    from genesis.outreach.types import OWNER_RELAY_ALERT_SUBJECT
+
+    await pending_outreach.enqueue(
+        db, message="a &amp; b", category="alert", channel="telegram",
+        email_subject=OWNER_RELAY_ALERT_SUBJECT if subject == "relay" else subject,
+    )
+    pipeline = _drain_pipeline(OutreachStatus.DELIVERED)
+    pipeline.channel_configured = lambda name: name in configured
+    scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
+
+    await scheduler._drain_pending_job()
+
+    req = pipeline.submit.call_args[0][0]
+    assert req.channel == channel and req.context == text
+
