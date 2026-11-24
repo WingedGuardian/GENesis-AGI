@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path, PurePath
+from types import SimpleNamespace
 
 import pytest
 
@@ -434,27 +435,63 @@ def test_no_genesis_module_holds_a_state_path_under_the_real_home(request):
     the private home. The checkout itself may live under the real home."""
     if not closure._S.home or _REAL_HOME is None:
         pytest.skip("HOME not redirected here")
-    roots = [Path(_REAL_HOME, r) for r in _STATE_ROOTS]
+    roots = [Path(_REAL_HOME, root).resolve() for root in _STATE_ROOTS]
     # The test home itself sits in the real ~/tmp; paths inside it are private.
-    ours = Path(closure._S.home)
+    ours = Path(closure._S.home).resolve()
     # So does pytest's basetemp, which keeps its real-home location on purpose
     # (test_the_box_lock_and_basetemp_keep_their_real_home_locations): a fixture
     # pointing a module's state file at tmp_path is private too.
-    base = Path(request.config._tmp_path_factory.getbasetemp())
+    base = request.config._tmp_path_factory.getbasetemp().resolve()
+    # Import-time DB/secrets use the closure's separate temporary directory.
+    # TMPDIR can place it under the real home too; its siblings remain live.
+    closure_base = Path(closure._S.base).resolve()
     offenders = []
     for name, module in list(sys.modules.items()):
         if module is None or not (name == "genesis" or name.startswith("genesis.")):
             continue
         for attr, value in list(vars(module).items()):
+            if not isinstance(value, PurePath):
+                continue
+            path = Path(value)
+            if not path.is_absolute():
+                continue
+            resolved = path.resolve()
             if (
-                isinstance(value, PurePath)
-                and value != ours
-                and ours not in value.parents
-                and base not in value.parents
-                and any(value == root or root in value.parents for root in roots)
+                not resolved.is_relative_to(ours)
+                and base not in resolved.parents
+                and not resolved.is_relative_to(closure_base)
+                and any(resolved.is_relative_to(root) for root in roots)
             ):
                 offenders.append(f"{name}.{attr}={value}")
     assert offenders == []
+
+
+@pytest.mark.parametrize("relative,owned", [
+    ("tmp/closure", True), ("tmp/closure/import-time-genesis.db", True),
+    ("tmp/closure-sibling/state.db", False), (".genesis/state.db", False),
+    ("tmp/closure/../closure-sibling/state.db", False),
+    ("tmp/closure/linked/state.db", False),
+    ("tmp/private-home/../closure-sibling/state.db", False),
+])
+def test_state_path_check_exempts_only_its_owned_closure(tmp_path, monkeypatch, relative, owned):
+    # Invoke the actual assertion with owned synthetic paths. No live file is
+    # opened even when the assertion is deliberately made to reject a path.
+    real = tmp_path / "synthetic-home"
+    (real / "tmp/closure").mkdir(parents=True)
+    (real / "tmp/closure-sibling").mkdir()
+    (real / "tmp/closure/linked").symlink_to("../closure-sibling", target_is_directory=True)
+    monkeypatch.setitem(globals(), "_REAL_HOME", str(real))
+    monkeypatch.setattr(closure._S, "home", str(real / "tmp/private-home"))
+    monkeypatch.setattr(closure._S, "base", str(real / "tmp/closure"))
+    module = SimpleNamespace(STATE=real / relative)
+    monkeypatch.setitem(sys.modules, "genesis._owned_closure_probe", module)
+    request = SimpleNamespace(config=SimpleNamespace(
+        _tmp_path_factory=SimpleNamespace(getbasetemp=lambda: real / "tmp/pytest-base")))
+    if owned:
+        test_no_genesis_module_holds_a_state_path_under_the_real_home(request)
+    else:
+        with pytest.raises(AssertionError, match="genesis._owned_closure_probe.STATE"):
+            test_no_genesis_module_holds_a_state_path_under_the_real_home(request)
 
 
 def test_the_box_lock_and_basetemp_keep_their_real_home_locations(request):

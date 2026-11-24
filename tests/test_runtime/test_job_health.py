@@ -95,6 +95,7 @@ async def test_failure_path_unbroken_and_success_preserved():
         assert last_error == "kaboom"
         assert last_success is not None, "prior success must be preserved across a failure"
         assert consec == 1
+        assert row[4:] == (2, 1, 1)
 
 
 async def test_clear_stale_failures_clears_persisted_failure():
@@ -123,3 +124,22 @@ async def test_clear_stale_failures_clears_persisted_failure():
         assert last_failure is None, "clear_stale must NULL persisted last_failure (WS-3b)"
         assert last_error is None
         assert consec == 0
+        assert row[4:] == (1, 0, 1)
+
+
+async def test_a_failure_marked_no_retry_counts_but_never_triggers_the_retry():
+    """Three failures in a row trigger the automatic retry, unless a failure is
+    recorded with retry=False: it still counts toward the streak."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    async with aiosqlite.connect(":memory:") as db:
+        await create_all_tables(db)
+        await db.commit()
+        for retry, expected in ((True, 1), (False, 0)):
+            rt = _make_runtime(db)
+            rt._job_retry_registry = MagicMock(attempt_retry=AsyncMock())
+            for _ in range(3):
+                rt.record_job_failure("job_r", "partial: x", retry=retry)
+            await _drain_pending()
+            assert rt._job_health["job_r"]["consecutive_failures"] == 3
+            assert rt._job_retry_registry.attempt_retry.await_count == expected

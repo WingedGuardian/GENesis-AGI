@@ -73,11 +73,12 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 5a3de4eee 2026-11-07
+verified: 273642a5e 2026-11-22
 ```
 
-The 2026-11-07 verification covers the request-owned memory thread boundaries
-below; other memory descriptions retain their individually cited verification dates.
+The 2026-11-22 verification covers weekly dream centrality. The 2026-11-07
+verification covers the request-owned memory thread boundaries below.
+Other memory descriptions retain their individually cited verification dates.
 
 **Shared-owner prerequisite (not activated):** nine thread boundaries in
 `memory/store.py`, `retrieval.py`, `intent.py` and `proactive.py` retain actual
@@ -305,9 +306,13 @@ Easy-to-forget mechanisms:
   but is FENCED (runs as `propose_only`, settings lever refuses it) until
   issue #2742 adds a merge-time check on durable pair state. A cursor-managed reconcile sweep
   rediscovers historical fuzzy pairs. Both fuzzy scans (the sweep and resolution's
-  `_closest`) run in a thread that keeps the GIL busy, so they go through
-  `entity_registry.fuzzy_ratio_at_least`, which skips pairs whose cheap difflib bounds
-  cannot reach the threshold (same matches, about 8x less CPU). Settings lever `entity_adjudication`
+  `_closest`) go through `entity_registry.fuzzy_ratio_at_least`, which skips pairs
+  whose cheap difflib bounds cannot reach the threshold (same matches, about 8x less
+  CPU). The sweep's scan runs in a fresh single-worker spawn process per run (a
+  thread held the GIL and slowed the server's other sqlite queries about 100x, #4877);
+  a crash or a 2-hour timeout fails the job and leaves the cursor, so the slice
+  retries next hour. The child imports the module from disk, so it runs pulled code
+  before the server restarts. `_closest` still runs in a thread. Settings lever `entity_adjudication`
   (off/propose_only/live) + `GENESIS_ENTITY_ADJUDICATION_DISABLED`. Distinct from
   `memory/entity_resolution.py`, which is near-duplicate memory-PAIR dedup.
   **Human-approval apply gate** (`entity_adjudication_approve`/`_apply`/`_reject`
@@ -332,7 +337,25 @@ weekly clustering (Sun 4am) persists a value-ranked worklist to
 **shadow-hardwired** (`dry_run=True`) — the live flip is a separate user-gated
 change (#892). `_CapacityBreaker` aborts on consecutive provider exhaustion.
 `_cross_wing_scan` writes `memory_links` even under dry_run — intentional
-additive layer, not a leak.
+additive layer, not a leak. Weekly betweenness scoring also runs in dry runs.
+`dream_centrality_worker.py` snapshots the primary database in one admitted
+read-only transaction, closes it, then builds and scores the NetworkX graph
+in a separate user scope. The worker budget is 5% of effective memory and
+half the effective CPU capacity, up to one core and 80% of the configured
+resource-budget CPU allowance. A two-hour deadline bounds a hung worker.
+The worker verifies its own kernel limits before reading the database. The
+parent publishes the full nonzero ranking in an owned transaction after
+validating the complete result. Failure before commit leaves the last good
+cache available to the importance shield. `GENESIS_DREAM_CENTRALITY_DISABLED=1`
+skips the worker and records the phase as unavailable.
+
+The scheduled weekly report distinguishes complete, partial and aborted runs.
+Only a complete run advances job health's last success. A failed phase or
+preflight records a bounded problem summary. A discovery exception continues
+through the scheduler's typed failure and reflex path, even after a semantic
+partial result. Job-health counters count the current disposition. Failed
+worklist inserts are counted as a partial result. Worklist replacement still
+follows the existing weekly scan policy.
 
 **Importance shield (Phase 2c)** — `memory/dream_shield.py` +
 `memory/dream_shield_config.py` (config: `config/dream_shield.yaml` + local
@@ -345,11 +368,11 @@ centrality ≥ the nonzero percentile. Thresholds freeze into each slice; the
 drain re-checks live members via `shield_filter_live` (catches salience that
 rose mid-week) and counts `shield_missing_thresholds` — which must be 0 before
 any live flip. Centrality persistence widened from top-500 to all-nonzero
-(`dream_centrality.py`, `graph.centrality_scores(top_n=None)`) so the shield has
+(`dream_centrality.py`) so the shield has
 a real bridge-node population; `centrality_cache` gains its first reader.
 
-**Graph backend is a SEAM (`memory/graphstore.py`)** — traversal and centrality
-run through a `GraphStore` protocol with two implementations: the default
+**Graph backend is a SEAM (`memory/graphstore.py`)** — interactive traversal and
+centrality run through a `GraphStore` protocol with two implementations: the default
 `NetworkxGraphStore` (the in-process MultiDiGraph projection of `memory_links`)
 and `FalkorGraphStore` (below);
 opt-in `RequestDatabase` traversal declines NetworkX before projection and uses
@@ -706,7 +729,8 @@ invocation modes share owned scopes, helper processes and the receipt deadline.
 The complete managed operation isolates provider observations and private
 diagnostics, while ordinary same-owner work keeps its current behavior. Failed
 drain retains native ownership; no contained transcript pointer is fabricated.
-This primitive does not grant foreign admission; its consumer is separate.
+This primitive does not grant foreign admission; the native conversation binding
+selects it only after explicit shared authorization and immutable trust checks.
 See `docs/reference/peer-execution.md`.
 
 Ordinary streaming and readiness share final-effective quota classification:
@@ -1735,7 +1759,9 @@ other intake evidence retains its dated basis.
   `remove_unit` tombstones a source when its last unit is deleted (invariant:
   only that method may tombstone). The conversational path
   (`knowledge_ingest_source` MCP) requires explicit user confirmation —
-  contrast the intake bypass in entry 4.
+  contrast the intake bypass in entry 4. A distilled batch's credential units
+  go through the credential chokepoint; its other units are stored as written
+  (uploaded documents are not redacted, owner ruling 2026-11-23).
 - **inbox/**: file-drop monitor with approval-gated dispatch.
   Explicit owner-requested disposition review uses the manual-only Tier-1
   `inbox-review` skill, reached by the attended-request pointer in `CLAUDE.md`.
@@ -1986,8 +2012,12 @@ authority/authentication, per-message caller/profile binding, shared/local
 ancestry admission, nonblocking tool capacity and authenticated version/catalog
 status. The gated explicit `--shared-service` path constructs the actual
 standalone services with a bounded facade, frozen limits and outer resource
-owner. Ordinary session selection remains unchanged. Unit readiness, native
-clients and rollout remain separate. See `docs/reference/shared-mcp-http.md`. That scoped check
+owner. Its readiness helper sends a local `READY=1` datagram after completed
+bind, skipping a stopping startup; notification failure uses the existing
+listener/SDK/registry cleanup path. Both installers render four inert
+`Type=notify` templates without enabling them. Actual manager readiness, measured
+start/stop settings, native clients and rollout remain separate. Ordinary session
+selection remains unchanged. See `docs/reference/shared-mcp-http.md`. That scoped check
 (5a3de4eee, 2026-11-08) does not requalify the other channels/interfaces subsystems.
 
 The neural monitor includes the non-routing **Fallback** observation, and the
@@ -2017,13 +2047,19 @@ the shared banner is not an assertion about all concurrent sessions.
   outage/recovery Telegram notices. Unknown readings preserve an open incident;
   deliberate disablement closes it quietly. Incident/phase delivery history
   supplies durable retry deduplication without a second queue.
-  `peers/conversation.py` serves same-owner asynchronous A2A conversations on the
+  `peers/conversation.py` serves enrolled asynchronous A2A conversations on the
   existing Flask/runtime loop: it atomically persists native receipts, binds
   contexts and retries to relationship epochs, and admits at most two
   outstanding peer turns globally and per peer, without a daily submission
-  quota. Fresh native turns use Genesis identity/cognition, available memory
-  enrichment, observe/interact tools, external unattended provenance and the
-  native background ceiling. Result heads and full artifacts have bounded
+  quota. Same-owner turns use Genesis identity/cognition, available memory
+  enrichment and observe/interact tools. Cross-owner turns require an additional
+  explicit conversation_shared grant, use only public identity and mode-bound
+  shared history, and select contained tools-free native execution before private
+  builders. Saved receipt trust/epoch prevents reclassification from exposing old
+  context. An atomic fixed pending-outreach owner notice is informational; an
+  owner action starts a new ordinary workflow, never promotes the foreign turn.
+  Foreign proactive outbox sends and approval-description reads remain refused.
+  Both modes retain external unattended provenance and the native background ceiling. Result heads and full artifacts have bounded
   disclosure checks. Approval attribution survives notification updates; the API
   lists pending owner actions and never resolves them.
   Native receipts record their public-state clock through transactional native
@@ -2182,9 +2218,10 @@ the shared banner is not an assertion about all concurrent sessions.
   orphaned uncertainty, original physical obligations and one-time accounting.
   Matching terminal leader states alone do not prove controller process end.
   The same-connection final drain observes callback-created evidence before
-  commit. The acknowledgement grants no retry or acceptance. The automatic
-  reconciliation caller remains separate (#3728); cutover,
-  native qualification and production capacity remain separate gates.
+  commit. The acknowledgement grants no retry or acceptance. The captured runner
+  sweeps unresolved original owners before claiming after strict readiness.
+  Unproved ownership stays held. Cutover, native qualification and production
+  capacity remain separate gates.
   Explicit request/revoke/status operations use the existing provider-state
   grant and bind actual work, retained debt, evidence, provider and runner/
   watchdog source, policy, boot and bounded dual-clock deadlines. Invalid grant
@@ -2684,7 +2721,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 0aa0bf9f2 2026-11-10
+verified: 204c69c1f 2026-11-22
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -2695,6 +2732,16 @@ verified: 0aa0bf9f2 2026-11-10
   host reconcilers that share its version probe run on any branch).
   Config `~/.genesis/guardian_remote.yaml`; missing → silently
   disabled.
+- **Recovery-brain auth canary** (`guardian/cc_canary.py`): once per
+  `cc.canary_interval_h` (24), on a tick whose probe found Genesis healthy, one
+  minimal real `claude -p` call through the diagnosis's own credential path
+  (`DiagnosisEngine._resolve_cc_env`) and its empty MCP config, as the last step
+  of the tick. A failure pages once per episode with Claude Code's own reason,
+  and recovery pages an all-clear; a page queued for the host queue drain counts
+  as sent (`AlertDispatcher.send_or_queue`). State in
+  `<state_dir>/cc_canary.json`; at most one attempt an hour. A failure episode that starts within
+  `confirmation.post_reboot_grace_s` (1200) of a detected host reboot gets that
+  longer bootstrap grace, because a cold boot of the container stack is slow.
 - **Delivered-alert history (development candidate)**: host `alert/sent_log.py`
   records successful alert deliveries as displayed text, with two bounded JSONL
   generations. The read-only `sent-log` gateway and existing container ingestor
@@ -2792,6 +2839,26 @@ verified: 0aa0bf9f2 2026-11-10
   can see (the host, a process owned by another user, or I/O byte counters
   miss, such as fsync storms and swap). Unreadable processes are counted, and
   command lines are never logged.
+- **`live` is armed** (#2978): `scripts/lib/deploy_live.sh` is the readiness
+  marker. `deploy_candidates add` and `rebuild` refuse until it is in the
+  server's base (merge-base of the commit the server booted from and
+  origin/main). Where a host guardian is configured (`~/.genesis/guardian_remote.yaml`),
+  the deployed commit its last probe recorded (`~/.genesis/host_gateway_state.json`,
+  written by update.sh and the nightly align timer) must also resolve to one
+  commit in this clone, from the object store only, that has the host guardian's
+  `live` ban (#3546, `HOST_REQUIRED`) as an ancestor. It is required by commit,
+  not by the marker, because update.sh redeploys the host only when a guardian
+  path changed. A missing, unreadable, non-regular, oversized or unresolvable
+  probe is a named refusal whose remedy is a re-probe
+  (`systemctl --user start genesis-cc-align.service`) or a detached
+  `scripts/update.sh` from main. `drop` runs no readiness check. Nothing
+  sources the marker. Admission refuses a candidate that changes it, and
+  deleting it disarms every install. Accepted gap (owner, 2026-11-20), until
+  the Guardian's own drop lands (the #4841 rework, PRs B1 and B2): no automatic
+  path removes a candidate that keeps the server down. The Guardian proposes a
+  container restart (next bullet), which keeps the candidate's code; remove it
+  with `scripts/deploy_candidates drop <branch> --wait 0`, then a detached
+  `scripts/deploy_code_only.sh restart`.
 - **Recovery on a `live` checkout** (#3492 D3): `REVERT_CODE` (stash, then
   revert HEAD) never runs where the container checkout is on `live`, judged by
   git's own HEAD (`refs/heads/live` bans, whatever the manifest says) and then
@@ -2879,8 +2946,12 @@ verified: 0aa0bf9f2 2026-11-10
   (`pool.py`) and **RAM** (`memory_watch.py`, E-rest) — the latter over two
   axes worst-of, container cgroup (via incus-exec, best-effort) + host-VM
   `/proc/meminfo` (the reliable axis). Both use the shared `_tier_for`/
-  `decide_alert` hysteresis; RAM adds flap damping on top: a per-axis exit
-  margin (`memory_tiers.exit_margin_pct`, default 5), a blind axis holding its
+  `decide_alert` hysteresis and the shared per-axis exit margin
+  (`pool.held_tier`: a tier is left only that many points below its line;
+  `storage_pool.exit_margin_pct` and `memory_tiers.exit_margin_pct`, default
+  5; the pool's state `pool_alert_state.json` keeps `axes`, and its severity,
+  exhaustion warning and provisioning rung follow the measured tier, not the
+  held one). RAM adds more flap damping on top: a blind axis holding its
   last tier (stale after one re-alert window, and named in the page), and a
   baseline of the highest tier paged since the last recovery that lasts one
   re-alert window (state `memory_alert_state.json`: `tier` = that peak,
@@ -3003,6 +3074,12 @@ verified: 0aa0bf9f2 2026-11-10
   taken over, and a cancel that fails keeps the park. The cancelled pattern
   starts the 15-minute resolved cooldown. A declined dispatch or action is
   quiet for 24 h through `handle_approval_resolution` (every pattern).
+- **sentinel/codex_mcp_inventory.py** reads the managed daemon's loaded thread
+  inventory and MCP groups once per minute while the learning scheduler runs.
+  Daily pruning applies a 72-hour cutoff to aggregate `codex.mcp_inventory`
+  events. Thread and process group identifiers used for comparisons stay in
+  memory. See the [MCP process report](../reference/mcp-process-report.md) for
+  limitations and the collection switch.
 - **sentinel/process_stop.py** (`python -m genesis.sentinel.process_stop`):
   the Failure Inventory remedy for ONE runaway process. Dry-run by default;
   `--execute` only inside an approved action. Resolves targets when it runs:
@@ -3027,7 +3104,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: c712f1bde 2026-11-06
+verified: 41c7343b3 2026-11-15
 ```
 
 - **Peer-handoff surface (2026-09-26)**: a SessionStart hook
@@ -3206,7 +3283,9 @@ verified: c712f1bde 2026-11-06
   own `tick_overdue`.
 - **scheduled-job telemetry (WS-2 M9)**: `runtime/_job_health.py` keeps the
   cumulative `job_health` row AND now appends per-run `job_run_events` (era
-  attribution the cumulative row can't give). Writes are debounced off the
+  attribution the cumulative row can't give). Each terminal outcome updates
+  its own cumulative counter. Startup cleanup preserves the totals.
+  Run-event writes are debounced off the
   persisted `job_health` anchors — a success only when ≥1h since the last, a
   failure on streak onset + hourly heartbeat — so a stuck sub-hourly poll costs
   ~24 rows/day. `duration_ms` is honest-or-NULL (only from an explicit
@@ -3226,9 +3305,11 @@ verified: c712f1bde 2026-11-06
   `util/tasks.normalized_frames` — a second normalizer would split one bug
   into two fingerprints. **The funnel (2026-07-23):** `record_job_failure`
   gained an `exc=` param and, when an exception caused the failure, ALSO emits
-  a throttled `job.failed` event (via `util/tasks.emit_sync`, sharing the
-  run-event throttle -> ~24/day/job). This bridges the ~50 background-job loops
-  that wrote only to `job_health` onto the event bus, where the reflex arc (a
+  a throttled `job.failed` event (via `util/tasks.emit_sync`). Its hour
+  window starts at the previous typed signal within a failure episode, so a
+  semantic failure cannot suppress the first exception signal. This bridges
+  the ~50 background-job loops that wrote only to `job_health` onto the event
+  bus, where the reflex arc (a
   bus subscriber) can reach the largest class of internal defects - previously
   invisible. Semantic/no-exception failures stay off the bus; callers that emit
   their own domain `.failed` pass `emit_event=False` to avoid double-counting.
@@ -3380,10 +3461,22 @@ verified: c712f1bde 2026-11-06
   come, and print or return advisory completeness prompts (`completeness_prompts`)
   on every run; the prompts change no verdict and are not stored. They do not
   replace the independent verifier (#4180; verified: 2026-11-14).
+  `scripts/verification_review.py prepare` acquires private source packets through
+  `session_awareness/pr_verification_sources.py`: bracketed PR identities, complete
+  file pagination, Git-parsed diff reconciliation and content digests. It acquires
+  review inputs only; it does not judge evidence or authorize a close. Usage and
+  refusal bounds: `docs/reference/verification-review.md`.
+  Typed `pr_completeness.CompletenessReview` receipts and the read-only `check`
+  command bind a retained independent inventory and evidence to that packet.
+  P2 parses/checks receipts; it does not yet enforce either close writer. Offline
+  checks do not establish live source freshness or reviewer independence.
   Fixture lookup injection stays outside the public MCP schema. Its
   server-side calibration gate forces preview until operator opt-in, including
   attempt notes. Real writes use a separate admitted existing-only connection;
-  preview uses SELECTs on the shared handle. Event-gated gaps are captured by
+  MCP preview uses SELECTs on the shared handle. CLI close and recheck previews
+  use an admitted, URI-encoded read-only connection, preserving committed WAL
+  data without checkpointing; SQLite sidecar/lock coordination remains possible.
+  Event-gated gaps are captured by
   the shared close CRUD as structured rechecks on the closed row. The backlog
   lists due dates and named events, with result commands bound to its database;
   the recheck CLI appends failed/done measurements without reopening the row.
@@ -4730,7 +4823,9 @@ CLI. Its `codex_exec_argv`/`codex_child_env` give every Codex run Genesis
 starts unattended (the executor's adversarial verifier, the contribution
 reviewer) a child environment from `caller_context.dispatched_child_env`:
 `GENESIS_CC_SESSION=1`, supervised marker dropped, origin kept.
-`tests/test_codex_dispatch_marker.py` fails on a `codex` literal anywhere else.
+`tests/test_codex_dispatch_marker.py` checks other `codex` literals and allows
+known read-only references, including the inventory socket path and event
+metadata. The inventory event's keyword details still go through the scan.
 The marker is inert until the Codex project config forwards it to the Genesis
 MCP launcher; it exists so an unmarked Codex run can mean the owner's own
 client, as an unmarked Claude Code session does.
@@ -5446,7 +5541,17 @@ logger or unrelated exceptions with copied text and no provenance.
   bootstrap never ran on). At main's merge, put the paths back and finish with
   `--post-merge`; a main row at the tag keeps the by-hand text (save, restore,
   Dismiss). Both live texts name `repair-move --restore <ts>` as the way back
-  for a path that was not the update's. The dashboard's progress poll returns the guard's remedy
+  for a path that was not the update's. A `live` row in a phase after `merging`
+  (bootstrap, migrations, health_check) with HEAD on `live` keeps main's
+  verdicts and exit codes but gets its own text (#3722 advice; nothing heals it
+  yet): at the rebuilt tip, whole (exit 0) or half-written back toward the tag
+  (exit 4), the text says the update was killed in that phase or failed there
+  and may have been rolling back, and names `--post-merge` only as a retry of
+  the same code whose database snapshot is taken after the migration; back at
+  the tag (exit 6), it says the rollback put the checkout there but may not
+  have finished the hooks, kit, packages, database or restart, and to Dismiss
+  and run the update again. For the half-written case repair-move prints that
+  text by command and pages it at boot, remedy first. The dashboard's progress poll returns the guard's remedy
   (`guard_remedy`) and the update card shows it. `deploy_code_only.sh` and the live engine refuse to
   restart or move the checkout while it guards; a plain `update.sh` exits 5
   (before tagging or writing anything), and the dashboard's `/apply` answers
@@ -5551,6 +5656,48 @@ logger or unrelated exceptions with copied text and no provenance.
   the exit code agree. Otherwise the run exits 1 and leaves no
   `update_refused.json`.
   The rebuilt tip is recorded in the "merging" row as soon as it is adopted.
+  **The Guardian's drop** (#4911): `drop <branch> --expect-branch live
+  --expect-head <tip> --expect-candidate <pinned head> [--restart-server]`, run
+  with the entry's `--wait 0`, does everything in the entry's ONE update.lock
+  hold. It refuses by name, nothing changed, when the manifest no longer pins
+  the branch at that head (a re-pin since), when the manifest it writes is gone
+  or differs in any way from the one it planned `live` from (checked as it is
+  written, before the checkout moves; every engine writer of the manifest holds
+  update.lock, so only an out-of-band edit trips it), when the expect checks
+  fail, or when a move refusal applies. After
+  the subtract-only drop it confirms from its own view (`observe()` and
+  `observe_moves()`): the branch neither listed nor in `live`'s holds, the
+  checkout on `live` at the move's result (`Move.at`), no move refusal; a
+  failure (an unreadable view included) exits 1 naming what it saw and that
+  the manifest was saved, and restarts nothing. It names `deploy_candidates
+  rebuild` only when the branch may still be listed or held; otherwise the drop
+  is done and only the restart is missing (rebuild would re-fetch origin/main).
+  The confirmation does not cover the git hook restore and sync after the move:
+  a failure there is a WARNING and still exit 0. Only after a passing
+  confirmation does `--restart-server`
+  read `ActiveState` and queue `systemctl --user restart --no-block
+  genesis-server` from python (no `pass_fds`, so no child holds the lock fd;
+  never from the bash entry, whose fd is inheritable); `activating` queues
+  nothing and exits 0 ("a start is already in progress"); a failed read, or an
+  enqueue that fails with an answer, exits 4 with the drop done; an enqueue that
+  gets no answer in 10 s exits 5 (the restart may have been queued: check
+  `scripts/deploy_code_only.sh status` before restarting). The engine exits milliseconds later, so
+  the start's boot repair finds the lock free. "Confirmed" holds when the
+  restart is queued, not when the server has loaded the tree: the stop can take
+  up to 90 s with the lock free, a lock-taking writer in that gap owns its own
+  restart, and a lockless one was never covered. Exit codes, in the engine's
+  header: 0, 1 (also the entry's refusal whose text carries "holds the deploy
+  marker", a wait; "cannot write the deploy marker" is a fault), 2, 4, 5, 97,
+  130/143 (which can follow a finished drop and a queued restart: bash runs the
+  trap after python returns; the engine view then says whether the drop
+  happened, nothing records the restart, and `scripts/deploy_code_only.sh
+  status` says what the server runs), 200. Without `--expect-candidate`, `drop` is unchanged; `--restart-server`
+  alone is a usage error. The Guardian reads the engine's view through `list
+  --json --move-refusals` (adds `checkout: {branch_ref, head}` and
+  `move_refusals`). Manifest order is pin order: re-adding a candidate at a new
+  head moves it to the end (the same head keeps its place), so the last listed
+  is the newest code. A re-pinned candidate therefore also merges last, so on
+  a conflict it is the one the next rebuild excludes.
   **The live-move repair** (`scripts/lib/live_move_repair.py`, #3492 PR D1;
   `scripts/deploy_candidates repair-move [--wait N] [--dismiss TS | --restore TS
   [--check]] [--explain]`; `--restore`, below
@@ -5596,7 +5743,7 @@ logger or unrelated exceptions with copied text and no provenance.
   a lock held past the budget on such a row); everything else starts (owner
   rulings): a HOLD, GUARDS or CONFLICT_PENDING with a `kept` warning (the
   guard's remedy), a half-written tree it never heals (a main checkout, or a
-  `live` rollback stopped after `merging`, #3722's wording) with a `mixed`
+  `live` rollback stopped after `merging`, whose page carries the guard's #3722 text) with a `mixed`
   critical page, a failure before judging with `skipped`. Each page's key is
   its class, the state's bytes as the run leaves them and an end mark of the
   checkout (HEAD, `status -z`, index.lock, and the lstat identity, ctime
@@ -6227,12 +6374,13 @@ verified: 81bbdb0a9 2026-11-08
   lifecycle enrollment. See `docs/reference/codex-validator-launcher.md` for
   operator commands, source inventory, permitted MCP startup effects and races.
   Codex's project config (`.codex/config.toml`) starts all four Genesis MCP
-  servers through `scripts/codex_owner_mcp.py`, which reuses the external
+  servers by resolving `scripts/codex_owner_mcp.py` relative to the Git checkout
+  root. The launcher reuses the external
   launcher's environment scrub and main-checkout resolution. An unmarked Codex
   run is the owner's: the ordinary bootstrap, every tool, labelled
   `GENESIS_CALLER_PROFILE=codex` (calls logged to `client_tool_calls`); read
-  tools are pre-approved in the config and every other tool prompts, new ones
-  included. A run Genesis starts unattended (`util/codex_cli.py` sets
+  tools are pre-approved in the config and all other tools use its prompt tier,
+  including new tools. A run Genesis starts unattended (`util/codex_cli.py` sets
   `GENESIS_CC_SESSION=1`, forwarded through `env_vars`) gets
   `--external-client` and the health/recall floor, and no outreach or recon
   server. Memory initialization skips Claude's pending plan-bookmark file for

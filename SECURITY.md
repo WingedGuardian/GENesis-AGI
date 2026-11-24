@@ -383,7 +383,9 @@ source — there is no `requirements.txt`). Known-CVE scanning runs automaticall
   from failing the job. Dependency installation failures still fail the job.
   Existing ignored advisories are listed with rationale in that job.
 - **Dependabot** — GitHub's dependency-graph security alerts are enabled for
-  the repo, and `.github/dependabot.yml` keeps the GitHub Actions current.
+  the repo. Dependabot opens no pull requests: version updates and automated
+  security fixes are both off, so every dependency or GitHub Actions bump is a
+  deliberate change that checks the new release before it lands.
 
 To scan locally:
 

@@ -7,6 +7,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
+from itertools import count
 from pathlib import Path
 
 import pytest
@@ -150,4 +151,63 @@ default_tools_approval_mode = "approve"
             finally:
                 evidence["model_requests"] = len(requests)
                 print("MCP_STDIO_EOF_EVIDENCE " + json.dumps(evidence, sort_keys=True), flush=True)
+        assert not requests
+
+
+def test_unsubscribe_unloads_the_thread_and_reaps_its_stdio_child(tmp_path):
+    binary = os.environ.get("GENESIS_CODEX_APP_SERVER_BIN")
+    assert binary and Path(binary).is_absolute() and Path(binary).is_file()
+    with fixture_provider({}) as (url, requests):
+        env = configure(tmp_path, url, "allow")
+        config = tmp_path / "codex/config.toml"
+        config.write_text("thread_unload_delay_secs = 1\n" + config.read_text().split("[[hooks.PreToolUse]]")[0] + f'''
+[mcp_servers.fixture]
+command = {json.dumps(sys.executable)}
+args = [{json.dumps(str(FIXTURE))}]
+startup_timeout_sec = 10
+tool_timeout_sec = 5
+default_tools_approval_mode = "approve"
+''')
+        driver = AppServer(binary, tmp_path, env)
+        ids = count(2)
+        elapsed = []
+        try:
+            driver.initialize()
+            for _ in range(2):
+                thread = driver.request("thread/start", {
+                    "cwd": str(tmp_path / "workspace"), "ephemeral": True,
+                }, next(ids))["thread"]["id"]
+                result = driver.request("mcpServer/tool/call", {
+                    "threadId": thread, "server": "fixture", "tool": "echo",
+                    "arguments": {"value": "unsubscribe"},
+                }, next(ids))
+                assert not result.get("isError"), result
+                pid = json.loads(result["content"][0]["text"])["pid"]
+                children = [
+                    row for row in snapshot()["processes"]
+                    if row["daemon_pid"] == driver.process.pid and row["pid"] == pid and row["stable"]
+                ]
+                assert len(children) == 1, "the responding fixture must belong to this app-server"
+                start_ticks = children[0]["start_ticks"]
+                page = driver.request("thread/loaded/list", {"limit": 10}, next(ids))
+                assert page["data"] == [thread] and page["nextCursor"] is None
+
+                start = time.monotonic()
+                driver.request("thread/unsubscribe", {"threadId": thread}, next(ids))
+                while True:
+                    page = driver.request("thread/loaded/list", {"limit": 10}, next(ids))
+                    try:
+                        _, ticks = proc_identity(Path("/proc") / str(pid))
+                    except FileNotFoundError:
+                        ticks = None
+                    # Keep the app-server PID reserved for process-group cleanup.
+                    assert os.waitid(os.P_PID, driver.process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None
+                    if page["data"] == [] and page["nextCursor"] is None and ticks != start_ticks:
+                        break
+                    assert time.monotonic() - start < 10, "the thread or its exact child survived unsubscribe"
+                    time.sleep(0.1)
+                elapsed.append(round(time.monotonic() - start, 2))
+        finally:
+            driver.close()
+        print(f"MCP_UNSUBSCRIBE_EVIDENCE unload_and_reap_seconds={elapsed} model_requests={len(requests)}")
         assert not requests

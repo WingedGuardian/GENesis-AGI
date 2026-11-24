@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -11,15 +12,40 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 
+def _user_local_now() -> datetime:
+    """Now in the configured user timezone, with its offset; UTC if unavailable.
+
+    The zone comes from ``genesis.util.tz.user_zone()``, the cache that
+    ``tz.reload()`` refreshes after a dashboard change, so this process follows
+    the change without a restart. It is imported here, not at module level:
+    ``genesis.util.tz`` resolves the zone at import time and can log a warning
+    while doing so, and that warning comes back through this formatter. During
+    that window the half-imported module has no ``user_zone`` yet, so the
+    lookup fails and the line is stamped in UTC instead of recursing.
+    """
+    try:
+        from genesis.util import tz as _tz
+
+        zone = _tz.user_zone()
+    except Exception:
+        zone = UTC
+    return datetime.now(zone)
+
+
 class GenesisFormatter(logging.Formatter):
     """key=value log formatter for Genesis subsystems.
 
-    Output: ts=2026-03-04T12:00:00+00:00 level=WARNING name=genesis.routing msg="..."
+    Output: ts=2026-03-04T13:00:00.123456+01:00 level=WARNING name=genesis.routing msg="..."
+
+    ``ts`` is local time in the configured user timezone, with its UTC offset,
+    so the owner reads the log in their own time and every line still maps to
+    one instant. Lines can be compared as instants, not as text: the offset
+    changes across a DST switch and across a timezone change.
     """
 
     def __init__(self, *, clock=None):
         super().__init__()
-        self._clock = clock or (lambda: datetime.now(UTC))
+        self._clock = clock or _user_local_now
 
     def format(self, record: logging.LogRecord) -> str:
         ts = self._clock().isoformat()
@@ -101,6 +127,13 @@ def configure_logging(
     # Avoid duplicate handlers on repeated calls
     if any(isinstance(h, logging.StreamHandler) for h in genesis_logger.handlers):
         return
+
+    # Resolve the user zone now, before any handler exists. Otherwise the first
+    # log line would import genesis.util.tz inside a handler's lock, and a
+    # thread first-importing it at that moment (holding the import lock while
+    # it logs an invalid-zone warning) could deadlock against that line.
+    with contextlib.suppress(Exception):
+        import genesis.util.tz  # noqa: F401
 
     formatter = GenesisFormatter(clock=clock)
 

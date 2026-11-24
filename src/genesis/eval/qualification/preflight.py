@@ -85,7 +85,7 @@ async def prepare(cases, temp_root, *, reference_policy=None):
                     row["candidate_mapping"] = mapping
                     row["storage"] = await replay(
                         case, messages, mapping, content, sandbox,
-                        "qualification-probe", "synthetic",
+                        "qualification-probe", "synthetic", served_model="synthetic",
                     )
                 plan[name][case["id"]] = row
     return load_json(canonical(plan))

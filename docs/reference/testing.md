@@ -31,19 +31,45 @@ All tests run from the genesis project root using pytest:
 source ~/genesis/.venv/bin/activate
 cd genesis
 
-# Full suite
-pytest -v
+# Full suite: run the hosted CI test job, not a local full-suite invocation.
 
-# Specific subsystem
-pytest -v tests/test_memory/
-pytest -v tests/test_resilience/
+# Local checks: name the relevant test files.
+pytest -v tests/test_pytest_storage.py tests/test_pytest_retention_policy.py
 
 # Linting (run before committing)
 ruff check .
 
-# Both (standard pre-commit check)
-ruff check . && pytest -v
 ```
+
+## Persistent test caches
+
+Default pytest cache data lives in `.pytest_cache/pytest` within the selected
+checkout. Pytest creates a fresh cache through a temporary sibling directory;
+the nested placement keeps that bootstrap inside `.pytest_cache` too.
+The root test conftest defaults Hypothesis storage to the same checkout's
+`.pytest_cache/hypothesis` before child conftests load. Constants and local
+example databases remain persistent between runs. Hypothesis profiles are
+unchanged, including the installed library's CI profile and its disabled
+default example database.
+
+These defaults start cold: existing `.hypothesis` and legacy `.pytest_cache/v`
+contents are neither migrated nor deleted. `--cache-clear` clears pytest's
+cache data while leaving the Hypothesis sibling in place.
+
+An explicit `HYPOTHESIS_STORAGE_DIRECTORY` wins, including relative or empty
+values; an empty value retains Hypothesis's native `.hypothesis` fallback.
+CI can supply its run-owned storage through that same variable. Pytest's
+`-o cache_dir=<path>` override and `-p no:cacheprovider` retain their usual
+behavior. Explicit paths outside test-owned storage remain subject to the
+write audit; these settings do not widen its exemptions. The libraries retain
+their own permission-error handling. A plugin that resolves Hypothesis storage
+before the root conftest loads must supply the environment variable before
+starting pytest; the conftest does not reset previously resolved global state.
+
+`tests/test_pytest_storage.py` exercises real fresh/repeated runs, early
+child-conftest resolution, serial and two-worker execution, persistence,
+overrides, `--lf`, and cache clearing. Its deliberate outside-cache write
+checks that the observer remains effective.
 
 ## Test Suite Overview
 
@@ -431,26 +457,54 @@ It also reports reads of the real credential files (the deployed `secrets.env`,
   box lock file, `/dev`, and `__pycache__` / `.pytest_cache` directories.
 - Each write is classed by where it lands (the deployed checkout, this checkout,
   `~/.genesis`, `~/.claude`, elsewhere in the home) and attributed to the test.
-- The run summary counts tests per class under "writes outside the test's temp
-  dirs"; `GENESIS_LIVE_WRITES_REPORT=<file>` writes one tab-separated line per
+- The run summary counts tests per class under "audit observations";
+  `GENESIS_LIVE_WRITES_REPORT=<file>` writes one escaped tab-separated line per
   (test, class, operation, path), on every run.
-- Hits are pre-operation classifications of audit events, not proof that a
-  syscall completed. Simple known no-ops (`mkdir(exist_ok=True)` on an existing
-  directory, `unlink` of a missing file, reopening an existing file without
-  writing) are filtered, but an operation the kernel refuses can still be
-  reported, and some aliases can be missed (tracked in #4193). A relative
-  `os.open` is judged against the cwd and labelled so (its audit event carries no
-  `dir_fd`). Writes during collection count as "outside any test".
+- An observation records a pre-operation event, not successful completion.
+  Established no-effect cases (`mkdir(exist_ok=True)` on an existing directory,
+  `unlink` of a missing file, reopening an existing file without writing) are
+  filtered; other refused operations can still be reported, and some aliases can
+  be missed (tracked in #4193). Relative `os.open`
+  events omit `dir_fd`. On Linux/CPython, `tests/_live_writes_fd.py` corrects a
+  supported successful call using its returned descriptor, one observed native
+  event and matching unchanged parent/target metadata. This applies to exact
+  string/bytes leaf names, explicit nonnegative integer directory descriptors
+  and write flags with `O_NOFOLLOW` or `O_CREAT|O_EXCL`, excluding `O_PATH`.
+  Failed, unsupported, saved-native-alias and ambiguous calls retain the primary
+  observer's explicitly labelled cwd guess. Existing credential observations
+  and every fault count remain; published evidence is never subtracted.
+  Writes during collection count as "outside any test".
+- The test-process wrapper changes `os.open` identity and builtin status;
+  signatures, pickling and directory-FD feature membership are preserved. It
+  restores only its own callable/member at unconfigure. Fork children bypass
+  refinement. This does not extend the child-process coverage below.
+- Report capture temporarily disables new refinement while sealing pending
+  calls and copying both observations and status. A pending call makes the
+  census incomplete even if it later succeeds. Calls entering during capture
+  use primary observation; later independent calls can refine again. Ordinary
+  writes after the snapshot retain the existing documented coverage limit.
+- An `observer fault` row identifies the test and the audit event/stage/fixed
+  builtin error category. Its path field is the literal `<not captured>`;
+  exception messages, filenames, custom type names and tracebacks are not
+  included. Failed test attribution uses `<attribution unavailable>`.
+  Identical diagnostic rows deduplicate, while the fault count includes every
+  judging failure. If diagnostic capture itself fails, the count still makes
+  the census incomplete. Older count-only reports cannot recover fault causes.
 - Not covered: writes made by child processes, writes without an audit event,
   metadata changes (`chmod`, `utime`, `setxattr`, `touch` of an existing file),
   `mkfifo`/`mknod`, SQLite writes through an already-open connection, and
   `file://localhost` or percent-encoded SQLite URIs. The OS-level sandbox is the
   boundary there.
 
-The list it produces is the to-do list for moving each such test under its own
-`tmp_path`. Keep it report-only while the #4193 accuracy gaps are corrected:
-enforcement requires a corrected audit and a complete empty CI census, which a
-selected local run cannot establish.
+The observations identify tests to investigate and move under their own
+`tmp_path`. Enforcement requires a successful complete census on corrected
+main, with an empty report, zero faults, an installed observer and no missing
+or disarmed workers. An empty TSV alone does not establish this: CI also checks
+the fresh run identity, test outcome, report digest/count and worker coverage.
+Both reliable write detection and credential-read coverage are prerequisites.
+The audit remains report-only while ambiguous observations and unknown faults
+remain unresolved; correcting successful destinations does not exempt denied
+reads or qualify enforcement by itself.
 
 Generated session MCP configs are isolated by the function-scoped autouse fixture
 in `tests/_session_config.py`, registered by the root conftest. It redirects only
@@ -485,8 +539,11 @@ The protocol step names the admission, policy, actual HTTP and shared CLI module
 explicitly. The CLI checks start all four real factories with disposable local
 dependencies, exercise catalog/authentication/read calls over TCP, and observe
 SDK shutdown and registered-owner drainage before resource closure on SIGTERM.
+They also exercise path/abstract readiness datagrams after bind and cleanup on
+failed notification, bind failure and shutdown requested during startup. The
+memory notification-failure case checks its actual provider/cache closers.
 Its fresh JUnit report must pass `scripts/check_skip_ceiling.py` with zero skips
-and a floor of 99 cases. Installation, collection, test or report-check failure
+and a floor of 104 cases. Installation, collection, test or report-check failure
 fails the job; missing or filtered workflow runs do not qualify a PR. Closing
 checks its actual head/base result. Ordinary skip-budget changes require observed
 skip identities; this workflow does not raise that budget automatically.
@@ -494,6 +551,16 @@ skip identities; this workflow does not raise that budget automatically.
 For a local run, use an already qualified isolated interpreter and the same
 strict test flag, then run the workflow's report check. Changing installed
 packages or enabling shared services is not part of that test command.
+
+`test_shared_notify.py` exercises owned local datagrams and error propagation
+without SDK qualification. `test_shared_mcp_templates.py` reuses both actual
+renderer loops and executes their activation sections with nondelegating command
+shims, checking literal paths, stamps and keep/take behavior without starting a
+unit. Successful per-test payload/event files require both an explicit scratch
+`--basetemp` and `-o tmp_path_retention_policy=all`; the normal policy removes
+successful test directories. Read-only `systemd-analyze verify` can validate
+rendered syntax with generators disabled; it does not execute or qualify a live
+service.
 
 ## Integration Tests
 

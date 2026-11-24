@@ -161,6 +161,26 @@ def unit_name(name: str, job_id: str) -> str:
     return f"{SCOPE_PREFIX}{safe}-{job_id}"
 
 
+def verify_current_caps(ram: int, cpu_percent: int) -> None:
+    """Require the kernel caps of this workload's actual cgroup."""
+    from pathlib import Path
+
+    try:
+        group = next(
+            line[3:] for line in Path("/proc/self/cgroup").read_text().splitlines()
+            if line.startswith("0::")
+        )
+        root = Path("/sys/fs/cgroup") / group.lstrip("/")
+        memory = int((root / "memory.max").read_text())
+        quota, period = map(int, (root / "cpu.max").read_text().split())
+        swap_off = not _swap_configured() or int((root / "memory.swap.max").read_text()) == 0
+        if 0 < memory <= ram and 0 < quota * 100 <= cpu_percent * period and swap_off:
+            return
+    except (OSError, ValueError, StopIteration) as exc:
+        raise ProbeRefused("could not read actual workload caps") from exc
+    raise ProbeRefused("actual workload caps exceed the admitted limits")
+
+
 def scope_properties(ram: int, cpu_pct: float, oom_continue: bool = True) -> list[str]:
     """Caps from the estimates. ``OOMPolicy=continue`` lets only the process that
     hit ``MemoryMax`` die, so the reporter survives to say so; systemd before
