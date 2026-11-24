@@ -258,6 +258,88 @@ async def test_unavailable_graph_keeps_the_existing_cache(phase_kwargs):
     )
 
 
+async def _seed_prior(db) -> None:
+    await db.execute(
+        "INSERT INTO centrality_cache (memory_id, centrality_score, computed_at) "
+        "VALUES ('mem-prior', 0.7, '2026-01-01T00:00:00+00:00')"
+    )
+    await db.commit()
+
+
+async def _cache_rows(db) -> int:
+    cursor = await db.execute("SELECT COUNT(*) FROM centrality_cache")
+    return (await cursor.fetchone())[0]
+
+
+@pytest.mark.parametrize("cause", ["disabled", "low_cpu", "in_memory_db"])
+async def test_nothing_to_score_is_a_skip_not_an_error(phase_kwargs, monkeypatch, cause):
+    """An install with nothing to score, by configuration, skips the phase:
+    no error, and the previous cache stays standing."""
+    import aiosqlite
+
+    from genesis.memory import dream_centrality
+
+    db = phase_kwargs["db"]
+    await _seed_prior(db)
+    kwargs = dict(phase_kwargs)
+    expected = {
+        "disabled": "centrality worker is disabled",
+        "low_cpu": "CPU capacity is below the minimum enforceable worker quota",
+        "in_memory_db": "centrality requires a file-backed database",
+    }[cause]
+    if cause == "disabled":
+        monkeypatch.setenv("GENESIS_DREAM_CENTRALITY_DISABLED", "1")
+    elif cause == "low_cpu":
+        monkeypatch.setattr(dream_centrality.readings, "cpu_capacity", lambda: 0.01)
+        # Fixed memory: the memory check runs first, so a host whose usage is
+        # unreadable would otherwise report that failure instead of the skip.
+        fixed = dream_centrality.readings.Memory(8 * 2**30, 4 * 2**30, "procfs")
+        monkeypatch.setattr(dream_centrality.readings, "read_memory", lambda: fixed)
+    if cause == "in_memory_db":
+        async with aiosqlite.connect(":memory:") as memory_db:
+            kwargs["db"] = memory_db
+            report = await run_centrality_recompute(**kwargs)
+    else:
+        report = await run_centrality_recompute(**kwargs)
+
+    assert report["not_applicable"] == expected
+    assert "error" not in report
+    assert await _cache_rows(db) == 1
+
+
+@pytest.mark.parametrize("cause", ["worker_crash", "memory_unreadable", "already_running"])
+async def test_an_unavailable_graph_that_is_not_a_skip_stays_an_error(
+    phase_kwargs, monkeypatch, cause
+):
+    """Every other graph-unavailable cause is a real failure the weekly health sees."""
+    from genesis.memory import dream_centrality
+    from genesis.memory.graphstore import GraphUnavailableError
+
+    db = phase_kwargs["db"]
+    await _seed_prior(db)
+    if cause == "worker_crash":
+        with patch(
+            "genesis.memory.dream_centrality._run_worker",
+            new_callable=AsyncMock,
+            side_effect=GraphUnavailableError(
+                "centrality worker exited 4; see resource and worker logs"
+            ),
+        ):
+            report = await run_centrality_recompute(**phase_kwargs)
+        assert report["error"].startswith("centrality worker exited 4")
+    elif cause == "memory_unreadable":
+        monkeypatch.setattr(dream_centrality.readings, "read_memory", lambda: None)
+        report = await run_centrality_recompute(**phase_kwargs)
+        assert report["error"] == "could not read worker memory capacity"
+    else:
+        async with dream_centrality._RECOMPUTE_LOCK:
+            report = await run_centrality_recompute(**phase_kwargs)
+        assert report["error"] == "a centrality recompute is already running"
+
+    assert "not_applicable" not in report
+    assert await _cache_rows(db) == 1
+
+
 async def test_empty_graph_still_supersedes_the_cache(phase_kwargs):
     """CONTROL for the fix above: a REAL empty result (zero bridges) must keep
     clearing stale rows — the unavailability fix must not turn every empty
