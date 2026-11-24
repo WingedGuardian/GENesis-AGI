@@ -24,7 +24,12 @@ from werkzeug.exceptions import BadRequest, RequestEntityTooLarge, RequestTimeou
 from genesis.dashboard._blueprint import _async_route
 from genesis.hosting.request_input import INPUT_KEY, MAX_BODY_BYTES
 from genesis.peers.auth import PeerRefusal, authenticate
-from genesis.peers.conversation import ConversationRefusal, ConversationService, receipt_id
+from genesis.peers.conversation import (
+    PEER_REASONS,
+    ConversationRefusal,
+    ConversationService,
+    receipt_id,
+)
 from genesis.peers.protocol import parse_cancel, parse_send, validate_version
 from genesis.peers.registry import PeerRegistry
 from genesis.peers.results import full_result, project
@@ -34,7 +39,7 @@ agent_api_bp = Blueprint("agent_api", __name__)
 ROOT = "/v1/agent/a2a"
 
 
-def _err(code, status, task_id=None):
+def _err(code, status, task_id=None, reason=None):
     states = {
         400: "INVALID_ARGUMENT",
         401: "UNAUTHENTICATED",
@@ -47,11 +52,14 @@ def _err(code, status, task_id=None):
         503: "UNAVAILABLE",
     }
     extra = {} if task_id is None else {"taskId": task_id}
+    # Only the peer allow-list is rendered; every other reason stays internal.
+    if reason in PEER_REASONS:
+        extra["reason"] = reason
     response = jsonify(
         error={
             "code": status,
             "status": states.get(status, "INTERNAL"),
-            "message": "Peer request refused",
+            "message": PEER_REASONS.get(reason, "Peer request refused"),
         },
         code=code,
         **extra,
@@ -99,7 +107,7 @@ def _handled(fn):
                 return jsonify(
                     build_rest_error_payload(TaskNotFoundError("Task is unavailable"))
                 ), 404
-            return _err(exc.code, exc.status)
+            return _err(exc.code, exc.status, reason=exc.reason)
         except Exception:
             logger.warning("Peer operation unavailable")
             return _err("not_ready", 503, _send_task_id())

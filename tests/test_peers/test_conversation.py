@@ -1505,3 +1505,112 @@ async def test_failure_after_commit_names_receipt_on_send_only(http_bridge, monk
         # The same generic failure on a read route carries no task id.
         read = await client.get(base + ROOT + f"/tasks/{sid}")
         assert read.status_code == 503 and read.json() == unchanged
+
+
+def _text(payload, text):
+    payload["message"]["parts"] = [{"text": text}]
+    return payload
+
+
+async def _refused(bridge, payload):
+    with pytest.raises(ConversationRefusal) as refused:
+        await bridge.service.send(bridge.identities["alpha"], incoming(payload))
+    return refused.value.code, refused.value.reason
+
+
+async def test_identical_retry_after_a_trust_change_is_not_a_content_conflict(bridge):
+    from genesis.db.crud import cc_sessions
+
+    payload = message()
+    done = await settle(
+        bridge, await bridge.service.send(bridge.identities["alpha"], incoming(payload))
+    )
+    await cc_sessions.merge_metadata(
+        bridge.db, done["id"], {"conversation_trust": "conversation_shared"}
+    )
+    assert await _refused(bridge, payload) == ("state_conflict", None)
+
+
+async def test_inbound_409_reason_follows_the_state_it_found(bridge):
+    from genesis.peers.outbox import Outbox
+
+    box = Outbox(bridge.registry)
+    asked, _ = await box.prepare("alpha", "A question for alpha")
+    await box.put(asked)
+    ctx, mid = asked.context_id, asked.message_id
+    reply_id = str(uuid4())  # the shipped peer client derives one stable id per inReplyTo
+    first = await bridge.service.send(
+        bridge.identities["alpha"], incoming(message(reply_id, ctx, inReplyTo=mid))
+    )
+    await settle(bridge, first)
+    # A second, different reply under the same derived id is a second reply, not a reused id.
+    assert await _refused(
+        bridge, _text(message(reply_id, ctx, inReplyTo=mid), "A different reply")
+    ) == ("state_conflict", "reply_already_received")
+    assert await _refused(bridge, message(str(uuid4()), ctx, inReplyTo=mid)) == (
+        "state_conflict", "reply_already_received"
+    )
+    # The same id with different content and no reply relation is a reused id.
+    plain = str(uuid4())
+    await settle(bridge, await bridge.service.send(bridge.identities["alpha"], incoming(message(plain, ctx))))
+    assert await _refused(bridge, _text(message(plain, ctx), "Changed")) == (
+        "state_conflict", "message_id_conflict"
+    )
+    # Carrying inReplyTo does not make it a second reply: the stored row is not one.
+    assert await _refused(bridge, _text(message(plain, ctx, inReplyTo=mid), "Changed")) == (
+        "state_conflict", "message_id_conflict"
+    )
+
+
+async def test_inbound_409_while_a_session_in_the_context_is_running(bridge):
+    from genesis.peers.outbox import Outbox
+
+    entered = asyncio.Event()
+
+    async def blocked(*a, **kw):
+        entered.set()
+        await asyncio.Event().wait()
+
+    bridge.invoker.run_streaming.side_effect = blocked
+    box = Outbox(bridge.registry)
+    # A plain turn is running: a first reply to a message in that context is busy, not a second reply.
+    other, _ = await box.prepare("alpha", "Another question")
+    await box.put(other)
+    await bridge.service.send(bridge.identities["alpha"], incoming(message(context=other.context_id)))
+    await entered.wait()
+    entered.clear()
+    assert await _refused(
+        bridge, message(context=other.context_id, inReplyTo=other.message_id)
+    ) == ("state_conflict", "context_busy")
+    asked, _ = await box.prepare("alpha", "A question for alpha")
+    await box.put(asked)
+    ctx, mid = asked.context_id, asked.message_id
+    await bridge.service.send(bridge.identities["alpha"], incoming(message(context=ctx, inReplyTo=mid)))
+    await entered.wait()
+    # A reply to the same message while the first reply is still running.
+    assert await _refused(bridge, message(context=ctx, inReplyTo=mid)) == (
+        "state_conflict", "reply_already_received"
+    )
+    # Anything else in that context while it runs.
+    assert await _refused(bridge, message(context=ctx)) == ("state_conflict", "context_busy")
+
+
+async def test_peer_sees_the_409_reason_and_next_step_but_no_internal_reason(http_bridge):
+    from genesis.peers.conversation import PEER_REASONS
+
+    b, app, base, owner = http_bridge
+    mid = str(uuid4())
+    async with sdk_client(base) as (client, transport):
+        task = await sdk_send(transport, message(mid))
+        await sdk_settle(transport, task.id)
+        changed = await client.post(
+            base + ROOT + "/message:send", json=_text(message(mid), "Changed content")
+        )
+        body = changed.json()
+        assert changed.status_code == 409 and body["code"] == "state_conflict"
+        assert body["reason"] == "message_id_conflict"
+        assert body["error"]["message"] == PEER_REASONS["message_id_conflict"]
+        assert body["error"]["status"] == "FAILED_PRECONDITION"
+        await b.registry.grant("alpha", "conversation", "deny")
+        denied = await client.post(base + ROOT + "/message:send", json=message())
+        assert denied.status_code == 403 and "reason" not in denied.json()  # not_permitted stays internal

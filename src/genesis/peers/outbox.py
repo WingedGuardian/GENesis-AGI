@@ -17,6 +17,25 @@ from genesis.peers.disclosure_scan import json_strings_safe
 from genesis.peers.protocol import _unique_object
 from genesis.peers.registry import PeerRegistry, identifier
 
+# Closed set of reasons agent_send reports; a reason never carries message text.
+REFUSAL_REASONS = frozenset(
+    {
+        "invalid_peer_id",
+        "unknown_peer",
+        "not_permitted",
+        "not_configured",
+        "empty_message",
+        "invalid_message_id",
+        "invalid_context_id",
+        "unknown_context",
+        "message_id_conflict",
+        "too_large",
+        "disclosure_blocked",
+        "malformed",
+        "refused",
+    }
+)
+
 
 @dataclass(frozen=True)
 class PeerEnvelope:
@@ -45,9 +64,15 @@ class PeerEnvelope:
 
     @classmethod
     def decode(cls, text):
+        # The stage names the check in progress, so the one except below reports
+        # which rule failed while code and status stay the peer-facing constant.
+        reason = "malformed"
         try:
-            if len(text.encode("utf-8")) > 256 * 1024:
+            size = len(text.encode("utf-8"))
+            reason = "too_large"
+            if size > 256 * 1024:
                 raise ValueError
+            reason = "malformed"
             value = json.loads(text, object_pairs_hook=_unique_object)
             if set(value) != {"peer_id", "epoch", "message"}:
                 raise ValueError
@@ -70,17 +95,22 @@ class PeerEnvelope:
                 or msg.parts[0].media_type
             ):
                 raise ValueError
+            reason = "invalid_message_id"
             uuid_id(msg.message_id)
+            reason = "invalid_context_id"
             uuid_id(msg.context_id)
+            # Also refuses a scan that could not finish (work budget, nesting).
+            reason = "disclosure_blocked"
             if not json_strings_safe(value["message"]):
                 raise ValueError
+            reason = "malformed"
             return cls(
                 value["peer_id"],
                 value["epoch"],
                 json.dumps(MessageToDict(msg), sort_keys=True, separators=(",", ":")),
             )
         except Exception:
-            raise ConversationRefusal("outbound_refused", 409) from None
+            raise ConversationRefusal("outbound_refused", 409, reason=reason) from None
 
     def request(self, *, defer_retry=True):
         from genesis.outreach.types import OutreachCategory, OutreachRequest
@@ -102,6 +132,13 @@ class PeerEnvelope:
         )
 
 
+def _checked_id(value, reason):
+    try:
+        return uuid_id(value)
+    except ConversationRefusal as exc:
+        raise ConversationRefusal(exc.code, exc.status, reason=reason) from None
+
+
 async def registry_for_db(db):
     rows = await (await db.execute("PRAGMA database_list")).fetchall()
     path = next((row[2] for row in rows if row[1] == "main"), "")
@@ -118,7 +155,7 @@ async def enabled(db):
         )
     ).fetchone()
     if row is None:
-        raise ConversationRefusal("not_configured", 503)
+        raise ConversationRefusal("not_configured", 503, reason="not_configured")
 
 
 async def owned_context(db, peer_id, epoch, context_id):
@@ -137,31 +174,43 @@ class Outbox:
         self.registry = registry
 
     async def prepare(self, peer_id, text, context_id=None, message_id=None):
-        identifier(peer_id)
+        try:
+            identifier(peer_id)
+        except ValueError:
+            raise ConversationRefusal("validation_error", 400, reason="invalid_peer_id") from None
         if not isinstance(text, str) or not text.strip():
-            raise ConversationRefusal("validation_error", 400)
-        message_id = uuid_id(message_id) if message_id is not None else str(uuid4())
+            raise ConversationRefusal("validation_error", 400, reason="empty_message")
+        message_id = (
+            _checked_id(message_id, "invalid_message_id")
+            if message_id is not None
+            else str(uuid4())
+        )
         async with self.registry.transaction() as db:
             await enabled(db)
             peer = await (
                 await db.execute("SELECT * FROM peers WHERE peer_id=?", (peer_id,))
             ).fetchone()
             if peer is None:
-                raise ConversationRefusal("not_found", 404)
+                raise ConversationRefusal("not_found", 404, reason="unknown_peer")
             peer = dict(peer)
             await authorize(db, PeerIdentity("", peer))
             default = str(uuid5(UUID(message_id), f"{peer_id}:{peer['epoch']}:context"))
-            context_id = uuid_id(context_id) if context_id is not None else default
+            context_id = (
+                _checked_id(context_id, "invalid_context_id") if context_id is not None else default
+            )
             if context_id != default and not await owned_context(
                 db, peer_id, peer["epoch"], context_id
             ):
-                raise ConversationRefusal("not_found", 404)
-            msg = Message(
-                message_id=message_id,
-                context_id=context_id,
-                role=Role.ROLE_AGENT,
-                parts=[Part(text=text)],
-            )
+                raise ConversationRefusal("not_found", 404, reason="unknown_context")
+            try:
+                msg = Message(
+                    message_id=message_id,
+                    context_id=context_id,
+                    role=Role.ROLE_AGENT,
+                    parts=[Part(text=text)],
+                )
+            except ValueError:  # e.g. a lone surrogate (UnicodeEncodeError)
+                raise ConversationRefusal("validation_error", 400, reason="malformed") from None
             envelope = PeerEnvelope(peer_id, peer["epoch"], json.dumps(MessageToDict(msg)))
             envelope = PeerEnvelope.decode(envelope.encode())
             existing = await self._existing(db, envelope)
@@ -175,7 +224,7 @@ class Outbox:
             )
         ).fetchone()
         if row is not None and row["message"] != envelope.message_json:
-            raise ConversationRefusal("state_conflict", 409)
+            raise ConversationRefusal("state_conflict", 409, reason="message_id_conflict")
         return dict(row) if row else None
 
     async def put(self, envelope):
@@ -242,7 +291,7 @@ class Outbox:
             ).fetchone()
             if row is not None:
                 if row["channel"] != "agent" or row["message"] != envelope.encode():
-                    raise ConversationRefusal("state_conflict", 409)
+                    raise ConversationRefusal("state_conflict", 409, reason="message_id_conflict")
                 state = (
                     "queue_closed"
                     if row["delivered"] or row["cancelled_at"]

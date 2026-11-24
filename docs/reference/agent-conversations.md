@@ -217,6 +217,21 @@ Once the runtime starts shutting down, new sends return 503 and in-flight
 admissions are drained or cancelled before sessions stop; an admission cut off
 there is recorded as outcome unknown after restart, never replayed.
 
+Refusal reasons. A 409 `state_conflict` on `message:send` carries a top-level
+`reason` and puts the next step in `error.message`. `code` and `error.status`
+are unchanged. The reason is chosen from what the check found, so a second
+reply sent under a client's derived reply id still reads as a second reply:
+
+| `reason` | Meaning | Next step |
+|---|---|---|
+| `reply_already_received` | This message already has a reply, finished or still running | Continue in the same context with a new messageId and no inReplyTo |
+| `context_busy` | Another turn in this context is still being answered or cleaned up | Retry after it finishes; list tasks with this contextId (`GET /tasks?contextId=…`) to see it |
+| `message_id_conflict` | This messageId was used with different content | Use a new messageId |
+
+Only these reasons are ever rendered to a peer. Other refusals look as before.
+The A2A SDK's REST transport discards an error body it does not map, so read
+the raw response to see them.
+
 A send that is still being admitted when the route's 15-second bound expires
 returns `503 not_ready`, but the admission is not abandoned: it keeps running,
 and either commits its receipt or is refused (403, 404, 409 or 429) after the
