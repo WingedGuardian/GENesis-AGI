@@ -3720,7 +3720,7 @@ function label(n) {
   if (!n) return '';
   const words = (x) => {
     const out = [];
-    const walk = document.createTreeWalker(x, NodeFilter.SHOW_TEXT);
+    const walk = (x.ownerDocument || document).createTreeWalker(x, NodeFilter.SHOW_TEXT);
     while (walk.nextNode()) out.push(walk.currentNode.nodeValue);
     return out.join(' ');
   };
@@ -3731,7 +3731,7 @@ function label(n) {
     const parts = [own(x)];
     const ids = x.getAttribute && x.getAttribute('aria-labelledby');
     if (ids) for (const id of ids.split(/\s+/)) {
-      const t = document.getElementById(id);
+      const t = x.getRootNode().getElementById(id);
       if (t) parts.push(words(t));
     }
     if (x.querySelectorAll) for (const img of x.querySelectorAll('img[alt]')) parts.push(img.alt);
@@ -3754,16 +3754,20 @@ _CONTROL_LABEL_JS = "(el) => {" + _LABEL_FN + r"""
 # The submit control of el's form: Enter in a field submits through it.
 _SUBMIT_FN = r"""
 function submitOf(el) {
-  const form = el && (el.form || (el.closest && el.closest('form')));
+  // A form control's owner is el.form (null when form="<id>" names no form);
+  // anything else submits the form around it.
+  const form = el && ('form' in el ? el.form : el.closest && el.closest('form'));
   // form.elements leaves out <input type=image>, which also submits.
   if (!form) return null;
   // An image input outside the form can belong to it through form="<id>".
   const outside = form.id
-    ? [...document.querySelectorAll('input[type=image][form="' + CSS.escape(form.id) + '"]')]
+    ? [...form.getRootNode().querySelectorAll(
+      'input[type=image][form="' + CSS.escape(form.id) + '"]')]
     : [];
+  // Only controls this form owns: form="<other id>" moves one to another form.
   const submits = [...form.elements, ...form.querySelectorAll('input[type=image]'), ...outside]
-    .filter((e) => e.type === 'submit' || e.type === 'image'
-      || (e.tagName === 'BUTTON' && !e.getAttribute('type')));
+    .filter((e) => e.form === form && (e.type === 'submit' || e.type === 'image'
+      || (e.tagName === 'BUTTON' && !e.getAttribute('type'))));
   // The browser submits through the first one in tree order.
   submits.sort((a, b) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1));
   return submits[0] || null;
@@ -3773,9 +3777,18 @@ function submitOf(el) {
 # "space": the form's submit for Enter in a one-line field, the control itself
 # for a button or link, and nothing where the key only types or toggles.
 _FOCUSED_LABEL_JS = "(kind) => {" + _LABEL_FN + _SUBMIT_FN + r"""
+  // Keys go to the focused control, through open shadow roots and into a
+  // frame. A frame from another origin cannot be read and is allowed.
   let el = document.activeElement;
-  while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
-  if (!el || el === document.body) return '';
+  for (;;) {
+    while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
+    if (!el || !['IFRAME', 'FRAME'].includes(el.tagName)) break;
+    let inner = null;
+    try { inner = el.contentDocument; } catch (e) { inner = null; }
+    if (!inner) return '';
+    el = inner.activeElement;
+  }
+  if (!el || el === el.ownerDocument.body) return '';
   const tag = el.tagName;
   const type = (el.getAttribute && (el.getAttribute('type') || '')).toLowerCase();
   const role = (el.getAttribute && el.getAttribute('role')) || '';

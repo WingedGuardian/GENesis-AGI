@@ -421,6 +421,14 @@ async def test_a_refused_keyboard_fallback_stops_the_click(monkeypatch):
         ("<form><div id=f role=option tabindex=0>Pay by card</div><button>Next</button></form>", "#f", "enter", False),
         ("<div id=f tabindex=0>Subscribe to our list</div>", "#f", "space", False),
         ("<a id=f href=#>Buy now</a>", "#f", "enter", True),
+        (
+            "<form id=a><input id=f><input type=image form=b alt=Continue src='data:,'>"
+            "<button>Pay</button></form><form id=b></form>",
+            "#f",
+            "enter",
+            True,
+        ),
+        ("<form><input id=f form=nowhere><button>Pay</button></form>", "#f", "enter", False),
     ],
 )
 def test_what_a_key_press_would_activate(real_page, html, focus, kind, purchase):
@@ -428,6 +436,13 @@ def test_what_a_key_press_would_activate(real_page, html, focus, kind, purchase)
     real_page.focus(focus)
     text = real_page.evaluate(browser._FOCUSED_LABEL_JS, kind)
     assert bool(browser._PURCHASE_WORDS.search(text)) is purchase
+
+
+def test_a_key_press_is_checked_in_the_focused_frame(real_page):
+    real_page.set_content("<iframe srcdoc='<form><input id=f><button>Pay now</button></form>'></iframe>")
+    real_page.frame_locator("iframe").locator("#f").focus()
+    text = real_page.evaluate(browser._FOCUSED_LABEL_JS, "enter")
+    assert browser._PURCHASE_WORDS.search(text)
 
 
 @pytest.mark.asyncio
