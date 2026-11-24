@@ -3,7 +3,8 @@
 `.github/test-tools/requirements.txt` pins the `[test]` extra's tools and is
 applied as a pip constraint on every CI install that runs or collects tests, so
 a new pytest release cannot turn main red between a PR's CI and its merge (it
-did on 2026-10-27). Dependabot bumps that folder alone, weekly.
+did on 2026-10-27). Nothing bumps those pins automatically: a version change is
+a deliberate PR that checks the new release first.
 """
 
 from __future__ import annotations
@@ -120,8 +121,9 @@ def test_no_ci_test_install_floats():
     assert floating == FLOATING_BY_DESIGN
 
 
-def test_dependabot_bumps_the_pins_folder_and_nothing_else_in_pip():
-    updates = yaml.safe_load(DEPENDABOT.read_text())["updates"]
-    pip = [u for u in updates if u["package-ecosystem"] == "pip"]
-    assert [u["directory"] for u in pip] == ["/.github/test-tools"]
-    assert PINS.parent == REPO / pip[0]["directory"].lstrip("/")
+def test_dependabot_version_updates_stay_off():
+    """Dependabot version updates are off (owner decision, 2026-11-22): a bump
+    PR arrived for these pins that nobody had evaluated. Restoring the config
+    is a decision to make in a PR of its own, not a side effect."""
+    assert not DEPENDABOT.exists()
+    assert not DEPENDABOT.with_suffix(".yaml").exists()

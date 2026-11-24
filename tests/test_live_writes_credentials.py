@@ -273,7 +273,9 @@ def test_legacy_missing_resolution_is_unknown_instead_of_clean(home, monkeypatch
         assert handle.read() == ""
         handle.write("owned")
     assert audit._S.faults == 1
-    assert audit._S.hits == {}
+    assert [row[1:] for row in audit._S.hits] == [
+        ("observer fault", "open/judge/FileNotFoundError", "<not captured>")
+    ]
     assert backing.read_text() == "owned"
 
 
