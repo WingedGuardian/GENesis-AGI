@@ -156,3 +156,30 @@ async def test_apply_returns_the_effort_the_write_stored(db, per_model):
     assert await cc_sessions.apply_model_effort(db, "missing", model="opus") is None
     assert await cc_sessions.apply_model_effort(db, "s1") is None
     assert not await cc_sessions.update_model_effort(db, "missing", model="opus")
+
+
+@pytest.mark.asyncio
+async def test_a_commit_landing_right_after_the_update_cannot_meet_its_open_statement(
+    db, per_model
+):
+    """Another coroutine on the shared connection may commit between the UPDATE
+    and the read of its RETURNING row (review finding: the lock is released when
+    execute() returns). The row is consumed in the same locked operation, so that
+    commit never meets a statement still in progress."""
+    await _session(db)
+
+    class OtherWriterCommitsAfterExecute:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        async def execute(self, sql, *args, **kwargs):
+            cursor = await self._inner.execute(sql, *args, **kwargs)
+            if "RETURNING" in sql:
+                await self._inner.commit()  # another writer, between execute and fetch
+            return cursor
+
+    wrapped = OtherWriterCommitsAfterExecute(db)
+    assert await cc_sessions.apply_model_effort(wrapped, "s1", model="opus") == "medium"

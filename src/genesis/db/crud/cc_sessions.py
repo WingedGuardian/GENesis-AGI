@@ -734,13 +734,15 @@ async def apply_model_effort(
     if not updates:
         return None
     params.append(id)
-    cursor = await db.execute(
+    # Run and consume the RETURNING statement as one operation: on the shared
+    # server connection, execute() releases the lock before a separate fetch,
+    # and another coroutine's commit would then meet a statement in progress.
+    rows = await db.execute_fetchall(
         f"UPDATE cc_sessions SET {', '.join(updates)} WHERE id = ? RETURNING effort",
         tuple(params),
     )
-    row = await cursor.fetchone()
     await db.commit()
-    return row[0] if row else None
+    return rows[0][0] if rows else None
 
 
 async def query_by_skill_tag(
