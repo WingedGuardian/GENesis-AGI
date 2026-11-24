@@ -73,11 +73,12 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 5a3de4eee 2026-11-07
+verified: 273642a5e 2026-11-22
 ```
 
-The 2026-11-07 verification covers the request-owned memory thread boundaries
-below; other memory descriptions retain their individually cited verification dates.
+The 2026-11-22 verification covers weekly dream centrality. The 2026-11-07
+verification covers the request-owned memory thread boundaries below.
+Other memory descriptions retain their individually cited verification dates.
 
 **Shared-owner prerequisite (not activated):** nine thread boundaries in
 `memory/store.py`, `retrieval.py`, `intent.py` and `proactive.py` retain actual
@@ -336,7 +337,25 @@ weekly clustering (Sun 4am) persists a value-ranked worklist to
 **shadow-hardwired** (`dry_run=True`) — the live flip is a separate user-gated
 change (#892). `_CapacityBreaker` aborts on consecutive provider exhaustion.
 `_cross_wing_scan` writes `memory_links` even under dry_run — intentional
-additive layer, not a leak.
+additive layer, not a leak. Weekly betweenness scoring also runs in dry runs.
+`dream_centrality_worker.py` snapshots the primary database in one admitted
+read-only transaction, closes it, then builds and scores the NetworkX graph
+in a separate user scope. The worker budget is 5% of effective memory and
+half the effective CPU capacity, up to one core and 80% of the configured
+resource-budget CPU allowance. A two-hour deadline bounds a hung worker.
+The worker verifies its own kernel limits before reading the database. The
+parent publishes the full nonzero ranking in an owned transaction after
+validating the complete result. Failure before commit leaves the last good
+cache available to the importance shield. `GENESIS_DREAM_CENTRALITY_DISABLED=1`
+skips the worker and records the phase as unavailable.
+
+The scheduled weekly report distinguishes complete, partial and aborted runs.
+Only a complete run advances job health's last success. A failed phase or
+preflight records a bounded problem summary. A discovery exception continues
+through the scheduler's typed failure and reflex path, even after a semantic
+partial result. Job-health counters count the current disposition. Failed
+worklist inserts are counted as a partial result. Worklist replacement still
+follows the existing weekly scan policy.
 
 **Importance shield (Phase 2c)** — `memory/dream_shield.py` +
 `memory/dream_shield_config.py` (config: `config/dream_shield.yaml` + local
@@ -349,11 +368,11 @@ centrality ≥ the nonzero percentile. Thresholds freeze into each slice; the
 drain re-checks live members via `shield_filter_live` (catches salience that
 rose mid-week) and counts `shield_missing_thresholds` — which must be 0 before
 any live flip. Centrality persistence widened from top-500 to all-nonzero
-(`dream_centrality.py`, `graph.centrality_scores(top_n=None)`) so the shield has
+(`dream_centrality.py`) so the shield has
 a real bridge-node population; `centrality_cache` gains its first reader.
 
-**Graph backend is a SEAM (`memory/graphstore.py`)** — traversal and centrality
-run through a `GraphStore` protocol with two implementations: the default
+**Graph backend is a SEAM (`memory/graphstore.py`)** — interactive traversal and
+centrality run through a `GraphStore` protocol with two implementations: the default
 `NetworkxGraphStore` (the in-process MultiDiGraph projection of `memory_links`)
 and `FalkorGraphStore` (below);
 opt-in `RequestDatabase` traversal declines NetworkX before projection and uses
@@ -1740,7 +1759,9 @@ other intake evidence retains its dated basis.
   `remove_unit` tombstones a source when its last unit is deleted (invariant:
   only that method may tombstone). The conversational path
   (`knowledge_ingest_source` MCP) requires explicit user confirmation —
-  contrast the intake bypass in entry 4.
+  contrast the intake bypass in entry 4. A distilled batch's credential units
+  go through the credential chokepoint; its other units are stored as written
+  (uploaded documents are not redacted, owner ruling 2026-11-23).
 - **inbox/**: file-drop monitor with approval-gated dispatch.
   Explicit owner-requested disposition review uses the manual-only Tier-1
   `inbox-review` skill, reached by the attended-request pointer in `CLAUDE.md`.
@@ -2839,7 +2860,42 @@ verified: 204c69c1f 2026-11-22
   `RESTART_CONTAINER` before Gate 2 (after F.1's git-health redirect), and
   `recovery.py` refuses it as a backstop. A restart ends lock holders and lets
   a boot repair run where one is installed; a bad candidate is removed by
-  `deploy_candidates drop`. The diagnosis snapshot carries the boot repair's
+  `deploy_candidates drop`. With `recovery.live_engine: true` in the host's
+  guardian.yaml (default false, and only a real bool arms it; #2978) the
+  Guardian runs that drop itself (`guardian/live_drop.py`): before Gate 2,
+  `check.py` reads the engine's `list --json --move-refusals` and proposes the
+  drop of the newest candidate (the last one `live` holds that the manifest
+  lists), an ESCALATE to `rebuild` when a drop is half-done, or
+  `RESTART_CONTAINER` when no drop can run. A drop is proposed only when the
+  view's `drop_preview` (that drop's own plan, computed lockless; it writes
+  only unreachable git objects) names the same branch and every other
+  candidate it takes out, and Gate 2's identity section, never cut and at
+  most 3,000 UTF-16 units, lists them all; otherwise the proposal is
+  `RESTART_CONTAINER`, naming why. The approved drop is ONE call to
+  the engine's guarded form (`--expect-branch live --expect-head
+  --expect-candidate --expect-leaving <the list Gate 2 showed>
+  --restart-server --wait 0`, 120 s client timeout; a plan that takes out a
+  different set refuses, nothing changed), which
+  drops, confirms and queues the restart under one update.lock hold; the
+  Guardian then judges only whether genesis-server booted from `live`'s new
+  tip (`scripts/lib/serving_commit.py`, as `deploy_code_only.sh status` reads
+  it), with no 30 s probe: the next check judges health. It restarts once
+  itself on exit 4, on exit 1 after the manifest save when the engine's view
+  shows the drop done, and on exit 5 only while the pre-drop server still
+  runs. An outcome it did not see (timeout, 130/143, an unknown code) records
+  the attempt in the Guardian state, which names it in the next diagnosis:
+  while the checkout has not settled since, nothing is proposed; once the
+  drop finished, a server not booted from `live`'s tip is offered a restart
+  before any further drop. The record lasts until a healthy snapshot. While
+  it is set, any action that ran ends in RECOVERED, which waits out the
+  backoff and then moves once to CONFIRMED_DEAD; that one transition passes
+  the episode's alert latch, so the next diagnosis always comes (the
+  escalation, at max_escalations). A container restart or rollback proposed
+  while that drop may still be running says at Gate 2 that it would interrupt
+  it, and an approved action held back by the backoff says it did not run.
+  Off, the
+  behaviour above is unchanged and no candidate is read. The diagnosis
+  snapshot carries the boot repair's
   `live-move repair:` journal lines and a summary of the newest
   `deploy-backups/*-live-move-repair/REPAIR.json` that is neither dismissed
   nor superseded and names `~/genesis` (6 h window on the ts in its dir name,
@@ -3255,7 +3311,9 @@ verified: 41c7343b3 2026-11-15
   own `tick_overdue`.
 - **scheduled-job telemetry (WS-2 M9)**: `runtime/_job_health.py` keeps the
   cumulative `job_health` row AND now appends per-run `job_run_events` (era
-  attribution the cumulative row can't give). Writes are debounced off the
+  attribution the cumulative row can't give). Each terminal outcome updates
+  its own cumulative counter. Startup cleanup preserves the totals.
+  Run-event writes are debounced off the
   persisted `job_health` anchors — a success only when ≥1h since the last, a
   failure on streak onset + hourly heartbeat — so a stuck sub-hourly poll costs
   ~24 rows/day. `duration_ms` is honest-or-NULL (only from an explicit
@@ -3275,9 +3333,11 @@ verified: 41c7343b3 2026-11-15
   `util/tasks.normalized_frames` — a second normalizer would split one bug
   into two fingerprints. **The funnel (2026-07-23):** `record_job_failure`
   gained an `exc=` param and, when an exception caused the failure, ALSO emits
-  a throttled `job.failed` event (via `util/tasks.emit_sync`, sharing the
-  run-event throttle -> ~24/day/job). This bridges the ~50 background-job loops
-  that wrote only to `job_health` onto the event bus, where the reflex arc (a
+  a throttled `job.failed` event (via `util/tasks.emit_sync`). Its hour
+  window starts at the previous typed signal within a failure episode, so a
+  semantic failure cannot suppress the first exception signal. This bridges
+  the ~50 background-job loops that wrote only to `job_health` onto the event
+  bus, where the reflex arc (a
   bus subscriber) can reach the largest class of internal defects - previously
   invisible. Semantic/no-exception failures stay off the bus; callers that emit
   their own domain `.failed` pass `emit_event=False` to avoid double-counting.

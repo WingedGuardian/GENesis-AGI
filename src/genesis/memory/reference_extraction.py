@@ -331,15 +331,17 @@ def _derive_identifier(
     2. First 80 chars of content trimmed to a sentence
     3. Default prefix with a short hash of the content
 
-    ``whole_tokens`` (a credential): a cut never splits a whitespace token, so
-    no part of a secret survives it; the ingest chokepoint masks every whole
-    one it sees (#2426).
+    ``whole_tokens`` (a credential): a named entity is never cut, so two names
+    that differ only past a cut stay two identities (the chokepoint masks it
+    and caps only the displayed name); a content name is cut, never splitting
+    a whitespace token, so no part of a secret survives it and the indexed
+    name never carries more of the held text than that (#2426).
     """
     cut = _cut_whole if whole_tokens else _cut_plain
     if extraction.entities:
         first = extraction.entities[0].strip()
         if first:
-            return cut(first, 120)
+            return first if whole_tokens else cut(first, 120)
     content = extraction.content.strip()
     if not content:
         return f"{default_prefix} (empty)"

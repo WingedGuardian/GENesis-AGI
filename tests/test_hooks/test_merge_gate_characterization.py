@@ -711,17 +711,16 @@ _CASES: list[tuple[str, object, int, str]] = [
         2,
         "bound to the Codex-verified head",
     ),
-    # (follow-up 535648be) `# review-override` also waives the INLINE P1 scan directly
-    # (not just transitively via the shared force_override).
+    # #4933: `# review-override` no longer waives a floor finding the scan can see.
     (
-        "inline_override_waives_P1_allows",
+        "inline_override_leaves_P1_blocking",
         lambda mp: _run(
             mp,
             _merge_cmd(trailer="# review-override"),
             router=_router(inline_lines=_INLINE_P1_LINE),
         ),
-        0,
-        "",
+        2,
+        "always-fix floor",
     ),
     # (follow-up 535648be) numberless merge + explicit --repo → fail CLOSED (can't
     # resolve the PR; a cwd-branch number gated against a named repo = the wrong-PR class).

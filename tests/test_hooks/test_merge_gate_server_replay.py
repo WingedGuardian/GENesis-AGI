@@ -532,9 +532,33 @@ def test_a_codex_p1_inline_finding_blocks(tmp_path):
 
 def test_a_maintainer_answered_p1_passes(tmp_path):
     """The control for the test above: the same P1, answered by the owner in its own
-    review. The inline comments reach the guard's jq filter non-empty and must come
-    out readable, with the reply's ``in_reply_to_id`` read as the P1 it answers."""
+    review with the commit that fixed it. The inline comments reach the guard's jq
+    filter non-empty and must come out readable, with the reply's ``in_reply_to_id``
+    read as the P1 it answers, and the fix read through the real commit endpoints."""
     state = _green_state()
+    finding_head = "a" * 40
+    state["api"][f"pulls/{PR}/commits"] = [
+        {
+            **state["api"][f"pulls/{PR}/commits"][0],
+            "sha": finding_head,
+            "commit": {
+                "message": "feat: add an example",
+                "committer": {"date": "2026-01-02T03:00:00Z"},
+            },
+        },
+        {
+            **state["api"][f"pulls/{PR}/commits"][0],
+            "parents": [{"sha": finding_head}],
+            "commit": {
+                "message": "fix: keep the last row",
+                "committer": {"date": "2026-01-02T04:00:00Z"},
+            },
+        },
+    ]
+    state["api"][f"commits/{HEAD}"] = {
+        "sha": HEAD,
+        "files": [{"filename": "src/example/module.py", "status": "modified", "changes": 2}],
+    }
     reply = {
         "id": 9102,
         "in_reply_to_id": 9101,
@@ -543,7 +567,7 @@ def test_a_maintainer_answered_p1_passes(tmp_path):
         "author_association": "OWNER",
         "path": "src/example/module.py",
         "line": 12,
-        "body": "Fixed.",
+        "body": f"Fixed in {HEAD[:9]}.",
         "created_at": "2026-01-02T05:00:00Z",
         "updated_at": "2026-01-02T05:00:00Z",
     }
@@ -553,7 +577,8 @@ def test_a_maintainer_answered_p1_passes(tmp_path):
         "author_association": "OWNER",
         "submitted_at": "2026-01-02T05:00:00Z",
     }
-    state["api"][f"pulls/{PR}/comments"] = [_codex_inline("P1"), reply]
+    finding = {**_codex_inline("P1"), "original_commit_id": finding_head}
+    state["api"][f"pulls/{PR}/comments"] = [finding, reply]
     state["api"][f"pulls/{PR}/reviews"].append(owner_review)
     proc, rows, _ = _report(tmp_path, state)
     assert proc.returncode == 0, proc.stdout + proc.stderr

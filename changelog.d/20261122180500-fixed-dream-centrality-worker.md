@@ -1,0 +1,1 @@
+- Keep health checks and scheduled work responsive while the weekly dream cycle recomputes memory-graph betweenness scores. A failed recompute preserves the previous importance-shield cache.

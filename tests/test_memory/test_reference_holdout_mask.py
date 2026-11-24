@@ -2131,3 +2131,72 @@ async def test_the_candidates_note_names_only_opaque_keys(db):
     held = (await kc.get(db, b))["body"]
     again = await _ingest(db, store, held, concept="Visa 5555 5555 5555 4444 PIN")
     assert all(re.fullmatch(r"cred-[0-9a-f]{12}", k) for k in again.candidates)
+
+
+def test_two_long_account_names_stay_two_identities():
+    """CodeRabbit round 3 on #4843 (Critical): a credential name is never cut
+    before its identity is taken."""
+    from genesis.memory.extraction import Extraction
+    from genesis.memory.reference_extraction import _derive_identifier
+
+    def name(**kw):
+        return _derive_identifier(Extraction(extraction_type="entity", confidence=0.9, **kw), default_prefix="account", whole_tokens=True)
+
+    assert len({name(content="x", entities=["Portal " + "a" * 130 + t]) for t in ("-east", "-west")}) == 2
+
+
+def test_two_api_key_captures_keep_two_names():
+    """CodeRabbit 4633597973 (Critical): a bare label never becomes the name."""
+    from genesis.memory.extraction import Extraction
+    from genesis.memory.reference_extraction import _derive_identifier
+
+    names = {
+        _derive_identifier(Extraction(content=f"API-key: {t}", extraction_type="entity", confidence=0.9), default_prefix="api_key", whole_tokens=True)
+        for t in ("sk-fakeAAAA1111", "sk-fakeBBBB2222")
+    }
+    assert len(names) == 2
+
+
+async def test_a_placeholder_only_upload_uploaded_again_is_one_entry(db):
+    """CodeRabbit round 3 on #4843: an upload whose whole text is the value
+    placeholder holds an empty value and is compared as that on re-upload."""
+    store = _PointStore()
+    first = await _untrusted(db, store, "notes.txt", ro.SECRET_PLACEHOLDER)
+    again = await _untrusted(db, store, "notes.txt", ro.SECRET_PLACEHOLDER)
+    assert again == first
+    assert len(await db.execute_fetchall("SELECT 1 FROM knowledge_units")) == 1
+
+
+async def test_the_incomplete_upload_notice_says_when_nothing_was_stored(monkeypatch):
+    import importlib
+    from types import SimpleNamespace as NS
+
+    from genesis.knowledge import ingest_upload
+    from genesis.knowledge.orchestrator import CREDENTIAL_NOT_STORED
+
+    mcp_knowledge = importlib.import_module("genesis.mcp.memory.knowledge")
+
+    for ids, tail in (([], "no unit was stored."), (["u1"], "the other units were stored.")):
+        orch = NS(ingest_source=AsyncMock(return_value=NS(error=None, unit_ids=ids, quality_flags=[f"{CREDENTIAL_NOT_STORED}RuntimeError"])))
+        monkeypatch.setattr(mcp_knowledge, "_get_orchestrator", lambda o=orch: o)
+        monkeypatch.setattr("genesis.runtime.GenesisRuntime.instance", lambda: NS(db=None))
+        _, notice = await ingest_upload._extract_with_pipeline("up1", "f.txt", project_type="reference", domain="auto", purpose=None, context="")
+        assert notice.endswith(tail)
+
+
+async def test_the_reference_migration_keeps_the_source_file_in_held_provenance(monkeypatch):
+    from pathlib import Path
+
+    from tests.conftest import private_module
+
+    mod = private_module("_migrate_ref", Path(__file__).parents[2] / "scripts" / "migrate_reference_data.py")
+    seen = {}
+
+    async def _capture(**kw):
+        seen.update(kw)
+        return "u1"
+
+    monkeypatch.setattr("genesis.memory.knowledge_ingest.ingest_knowledge_unit", _capture)
+    entry = mod.ReferenceEntry(kind="credentials", identifier="lab", value="Zz1!fake", description="d", source_file="notes/lab.md")
+    await mod._ingest_entry(entry, store=None, db=None)
+    assert seen["provenance"]["source_file"] == "notes/lab.md"

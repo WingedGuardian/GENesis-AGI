@@ -47,6 +47,7 @@ _HOST_MODULES = (
     "genesis.guardian.recovery",
     "genesis.guardian.diagnosis",
     "genesis.guardian.collector",
+    "genesis.guardian.live_drop",          # check, recovery and collector on `live`
     "genesis.guardian.host_profile",       # --host-profile
     "genesis.guardian.bundle_watch",       # --bundle-status
     "genesis.guardian.memory_watch",       # --ram-status

@@ -10,6 +10,8 @@ observations for review.
 from __future__ import annotations
 
 import logging
+import sqlite3
+from collections import Counter
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -43,6 +45,7 @@ async def run_orphan_detection(
         "orphans_found": 0,
         "orphans_connected": 0,
         "orphans_flagged": 0,
+        "errors": [],
     }
 
     # 1. All non-deprecated memory_ids
@@ -86,9 +89,11 @@ async def run_orphan_detection(
     from genesis.qdrant import collections as qdrant_ops
 
     orphan_list = list(orphans)[:MAX_ORPHANS_PER_RUN]
+    retrieve_failures: Counter[str] = Counter()
     vectors = qdrant_ops.batch_retrieve_vectors(
-        qdrant, orphan_list, collection=COLLECTION,
+        qdrant, orphan_list, collection=COLLECTION, failures=retrieve_failures,
     )
+    report["failure_counts"] = dict(retrieve_failures)
 
     connected = 0
     flagged = 0
@@ -117,6 +122,7 @@ async def run_orphan_detection(
         if neighbors:
             # Create related_to links to top 3 neighbors
             now_iso = datetime.now(UTC).isoformat()
+            found_link = False
             for neighbor in neighbors[:3]:
                 try:
                     await memory_links.create(
@@ -127,9 +133,14 @@ async def run_orphan_detection(
                         strength=round(neighbor["score"], 4),
                         created_at=now_iso,
                     )
-                except Exception:  # noqa: PERF203
-                    logger.debug("Link %s→%s already exists", oid[:8], neighbor["id"][:8])
-            connected += 1
+                except Exception as exc:  # noqa: PERF203
+                    if getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY:
+                        found_link = True
+                    else:
+                        report["errors"].append({"error": f"link/{type(exc).__name__}"})
+                else:
+                    found_link = True
+            connected += int(found_link)
         else:
             flagged += 1
 

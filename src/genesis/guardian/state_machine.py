@@ -48,6 +48,21 @@ class GuardianState(StrEnum):
     PAUSED = "paused"
 
 
+_DROP_ATTEMPT_KEYS = frozenset({"branch", "pinned_head", "tip", "at"})
+
+
+def _drop_attempt(raw: object) -> dict | None:
+    """A persisted drop attempt, or None when it is not one (a hand-edited or
+    older state file)."""
+    if (
+        isinstance(raw, dict)
+        and set(raw) == _DROP_ATTEMPT_KEYS
+        and all(isinstance(v, str) for v in raw.values())
+    ):
+        return dict(raw)
+    return None
+
+
 @dataclass
 class StateData:
     """Persistent state between timer invocations."""
@@ -76,6 +91,13 @@ class StateData:
     snapshot_size_history: list[int] = field(default_factory=list)  # Last N snapshot sizes in bytes
     boot_id: str = ""  # kernel boot UUID when this state was last written; "" = unknown
     rebooted_at: str | None = None  # when this process last saw a host reboot (post-reboot grace)
+    # The Guardian's last drop on `live` this episode (#2978): branch,
+    # pinned_head, tip (`live` before it) and at. Read only with
+    # recovery.live_engine on; kept through the auto-reset, a DENY and a failed
+    # send; cleared when the episode ends (a healthy snapshot). While it is set,
+    # an action that ran ends in RECOVERED, whose one transition to
+    # CONFIRMED_DEAD lets the next diagnosis past the down-alert latch.
+    live_drop_attempt: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -103,6 +125,7 @@ class StateData:
             "snapshot_size_history": self.snapshot_size_history[-5:],
             "boot_id": self.boot_id,
             "rebooted_at": self.rebooted_at,
+            "live_drop_attempt": self.live_drop_attempt,
         }
 
     @classmethod
@@ -136,6 +159,7 @@ class StateData:
             snapshot_size_history=data.get("snapshot_size_history", []),
             boot_id=str(data.get("boot_id") or ""),
             rebooted_at=data.get("rebooted_at") or None,
+            live_drop_attempt=_drop_attempt(data.get("live_drop_attempt")),
         )
 
 
@@ -222,14 +246,25 @@ class ConfirmationStateMachine:
                 return float("inf")
             backoff_s = 100.0 * (3.0 ** (attempts - 1))
 
-        if not self._state.last_recovery_at:
-            return backoff_s
+        elapsed = (datetime.now(UTC) - self._recovery_stamp()).total_seconds()
+        return max(0.0, backoff_s - elapsed)
+
+    def _recovery_stamp(self) -> datetime:
+        """last_recovery_at, readable. A missing, unparseable, naive or future
+        stamp would freeze the backoff at its full length on every tick (a held
+        or deferred action that never runs), so it is reset to now and the
+        backoff counts down once from there; the state is saved every cycle."""
+        now = datetime.now(UTC)
+        raw = self._state.last_recovery_at
         try:
-            last = datetime.fromisoformat(self._state.last_recovery_at)
-            elapsed = (datetime.now(UTC) - last).total_seconds()
-            return max(0.0, backoff_s - elapsed)
+            last = datetime.fromisoformat(raw or "")
+            if last.tzinfo is not None and last <= now:
+                return last
         except (ValueError, TypeError):
-            return backoff_s
+            pass
+        logger.warning("last_recovery_at %r is unusable; counting the backoff from now", raw)
+        self._state.last_recovery_at = now.isoformat()
+        return now
 
     def record_recovery_attempt(self, action: str = "") -> None:
         """Record that a recovery attempt was made (for backoff tracking).
@@ -261,6 +296,8 @@ class ConfirmationStateMachine:
         })
         # Keep last 20
         self._state.signal_history = self._state.signal_history[-20:]
+        if snapshot.all_alive:  # the episode is over: its drop needs no naming
+            self._state.live_drop_attempt = None
 
         old_state = self._state.current_state
 
@@ -593,6 +630,19 @@ class ConfirmationStateMachine:
                 reason="recovery verified — all probes healthy",
             )
 
+        # After a `live` drop attempt (#2978) the next decision waits out the
+        # backoff here: CONFIRMED_DEAD would auto-reset, or stay latched. At
+        # max_escalations the backoff never ends, so it goes on to the escalation.
+        # RECOVERED has no auto-reset; the hold ends because the backoff always
+        # counts down (an unusable stamp restarts it from now, _recovery_stamp).
+        backoff = self.recovery_backoff_remaining_s()
+        drop = self._config.recovery.live_engine and self._state.live_drop_attempt
+        if drop and 0 < backoff < float("inf"):
+            return Transition(
+                old_state=GuardianState.RECOVERED,
+                new_state=GuardianState.RECOVERED,
+                reason=f"after a drop attempt: {backoff:.0f}s of backoff before the next decision",
+            )
         # Recovery failed — back to CONFIRMED_DEAD for escalation.
         # recovery_attempts already incremented by record_recovery_attempt().
         self._state.current_state = GuardianState.CONFIRMED_DEAD

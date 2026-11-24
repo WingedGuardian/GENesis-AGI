@@ -195,10 +195,10 @@ async def check_entity_duplicate(
         )
     except Exception as exc:
         logger.error("Entity adversarial review failed: %s", exc)
-        return {"relationship": "distinct", "reasoning": f"error: {exc}"}
+        return {"relationship": "distinct", "reasoning": f"error: {exc}", "error": "check"}
 
     if not result.success:
-        return {"relationship": "distinct", "reasoning": f"LLM error: {result.error}"}
+        return {"relationship": "distinct", "reasoning": f"LLM error: {result.error}", "error": "provider"}
 
     text = (result.content or "").strip()
     match = _JSON_BLOCK_RE.search(text)
@@ -207,9 +207,9 @@ async def check_entity_duplicate(
 
     try:
         data = json.loads(text)
-        rel = data.get("relationship", "distinct")
+        rel = data.get("relationship")
         if rel not in ("duplicate", "distinct"):
-            rel = "distinct"
+            return {"relationship": "distinct", "reasoning": "invalid relationship", "error": "response"}
         return {"relationship": rel, "reasoning": data.get("reasoning", "")}
-    except (json.JSONDecodeError, Exception):
-        return {"relationship": "distinct", "reasoning": "parse error — defaulting to distinct"}
+    except Exception:
+        return {"relationship": "distinct", "reasoning": "parse error — defaulting to distinct", "error": "response"}
