@@ -34,8 +34,11 @@ Skill tool, or Read its file if this text reached you by injection.
 - **validating**, post-merge verification, deploy and E2E: `validating-merges`
   (`.claude/skills/validating-merges/SKILL.md`).
 
-**A foreground session with the owner present** (including a channel
-conversation Genesis marks `GENESIS_SESSION_SUPERVISED=1`) takes its type from,
+**A channel conversation** (Telegram, the dashboard, or another channel Genesis
+marks `GENESIS_SESSION_SUPERVISED=1`) has no session type: it stays universal,
+and the spec default below does not apply to it.
+
+**A foreground session with the owner present** takes its type from,
 in this order: the owner's words naming a type (a type word counts only when it
 names the session: "this is a build session", "build session for X"); a handoff file's `For: <type> session`
 line; a handed-over spec whose frontmatter status counts as approved (its first
@@ -45,6 +48,9 @@ default.
 - A request for a change ("fix X", "add Y", "build X") names a task, not a type: the
   session is a spec session and runs the spec process, unless the change is on
   the skip list (spec-session, "Skipping the spec stage").
+- A request whose work is the open-PR queue ("close out the open PRs") names a
+  closing session, and one whose work is verifying a merged PR ("validate the
+  merged PRs") names a validating session.
 - A change on the skip list makes the session a build session once it has said
   which entry applies. So do the owner's words in conversation skipping the
   spec stage, at any time, an outage included; the session records them.
@@ -73,7 +79,9 @@ premise items, named in its prompt, or, for the task executor, the build spec
 on the build-lane greenlight card or a completed `/task` intake. Its plan is
 one the owner approved; for the task executor, its plan review together with
 the owner's approval of the task (the greenlight card, or the `/task`
-submission's approval) is that approval. Given a change on the skip list, it
+submission's approval) is that approval. A board builder plans first and asks
+the owner to approve its plan before its first edit: the Build move approves
+building the issue, not a plan. Given a change on the skip list, it
 may name the entry in its output in place of a contract. A build whose contract
 is a nine-item issue saves the issue's body at the start as
 `~/.genesis/output/specs/issue-<N>.md` and uses it as its spec; it has no

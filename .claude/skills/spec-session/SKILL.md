@@ -45,8 +45,8 @@ The skip list:
   qualify);
 - revert commits;
 - a change to install-local configuration only, outside the repo;
-- a change of 10 or fewer lines of code, counted as lines added plus lines
-  removed in code files, tests and prose excluded.
+- a change of 10 or fewer counted lines, as
+  `python3 scripts/pr_shape.py --base <base>` counts them.
 
 Dependency bumps are not on it. A session using the list says which entry
 applies, and checks the staged diff against that entry again before its

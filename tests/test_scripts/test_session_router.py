@@ -18,6 +18,27 @@ def test_router_defaults_to_spec_and_names_one_type_per_session():
     assert "without `GENESIS_SESSION_SUPERVISED=1`" in text
     assert "`GENESIS_BUILDER_KEY`" in text
     assert "A closing or validating session, foreground or dispatched" in text
+    assert '("close out the open PRs") names a closing session' in text
+    assert '("validate the merged PRs") names a validating session' in text
+    assert "has no session type: it stays universal" in text
+    assert "A board builder plans first and asks the owner to approve its plan" in text
+
+
+def test_skip_list_counts_with_pr_shape_and_claude_md_points_to_it():
+    repo = SKILLS.parents[1]
+    skill = " ".join((SKILLS / "spec-session" / "SKILL.md").read_text(encoding="utf-8").split())
+    assert (
+        "a change of 10 or fewer counted lines, as `python3 scripts/pr_shape.py --base <base>` counts them"
+        in skill
+    )
+    claude = " ".join((repo / "CLAUDE.md").read_text(encoding="utf-8").split())
+    assert "write no code unless the change is on the spec skill's skip list" in claude
+
+
+def test_board_builder_prompt_plans_before_building():
+    prompt = (SKILLS.parents[1] / "config" / "BUILDER_PROMPT.md").read_text(encoding="utf-8")
+    assert "not for a plan" in prompt
+    assert "Before your first edit, show the owner the plan" in prompt
 
 
 def test_sibling_skills_defer_to_the_router():
