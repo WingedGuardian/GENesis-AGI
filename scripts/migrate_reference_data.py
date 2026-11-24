@@ -383,6 +383,9 @@ async def _ingest_entry(
         "source_doc": "reference_store:migrate_reference_data",
         "source_pipeline": "migrate_reference_data",
         "platform": "migrate_reference_data",
+        # The file it came from: a credential's held provenance keeps it (its
+        # rebuilt body carries no Captured line).
+        **({"source_file": entry.source_file} if entry.source_file else {}),
     }
 
     unit_id = await ingest_knowledge_unit(

@@ -15,6 +15,9 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
+import time
+from collections import Counter
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -85,6 +88,13 @@ async def run_entity_resolution(
         "errors": [],
     }
 
+    failures: Counter[str] = Counter()
+    report["failure_counts"] = failures
+
+    async def record_audit(**fields: Any) -> None:
+        if not await log_resolution(db, run_id=run_id, **fields):
+            failures["audit/write"] += 1
+
     # 1. Use pre-scrolled buckets if available, otherwise scroll independently
     if buckets is None:
         from genesis.memory.dream_cycle import _scroll_and_group
@@ -139,13 +149,21 @@ async def run_entity_resolution(
             # 2. Fetch vectors for this chunk
             point_ids = [p["id"] for p in active_chunk]
             vectors = qdrant_ops.batch_retrieve_vectors(
-                qdrant, point_ids, collection=COLLECTION,
+                qdrant, point_ids, collection=COLLECTION, failures=failures,
             )
 
             # 3. Find dedup candidates (cosine ≥ 0.92)
-            candidates = await find_dedup_candidates(
-                qdrant, active_chunk, vectors, collection=COLLECTION,
-            )
+            started = time.monotonic()
+            try:
+                candidates = await find_dedup_candidates(
+                    qdrant, active_chunk, vectors, collection=COLLECTION,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Dream entity candidate search failed after %.1fs (%s, %d points, %d vectors)",
+                    time.monotonic() - started, type(exc).__name__, len(active_chunk), len(vectors),
+                )
+                raise
 
             new_candidates = 0
             for point_a, point_b, score in candidates:
@@ -200,9 +218,7 @@ async def run_entity_resolution(
                         payload_a, payload_b, score,
                     )
                     if strength < EVIDENCE_THRESHOLD:
-                        await log_resolution(
-                            db,
-                            run_id=run_id,
+                        await record_audit(
                             action="flagged",
                             memory_id_a=point_a["id"],
                             memory_id_b=point_b["id"],
@@ -237,9 +253,7 @@ async def run_entity_resolution(
                             report["already_retired"] += 1
                             deprecated_this_run.add(retired)
                             continue
-                        await log_resolution(
-                            db,
-                            run_id=run_id,
+                        await record_audit(
                             action="auto_merge",
                             memory_id_a=point_a["id"],
                             memory_id_b=point_b["id"],
@@ -268,6 +282,8 @@ async def run_entity_resolution(
                     verdict = await check_semantic_overlap(
                         router, content_a, content_b,
                     )
+                    if error := verdict.get("error"):
+                        report["errors"].append({"error": f"semantic_check/{error}"})
                     rel = verdict.get("relationship", "distinct")
                     reasoning = verdict.get("reasoning", "")
 
@@ -284,31 +300,35 @@ async def run_entity_resolution(
                                 content_a=content_a,
                                 content_b=content_b,
                             )
-                            if second_opinion["relationship"] == "distinct":
-                                logger.info(
-                                    "Entity challenge override: %s vs %s — "
-                                    "primary=duplicate, challenge=distinct (%s). "
-                                    "Keeping both.",
-                                    point_a["id"][:8], point_b["id"][:8],
-                                    second_opinion["reasoning"],
-                                )
-                                report.setdefault("challenge_overrides", 0)
-                                report["challenge_overrides"] += 1
-                                await log_resolution(
-                                    db,
-                                    run_id=run_id,
+                            challenge_error = second_opinion.get("error")
+                            if challenge_error or second_opinion["relationship"] == "distinct":
+                                if challenge_error:
+                                    challenge_verdict = "challenge_unavailable"
+                                    challenge_reason = f"challenge/{challenge_error}"
+                                    report["errors"].append({"error": challenge_reason})
+                                else:
+                                    challenge_verdict = "challenge_override_to_distinct"
+                                    challenge_reason = second_opinion["reasoning"]
+                                    logger.info(
+                                        "Entity challenge override: %s vs %s — "
+                                        "primary=duplicate, challenge=distinct (%s). Keeping both.",
+                                        point_a["id"][:8], point_b["id"][:8], challenge_reason,
+                                    )
+                                    report["challenge_overrides"] = report.get("challenge_overrides", 0) + 1
+                                await record_audit(
                                     action="flagged",
                                     memory_id_a=point_a["id"],
                                     memory_id_b=point_b["id"],
                                     content_a=content_a,
                                     content_b=content_b,
                                     cosine_score=score,
-                                    llm_verdict="challenge_override_to_distinct",
-                                    llm_reasoning=second_opinion["reasoning"],
+                                    llm_verdict=challenge_verdict,
+                                    llm_reasoning=challenge_reason,
                                 )
                                 continue  # Skip deprecation
-                        except Exception:
+                        except Exception as exc:
                             # Challenge call failed — fail-safe: skip deprecation
+                            report["errors"].append({"error": f"challenge/{type(exc).__name__}"})
                             logger.debug(
                                 "Entity challenge call failed, preserving both",
                                 exc_info=True,
@@ -331,9 +351,7 @@ async def run_entity_resolution(
                                 report["already_retired"] += 1
                                 deprecated_this_run.add(retired)
                                 continue
-                            await log_resolution(
-                                db,
-                                run_id=run_id,
+                            await record_audit(
                                 action="llm_merge",
                                 memory_id_a=point_a["id"],
                                 memory_id_b=point_b["id"],
@@ -381,15 +399,14 @@ async def run_entity_resolution(
                             )
                         except Exception as link_exc:
                             # Only PK collision is expected; log unexpected errors
-                            if "UNIQUE constraint" not in str(link_exc):
+                            if getattr(link_exc, "sqlite_errorcode", None) != sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY:
+                                report["errors"].append({"error": f"link/{type(link_exc).__name__}"})
                                 logger.warning(
                                     "Contradiction link %s→%s failed: %s",
                                     src[:8], tgt[:8], link_exc,
                                 )
 
-                        await log_resolution(
-                            db,
-                            run_id=run_id,
+                        await record_audit(
                             action="contradiction" if link_type == "contradicts" else "succeeded_by",
                             memory_id_a=point_a["id"],
                             memory_id_b=point_b["id"],
@@ -403,9 +420,7 @@ async def run_entity_resolution(
 
                     else:
                         # distinct — log and skip
-                        await log_resolution(
-                            db,
-                            run_id=run_id,
+                        await record_audit(
                             action="skipped",
                             memory_id_a=point_a["id"],
                             memory_id_b=point_b["id"],

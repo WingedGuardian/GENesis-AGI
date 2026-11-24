@@ -19,7 +19,6 @@ from tests.test_scripts._deploy_candidates_world import (
     ENTRY,
     HELPER_NAMES,
     HOOK_NAMES,
-    REPO,
     SCRIPTS,
     World,
 )
@@ -542,16 +541,6 @@ def test_every_python_the_deploy_path_runs_is_isolated():
                 assert m.group(1) in want, f"{name}:{n}: {line.strip()}"
     # Both spellings are present today: a matcher that found none would pass.
     assert seen >= 10, seen
-
-
-def test_the_engine_is_inert_in_this_repository_until_pr_c_lands(dc):
-    """PR C creates the readiness marker file; until then no install is ready.
-    When PR C lands it deletes this test along with adding the file."""
-    res = subprocess.run(
-        ["git", "-C", str(REPO), "cat-file", "-e", f"HEAD:{dc.gate.PR_C_MARKER}"],
-        capture_output=True,
-    )
-    assert res.returncode != 0
 
 
 def test_the_real_required_commit_is_not_taken_on_trust(dc, dc_world, capsys):

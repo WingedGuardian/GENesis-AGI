@@ -20,6 +20,7 @@ from genesis.channels.telegram._handler_helpers import (
     _reply_formatted,
     interrupt_key,
 )
+from genesis.channels.telegram._progress import PROGRESS_SENDER, TurnProgress
 from genesis.channels.telegram.transport.streaming import DraftStreamer, generate_draft_id
 from genesis.channels.telegram.transport.update_dedupe import message_key
 from genesis.util.approval_words import phrase_decision, scoped_decision
@@ -205,6 +206,38 @@ async def _make_streamer(ctx: HandlerContext, msg, user, tid) -> DraftStreamer |
     return streamer
 
 
+def _rescue_text(progress: TurnProgress | None, streamer: DraftStreamer | None) -> str:
+    """What a rescue may still send: everything streamed and not yet delivered."""
+    if progress is not None and progress.saw_text:
+        return progress.pending()
+    return streamer.accumulated_text if streamer else ""
+
+
+def _make_progress(
+    ctx: HandlerContext, msg, tid, streamer: DraftStreamer | None, interrupt: asyncio.Event
+) -> TurnProgress | None:
+    """Interim delivery for a private chat (#4849); groups and topics get none."""
+    if msg.chat.type != "private":
+        return None
+
+    async def deliver(text: str) -> None:
+        sent = await _reply_formatted(msg, text)
+        if sent:
+            await _persist_tg_message(
+                ctx,
+                msg.chat.id,
+                sent.message_id,
+                PROGRESS_SENDER,
+                text,
+                thread_id=tid,
+                direction="outbound",
+            )
+
+    progress = TurnProgress(deliver, streamer, interrupt)
+    progress.start()
+    return progress
+
+
 async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
     """Inner implementation for text handling."""
     from genesis.channels.telegram._handler_helpers import _TypingKeepAliveV2
@@ -214,23 +247,9 @@ async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
     ctx.active_interrupts[ikey] = interrupt_event
 
     streamer = await _make_streamer(ctx, msg, user, tid)
-    on_event = ctx.make_on_event(interrupt_event, streamer)
+    progress = _make_progress(ctx, msg, tid, streamer, interrupt_event)
+    on_event = ctx.make_on_event(interrupt_event, streamer, progress)
     typing_ka = _TypingKeepAliveV2(msg.chat, ctx.typing_breaker_instance)
-
-    # One-shot status snapshot: if CC takes >60s, persist draft as real message
-    async def _status_snapshot() -> None:
-        await asyncio.sleep(60)
-        if streamer and streamer.any_draft_sent and not interrupt_event.is_set():
-            draft_text = streamer._compose_draft()
-            if draft_text.strip():
-                try:
-                    await msg.reply_text(draft_text)
-                except Exception:
-                    log.debug("Status snapshot send failed", exc_info=True)
-
-    from genesis.util.tasks import tracked_task
-
-    status_task = tracked_task(_status_snapshot(), name="status-snapshot")
 
     try:
         await _send_typing_safe(ctx, msg.chat)
@@ -247,23 +266,26 @@ async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
             if len(replied) > 2000:
                 replied = replied[:2000] + "…"
             prompt_text = (
-                f"[User replied to this message:]\n{replied}\n\n"
-                f"[User's reply:]\n{msg.text}"
+                f"[User replied to this message:]\n{replied}\n\n[User's reply:]\n{msg.text}"
             )
 
-        response = await ctx.loop.handle_message_streaming(
-            prompt_text,
-            user_id=f"tg-{user.id}",
-            channel=ChannelType.TELEGRAM,
-            on_event=on_event,
-            thread_id=tid,
-            session_key=interrupt_key(*ikey),
-            chat_id=str(msg.chat.id),
-            # WS-3: on a quote-reply the prompt is a composite (quoted bot text +
-            # owner reply); the quoted text can relay external content, so scan
-            # slash intents (/task, /model, …) from the OWNER's reply only.
-            intent_text=msg.text if composite else None,
-        )
+        try:
+            response = await ctx.loop.handle_message_streaming(
+                prompt_text,
+                user_id=f"tg-{user.id}",
+                channel=ChannelType.TELEGRAM,
+                on_event=on_event,
+                thread_id=tid,
+                session_key=interrupt_key(*ikey),
+                chat_id=str(msg.chat.id),
+                # WS-3: on a quote-reply the prompt is a composite (quoted bot text +
+                # owner reply); the quoted text can relay external content, so scan
+                # slash intents (/task, /model, …) from the OWNER's reply only.
+                intent_text=msg.text if composite else None,
+            )
+        finally:
+            if progress is not None:
+                progress.finish()
         log.info("Response to %s (%d chars)", user.id, len(response or ""))
 
         await _apply_pending_settings(ctx, user.id, tid)
@@ -295,20 +317,21 @@ async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
             # authoritative final text and the accumulated draft is a prefix of
             # it — concatenating there would duplicate the answer.
             if (
-                streamer
-                and streamer.accumulated_text
+                _rescue_text(progress, streamer)
                 and response
                 and response.strip() == _TRUNCATION_NOTICE
             ):
                 log.warning(
                     "Truncation notice would have replaced %d streamed chars "
                     "for user %s — delivering both",
-                    len(streamer.accumulated_text),
+                    len(_rescue_text(progress, streamer)),
                     user.id,
                 )
-                response = f"{streamer.accumulated_text}\n\n{response}"
+                response = f"{_rescue_text(progress, streamer)}\n\n{response}"
 
             # Always send text first — voice is additional, never a replacement
+            if progress is not None:
+                response = progress.final_reply(response or "")
             if response:
                 response = response.lstrip("\n")
                 response = _with_model_prefix(streamer, response)
@@ -355,21 +378,23 @@ async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
         except Exception:
             log.error("Failed to send error reply to user %s", user.id, exc_info=True)
     except (TimeoutError, ConnectionError, OSError):
-        if streamer and streamer.accumulated_text:
+        rescued = _rescue_text(progress, streamer)
+        if rescued or (progress is not None and progress.any_delivered):
+            rescued = rescued or "(the connection dropped after the messages above)"
             log.warning(
                 "Connection error for user %s after streaming %d chars — delivering accumulated text",
                 user.id,
-                len(streamer.accumulated_text),
+                len(rescued),
             )
             try:
-                sent = await _reply_formatted(msg, streamer.accumulated_text)
+                sent = await _reply_formatted(msg, rescued)
                 if sent:
                     await _persist_tg_message(
                         ctx,
                         msg.chat.id,
                         sent.message_id,
                         "genesis",
-                        streamer.accumulated_text,
+                        rescued,
                         thread_id=tid,
                         direction="outbound",
                     )
@@ -415,7 +440,8 @@ async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
             log.error("Failed to send error reply to user %s", user.id, exc_info=True)
     finally:
         await typing_ka.stop()
-        status_task.cancel()
+        if progress is not None:
+            progress.stop()
         ctx.active_interrupts.pop(ikey, None)
 
 
@@ -429,23 +455,9 @@ async def _handle_voice_inner(ctx: HandlerContext, msg, user, voice, context, wh
     ctx.active_interrupts[ikey] = interrupt_event
 
     streamer = await _make_streamer(ctx, msg, user, tid)
-    on_event = ctx.make_on_event(interrupt_event, streamer)
+    progress = _make_progress(ctx, msg, tid, streamer, interrupt_event)
+    on_event = ctx.make_on_event(interrupt_event, streamer, progress)
     typing_ka = _TypingKeepAliveV2(msg.chat, ctx.typing_breaker_instance)
-
-    # One-shot status snapshot: if CC takes >60s, persist draft as real message
-    async def _status_snapshot() -> None:
-        await asyncio.sleep(60)
-        if streamer and streamer.any_draft_sent and not interrupt_event.is_set():
-            draft_text = streamer._compose_draft()
-            if draft_text.strip():
-                try:
-                    await msg.reply_text(draft_text)
-                except Exception:
-                    log.debug("Status snapshot send failed", exc_info=True)
-
-    from genesis.util.tasks import tracked_task
-
-    status_task = tracked_task(_status_snapshot(), name="voice-status-snapshot")
 
     try:
         await _send_typing_safe(ctx, msg.chat)
@@ -469,15 +481,19 @@ async def _handle_voice_inner(ctx: HandlerContext, msg, user, voice, context, wh
 
         typing_ka.start()
 
-        response = await ctx.loop.handle_message_streaming(
-            text,
-            user_id=f"tg-{user.id}",
-            channel=ChannelType.TELEGRAM,
-            on_event=on_event,
-            thread_id=tid,
-            session_key=interrupt_key(*ikey),
-            chat_id=str(msg.chat.id),
-        )
+        try:
+            response = await ctx.loop.handle_message_streaming(
+                text,
+                user_id=f"tg-{user.id}",
+                channel=ChannelType.TELEGRAM,
+                on_event=on_event,
+                thread_id=tid,
+                session_key=interrupt_key(*ikey),
+                chat_id=str(msg.chat.id),
+            )
+        finally:
+            if progress is not None:
+                progress.finish()
         log.info("Voice response to %s (%d chars)", user.id, len(response or ""))
 
         await _apply_pending_settings(ctx, user.id, tid)
@@ -492,10 +508,13 @@ async def _handle_voice_inner(ctx: HandlerContext, msg, user, voice, context, wh
             if streamer:
                 streamer.disable()
             # Send response first — voice and transcription echo follow separately
+            if progress is not None:
+                response = progress.final_reply(response or "")
             if response:
                 response = response.lstrip("\n")
                 response = _with_model_prefix(streamer, response)
-            sent_msg = await _reply_formatted(msg, response or "(no response)")
+            if response or not (progress and progress.any_delivered):
+                sent_msg = await _reply_formatted(msg, response or "(no response)")
 
             # Then send voice if wanted (text already delivered; TTS failure is non-fatal)
             if ctx.want_voice(msg.chat.id, input_was_voice=True) and response and ctx.adapter:
@@ -544,21 +563,23 @@ async def _handle_voice_inner(ctx: HandlerContext, msg, user, voice, context, wh
         except Exception:
             log.error("Failed to send error reply to voice user %s", user.id, exc_info=True)
     except (TimeoutError, ConnectionError, OSError):
-        if streamer and streamer.accumulated_text:
+        rescued = _rescue_text(progress, streamer)
+        if rescued or (progress is not None and progress.any_delivered):
+            rescued = rescued or "(the connection dropped after the messages above)"
             log.warning(
                 "Connection error for voice %s after streaming %d chars — delivering accumulated text",
                 user.id,
-                len(streamer.accumulated_text),
+                len(rescued),
             )
             try:
-                sent = await _reply_formatted(msg, streamer.accumulated_text)
+                sent = await _reply_formatted(msg, rescued)
                 if sent:
                     await _persist_tg_message(
                         ctx,
                         msg.chat.id,
                         sent.message_id,
                         "genesis",
-                        streamer.accumulated_text,
+                        rescued,
                         thread_id=tid,
                         direction="outbound",
                     )
@@ -606,7 +627,8 @@ async def _handle_voice_inner(ctx: HandlerContext, msg, user, voice, context, wh
             log.error("Failed to send error reply to voice user %s", user.id, exc_info=True)
     finally:
         await typing_ka.stop()
-        status_task.cancel()
+        if progress is not None:
+            progress.stop()
         ctx.active_interrupts.pop(ikey, None)
 
 
@@ -627,22 +649,9 @@ async def _handle_media_inner(
     ctx.active_interrupts[ikey] = interrupt_event
 
     streamer = await _make_streamer(ctx, msg, user, tid)
-    on_event = ctx.make_on_event(interrupt_event, streamer)
+    progress = _make_progress(ctx, msg, tid, streamer, interrupt_event)
+    on_event = ctx.make_on_event(interrupt_event, streamer, progress)
     typing_ka = _TypingKeepAliveV2(msg.chat, ctx.typing_breaker_instance)
-
-    async def _status_snapshot() -> None:
-        await asyncio.sleep(60)
-        if streamer and streamer.any_draft_sent and not interrupt_event.is_set():
-            draft_text = streamer._compose_draft()
-            if draft_text.strip():
-                try:
-                    await msg.reply_text(draft_text)
-                except Exception:
-                    log.debug("Status snapshot send failed", exc_info=True)
-
-    from genesis.util.tasks import tracked_task
-
-    status_task = tracked_task(_status_snapshot(), name="media-status-snapshot")
 
     # Build prompt — CC's Read tool will open the file (images, PDFs)
     if caption:
@@ -657,15 +666,19 @@ async def _handle_media_inner(
         await _send_typing_safe(ctx, msg.chat)
         typing_ka.start()
 
-        response = await ctx.loop.handle_message_streaming(
-            prompt,
-            user_id=f"tg-{user.id}",
-            channel=ChannelType.TELEGRAM,
-            on_event=on_event,
-            thread_id=tid,
-            session_key=interrupt_key(*ikey),
-            chat_id=str(msg.chat.id),
-        )
+        try:
+            response = await ctx.loop.handle_message_streaming(
+                prompt,
+                user_id=f"tg-{user.id}",
+                channel=ChannelType.TELEGRAM,
+                on_event=on_event,
+                thread_id=tid,
+                session_key=interrupt_key(*ikey),
+                chat_id=str(msg.chat.id),
+            )
+        finally:
+            if progress is not None:
+                progress.finish()
         log.info("Media response to %s (%d chars)", user.id, len(response or ""))
 
         await _apply_pending_settings(ctx, user.id, tid)
@@ -679,6 +692,8 @@ async def _handle_media_inner(
         else:
             if streamer:
                 streamer.disable()
+            if progress is not None:
+                response = progress.final_reply(response or "")
             if response:
                 response = response.lstrip("\n")
                 response = _with_model_prefix(streamer, response)
@@ -713,21 +728,23 @@ async def _handle_media_inner(
         except Exception:
             log.error("Failed to send error reply to media user %s", user.id, exc_info=True)
     except (TimeoutError, ConnectionError, OSError):
-        if streamer and streamer.accumulated_text:
+        rescued = _rescue_text(progress, streamer)
+        if rescued or (progress is not None and progress.any_delivered):
+            rescued = rescued or "(the connection dropped after the messages above)"
             log.warning(
                 "Connection error for media %s after streaming %d chars — delivering accumulated text",
                 user.id,
-                len(streamer.accumulated_text),
+                len(rescued),
             )
             try:
-                sent = await _reply_formatted(msg, streamer.accumulated_text)
+                sent = await _reply_formatted(msg, rescued)
                 if sent:
                     await _persist_tg_message(
                         ctx,
                         msg.chat.id,
                         sent.message_id,
                         "genesis",
-                        streamer.accumulated_text,
+                        rescued,
                         thread_id=tid,
                         direction="outbound",
                     )
@@ -775,7 +792,8 @@ async def _handle_media_inner(
             log.error("Failed to send error reply to media user %s", user.id, exc_info=True)
     finally:
         await typing_ka.stop()
-        status_task.cancel()
+        if progress is not None:
+            progress.stop()
         ctx.active_interrupts.pop(ikey, None)
         try:
             file_path.unlink(missing_ok=True)

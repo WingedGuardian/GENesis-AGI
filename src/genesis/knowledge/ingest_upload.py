@@ -320,7 +320,8 @@ async def _extract_with_pipeline(
         reasons = ", ".join(sorted({f[len(CREDENTIAL_NOT_STORED):] for f in missing}))
         incomplete = (
             f"Ingest incomplete: {len(missing)} credential unit(s) could not be stored "
-            f"({reasons}); the other units were stored."
+            f"({reasons}); "
+            + ("the other units were stored." if result.unit_ids else "no unit was stored.")
         )
         logger.warning("Upload %s ingested incomplete: %s", upload_id, incomplete)
     return result.unit_ids, incomplete

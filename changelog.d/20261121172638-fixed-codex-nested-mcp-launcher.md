@@ -1,0 +1,1 @@
+- Codex now finds the Genesis MCP launcher when started from a nested directory in a linked Git worktree.

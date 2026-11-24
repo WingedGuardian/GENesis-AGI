@@ -25,9 +25,9 @@ from genesis.routing.types import RoutingResult
 
 
 class Replay:
-    def __init__(self, case, messages, content, alias, model):
+    def __init__(self, case, messages, content, alias, model, served_model):
         self.case, self.messages, self.content = case, messages, content
-        self.alias, self.model = alias, model
+        self.alias, self.model, self.served_model = alias, model, served_model
         self.calls = 0
         self.scoping_calls = self.extraction_calls = 0
         self.errors = []
@@ -62,8 +62,10 @@ class Replay:
         else:
             self.errors.append("unexpected storage replay call")
             raise Incomplete(self.errors[-1])
-        return RoutingResult(success=True, call_site_id=call_site_id, content=content,
-                             provider_used=self.alias, model_id=self.model)
+        return RoutingResult(
+            success=True, call_site_id=call_site_id, content=content,
+            provider_used=self.alias, model_id=self.model, served_model=self.served_model,
+        )
 
 
 class OtherGates:
@@ -190,7 +192,7 @@ def insertion(before, after, stored, case, path, gates):
         raise Incomplete("storage replay inserted invalid generated identity/time")
 
 
-async def replay(case, messages, mapping, content, sandbox, alias, model):
+async def replay(case, messages, mapping, content, sandbox, alias, model, *, served_model):
     case, messages, mapping = load_json(canonical([case, messages, mapping]))
     corpus.validate_novelty(case)
     contracts.candidate_mapping(case, messages, mapping)
@@ -200,14 +202,21 @@ async def replay(case, messages, mapping, content, sandbox, alias, model):
     selected = contracts.candidate_mapping(case, probe.calls[0][0], rendered["candidate_ids"])
     if probe.calls[0][0] != messages or selected != mapping:
         raise Incomplete("storage replay differs from the actual production question")
+    # Both allowlists see the same response identity. Preflight supplies
+    # an explicitly synthetic identity.
+    response_matches = served_model == model or (
+        alias == extractor._OPENROUTER_NOVELTY_ALIAS and served_model == f"openrouter/{model}"
+    )
     outcomes = {}
     for promoted in (False, True):
         allowlist = dict(extractor._NOVELTY_VALIDATED_MODELS)
         if promoted:
             allowlist[alias] = model
+        suppression_authorized = response_matches and allowlist.get(alias) == model
         for path in ("judge", "extractor"):
             async with sandbox.database(case) as db:
-                router, gates = Replay(case, messages, content, alias, model), OtherGates()
+                router = Replay(case, messages, content, alias, model, served_model)
+                gates = OtherGates()
                 before = await committed_rows(db)
                 with (
                     patch.dict(extractor._NOVELTY_VALIDATED_MODELS, allowlist, clear=True),
@@ -230,7 +239,7 @@ async def replay(case, messages, mapping, content, sandbox, alias, model):
                         )
                 after = await committed_rows(db)
                 insertion(before, after, stored, case, path, gates)
-                expected_store = not gates.flags and (target is None or allowlist.get(alias) != model)
+                expected_store = not gates.flags and (target is None or not suppression_authorized)
                 if (router.errors or router.calls != (0 if "behavioral_directive" in gates.flags else 1)
                     or router.scoping_calls != 1 or router.extraction_calls != (path == "extractor")
                     or (stored is not None) != expected_store):
@@ -239,6 +248,6 @@ async def replay(case, messages, mapping, content, sandbox, alias, model):
                     "stored": stored is not None, "original_candidates_preserved": True,
                     "novelty_replayed": router.calls == 1, "other_gate_rejections": gates.flags,
                     "gates": gates.results, "provider": alias, "model": model,
-                    "raw_target": target, "suppression_authorized": allowlist.get(alias) == model,
+                    "raw_target": target, "suppression_authorized": suppression_authorized,
                 }
     return outcomes
