@@ -257,7 +257,8 @@ PR.** Review then looks at a change that works, not at its first attempt to run.
 Put what you ran and what you saw under the PR's `## Testing` section. The `E2E:`
 line keeps its meaning: the check to run AFTER the merge. For a hook that is still
 needed, because a pre-PR run tests the worktree copy, not the merged copy the
-harness fires.
+harness fires. When the build has a spec, the `E2E:` line cites the spec's `V-n`
+items (its `Definition of Verified`) that the PR delivers.
 
 **Work built from a spec converges against it before the PR.** Run the pass in
 `.claude/skills/spec-session/references/spec-converge.md`:
@@ -2119,11 +2120,10 @@ python interpreter with an adjacent `-m pytest`.
   through is a convention with better documentation.
 
 Before any "X is absent" or "nothing adoptable exists" claim, follow
-"Auditing Existing Capabilities" in `.claude/skills/spec-session/SKILL.md`.
+`.claude/skills/spec-session/references/existing-capabilities.md`.
 
 Before writing repo-local code that decides something about a pull request, read
-"Never reinvent what GitHub already does natively" in
-`.claude/skills/spec-session/SKILL.md`.
+`.claude/skills/spec-session/references/github-native.md`.
 
 ## Generalizability Gate — build for ANY install, not this one
 

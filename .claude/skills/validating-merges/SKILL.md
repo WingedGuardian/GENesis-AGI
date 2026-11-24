@@ -802,6 +802,13 @@ because each pilot broke a field the obvious version would have had:
   neighbour, because `pass-mechanical` asserts that nothing was left out. A claim
   this install cannot reach is `NOT_VERIFIABLE_HERE`. A claim you could have run
   but did not is a `not_yet_done` gap with its `command`, which keeps the row open.
+  **A PR built from a spec (its body carries a `Spec:` line) is verified against
+  the spec first:** read the spec's `Definition of Verified` section before the
+  PR's own claims, list each of its `A-n` and `V-n` items that the PR's plan parts
+  name as its own claim, with the item's id at the start of the claim text
+  (`V-2: ...`). The PR's `<met>/<total>` is then the count of those claims that
+  pass over the count listed; say it in your report. A PR that cites no spec is
+  verified against its own claims, as above.
 - **`e2e[]`** — explicit coverage of the PR's declared E2E work. Each entry has
   `step` (the exact declaration text without the `E2E:` prefix) and exactly one
   zero-based `claim` or `gap` index into `claims[]` or `gaps[]`, for example:
