@@ -4,3 +4,7 @@
 telegram:
   default_model: sonnet
   default_effort: medium
+  # Effort a model switch takes when it names no effort (an explicit effort
+  # always wins). Empty by default; set it in channels.local.yaml, e.g.
+  #   default_effort_by_model: {sonnet: high, opus: medium}
+  default_effort_by_model: {}
