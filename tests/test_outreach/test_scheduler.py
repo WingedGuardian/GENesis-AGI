@@ -771,7 +771,7 @@ async def test_drain_does_not_send_a_row_cancelled_after_the_snapshot(config, db
     ("configured", "subject", "channel", "text"),
     [
         ({"email"}, "relay", "email", "a & b"),
-        ({"email"}, "relay-summary", "email", "[s] Acted via m: used x; ended done."),
+        ({"email"}, "relay-summary", "email", '[s] Acted via m: used x; ended done. Session said: "/home/x/secret"'),
         ({"telegram", "email"}, "relay", "telegram", "a &amp; b"),
         ({"email"}, "Weekly", "telegram", "a &amp; b"),
         (set(), "relay", "telegram", "a &amp; b"),
@@ -798,4 +798,6 @@ async def test_drain_sends_a_relay_alert_by_email_where_telegram_is_absent(
 
     req = pipeline.submit.call_args[0][0]
     assert req.channel == channel and req.context == text
+    # A rerouted alert has one retry owner, its queue row.
+    assert req.defer_retry is not subject.startswith("relay")
 

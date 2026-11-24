@@ -74,9 +74,9 @@ async def _notify_owner_relay(
             f"is incomplete; ended {ended}."
         )
     channel = _owner_alert_channel()
-    # By email the model-written summary is left out: the outbound content scan
-    # could quarantine the whole alert over a path or address in it.
-    text = head if channel == "email" else f"{head} {relay.quoted(reason)}"
+    # The pipeline drops the summary only if the outbound content scan would
+    # otherwise block the alert (OutreachPipeline._relay_alert_without_summary).
+    text = f"{head} {relay.quoted(reason)}"
     await pending_outreach.enqueue(
         db,
         # Escaped where the channel renders HTML: the summary is model-written.
@@ -104,9 +104,10 @@ def _owner_alert_channel() -> str:
     channel = prefs.get("alert", prefs.get("default", "telegram"))
     # The queue's channel column is NOT NULL: a blank or null preference would
     # otherwise fail every finalization retry.
-    # Only an owner channel: a webhook channel would post the session's summary
-    # outside. A blank or unknown preference falls back to Telegram.
-    return channel if channel in ("telegram", "email") else "telegram"
+    # The agent channel carries peer envelopes, never an owner alert.
+    if not isinstance(channel, str) or not channel.strip() or channel == "agent":
+        return "telegram"
+    return channel
 
 
 def _failure_outcome(partial, error) -> tuple[str, str | None]:

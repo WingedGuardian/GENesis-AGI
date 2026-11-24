@@ -3757,7 +3757,11 @@ function submitOf(el) {
   const form = el && (el.form || (el.closest && el.closest('form')));
   // form.elements leaves out <input type=image>, which also submits.
   if (!form) return null;
-  const submits = [...form.elements, ...form.querySelectorAll('input[type=image]')]
+  // An image input outside the form can belong to it through form="<id>".
+  const outside = form.id
+    ? [...document.querySelectorAll('input[type=image][form="' + CSS.escape(form.id) + '"]')]
+    : [];
+  const submits = [...form.elements, ...form.querySelectorAll('input[type=image]'), ...outside]
     .filter((e) => e.type === 'submit' || e.type === 'image'
       || (e.tagName === 'BUTTON' && !e.getAttribute('type')));
   // The browser submits through the first one in tree order.
@@ -3765,16 +3769,33 @@ function submitOf(el) {
   return submits[0] || null;
 }
 """
-_FOCUSED_LABEL_JS = "() => {" + _LABEL_FN + _SUBMIT_FN + r"""
+# What a key press on the focused control would activate, for kind "enter" or
+# "space": the form's submit for Enter in a one-line field, the control itself
+# for a button or link, and nothing where the key only types or toggles.
+_FOCUSED_LABEL_JS = "(kind) => {" + _LABEL_FN + _SUBMIT_FN + r"""
   let el = document.activeElement;
   while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
   if (!el || el === document.body) return '';
-  // Enter in a dropdown or list picks an option; it does not submit the form.
+  const tag = el.tagName;
+  const type = (el.getAttribute && (el.getAttribute('type') || '')).toLowerCase();
   const role = (el.getAttribute && el.getAttribute('role')) || '';
-  if (el.tagName === 'SELECT' || ['combobox', 'listbox', 'option', 'menu', 'menuitem'].includes(role)) {
-    return label(el);
+  const multiline = tag === 'TEXTAREA' || el.isContentEditable;
+  const typing = multiline || (tag === 'INPUT' && !['button', 'submit', 'image', 'reset',
+    'checkbox', 'radio', 'file', 'color', 'range'].includes(type));
+  if (typing) return kind === 'enter' && !multiline ? label(submitOf(el)) : '';
+  // Enter on a checkbox, radio or range submits the form (measured, Chromium);
+  // Space only toggles it.
+  if (['checkbox', 'radio', 'range'].includes(type)) {
+    return kind === 'enter' ? label(submitOf(el)) : '';
   }
-  return label(el) + ' ' + label(submitOf(el));
+  // Picking from a list or a menu never submits the form.
+  if (tag === 'SELECT' || ['combobox', 'listbox', 'option', 'menu', 'menuitem',
+      'checkbox', 'radio', 'switch'].includes(role)) return '';
+  // Space activates only a button; Enter also follows a link.
+  const button = tag === 'BUTTON' || role === 'button'
+    || (tag === 'INPUT' && ['button', 'submit', 'image', 'reset'].includes(type));
+  if (kind === 'space' && !button) return '';
+  return button || tag === 'A' ? label(el) : '';
 }"""
 # What a line break typed into el would submit: nothing in a multi-line box.
 _NEWLINE_SUBMIT_LABEL_JS = "(el) => {" + _LABEL_FN + _SUBMIT_FN + r"""
@@ -3809,7 +3830,8 @@ async def _relay_key_refusal(page, key: str) -> dict | None:
     if not _relayed() or (key.rsplit("+", 1)[-1] or key) not in _SUBMIT_KEYS:
         return None
     try:
-        text = await asyncio.wait_for(page.evaluate(_FOCUSED_LABEL_JS), timeout=3.0)
+        kind = "space" if (key.rsplit("+", 1)[-1] or key) in {"Space", " "} else "enter"
+        text = await asyncio.wait_for(page.evaluate(_FOCUSED_LABEL_JS, kind), timeout=3.0)
     except Exception:
         return None  # best effort: what cannot be read is allowed
     if _PURCHASE_WORDS.search(str(text or "")):
@@ -3924,6 +3946,8 @@ async def _click_and_follow(page, selector: str) -> dict:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(arrived.wait(), timeout=remaining)
     except Exception as e:
+        if isinstance(e, RelayPurchaseRefused):
+            raise  # _impl_browser_click reports it as the refusal
         return await _with_stall_diagnostics(
             _click_failed(selector, e), page, selector, e, "browser_click", nav
         )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import html
 import logging
 
@@ -787,6 +788,7 @@ class OutreachScheduler:
                     # real v3.0b18 announcement, caught before it drained.
                     raw_channel = row.get("channel", "telegram")
                     message = row["message"]
+                    rerouted = False
                     if (
                         raw_channel == "telegram"
                         and row.get("email_subject") == OWNER_RELAY_ALERT_SUBJECT
@@ -795,12 +797,9 @@ class OutreachScheduler:
                     ):
                         # A relay alert must reach the owner: on an install with
                         # email and no Telegram it goes by email, as plain text
-                        # (it was queued escaped for Telegram's HTML), and without
-                        # the session's own summary, which the outbound content
-                        # scan could quarantine (as managed_session does by email).
-                        head = message.split(" Session said: ", 1)[0]
-                        head = head.split(" No summary recorded.", 1)[0]
-                        raw_channel, message = "email", html.unescape(head)
+                        # (it was queued escaped for Telegram's HTML).
+                        raw_channel, message = "email", html.unescape(message)
+                        rerouted = True
                     is_discord_subchannel = raw_channel in _DISCORD_CHANNELS
                     channel = "discord" if is_discord_subchannel else raw_channel
 
@@ -827,6 +826,10 @@ class OutreachScheduler:
                         # the LLM drafter must never re-word a stored message.
                         verbatim=True,
                     )
+                    if rerouted or row.get("email_subject") == OWNER_RELAY_ALERT_SUBJECT:
+                        # A relay alert's queue row is its one retry owner: no
+                        # second copy in the deferred-work queue.
+                        req = dataclasses.replace(req, defer_retry=False)
                     if channel == "agent":
                         from genesis.peers.outbox import PeerEnvelope
 

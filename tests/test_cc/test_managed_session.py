@@ -1647,7 +1647,7 @@ async def test_an_email_owner_alert_carries_the_relay_subject(db, native, monkey
         await db.execute("SELECT channel, email_subject, message FROM pending_outreach")
     ).fetchone()
     assert row["channel"] == "email" and row["email_subject"] == OWNER_RELAY_ALERT_SUBJECT
-    assert "Session said" not in row["message"]  # no model text by email
+    assert "Session said" in row["message"] or "No summary recorded." in row["message"]
 
 
 async def test_a_relayed_session_cancelled_before_launch_sends_no_owner_alert(db, native):

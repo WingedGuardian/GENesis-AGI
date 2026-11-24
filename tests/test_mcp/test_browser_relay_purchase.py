@@ -62,7 +62,7 @@ class _Page:
     def locator(self, selector):
         return type("L", (), {"first": self.target})()
 
-    async def evaluate(self, script):
+    async def evaluate(self, script, *args):
         if isinstance(self.focused, Exception):
             raise self.focused
         return self.focused
@@ -311,13 +311,13 @@ def test_the_focus_script_reads_the_form_submit_shadow_roots_and_frames(real_pag
         "<form><input id=q><button>Place order</button></form>"
     )
     real_page.focus("#q")
-    assert browser._PURCHASE_WORDS.search(real_page.evaluate(browser._FOCUSED_LABEL_JS))
+    assert browser._PURCHASE_WORDS.search(real_page.evaluate(browser._FOCUSED_LABEL_JS, "enter"))
     real_page.set_content("<div id=h></div>")
     real_page.evaluate(
         "() => { const r = document.getElementById('h').attachShadow({mode: 'open'});"
         " r.innerHTML = '<button>Pay now</button>'; r.querySelector('button').focus(); }"
     )
-    assert browser._PURCHASE_WORDS.search(real_page.evaluate(browser._FOCUSED_LABEL_JS))
+    assert browser._PURCHASE_WORDS.search(real_page.evaluate(browser._FOCUSED_LABEL_JS, "enter"))
     real_page.set_content(
         "<form><textarea id=t></textarea><input id=i><button>Place order</button></form>"
     )
@@ -343,7 +343,7 @@ def test_place_a_bid_and_image_submits_are_covered(real_page):
         "<form><input id=q><input type=image alt='Place order' src='data:,'></form>"
     )
     real_page.focus("#q")
-    assert browser._PURCHASE_WORDS.search(real_page.evaluate(browser._FOCUSED_LABEL_JS))
+    assert browser._PURCHASE_WORDS.search(real_page.evaluate(browser._FOCUSED_LABEL_JS, "enter"))
 
 
 
@@ -367,12 +367,12 @@ def test_the_form_submit_follows_tree_order_and_dropdowns_are_free(real_page):
         "<button>Save for later</button></form>"
     )
     real_page.focus("#q")
-    assert browser._PURCHASE_WORDS.search(real_page.evaluate(browser._FOCUSED_LABEL_JS))
+    assert browser._PURCHASE_WORDS.search(real_page.evaluate(browser._FOCUSED_LABEL_JS, "enter"))
     real_page.set_content(
         "<form><select id=s><option>Small</option></select><button>Place order</button></form>"
     )
     real_page.focus("#s")
-    assert not browser._PURCHASE_WORDS.search(real_page.evaluate(browser._FOCUSED_LABEL_JS))
+    assert not browser._PURCHASE_WORDS.search(real_page.evaluate(browser._FOCUSED_LABEL_JS, "enter"))
 
 
 def test_the_enclosing_buttons_own_labels_are_read(real_page):
@@ -406,4 +406,42 @@ async def test_a_refused_keyboard_fallback_stops_the_click(monkeypatch):
         await browser._stealth_click(page, "#go", timeout=10)
     page.keyboard.press.assert_not_awaited()
     shadow.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("html", "focus", "kind", "purchase"),
+    [
+        ("<form><input id=f><button>Place order</button></form>", "#f", "enter", True),
+        ("<form><input id=f><button>Place order</button></form>", "#f", "space", False),
+        ("<form><textarea id=f></textarea><button>Place order</button></form>", "#f", "enter", False),
+        ("<form><input id=f type=checkbox><button>Pay</button></form>", "#f", "space", False),
+        ("<form><button id=f>Pay now</button></form>", "#f", "space", True),
+        ("<form id=c><input id=f></form><input type=image form=c alt='Pay now' src='data:,'>", "#f", "enter", True),
+        ("<form><input id=f type=checkbox><button>Pay</button></form>", "#f", "enter", True),
+        ("<form><div id=f role=option tabindex=0>Pay by card</div><button>Next</button></form>", "#f", "enter", False),
+        ("<div id=f tabindex=0>Subscribe to our list</div>", "#f", "space", False),
+        ("<a id=f href=#>Buy now</a>", "#f", "enter", True),
+    ],
+)
+def test_what_a_key_press_would_activate(real_page, html, focus, kind, purchase):
+    real_page.set_content(html)
+    real_page.focus(focus)
+    text = real_page.evaluate(browser._FOCUSED_LABEL_JS, kind)
+    assert bool(browser._PURCHASE_WORDS.search(text)) is purchase
+
+
+@pytest.mark.asyncio
+async def test_a_fallback_refusal_reaches_the_caller_as_a_refusal(tool_page, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    async def refuse(page, selector, timeout=10000):
+        raise browser.RelayPurchaseRefused()
+
+    monkeypatch.setattr(browser, "_stealth_click", refuse)
+    monkeypatch.setattr(browser, "_human_delay", AsyncMock())
+    monkeypatch.setattr(browser, "_declares_new_tab", AsyncMock(return_value=False))
+    tool_page(_tool_page(label="Continue"))
+    with request_caller(RELAYED):
+        result = await browser._impl_browser_click("#go")
+    assert result["code"] == "relay_purchase_refused"
 
