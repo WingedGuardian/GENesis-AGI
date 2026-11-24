@@ -890,9 +890,13 @@ jobs:
         # actual systemd resource scope"; needs GENESIS_DREAM_NATIVE_E2E=1, which
         # no CI job sets). The only id new between main runs 45284169203 (607)
         # and 45291106068 (608), 607 -> 608.
+        # Native validator writers (#4973): two more opt-in cases, the
+        # "inconclusive" and "failed" verdicts in test_validator_writers_native.py
+        # CASES, skipped without the native Codex stack. Its PR run 44965596357
+        # measured 609 on a 607 base, so 608 + 2 = 610.
         env:
           GENESIS_JUNIT_REPORT: ${{ steps.census_prepare.outcome == 'success' && steps.census_prepare.outputs.junit_report || 'junit.xml' }}
-        run: python scripts/check_skip_ceiling.py "$GENESIS_JUNIT_REPORT" --ceiling 608
+        run: python scripts/check_skip_ceiling.py "$GENESIS_JUNIT_REPORT" --ceiling 610
 
   test-ubuntu-2404:
     # ubuntu-latest is moving to 26.04, so `test` alone stops showing a break on
