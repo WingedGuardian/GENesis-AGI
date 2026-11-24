@@ -1,0 +1,1 @@
+- Verification CLI previews preserve committed WAL data without checkpointing the database, including recheck previews and filenames containing URI characters.

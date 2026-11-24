@@ -8,10 +8,10 @@ Genesis starts unattended must say so.
 
 The guarantee is structural: ``genesis.util.codex_cli`` is the only place under
 ``src/genesis`` that names the Codex binary, and every spawn of its argv must
-pass its marked environment. The ban test fails on any other mention of the
-word ``codex`` in a string literal, except docstrings and logging messages,
-which cannot start a process. A name assembled from pieces, or read from
-configuration, is not a literal and is out of its reach.
+pass its marked environment. The ban test scans string literals for the word
+``codex`` and exempts docstrings, logging messages, and known read-only
+references. The scan covers literal names. Names assembled at runtime or read
+from configuration are outside its scope.
 
 Scope is ``src/genesis``, the code that runs unattended. Scripts under
 ``scripts/`` are operator-run; the one Codex spawn there, the validator
@@ -53,6 +53,14 @@ ALLOWED = {
     # The infra:codex_mcp_held alert text names the app-server it measures.
     "mcp/health/errors.py": 1,
 }
+# The event shape includes its positional metadata. Keyword details remain
+# subject to the scanner and may evolve independently.
+INVENTORY_FILE = "sentinel/codex_mcp_inventory.py"
+INVENTORY_METADATA = (
+    'EVENT_TYPE = "codex.mcp_inventory"',
+    'root = Path(codex_home).expanduser() if codex_home else Path.home() / ".codex"',
+    'bus.emit(Subsystem.HEALTH, Severity.DEBUG, EVENT_TYPE, "Sampled Codex MCP inventory")',
+)
 _LOG_METHODS = frozenset({"debug", "info", "warning", "error", "exception", "critical", "log"})
 
 
@@ -170,14 +178,31 @@ def _excluded_constants(tree: ast.AST) -> set[int]:
     return excluded
 
 
-def _codex_literals(tree: ast.AST) -> list[int]:
+def _metadata_constants(tree: ast.AST, statements: tuple[str, ...]) -> set[int]:
+    if not statements:
+        return set()
+    parsed = ast.parse("\n".join(statements))
+    remaining = {ast.dump(node.value if isinstance(node, ast.Expr) else node) for node in parsed.body}
+    allowed = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            node = ast.Call(func=node.func, args=node.args, keywords=[])
+        elif not isinstance(node, ast.Assign):
+            continue
+        shape = ast.dump(node)
+        if shape in remaining:
+            remaining.remove(shape)
+            allowed.update(id(item) for item in ast.walk(node) if isinstance(item, ast.Constant))
+    return allowed
+
+
+def _codex_literals(tree: ast.AST, *, allowed_metadata: tuple[str, ...] = ()) -> list[int]:
     """Line numbers of string literals that mention the Codex binary.
 
-    Everything but docstrings and logging messages counts, whatever the
-    surrounding call looks like, so the ban does not depend on recognising the
-    shape of a spawn.
+    Docstrings, logging and explicitly matched metadata are excluded. Every
+    other mention counts regardless of how it is used.
     """
-    excluded = _excluded_constants(tree)
+    excluded = _excluded_constants(tree) | _metadata_constants(tree, allowed_metadata)
     return [
         node.lineno
         for node in ast.walk(tree)
@@ -223,12 +248,35 @@ def test_ban_scanner_ignores_docstrings_logging_and_other_words():
     assert _codex_literals(ast.parse(src)) == []
 
 
+@pytest.mark.parametrize(
+    "statement",
+    [
+        'subprocess.Popen(["codex", "exec", "-"])',
+        'subprocess.Popen([".codex"])',
+        'subprocess.Popen(["codex.mcp_inventory"])',
+        INVENTORY_METADATA[0],
+    ],
+)
+def test_inventory_metadata_allowance_still_flags_other_uses(statement):
+    tree = ast.parse("\n".join((*INVENTORY_METADATA, statement)))
+    assert _codex_literals(tree, allowed_metadata=INVENTORY_METADATA) == [4]
+
+
+def test_inventory_event_details_stay_subject_to_the_scanner():
+    dispatch = INVENTORY_METADATA[-1]
+    with_details = f'{dispatch[:-1]}, paging=comparison,\n detail="codex")'
+    assert _codex_literals(ast.parse(with_details), allowed_metadata=INVENTORY_METADATA) == [2]
+
+
 def test_codex_is_named_only_in_the_chokepoint():
     seen_chokepoint = False
     unexpected = []
     for path in sorted(SRC.rglob("*.py")):
         rel = path.relative_to(SRC).as_posix()
-        hits = _codex_literals(ast.parse(path.read_text(), str(path)))
+        hits = _codex_literals(
+            ast.parse(path.read_text(), str(path)),
+            allowed_metadata=INVENTORY_METADATA if rel == INVENTORY_FILE else (),
+        )
         if rel == CHOKEPOINT:
             seen_chokepoint = bool(hits)
             continue

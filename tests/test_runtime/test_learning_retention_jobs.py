@@ -113,3 +113,48 @@ async def test_graph_traverse_prune_removes_only_old_telemetry(db, tmp_path, mon
         ("recall_trace", '{"k": "other-type"}'),
     ]
     assert lost.read_text() == '{"ts": "2999-01-01T00:00:00.000000Z"}\n'
+
+
+async def test_codex_inventory_has_its_own_retention_cutoff(db, monkeypatch):
+    from datetime import UTC, datetime, timedelta
+    from unittest.mock import AsyncMock
+
+    from genesis.observability.events import GenesisEventBus
+    from genesis.observability.types import Severity, Subsystem
+    from genesis.sentinel import codex_mcp_inventory as inventory
+
+    now = datetime.now(UTC)
+    clock = now - timedelta(hours=73)
+    bus = GenesisEventBus(clock=lambda: clock)
+    bus.enable_persistence(db)
+    monkeypatch.delenv("GENESIS_CODEX_MCP_INVENTORY_DISABLED", raising=False)
+    monkeypatch.setattr(inventory.codex_mcp_stop, "load_mode", lambda: "propose_only")
+    monkeypatch.setattr(inventory, "_latest", None)
+    collect = AsyncMock(side_effect=lambda: inventory.Inventory(
+        clock.isoformat(), "complete", daemon=("boot", 1, 100),
+        threads=frozenset({"fixture-thread"}), groups=frozenset({(99, 100)}),
+    ))
+    monkeypatch.setattr(inventory, "collect", collect)
+    try:
+        await inventory.sample(bus)
+        await bus.emit(Subsystem.HEALTH, Severity.DEBUG, "ordinary_event", "Retain by normal policy")
+        clock = now
+        await inventory.sample(bus)
+    finally:
+        await bus.stop()
+    assert collect.await_count == 2
+    before = await db.execute_fetchall("SELECT details FROM events WHERE event_type = ?", (inventory.EVENT_TYPE,))
+    assert len(before) == 2
+    assert all("fixture-thread" not in row[0] for row in before)
+
+    rt = _StubRT()
+    rt._db = db
+    sched = AsyncIOScheduler()
+    _wire_drip_retention_jobs(sched, rt)
+    sched.start(paused=True)
+    try:
+        await sched.get_job("events_prune").func()
+    finally:
+        sched.shutdown(wait=False)
+    remaining = await db.execute_fetchall("SELECT event_type FROM events ORDER BY timestamp")
+    assert [row[0] for row in remaining] == ["ordinary_event", inventory.EVENT_TYPE]

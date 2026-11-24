@@ -123,8 +123,10 @@ READINESS (add and rebuild): the commits in deploy_candidates_gate.REQUIRED_MERG
 and PR C's file (PR_C_MARKER) are in the server's base (merge-base of the
 commit it booted from and origin/main), and every git hook and helper
 sync-hooks.sh installs is byte-identical to its source at HEAD, in the directory
-git runs hooks from. PR C (the wipers rebuild `live`) has not merged, so every
-install refuses and the engine ships INERT.
+git runs hooks from. Where a host guardian is configured, the deployed commit its
+last probe recorded (~/.genesis/host_gateway_state.json) must also carry the host
+guardian's `live` ban (deploy_candidates_gate.HOST_REQUIRED), since REVERT_CODE
+runs on the host from that commit.
 
 ADMISSION (v1): a candidate whose diff against its merge base with origin/main
 changes a migration or the boot-time schema, the host guardian's own files,
