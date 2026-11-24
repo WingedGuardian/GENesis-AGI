@@ -2008,12 +2008,14 @@ def test_a_busy_checkout_lock_keeps_the_harmless_update_record(
     assert state.exists() and json.loads(state.read_text()) == record
 
 
-def test_a_refused_manifest_write_keeps_the_harmless_update_record(
+def test_a_refused_manifest_write_after_the_retirement_names_the_removal(
     dc, dc_ready, capsys, monkeypatch
 ):
-    """drop's save() refused: "this drop wrote nothing" holds for the record too."""
+    """Round 1: drop's save() retires the record first, so a manifest write that
+    then refuses says the manifest is unchanged AND that the leftover went."""
     w = dc_ready
-    state, record, argv = _harmless_record_world(dc, w, capsys, "drop")
+    state, _, argv = _harmless_record_world(dc, w, capsys, "drop")
+    before = w.manifest_path.read_text()
 
     def refuse(self, change):
         raise dc.core.Refusal("the manifest could not be written; nothing changed.")
@@ -2021,8 +2023,48 @@ def test_a_refused_manifest_write_keeps_the_harmless_update_record(
     monkeypatch.setattr(dc.manifest.ManifestStore, "update", refuse)
     assert w.run(dc, *argv) == 1
     err = capsys.readouterr().err
-    assert "The manifest is unchanged" in err, err
-    assert state.exists() and json.loads(state.read_text()) == record
+    assert "The manifest is unchanged" in err and "WAS saved" not in err, err
+    assert "harmless update_state.json leftover was removed" in err, err
+    assert not state.exists() and w.manifest_path.read_text() == before
+
+
+def test_a_refused_manifest_write_with_no_leftover_names_no_removal(
+    dc, dc_ready, capsys, monkeypatch
+):
+    w = dc_ready
+    _, _, argv = _harmless_record_world(dc, w, capsys, "drop")
+    (w.home / ".genesis" / "update_state.json").unlink()
+
+    def refuse(self, change):
+        raise dc.core.Refusal("the manifest could not be written; nothing changed.")
+
+    monkeypatch.setattr(dc.manifest.ManifestStore, "update", refuse)
+    assert w.run(dc, *argv) == 1
+    err = capsys.readouterr().err
+    assert "The manifest is unchanged" in err and "leftover was removed" not in err, err
+
+
+def test_a_retirement_that_cannot_unlink_leaves_no_half_drop(dc, dc_ready, capsys, monkeypatch):
+    """Round 1: the unlink refuses before the manifest write, so feat/b is still
+    listed (no half-drop) and a retry once the file can go drops it."""
+    w = dc_ready
+    state, record, argv = _harmless_record_world(dc, w, capsys, "drop")
+    before = w.manifest_path.read_text()
+    real = os.unlink
+
+    def unlink(path, *a, **kw):
+        if str(path).endswith("update_state.json"):
+            raise PermissionError("read-only")
+        return real(path, *a, **kw)
+
+    monkeypatch.setattr(dc.os, "unlink", unlink)
+    assert w.run(dc, *argv) == 1
+    err = capsys.readouterr().err
+    assert "The manifest is unchanged" in err and "WAS saved" not in err, err
+    assert w.manifest_path.read_text() == before and json.loads(state.read_text()) == record
+    monkeypatch.setattr(dc.os, "unlink", real)
+    assert w.run(dc, *argv) == 0, capsys.readouterr()
+    assert not state.exists()
 
 
 @pytest.mark.parametrize("command", ["rebuild", "drop"])

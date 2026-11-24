@@ -602,3 +602,27 @@ async def test_the_backoff_runs_from_the_actions_end_counted_once():
         await engine.execute(_drop_diagnosis(RecoveryAction.RESTART_SERVICES))
     assert engine._sm.state.recovery_attempts == 1
     assert engine._sm.recovery_backoff_remaining_s("RESTART_SERVICES") > 95
+
+
+async def test_a_checkpoint_that_cannot_be_saved_runs_nothing(tmp_path):
+    """Round 1: no action starts without its outcome-unknown checkpoint on disk."""
+    engine, path = _loaded_engine(tmp_path, _PRIOR)
+    st = engine._sm.state
+    st.recovery_attempts, st.last_recovery_at = 1, "2000-01-01T00:00:00+00:00"
+    st.down_alert_sent = True
+    before = {**st.to_dict(), "down_alert_sent": False}  # the next check re-decides
+    action = AsyncMock(return_value=(True, "ran"))
+    sent = AsyncMock()
+    with (
+        patch.object(engine, "_execute_action", action),
+        patch.object(engine._sm, "save_state", MagicMock(return_value=False)),
+        patch.object(engine._dispatcher, "send", sent),
+    ):
+        result = await engine.execute(_drop_diagnosis())
+    action.assert_not_awaited()
+    assert not result.success and not result.deferred
+    assert [a.args[0].severity.value for a in sent.await_args_list] == ["critical"]
+    alert = sent.await_args.args[0]
+    assert "could not save its state before REVERT_CODE; nothing was run" in alert.title + alert.body
+    assert str(path) in alert.body and "next check" in alert.body
+    assert engine._sm.state.to_dict() == before

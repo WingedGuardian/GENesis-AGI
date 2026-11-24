@@ -178,12 +178,41 @@ class RecoveryEngine:
         # The outcome-unknown end state, on disk before anything runs (#5007): a
         # tick killed from here on wakes in RECOVERED with the attempt counted,
         # and a drop's attempt recorded, so its next tick has a next decision.
+        st = self._sm.state
+        kept = (st.recovery_attempts, st.io_triage_attempts, st.last_recovery_at,
+                st.current_state, st.live_drop_attempt, self._prior_attempt)
         self._sm.record_recovery_attempt(action.value)
         self._sm.set_recovered()
         drop = self._approved_drop(diagnosis)
         if drop is not None:
             self._mark_drop_attempt(drop)
-        self._sm.persist()
+        # The checkpoint carries the episode's alert latch CLEAR, on disk only: a
+        # tick killed during the action then gets a fresh diagnosis, as one
+        # killed before this ever did (a drop's also passes on after_action).
+        latch = st.down_alert_sent
+        st.down_alert_sent = False
+        saved = self._sm.persist()
+        st.down_alert_sent = latch
+        if not saved:
+            # No action starts without its checkpoint on disk: put it all back,
+            # and clear the latch (a prompt that led nowhere), so the next
+            # check decides again.
+            (st.recovery_attempts, st.io_triage_attempts, st.last_recovery_at,
+             st.current_state, st.live_drop_attempt, self._prior_attempt) = kept
+            self._sm.clear_down_alert_sent()
+            detail = (
+                f"the Guardian could not save its state before {action.value}; nothing was run"
+            )
+            await self._dispatcher.send(Alert(
+                severity=AlertSeverity.CRITICAL,
+                title=f"Recovery not started: {detail}",
+                body=(
+                    f"{detail}. State file: {self._sm.path} (see the Guardian log). "
+                    "The next check diagnoses and asks again."
+                ),
+                proposed_action=action.value,
+            ))
+            return RecoveryResult(action=action, success=False, detail=detail, duration_s=0.0)
 
         # Pre-recovery alert
         await self._dispatcher.send(Alert(

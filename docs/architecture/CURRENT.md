@@ -2899,16 +2899,19 @@ verified: 204c69c1f 2026-11-22
   Off, the
   behaviour above is unchanged and no candidate is read. On every install
   (#5007): each approved action, before it runs, counts its attempt and saves
-  RECOVERED to disk (the backoff is re-stamped when it ends), and a SIGTERM
-  (systemd's stop or TimeoutStartSec) cancels the tick, so the state is still
-  saved and a running `incus exec` client is killed; a RECOVERING read from
-  disk is a killed tick's and goes on as RECOVERED. A gate wait killed that
-  way keeps the episode's alert latch, so the episode stays quiet until the
-  CONFIRMED_DEAD auto-reset. An approved action held back by a finite backoff
-  of at most 900 s is waited out inside the tick, then runs unless Genesis is
-  back; a proposal whose own budget is spent (IO_TRIAGE's counter included)
-  becomes ESCALATE on the re-diagnosis path before Gate 1, and on every path
-  before Gate 2. The diagnosis
+  RECOVERED to disk (the backoff is re-stamped when it ends); when that save
+  fails, nothing runs, the checkpoint's changes are put back, the episode's
+  alert latch is cleared so the next check asks again, and one CRITICAL alert
+  names the state file. The checkpoint is written with that latch clear (on
+  disk only). A killed tick (systemd's stop or TimeoutStartSec) saves nothing
+  more, so the disk holds either that checkpoint (outcome unknown: the next
+  tick diagnoses afresh) or the previous tick's state; a RECOVERING read from disk goes on as RECOVERED. A cancelled
+  `incus exec` client is killed and reaped. An approved action held back by a
+  backoff of at most 900 s (one that ran out between two reads included) is
+  waited out inside the tick, then runs unless Genesis is back, paused, or the
+  Guardian stood down (the latch is then cleared, as on a DENY); a proposal whose own budget is spent (IO_TRIAGE's
+  counter for IO_TRIAGE, the main one for the rest) becomes ESCALATE on the
+  re-diagnosis path before Gate 1, and on every path before Gate 2. The diagnosis
   snapshot carries the boot repair's
   `live-move repair:` journal lines and a summary of the newest
   `deploy-backups/*-live-move-repair/REPAIR.json` that is neither dismissed

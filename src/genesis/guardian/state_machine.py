@@ -212,21 +212,27 @@ class ConfirmationStateMachine:
             logger.warning("State file corrupted, starting fresh: %s", exc)
             self._state = StateData()
 
-    def save_state(self, path: Path) -> None:
-        """Persist state to disk atomically."""
-        path.parent.mkdir(parents=True, exist_ok=True)
+    def save_state(self, path: Path) -> bool:
+        """Persist state to disk atomically. True once it is on disk."""
         tmp = path.with_suffix(".tmp")
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_text(json.dumps(self._state.to_dict(), indent=2))
             tmp.replace(path)
         except OSError as exc:
             logger.error("Failed to save state: %s", exc, exc_info=True)
+            return False
+        return True
 
-    def persist(self) -> None:
+    @property
+    def path(self) -> Path | None:
+        return self._path
+
+    def persist(self) -> bool:
         """Save to the path load_state read, mid-tick (#5007): a tick killed
-        later still leaves this on disk. No path read (tests): nothing."""
-        if self._path is not None:
-            self.save_state(self._path)
+        later still leaves this on disk. False when it could not be saved; no
+        path read (tests): nothing written, True."""
+        return self._path is None or self.save_state(self._path)
 
     def recovery_backoff_remaining_s(self, action: str = "") -> float:
         """Seconds remaining before next recovery attempt is allowed.
@@ -870,9 +876,9 @@ class ConfirmationStateMachine:
         self._state.down_alert_sent = False
 
     def should_escalate(self, action: str = "") -> bool:
-        """Max recovery attempts exceeded: the main budget, or IO_TRIAGE's own
-        when that is the proposed action (#5007), the counter execute() reads."""
-        if self._state.recovery_attempts >= self._config.recovery.max_escalations:
-            return True
-        max_io = getattr(self._config.recovery, "max_io_triage_attempts", 5)
-        return action == "IO_TRIAGE" and self._state.io_triage_attempts >= max_io
+        """Max recovery attempts exceeded for the proposed action's OWN budget
+        (#5007), the counter execute() reads: IO_TRIAGE's, or the main one."""
+        if action == "IO_TRIAGE":
+            max_io = getattr(self._config.recovery, "max_io_triage_attempts", 5)
+            return self._state.io_triage_attempts >= max_io
+        return self._state.recovery_attempts >= self._config.recovery.max_escalations

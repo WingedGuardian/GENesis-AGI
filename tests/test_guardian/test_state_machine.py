@@ -738,4 +738,14 @@ class TestKilledTickState:
         assert sm.should_escalate("RESTART_SERVICES") is False
         sm._state.io_triage_attempts = 0
         sm._state.recovery_attempts = config.recovery.max_escalations
-        assert sm.should_escalate("IO_TRIAGE") is True  # main budget spent: escalate as before
+        assert sm.should_escalate("IO_TRIAGE") is False  # its own budget only (round 1)
+        assert sm.should_escalate("RESTART_SERVICES") is True
+
+
+def test_save_state_reports_whether_it_saved(tmp_path: Path) -> None:
+    sm = ConfirmationStateMachine(GuardianConfig())
+    assert sm.save_state(tmp_path / "state.json") is True
+    (tmp_path / "dir.json").mkdir()  # replace() onto a directory fails
+    assert sm.save_state(tmp_path / "dir.json") is False
+    sm.load_state(tmp_path / "dir.json")
+    assert sm.persist() is False
