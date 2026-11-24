@@ -9,6 +9,7 @@ The container is a fake that answers each command by what it contains."""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from dataclasses import replace
@@ -19,7 +20,11 @@ import pytest
 
 from genesis.guardian import live_drop
 from genesis.guardian.alert.telegram import _utf16_units
-from genesis.guardian.check import _execute_recovery_with_approval, _gate2_cause
+from genesis.guardian.check import (
+    _execute_recovery_with_approval,
+    _gate2_cause,
+    _handle_confirmed_dead,
+)
 from genesis.guardian.collector import DiagnosticSnapshot, collect_diagnostics
 from genesis.guardian.config import GuardianConfig, RecoveryConfig, load_config
 from genesis.guardian.diagnosis import (
@@ -297,6 +302,64 @@ async def test_an_unreadable_view_after_an_attempt_names_the_drop_in_the_restart
     got = await _propose(Container(None), _attempt())
     assert got.recommended_action == RecoveryAction.RESTART_CONTAINER
     assert "feat/b" in got.likely_cause and "may still be running" in got.likely_cause
+
+
+@pytest.mark.parametrize(
+    "shared,needle",
+    [
+        ({"feat/b": ["feat/a"], "feat/a": ["feat/b"]}, "leave `live` with it: feat/a"),
+        ({}, "No other candidate on `live` shares its commits"),
+        (None, "could not list"),
+    ],
+)
+async def test_gate_2_names_every_candidate_that_leaves_with_the_drop(shared, needle):
+    view = _view()
+    if shared is not None:
+        view["shared"] = shared
+    got = await _propose(Container(view))
+    assert got.drop_candidate is not None and needle in got.likely_cause
+
+
+@pytest.mark.parametrize("state", ["error", "foreign"])
+async def test_an_unread_manifest_is_never_read_as_an_empty_one(state):
+    """observe() lists nothing when the manifest cannot be read: held candidates
+    must not read as dropped, nor the attempted one as gone."""
+    view = _view(listed=())
+    view["manifest"] = {"state": state, "reason": "x"}
+    got = await _propose(Container(view, boot=_boot(TIP, TIP)), _attempt())
+    assert got.recommended_action == RecoveryAction.RESTART_CONTAINER
+    assert got.drop_candidate is None and "could not be read" in got.likely_cause
+
+
+async def test_a_sick_server_after_a_drop_gets_exactly_one_more_diagnosis():
+    """The episode's one-alert latch would otherwise keep the next-candidate
+    proposal from ever running."""
+    config = _armed()
+    sm = ConfirmationStateMachine(config)
+    sm.mark_down_alert_sent()
+    sm.mark_live_drop_followup()
+    assert StateData.from_dict(sm.state.to_dict()).live_drop_followup is True
+    collect = AsyncMock(side_effect=RuntimeError("stop here"))
+
+    async def run() -> None:
+        with (
+            patch("genesis.guardian.check.collect_diagnostics", collect),
+            contextlib.suppress(RuntimeError),
+        ):
+            await _handle_confirmed_dead(config, sm, AsyncMock(), AsyncMock(), AsyncMock())
+
+    await run()
+    assert collect.await_count == 1 and sm.state.live_drop_followup is False
+    sm.mark_down_alert_sent()
+    await run()
+    assert collect.await_count == 1  # the latch holds again
+
+
+def test_a_genuine_recovery_clears_the_follow_up():
+    sm = ConfirmationStateMachine(_armed())
+    sm.mark_live_drop_followup()
+    sm.clear_down_alert_sent()
+    assert sm.state.live_drop_followup is False
 
 
 def test_the_gate_2_cause_stays_deliverable_and_keeps_what_runs():

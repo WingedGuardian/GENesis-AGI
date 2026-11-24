@@ -173,6 +173,24 @@ def test_the_restart_is_queued_in_a_later_second_than_the_move(dc, dc_ready, stu
     assert int(_records(stub)[1]["at"]) > moved_at
 
 
+def test_the_wait_comes_before_the_confirmation(dc, dc_ready, stub, monkeypatch):
+    """A session can switch the checkout without any lock: the confirmation must
+    be the last look before the restart is queued."""
+    w = dc_ready
+    _two_live(w, dc)
+    order: list[str] = []
+    monkeypatch.setattr(dc.time, "sleep", lambda _s: order.append("wait"))
+    real = dc.Engine._unconfirmed_drop
+
+    def confirm(self, *args):
+        order.append("confirm")
+        return real(self, *args)
+
+    monkeypatch.setattr(dc.Engine, "_unconfirmed_drop", confirm)
+    assert w.run(dc, *_guarded(w, None, "--restart-server")) == 0  # --wait is the entry's
+    assert order == ["wait", "confirm"]
+
+
 @pytest.mark.parametrize("stream", ["stdout", "stderr"])
 def test_a_closed_output_pipe_does_not_stop_the_engine(stream, tmp_path):
     """When the Guardian's incus client is killed at its timeout, the command in

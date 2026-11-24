@@ -157,6 +157,22 @@ def _moves(w: World, dc, capsys) -> dict:
     return json.loads(capsys.readouterr().out)
 
 
+def test_move_view_names_the_held_candidates_that_share_commits(dc, dc_ready, capsys):
+    """A drop takes these out of `live` too, so the approval must name them."""
+    w = dc_ready
+    w.candidate("feat/a", {"x.txt": "x\n"})
+    w.candidate("feat/b", {"y.txt": "y\n"}, base="feat/a")
+    w.write_manifest([w.entry("feat/b")])
+    assert w.run(dc, "rebuild") == 0
+    w.write_manifest([w.entry("feat/a"), w.entry("feat/b")])  # both now held
+    assert _moves(w, dc, capsys)["shared"] == {"feat/a": ["feat/b"], "feat/b": ["feat/a"]}
+
+
+def test_move_view_with_no_sharing_says_so(dc, dc_ready, capsys):
+    _two_live(dc_ready, dc)
+    assert _moves(dc_ready, dc, capsys)["shared"] == {}
+
+
 def test_without_the_flag_there_is_no_move_key(dc, dc_ready, capsys):
     """deploy_health reads plain `list --json`; it pays for no git status."""
     got = _observe(dc_ready, dc, capsys)

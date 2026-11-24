@@ -632,6 +632,7 @@ class Engine(Repo):
             seen = self.observe()
             if move_refusals:
                 seen.update(self.observe_moves())
+                seen["shared"] = self._held_sharing(seen)
             out(json.dumps(seen, sort_keys=True))
             return 0
         data = self.store.load()
@@ -725,6 +726,21 @@ class Engine(Repo):
             }
         except (Refusal, Unknown) as exc:
             return {"checkout": None, "move_refusals": [f"could not judge: {exc}"]}
+
+    def _held_sharing(self, seen: dict) -> dict[str, list[str]] | None:
+        """For each candidate `live` holds, the others sharing an unmerged commit
+        with it: dropping one takes them out too, so an approval must name them.
+        None when that cannot be read (never an empty answer)."""
+        holds = seen["live"]["holds"]
+        if not holds:
+            return {} if holds == [] else None
+        try:
+            live_base, _ = self.live_chain(seen["base"])
+            if live_base is None:
+                return None
+            return plan.shared_with(self, live_base, {h["branch"]: h["head"] for h in holds})
+        except (Refusal, Unknown):
+            return None
 
     def cmd_add(
         self, branch: str, owner: str, pr: int | None, approve_hooks: str | None = None
@@ -1017,6 +1033,12 @@ class Engine(Repo):
         if pinned is None:
             _restart_advice(moved)
             return 0
+        if restart:
+            # serving_commit.py cannot name the boot commit of a start in the
+            # second HEAD moved, and a down server starts with no stop phase.
+            # Before the confirmation: nothing locks out a session switching the
+            # checkout, so the confirmation stays the last look before the queue.
+            time.sleep(1.01 - time.time() % 1)
         try:
             seen, still_in = self._unconfirmed_drop(branch, moved)
         except (Refusal, Unknown) as exc:  # past the save: never "nothing changed"
@@ -1101,10 +1123,6 @@ class Engine(Repo):
         inheritable. Exit 4 when it was not queued (the read failed, or the
         enqueue failed with an answer), exit 5 when the enqueue got no answer
         and may have been queued: the drop stays done either way."""
-        # serving_commit.py cannot name the boot commit of a start in the second
-        # HEAD moved, and a down server starts with no stop phase. Before the
-        # state read, so a start that begins meanwhile is seen and left alone.
-        time.sleep(1.01 - time.time() % 1)
         show = _systemctl(self.env, "show", "-p", "ActiveState", gate.SERVER_UNIT)
         state = show.stdout.strip().removeprefix("ActiveState=") if show.returncode == 0 else None
         if state == "activating":

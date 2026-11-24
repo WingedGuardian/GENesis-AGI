@@ -106,6 +106,10 @@ def _valid_view(data: object) -> bool:
     refusals, checkout = data.get("move_refusals"), data.get("checkout")
     if not isinstance(listed, list) or not isinstance(live, dict):
         return False
+    # An unread manifest lists nothing: held candidates would read as dropped.
+    manifest = data.get("manifest")
+    if not isinstance(manifest, dict) or manifest.get("state") not in ("ok", "absent"):
+        return False
     if not all(
         isinstance(r, dict) and isinstance(r.get("branch"), str) and isinstance(r.get("head"), str)
         for r in listed
@@ -272,6 +276,21 @@ def _escalation(diagnosis: DiagnosisResult, kind: str, why: str) -> DiagnosisRes
     )
 
 
+def _leaving_with(data: dict, branch: str) -> str:
+    """Which other held candidates leave `live` with ``branch``, for Gate 2."""
+    shared = data.get("shared")
+    others = shared.get(branch) if isinstance(shared, dict) else None
+    if others is None and not isinstance(shared, dict):
+        return (
+            "The engine could not list which candidates share its unmerged commits; "
+            "any that do leave `live` with it"
+        )
+    if not others:
+        return "No other candidate on `live` shares its commits"
+    names = ", ".join(shown(b) for b in others if isinstance(b, str))
+    return f"These share its unmerged commits and leave `live` with it: {names}"
+
+
 def _since(attempt: dict | None, target: tuple[str, str, str, str]) -> str:
     """What the proposal says about the last drop, when there was one."""
     if not attempt:
@@ -359,9 +378,8 @@ async def live_revert_proposal(
                 + f" — On `live`, REVERT_CODE means: drop the newest candidate {branch} "
                 f"({code}) from the deploy manifest and rebuild `live` "
                 f"without it (`live` runs {tip[:12]} now), re-sync the git hooks, then "
-                "restart genesis-server. Candidates that share its unmerged commits leave "
-                f"`live` with it (the engine names them). `scripts/deploy_candidates add "
-                f"{branch} --owner <who>` puts it back{note}"
+                f"restart genesis-server. {_leaving_with(data, branch)}. "
+                f"`scripts/deploy_candidates add {branch} --owner <who>` puts it back{note}"
             ),
         )
     logger.warning("REVERT_CODE proposed on `live` — proposing RESTART_CONTAINER (%s)", why)

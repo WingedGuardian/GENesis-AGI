@@ -1820,7 +1820,9 @@ async def _handle_confirmed_dead(
     # recovery retry, no re-alert — until genuine recovery (which clears the flag
     # and sends a single "restored" ping). Recovery detection is unaffected: it
     # happens in state_machine.process() via the cheap signal probes, not here.
-    if sm.state.down_alert_sent:
+    # One exception: a `live` drop that took and left Genesis down gets one new
+    # diagnosis, so the next candidate can reach its own Gate 2.
+    if sm.state.down_alert_sent and not sm.take_live_drop_followup():
         logger.info(
             "Down alert already sent this episode — staying quiet until recovery "
             "(no re-diagnosis/re-alert)",

@@ -96,6 +96,9 @@ class StateData:
     # recovery.live_engine on; kept through the auto-reset, a DENY and a failed
     # send; cleared when the episode ends (a healthy snapshot).
     live_drop_attempt: dict | None = None
+    # A drop took: if Genesis is still down, ONE new diagnosis may pass the
+    # down-alert latch, so the next candidate can reach its own Gate 2.
+    live_drop_followup: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -124,6 +127,7 @@ class StateData:
             "boot_id": self.boot_id,
             "rebooted_at": self.rebooted_at,
             "live_drop_attempt": self.live_drop_attempt,
+            "live_drop_followup": self.live_drop_followup,
         }
 
     @classmethod
@@ -158,6 +162,7 @@ class StateData:
             boot_id=str(data.get("boot_id") or ""),
             rebooted_at=data.get("rebooted_at") or None,
             live_drop_attempt=_drop_attempt(data.get("live_drop_attempt")),
+            live_drop_followup=data.get("live_drop_followup") is True,
         )
 
 
@@ -285,6 +290,7 @@ class ConfirmationStateMachine:
         self._state.signal_history = self._state.signal_history[-20:]
         if snapshot.all_alive:  # the episode is over: its drop needs no naming
             self._state.live_drop_attempt = None
+            self._state.live_drop_followup = False
 
         old_state = self._state.current_state
 
@@ -838,6 +844,16 @@ class ConfirmationStateMachine:
     def clear_down_alert_sent(self) -> None:
         """Clear the down-alert flag — called by check.py on genuine recovery only."""
         self._state.down_alert_sent = False
+        self._state.live_drop_followup = False
+
+    def mark_live_drop_followup(self) -> None:
+        """A drop took: let one new diagnosis past the latch if Genesis stays down."""
+        self._state.live_drop_followup = True
+
+    def take_live_drop_followup(self) -> bool:
+        """Whether a follow-up is owed, spending it."""
+        owed, self._state.live_drop_followup = self._state.live_drop_followup, False
+        return owed
 
     def should_escalate(self) -> bool:
         """Check if we've exceeded max recovery attempts."""

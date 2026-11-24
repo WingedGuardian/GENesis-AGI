@@ -219,6 +219,14 @@ async def test_an_approved_drop_skips_the_30s_probe_and_leaves_health_to_the_nex
     assert result.success and "dropped feat/b" in result.detail
     probes.assert_not_awaited()
     assert engine._sm.current_state == GuardianState.RECOVERED
+    assert engine._sm.state.live_drop_followup is True  # a still-sick server is diagnosed again
+
+
+async def test_empty_tip_and_boot_reads_are_not_a_boot_from_the_new_tip():
+    """A failed `live` read on a stopped unit gives two empty strings."""
+    unread = _boot("unknown: x", live="", state="failed")
+    ok, detail, _ = await _drop(Box(boots=(unread,)))
+    assert not ok and "has not booted" in detail
 
 
 # ── exit 4 and 5 ─────────────────────────────────────────────────────────────

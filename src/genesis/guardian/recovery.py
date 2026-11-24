@@ -211,8 +211,10 @@ class RecoveryEngine:
         if success and self._approved_drop(diagnosis):
             # No 30 s probe after a drop (owner ruling, #2978): it succeeded when
             # genesis-server booted from `live`'s new tip; the next check judges
-            # health (RECOVERED -> healthy, or back to CONFIRMED_DEAD).
+            # health (RECOVERED -> healthy, or back to CONFIRMED_DEAD, where the
+            # follow-up lets one new diagnosis past the episode's alert latch).
             self._sm.set_recovered()
+            self._sm.mark_live_drop_followup()
             await self._dispatcher.send(Alert(
                 severity=AlertSeverity.INFO,
                 title=f"Recovery action done: {action.value} on `live`",
@@ -620,7 +622,7 @@ class RecoveryEngine:
                 continue
             unread, last = 0, unit
             new = unit.get("live", "")
-            if new != old_tip and booted_from(unit) == new:
+            if new and new != old_tip and booted_from(unit) == new:
                 return True, f"genesis-server booted from `live`'s new tip {new[:12]}"
             if unit.get("Result") == "start-limit-hit" and unit.get("ActiveState") == "failed":
                 break
