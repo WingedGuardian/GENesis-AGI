@@ -885,9 +885,13 @@ jobs:
         # [plain|html|private_redirect|brotli|error] ("requires the browser extra";
         # this job installs none). They run in dependency-audit. Within the
         # ceiling, no raise: main measured 591 at run 44079105066, + 5 = 596.
+        # Centrality worker (#4982): one opt-in native case skipped unless
+        # GENESIS_DREAM_NATIVE_E2E=1, test_dream_centrality_native.py::
+        # test_capped_child_to_cache. Main measured 607 (602 + 5 xfail) at run
+        # 45284169203 and 608 (603 + 5) at run 45291106068, 607 -> 608.
         env:
           GENESIS_JUNIT_REPORT: ${{ steps.census_prepare.outcome == 'success' && steps.census_prepare.outputs.junit_report || 'junit.xml' }}
-        run: python scripts/check_skip_ceiling.py "$GENESIS_JUNIT_REPORT" --ceiling 607
+        run: python scripts/check_skip_ceiling.py "$GENESIS_JUNIT_REPORT" --ceiling 608
 
   test-ubuntu-2404:
     # ubuntu-latest is moving to 26.04, so `test` alone stops showing a break on
