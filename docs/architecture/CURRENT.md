@@ -1751,7 +1751,9 @@ other intake evidence retains its dated basis.
   `remove_unit` tombstones a source when its last unit is deleted (invariant:
   only that method may tombstone). The conversational path
   (`knowledge_ingest_source` MCP) requires explicit user confirmation —
-  contrast the intake bypass in entry 4.
+  contrast the intake bypass in entry 4. A distilled batch's credential units
+  go through the credential chokepoint; its other units are stored as written
+  (uploaded documents are not redacted, owner ruling 2026-11-23).
 - **inbox/**: file-drop monitor with approval-gated dispatch.
   Explicit owner-requested disposition review uses the manual-only Tier-1
   `inbox-review` skill, reached by the attended-request pointer in `CLAUDE.md`.
