@@ -1,1 +1,1 @@
-Judge results record the provider-reported model when available, so rubric grades and J9 relevance scores can be attributed to the model that served them.
+- Judge results record the provider-reported model when available, so rubric grades and J9 relevance scores can be attributed to the model that served them.
