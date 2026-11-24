@@ -2284,6 +2284,10 @@ async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
             if _click_was_sent(plain_err, selector):
                 raise
             logger.warning("Plain click also failed for '%s': %s", selector, plain_err)
+            if _relayed():
+                # Both fallbacks below act on a control the purchase check never
+                # read (a key press on a focused field, a shadow-DOM match).
+                raise plain_err
             # --- Keyboard fallback (last resort) ---
             # Focus the element and press Space/Enter.  Works for radios,
             # checkboxes, buttons — anything keyboard-navigable per WCAG.
@@ -3730,10 +3734,20 @@ function label(n) {
   if (n.querySelectorAll) for (const img of n.querySelectorAll('img[alt]')) parts.push(img.alt);
   const host = n.closest && n.closest('button, a, [role=button], label');
   if (host && host !== n) parts.push(own(host));
-  return parts.join(' ').slice(0, 2000);
+  return parts.join(' ');
 }
 """
-_CONTROL_LABEL_JS = "(el) => {" + _LABEL_FN + " return label(el); }"
+# A frame (wallet buttons are often iframes) cannot be read from here: null, so it
+# is refused. An open shadow root's text is read as part of its host.
+_CONTROL_LABEL_JS = "(el) => {" + _LABEL_FN + r"""
+  if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') return null;
+  const inner = [];
+  if (el.shadowRoot) {
+    const walk = document.createTreeWalker(el.shadowRoot, NodeFilter.SHOW_TEXT);
+    while (walk.nextNode()) inner.push(walk.currentNode.nodeValue);
+  }
+  return label(el) + ' ' + inner.join(' ');
+}"""
 # Enter in a field submits its form through the form's default button.
 _FOCUSED_LABEL_JS = "() => {" + _LABEL_FN + r"""
   let el = document.activeElement;
@@ -3772,8 +3786,10 @@ async def _relay_purchase_refusal(page, selector: str) -> dict | None:
     try:
         text = await asyncio.wait_for(target.evaluate(_CONTROL_LABEL_JS), timeout=3.0)
     except Exception:
+        text = None
+    if text is None:  # a frame, or a label that could not be read
         return {"error": _REFUSE_UNREADABLE, "code": "relay_purchase_refused"}
-    if _PURCHASE_WORDS.search(str(text or "")):
+    if _PURCHASE_WORDS.search(str(text)):
         return {"error": _REFUSE_PURCHASE, "code": "relay_purchase_refused"}
     return None
 
@@ -4369,6 +4385,8 @@ async def _impl_browser_fill(selector: str, value: str) -> dict:
         return (
             refused
             or await _relay_fill_refusal(page, selector, value)
+            # The fill clicks its target to focus it: checked like a click.
+            or await _relay_purchase_refusal(page, selector)
             or await _fill(page, selector, value)
         )
 

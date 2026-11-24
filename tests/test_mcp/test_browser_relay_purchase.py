@@ -259,12 +259,12 @@ async def test_browser_fill_refuses_a_line_break_in_a_single_line_field(tool_pag
 
     fill = AsyncMock(return_value={"filled": "#f"})
     monkeypatch.setattr(browser, "_fill", fill)
-    tool_page(_tool_page())
+    tool_page(_tool_page(label="About you"))
     with request_caller(RELAYED):
         result = await browser._impl_browser_fill("#f", "a\nb")
     assert result["code"] == "relay_purchase_refused"
     fill.assert_not_awaited()
-    tool_page(_tool_page(multiline=True))
+    tool_page(_tool_page(label="About you", multiline=True))
     with request_caller(RELAYED):
         await browser._impl_browser_fill("#f", "a\nb")
     fill.assert_awaited_once()
@@ -296,6 +296,7 @@ def real_page():
         ("<a href=#><img alt='Checkout'></a>", "img", True),
         ("<span id=l>Pay</span><button aria-labelledby=l>&rarr;</button>", "button", True),
         ("<button>Sign in with PayPal</button>", "button", False),
+        ("<button>" + "x " * 1500 + "Pay now</button>", "button", True),
     ],
 )
 def test_the_label_script_reads_what_a_shopper_sees(real_page, html, selector, purchase):
@@ -335,4 +336,33 @@ def test_place_a_bid_and_image_submits_are_covered(real_page):
     )
     real_page.focus("#q")
     assert browser._PURCHASE_WORDS.search(real_page.evaluate(browser._FOCUSED_LABEL_JS))
+
+
+
+
+@pytest.mark.asyncio
+async def test_a_relayed_click_on_a_frame_is_refused_as_unreadable():
+    with request_caller(RELAYED):
+        result = await browser._relay_purchase_refusal(_Page(_Target(None)), "iframe")
+    assert result["error"] == browser._REFUSE_UNREADABLE
+
+
+def test_no_fallback_click_runs_in_a_relayed_session():
+    import inspect
+
+    source = inspect.getsource(browser._stealth_click)
+    assert source.index("if _relayed():") < source.index("# --- Keyboard fallback")
+
+
+@pytest.mark.asyncio
+async def test_browser_fill_refuses_typing_into_a_purchase_control(tool_page, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    fill = AsyncMock(return_value={"filled": "#f"})
+    monkeypatch.setattr(browser, "_fill", fill)
+    tool_page(_tool_page(label="Place order"))
+    with request_caller(RELAYED):
+        result = await browser._impl_browser_fill("#f", "anything")
+    assert result["code"] == "relay_purchase_refused"
+    fill.assert_not_awaited()
 
