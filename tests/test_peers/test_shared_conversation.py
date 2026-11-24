@@ -48,6 +48,23 @@ async def foreign(b, *, grant="allow"):
     return b.identities["alpha"]
 
 
+async def test_a_shared_peer_is_never_relayed_even_with_the_grant(bridge):
+    """owner_relay applies to same-owner peers only: an external shared peer
+    that also holds the grant gets the shared framing and no owner alert flag."""
+    b = bridge
+    identity = await foreign(b)
+    async with b.registry.transaction() as db:
+        await db.execute(
+            "INSERT INTO peer_grants(peer_id,capability,decision) VALUES('alpha','owner_relay','allow')"
+        )
+    done = await settle(b, await b.service.send(identity, incoming(message(timeout_s=30))))
+    meta = json.loads(done["metadata"])
+    assert meta["conversation_trust"] == "conversation_shared"
+    assert "owner_relay" not in meta
+    prompt = b.invoker.run_streaming.call_args.args[0].system_prompt or ""
+    assert "owner's own agent" not in prompt
+
+
 async def test_owner_can_explicitly_grant_shared_capability(bridge):
     await bridge.registry.grant("alpha", "conversation_shared", "allow")
     assert (await bridge.registry.grants("alpha"))["conversation_shared"] == "allow"

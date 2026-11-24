@@ -1622,3 +1622,36 @@ async def test_reply_preserves_full_thread_subject_in_mime(config, db, monkeypat
     )
     expected = original if original.startswith("Re:") else f"Re: {original}"
     assert _sent_subject(smtp) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("category", "subject", "validated", "gated"),
+    [
+        ("alert", "relay", None, False),
+        ("alert", "relay", "owner@example.com", False),
+        ("alert", "relay", "stranger@example.com", True),
+        ("alert", "Weekly report", None, True),
+        ("notification", "relay", None, True),
+    ],
+)
+async def test_only_a_relay_alert_to_the_owner_skips_the_email_gate(
+    config, db, monkeypatch, category, subject, validated, gated,
+):
+    from genesis.outreach.types import OWNER_RELAY_ALERT_SUBJECT
+
+    pipe, smtp = _smtp_pipe(monkeypatch, config, db, None)
+    pipe._recipients = {"email": "owner@example.com"}
+    held = MagicMock()
+    held.check = AsyncMock(return_value=MagicMock(allow=False, pending_id="p1"))
+    pipe.set_autonomy_gate(held)
+    result = await pipe.submit(OutreachRequest(
+        category=OutreachCategory(category), topic="t",
+        email_subject=OWNER_RELAY_ALERT_SUBJECT if subject == "relay" else subject,
+        context="A relayed session acted.", salience_score=1.0, channel="email",
+        verbatim=True, validated_recipient=validated,
+    ))
+    assert held.check.called is gated
+    assert (result.status == OutreachStatus.HELD) is gated
+    assert smtp.send_message.called is not gated
+
