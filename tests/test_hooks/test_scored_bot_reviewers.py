@@ -316,7 +316,7 @@ class TestDevinDedupAndClearing:
             _c(9, "✅ **Resolved**: The path now checks the lock first.", reply_to=1),
         ]
         block, msg = _scan(guard, comments)
-        assert block and "no reply says 'Fixed in <sha>'" in msg
+        assert block and "no reply has a line starting 'Fixed in <sha>'" in msg
 
     def test_devins_resolved_reply_on_a_duplicate_clears_the_group(self, guard, monkeypatch):
         monkeypatch.setattr(guard._FixEvidence, "verify", lambda *_a: None)

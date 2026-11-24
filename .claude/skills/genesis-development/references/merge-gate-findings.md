@@ -17,9 +17,10 @@
    first line starting `✅ **Resolved**` (no bot can clear another's, and Codex and
    CodeRabbit findings still need a maintainer reply).
 
-   **Clearing a FLOOR finding (#4933):** a reply saying `Fixed in <sha>` (or
-   `at`/`by`) whose commit is one of the PR's own, single-parent, later than the
-   head the finding was posted on, and touching its file; or the owner's
+   **Clearing a FLOOR finding (#4933):** a reply with a line that starts with
+   `Fixed in <sha>` (or `at`/`by`), outside quotes and code and unhedged, whose commit
+   is one of the PR's own, single-parent, descending from the head the finding was
+   posted on, and touching its file or its renamed name; or the owner's
    `# floor-accept=<id>[,<id>]`. Any other reply clears nothing, and neither does
    `# review-override`. MEASURED over the 739 floor findings on the 862 PRs merged
    2026-10-01 to 2026-11-20, two readers agreed that 73 replies did not fix a

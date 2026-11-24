@@ -548,6 +548,7 @@ def test_a_maintainer_answered_p1_passes(tmp_path):
         },
         {
             **state["api"][f"pulls/{PR}/commits"][0],
+            "parents": [{"sha": finding_head}],
             "commit": {
                 "message": "fix: keep the last row",
                 "committer": {"date": "2026-01-02T04:00:00Z"},
@@ -556,7 +557,7 @@ def test_a_maintainer_answered_p1_passes(tmp_path):
     ]
     state["api"][f"commits/{HEAD}"] = {
         "sha": HEAD,
-        "files": [{"filename": "src/example/module.py"}],
+        "files": [{"filename": "src/example/module.py", "status": "modified", "changes": 2}],
     }
     reply = {
         "id": 9102,

@@ -1585,7 +1585,7 @@ class TestCheckInlineReviewFindings:
         with self._mock(guard_module, answered):
             block, msg = guard_module._check_inline_review_findings("100")
         assert block
-        assert "finding 1: no reply says 'Fixed in <sha>'" in msg
+        assert "finding 1 (src/benign.py): no reply has a line starting 'Fixed in <sha>'" in msg
 
     def test_coderabbit_critical_blocks(self, guard_module):
         with self._mock(guard_module, [self._coderabbit(1, _CR_CRITICAL_BODY)]):

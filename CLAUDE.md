@@ -609,7 +609,7 @@ gate works, its exemption categories, and the unit rules for size bounds:
   such as Devin or CodeRabbit, except a bot the PR's own workflow drives and CodeQL)
   — ask the user in conversation each time; the sigil records the yes.
   A maintainer reply clears a below-floor finding. A floor finding clears only on a
-  reply saying `Fixed in <sha>` for a later PR commit touching its file, or on the
+  reply line starting `Fixed in <sha>` for a later PR commit touching its file, or on the
   user's `# floor-accept=<id>`; `# review-override` does not cover it. Findings on files
   outside the PR diff do not score; under the shipped `doc_findings: skip`,
   documentation findings do not score either. `codex-at-head: ok` is not "review is clear": read the

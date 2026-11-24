@@ -2398,11 +2398,13 @@ The review-findings gate specifically:
    `_check_inline_review_findings`.
    The doctrinal floor is wider than this check: a P1, a security defect, anything destructive or fail-open is fixed, never accepted by a session, whatever label a reviewer attached; only the owner accepts one, through `# floor-accept`.
    **What clears a floor finding (#4933).** Only one of two things:
-   - An in-thread maintainer reply saying `Fixed in <sha>` (or `at`/`by`), where the
-     sha is one of the PR's own single-parent commits, later than the head the finding
-     was posted on (if a force-push removed that head, order cannot be proven and only
-     a new review or the sigil clears it), and touching the finding's file. Quoted or
-     hedged text ("will be fixed in") claims nothing. Cite the commit that made the fix,
+   - An in-thread maintainer reply with a line that STARTS with `Fixed in <sha>` (or
+     `at`/`by`), where the sha is one of the PR's own single-parent commits, descending
+     from the head the finding was posted on (if a force-push removed that head, order
+     cannot be proven and only the sigil clears it), and touching the finding's file or
+     the name a rename in the PR gave it. Quoted, coded, struck or hedged text ("will be
+     fixed in", "Fixed in X, pending CI"), and a claim in the middle of a line, claim
+     nothing. Write the claim as its own line: `Fixed in <sha>.` then any explanation. Cite the commit that made the fix,
      never a merge of main. A reply that defers, accepts, disputes or says "partly
      fixed" clears nothing.
    - The owner's `# floor-accept=<id>[,<id>]` on the merge command, for a fix in another

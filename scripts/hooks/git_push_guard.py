@@ -3458,27 +3458,47 @@ def _findings_distribution(
     return "\n".join(lines)
 
 
-#: The one form of reply that claims a fix: "Fixed in/at/by <sha>". A bare commit id
-#: is not a claim. MEASURED over 739 floor findings: 8 of 73 replies that did not fix
-#: their finding still cited a real later commit on the file ("Documented in <sha>",
-#: "verified at <sha>", "Partly fixed in <sha>"). With this form, none of them clears.
+#: The one form of reply that claims a fix: a line that STARTS with "Fixed in/at/by
+#: <sha>" (a list marker may precede it), then ends or goes on after . , : ; a dash or a
+#: parenthesis. A bare commit id is not a claim. MEASURED over 739 floor findings: 8 of
+#: 73 replies that did not fix their finding still cited a real later commit on the
+#: file ("Documented in <sha>", "Partly fixed in <sha>"). Matching the phrase anywhere
+#: let quoted, struck, tagged and mid-sentence text claim a fix (round-1 class audit);
+#: a line that starts with it is the form Devin's own replies use (23 of 62).
 _FIX_CLAIM_RE = re.compile(
-    r"(?<![a-z])fixe[ds] (?:in|at|by) (?:commit )?`?((?-i:[0-9a-f]{7,40}))(?![0-9A-Za-z])",
-    re.IGNORECASE,
+    r"^[ \t]*(?:[-*+][ \t]+)?fixe[ds] (?:in|at|by) (?:commit )?`?((?-i:[0-9a-f]{7,40}))`?"
+    r"(?=[ \t]*$|[.,:;]|[ \t]+[-(\u2013\u2014])",
+    re.IGNORECASE | re.MULTILINE,
 )
-#: A word that turns the claim after it into something else ("will be fixed in",
-#: "not yet fixed in"), looked for earlier in the same sentence.
+#: A word that turns the claim into something else ("will be fixed in", "Fixed in X,
+#: pending CI"), looked for in the claim's own sentence on both sides.
 _FIX_HEDGE_RE = re.compile(
-    r"\b(?:not|never|yet|will|would|should|could|might|may|once|when|if|until|partly"
-    r"|partially|planned|pending|to be|cannot|hasnt|havent|isnt|wasnt|arent)\b|n't\b",
+    r"\b(?:not|never|yet|will|would|should|could|might|may|once|when|if|unless|until"
+    r"|whether|partly|partially|planned|pending|to be|cannot|hasnt|havent|isnt|wasnt"
+    r"|arent|probably|maybe|perhaps|hopefully|likely|reverted|revert|undone|wip|tbd"
+    r"|todo|except|mostly|remains|remaining|follow-up|followup)\b|n't\b",
     re.IGNORECASE,
 )
-_FIX_HEDGE_WINDOW = 40
+#: How far the sentence is read on each side. It bounds the CPU of a reply with many
+#: claims; a sentence is cut at . ! ? ; : or a blank line, and a soft line break
+#: continues it.
+_FIX_HEDGE_WINDOW = 400
+_FIX_SENTENCE_END_RE = re.compile(r"[.!?;:]|\n[ \t]*\n")
+#: A line that starts the way a claim does, whether or not it is one.
+_FIX_LINE_START_RE = re.compile(r"^[ \t]*(?:[-*+][ \t]+)?fixe[ds] (?:in|at|by) ", re.I | re.M)
+#: HTML a reader sees as code, a quote, struck text or a folded aside. The tag head
+#: excludes '<', so each attempt stops at the next tag and the scan stays linear.
+_HTML_ASIDE_RE = re.compile(
+    r"<(pre|code|kbd|samp|blockquote|details|del|s|strike|sub|sup)\b[^<>]*>.*?(?:</\1\s*>|\Z)",
+    re.IGNORECASE | re.S,
+)
 #: A closing fence is at least as long as its opener and carries no info string.
 _FENCED_BLOCK_RE = re.compile(
     r"^ {0,3}(`{3,}|~{3,})[^\n]*\n.*?(?:^ {0,3}\1[`~]*[ \t]*$|\Z)", re.M | re.S
 )
-_QUOTED_LINE_RE = re.compile(r"^ {0,3}>.*$", re.M)
+#: A quote runs on over the lines after it until a blank line (markdown's lazy
+#: continuation), so those lines are quoted text too.
+_QUOTED_LINE_RE = re.compile(r"^ {0,3}>.*(?:\n[ \t]*\S.*)*", re.M)
 _INDENTED_CODE_RE = re.compile(r"^(?: {4}|\t).*$", re.M)
 _HTML_COMMENT_RE = re.compile(r"<!--.*?(?:-->|\Z)", re.S)
 #: Distinct ids one finding's replies may cite. The most measured on a PR is 5; this
@@ -3486,16 +3506,26 @@ _HTML_COMMENT_RE = re.compile(r"<!--.*?(?:-->|\Z)", re.S)
 _FIX_CHECK_MAX_CITED = 64
 
 
+def _claim_text(body: str) -> str:
+    """The reply as a reader sees it: no quotes, code, comments or HTML asides."""
+    body = body.replace("\r\n", "\n").replace("\r", "\n")  # the web editor writes CRLF
+    text = _FENCED_BLOCK_RE.sub("", _HTML_COMMENT_RE.sub("", body))
+    text = _HTML_ASIDE_RE.sub("", text)
+    return _INDENTED_CODE_RE.sub("", _QUOTED_LINE_RE.sub("", text)).replace("\u2019", "'")
+
+
 def _fix_claims(body: str) -> list[str]:
     """The commit ids a reply claims as fixes. Text a reader sees as a quote or as
     code, or does not see at all, claims nothing."""
-    body = body.replace("\r\n", "\n").replace("\r", "\n")  # the web editor writes CRLF
-    text = _FENCED_BLOCK_RE.sub("", _HTML_COMMENT_RE.sub("", body))
-    text = _INDENTED_CODE_RE.sub("", _QUOTED_LINE_RE.sub("", text)).replace("\u2019", "'")
+    text = _claim_text(body)
     claims = []
     for match in _FIX_CLAIM_RE.finditer(text):
-        before = re.split(r"[.!?;:\n]", text[max(0, match.start() - _FIX_HEDGE_WINDOW) : match.start()])[-1]
-        if not _FIX_HEDGE_RE.search(before) and text[match.end() :].lstrip("`")[:1] != "?":
+        before = _FIX_SENTENCE_END_RE.split(text[max(0, match.start() - _FIX_HEDGE_WINDOW) : match.start()])[-1]
+        after = text[match.end() : match.end() + _FIX_HEDGE_WINDOW]
+        end = _FIX_SENTENCE_END_RE.search(after)
+        clause = after[: end.start()] if end else after
+        asks = end is not None and end.group() == "?"
+        if not asks and not _FIX_HEDGE_RE.search(before) and not _FIX_HEDGE_RE.search(clause):
             claims.append(match.group(1))
     return claims
 
@@ -3503,16 +3533,19 @@ def _fix_claims(body: str) -> list[str]:
 #: GitHub returns at most this many commits from ``pulls/N/commits``.
 _PR_COMMITS_API_CAP = 250
 #: Distinct commits whose file lists one scan may read. Each is at least one API call
-#: on the merge path's 45s budget, and a reply can cite any number of ids.
-_FIX_CHECK_MAX_COMMITS = 20
+#: on the merge path, which the merge deadline bounds too; the cap matches the cited
+#: ids one finding may name, so a large round of real fixes is not refused.
+_FIX_CHECK_MAX_COMMITS = 64
 
 
 class _FixEvidence:
     """Whether a reply's cited commit is a fix for one floor finding (#4933).
 
-    Evidence is a single-parent commit of THIS PR, later than the head the finding
-    was posted on, that touches the finding's file. It proves provenance, not that
-    the change is correct. Every read failure means "not verified": the finding
+    Evidence is a single-parent commit of THIS PR that descends from the head the
+    finding was posted on and touches the finding's file, or the name a rename in
+    this PR gave it. "Descends" is read from parent links: GitHub lists a PR's
+    commits by date, not ancestry (``review_budget``). It proves provenance, not
+    that the change is correct. Every read failure means "not verified": the finding
     stays blocked and the reason says why, so ``# floor-accept`` is the way through.
     """
 
@@ -3521,6 +3554,8 @@ class _FixEvidence:
         self._repo = repo
         self._commits: tuple[list[dict] | None, bool] | None = None
         self._files: dict[str, set[str] | None] = {}
+        self._ancestors: dict[str, set[str]] = {}
+        self._claims: dict[str, list[str]] = {}
 
     def _commit_list(self) -> tuple[list[dict] | None, bool]:
         if self._commits is None:
@@ -3528,7 +3563,7 @@ class _FixEvidence:
                 f"pulls/{self._pr_num}/commits",
                 self._pr_num,
                 self._repo,
-                ".[] | {sha: .sha, parents: (.parents | length)}",
+                ".[] | {sha: .sha, parents: [.parents[]?.sha]}",
             )
         return self._commits
 
@@ -3538,62 +3573,102 @@ class _FixEvidence:
                 f"commits/{sha}",
                 self._pr_num,
                 self._repo,
-                ".files[]? | {f: .filename, p: .previous_filename}",
+                ".files[]? | {f: .filename, p: .previous_filename, s: .status, c: .changes}",
             )
+            # A row that changes no line (a pure rename, copy or mode change) fixes
+            # nothing, and only a rename's old name is the same file.
             self._files[sha] = (
-                {name for r in rows for name in (r.get("f"), r.get("p")) if name}
+                {
+                    name
+                    for r in rows
+                    if isinstance(r.get("c"), int) and r["c"] > 0
+                    for name in (r.get("f"), r.get("p") if r.get("s") == "renamed" else None)
+                    if isinstance(name, str) and name
+                }
                 if rows is not None and complete
                 else None
             )
         return self._files[sha]
 
+    def _ancestry(self, sha: str, parents: dict[str, list]) -> set[str]:
+        """The PR commits ``sha`` descends from, through parent links inside the PR."""
+        if sha not in self._ancestors:
+            seen: set[str] = set()
+            todo = list(parents.get(sha) or [])
+            while todo:
+                cur = todo.pop()
+                if isinstance(cur, str) and cur in parents and cur not in seen:
+                    seen.add(cur)
+                    todo.extend(parents.get(cur) or [])
+            seen.discard(sha)
+            self._ancestors[sha] = seen
+        return self._ancestors[sha]
+
+    def _names(self, path: str) -> set[str]:
+        """``path``, and the name a rename in this PR gave it."""
+        renamed = _pr_rename_map(self._pr_num, repo=self._repo).get(path)
+        return {path, renamed} if isinstance(renamed, str) else {path}
+
     def verify(self, path: str | None, origs: list, bodies: list[str]) -> str | None:
         """None when a cited commit is a fix, otherwise why none is.
 
         ``origs`` holds the head of every copy of the finding on ``path``: the fix has
-        to be later than all of them.
+        to descend from all of them.
         """
         if not path:
             return "the finding names no file, so only the sigil can clear it"
-        cited = list(dict.fromkeys(t for b in bodies for t in _fix_claims(b)))
+        if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
+            return "fix could not be verified (merge deadline reached)"
+        for b in bodies:
+            if b not in self._claims:
+                self._claims[b] = _fix_claims(b)
+        cited = list(dict.fromkeys(t for b in bodies for t in self._claims[b]))
         if not cited:
-            return "no reply says 'Fixed in <sha>'"
+            if any(_FIX_LINE_START_RE.search(_claim_text(b)) for b in bodies):
+                return (
+                    "a reply's 'Fixed in' line is not a claim: it is hedged, a question, has "
+                    "no lowercase sha, or runs on after the sha; once the fix is complete, "
+                    "write 'Fixed in <sha>.'"
+                )
+            return "no reply has a line starting 'Fixed in <sha>'"
         if len(cited) > _FIX_CHECK_MAX_CITED:
             return f"replies cite more than {_FIX_CHECK_MAX_CITED} commits"
         rows, complete = self._commit_list()
         if rows is None or not complete:
             return "fix could not be verified (PR commit list unreadable)"
         rows = [r for r in rows if isinstance(r.get("sha"), str)]
-        position = {r["sha"]: i for i, r in enumerate(rows)}
-        clipped = f"commit list clipped at {_PR_COMMITS_API_CAP} (GitHub cap); fix could not be verified"
-        if not origs or any(not isinstance(o, str) or o not in position for o in origs):
-            if len(rows) >= _PR_COMMITS_API_CAP:
-                return clipped
-            # A rebase refreshes every committer date, so a date cannot stand in for
-            # the order this list no longer shows.
-            return "the head this finding was posted on is gone, so a later fix cannot be proven"
-        latest_head = max(position[o] for o in origs)
+        if len(rows) >= _PR_COMMITS_API_CAP:
+            # An unlisted commit could sit on the path between the head and the fix.
+            return f"commit list clipped at {_PR_COMMITS_API_CAP} (GitHub cap); fix could not be verified"
+        parents = {
+            r["sha"]: r["parents"] if isinstance(r.get("parents"), list) else None for r in rows
+        }
+        if not origs or any(not isinstance(o, str) or o not in parents for o in origs):
+            return (
+                "the head this finding was posted on is gone (rebased or force-pushed), "
+                "so a later fix cannot be proven; only the sigil clears it"
+            )
         why = ""
         for token in cited:
             if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
                 return "fix could not be verified (merge deadline reached)"
-            hits = [i for i, r in enumerate(rows) if r["sha"].startswith(token)]
+            hits = [s for s in parents if s.startswith(token)]
             if len(hits) != 1:
                 if hits:
                     why = f"cited id {token} is ambiguous"
-                elif len(rows) >= _PR_COMMITS_API_CAP:
-                    why = clipped
                 else:
                     why = f"cited id {token} is not among the PR's commits (rebased?)"
                 continue
-            row = rows[hits[0]]
-            if row.get("parents") != 1:
+            sha = hits[0]
+            if parents[sha] is None:
+                why = f"fix could not be verified (parents of {token} unreadable)"
+                continue
+            if len(parents[sha]) != 1:
                 why = f"cited commit {token} is a merge commit; cite the commit that made the fix"
                 continue
-            if hits[0] <= latest_head:
-                why = f"cited commit {token} predates the finding"
+            if not all(o in self._ancestry(sha, parents) for o in origs):
+                why = f"cited commit {token} does not come after the head the finding was posted on"
                 continue
-            sha = str(row["sha"])
             if sha not in self._files and len(self._files) >= _FIX_CHECK_MAX_COMMITS:
                 why = f"fix-check cap reached ({_FIX_CHECK_MAX_COMMITS} commits read)"
                 continue
@@ -3601,7 +3676,7 @@ class _FixEvidence:
             if touched is None:
                 why = f"fix could not be verified (file list of {token} unreadable)"
                 continue
-            if path in touched:
+            if touched & self._names(path):
                 return None
             why = f"cited commit {token} does not touch {path}"
         return why
@@ -3771,7 +3846,7 @@ def _check_inline_review_findings(
     devin_off_diff: list[tuple[str, str]] = []  # scoring Devin findings outside the diff
     evidence = _FixEvidence(pr_num, repo)
     floor_verdicts: dict[tuple, bool] = {}
-    floor_unmet: list[tuple[int, str]] = []  # (finding id, why it is still open)
+    floor_unmet: list[tuple[int, str, str | None]] = []  # (finding id, why open, its file)
     floor_fixed: set[int] = set()
     floor_refused: set[int] = set()  # named by the sigil in a dispatched session
     floor_devin_only: set[tuple] = set()  # cleared only with Devin's own reply
@@ -3819,6 +3894,7 @@ def _check_inline_review_findings(
                 sources.append((cp, own, True))
         rested_on_devin = False
         cleared = bool(wanted)
+        open_path = group[0].get("path")  # the file the reason is about
         for path in wanted:
             covered = False
             origs = [cp.get("orig") for cp in group if cp.get("path") == path]
@@ -3833,6 +3909,7 @@ def _check_inline_review_findings(
                 why = verdict
             if not covered:
                 cleared = False
+                open_path = path
                 break
         if cleared:
             floor_fixed.update(i for i in key if isinstance(i, int))
@@ -3847,7 +3924,7 @@ def _check_inline_review_findings(
                 used_ids.update(named)
                 cleared = True
         if not cleared:
-            floor_unmet.append((group[0].get("id"), why))
+            floor_unmet.append((group[0].get("id"), why, open_path))
         floor_verdicts[key] = cleared
         return cleared
 
@@ -4882,7 +4959,9 @@ def _check_inline_review_findings(
             + [f"  [Devin severe] {t}" for t in devin_block[:5]]
         )
         reasons = "\n".join(
-            f"  finding {fid}: {_one_safe_line(why)}" for fid, why in floor_unmet[:10]
+            f"  finding {fid} ({_safe_report_path(fpath) if fpath else 'no file'}): "
+            f"{_one_safe_line(why)}"
+            for fid, why, fpath in floor_unmet[:10]
         )
         if len(floor_unmet) > 10:
             reasons += f"\n  ... and {len(floor_unmet) - 10} more"
@@ -4895,7 +4974,8 @@ def _check_inline_review_findings(
             f"change is {lane.upper()}); the per-lane score threshold "
             f"({threshold:.1f} here) governs how many P2s may accumulate, never "
             f"whether a P1 counts:\n{listing}\n{reasons}\n"
-            f"Fix it and reply in-thread with 'Fixed in <sha>'. Otherwise ask the owner, "
+            f"Fix it and reply in-thread with a line that starts 'Fixed in <sha>.' (the "
+            f"fix commit, not a merge; any explanation after it). Otherwise ask the owner, "
             f"and on their yes append '# floor-accept=<id>[,<id>]' to the merge command."
         )
     if force:
