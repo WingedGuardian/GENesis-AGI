@@ -25,18 +25,62 @@ Genesis itself, or using Genesis for something else?"
 This is the shared core. Each session type has its own skill: load it with the
 Skill tool, or Read its file if this text reached you by injection.
 
-- **Spec**, shaping a change before anyone plans it: `spec-session`
+- **spec**, shaping a change before anyone plans it: `spec-session`
   (`.claude/skills/spec-session/SKILL.md`).
-- **Build**, one item from Ready to its open PR, including rework from a
+- **build**, one item from Ready to its open PR, including rework from a
   send-back spec: `build-session` (`.claude/skills/build-session/SKILL.md`).
-- **Close**, driving open PRs to merge and fixing their review findings:
+- **closing**, driving open PRs to merge and fixing their review findings:
   `closing-session` (`.claude/skills/closing-session/SKILL.md`).
-- **Validate**, post-merge verification, deploy and E2E: `validating-merges`
+- **validating**, post-merge verification, deploy and E2E: `validating-merges`
   (`.claude/skills/validating-merges/SKILL.md`).
 
-Decide from the owner's words, the task's shape, or the dispatcher's prompt;
-none fits (debugging the runtime, a one-off fix)? Load `build-session`. Two
-types (spec, then build) load both, in order. Build and close sessions Read
+**A foreground session with the owner present** (including a channel
+conversation Genesis marks `GENESIS_SESSION_SUPERVISED=1`) takes its type from,
+in this order: the owner's words naming a type (a type word counts only when it
+names the session: "this is a build session", "build session for X"); a handoff file's `For: <type> session`
+line; a handed-over spec whose frontmatter status counts as approved (its first
+word is `approved`), which makes it a build session. Anything else, including a
+handed-over spec with any other status, leaves it a **spec session**, the
+default.
+- A request for a change ("fix X", "add Y", "build X") names a task, not a type: the
+  session is a spec session and runs the spec process, unless the change is on
+  the skip list (spec-session, "Skipping the spec stage").
+- A change on the skip list makes the session a build session once it has said
+  which entry applies. So do the owner's words in conversation skipping the
+  spec stage, at any time, an outage included; the session records them.
+- Diagnosing a failure needs no spec under any type.
+- A closing or validating session, foreground or dispatched, that edits the
+  repo to fix a finding on an existing PR is covered by that PR's own contract:
+  its fix is checked against that PR's spec and plan, and it is not a new build.
+- A session writes its type as the first word of its mission line (`Spec:`,
+  `Build:`, `Closing:`, `Validating:`). After a compaction its type is that
+  word, and it loads that type's skill; it runs this router again only when its
+  mission line names no type. A session that has already edited the repo under
+  an earlier type keeps it, and writes it as the first word of its mission line. A session has
+  one type at a time, and changes type only on the owner's word or by stating a
+  skip-list entry. An owner who keeps one
+  session for both spec and build changes its type, and its mission line, when
+  the build starts.
+
+**A subagent** follows its prompt and loads a type skill only when the prompt
+says so. **A dispatched session** (no owner attending: Genesis launched it with
+`GENESIS_CC_SESSION=1` and without `GENESIS_SESSION_SUPERVISED=1`, or it is a
+board builder slot, which sets `GENESIS_BUILDER_KEY`) takes its type from its
+dispatcher's prompt, never the foreground default;
+one whose task is to change the repo is a build session for the task its
+prompt names. Its contract is an approved spec or an issue answering all nine
+premise items, named in its prompt, or, for the task executor, the build spec
+on the build-lane greenlight card or a completed `/task` intake. Its plan is
+one the owner approved; for the task executor, its plan review together with
+the owner's approval of the task (the greenlight card, or the `/task`
+submission's approval) is that approval. Given a change on the skip list, it
+may name the entry in its output in place of a contract. A build whose contract
+is a nine-item issue saves the issue's body at the start as
+`~/.genesis/output/specs/issue-<N>.md` and uses it as its spec; it has no
+approval report, so the reviewer skips the hash check for it and cites its
+items by line.
+
+Build and closing sessions Read
 `.claude/skills/genesis-development/references/commit-path.md` before their
 first commit.
 

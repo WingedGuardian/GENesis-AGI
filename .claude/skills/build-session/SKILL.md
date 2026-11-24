@@ -39,7 +39,9 @@ Read both, in that order; they are not on-demand reference.
 
 **A session that writes code and a session that drives a PR to merge are
 different SESSION TYPES, not two phases of one session's life** (user decision,
-2026-09-02). Loading this skill makes you a **build session**.
+2026-09-02). Loading this skill does not make a session a build session:
+the core's router (`genesis-development`, "Which session are you?") decides a
+session's type, and this skill is for a session the router made one.
 
 - **A build session owns an item from Ready through opening its PR.** It runs
   the review the change EARNS — `/deep-review` for a substantial one, because
@@ -54,8 +56,8 @@ different SESSION TYPES, not two phases of one session's life** (user decision,
   pass to the closing session along with the PR; they do not lapse.
 - **A closing session owns the open-PR queue**, whichever session built each
   PR. Its unit of work is the queue, not the card. That is the
-  **`closing-session`** skill; load it instead when the job is "get the open PRs
-  merged".
+  **`closing-session`** skill, for a session the router (`genesis-development`,
+  "Which session are you?") makes a closing session.
 - **A cloud coding agent (Devin) is a third kind of builder.** It works from the
   public repo in its own VM, with no access to an install: no running Genesis, no
   `~/.genesis/`, none of an install's hooks or local reviewers. Hand it only

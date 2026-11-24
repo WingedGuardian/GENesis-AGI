@@ -3,9 +3,11 @@ name: spec-session
 description: >
   This skill should be used when a session SPECIFIES a Genesis change before it
   is planned or built: shaping the problem, the PRD, the architecture and the
-  tickets a build session will take. Load `genesis-development` (the shared core)
-  first. Do NOT load it for building (`build-session`), closing open PRs
-  (`closing-session`), or post-merge verification (`validating-merges`).
+  tickets a build session will take. It is the default for a foreground
+  development session whose type the owner did not state. Load
+  `genesis-development` (the shared core) first. Do NOT load it for building
+  (`build-session`), closing open PRs (`closing-session`), or post-merge
+  verification (`validating-merges`).
 # MEASURED with the real scorer on this repo's skills, 2026-11-24: it fires on
 # "draft a PRD for the backup change", "write the PRD", "let's start a spec
 # session" and "new spec session for the voice bridge" (4/4), and on none of
@@ -41,7 +43,10 @@ The skip list:
 - a fix confined to one file that `classify_change_substantiality` in
   `scripts/review_scope.py` classes `inline` (an `unknown` result does not
   qualify);
-- revert commits.
+- revert commits;
+- a change to install-local configuration only, outside the repo;
+- a change of 10 or fewer lines of code, counted as lines added plus lines
+  removed in code files, tests and prose excluded.
 
 Dependency bumps are not on it. A session using the list says which entry
 applies, and checks the staged diff against that entry again before its

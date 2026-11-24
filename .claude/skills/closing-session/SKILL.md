@@ -41,9 +41,10 @@ skill_type: workflow
 
 ## Load Gate
 
-This skill is for **closing** work, not building it. If the task is "implement
-X and open a PR", you are a build session — load `build-session` instead.
-If the task is "take the open PRs and get them merged", you are here.
+This skill is for **closing** work, not building it. For a foreground session, a
+task does not decide the type: the core's router (`genesis-development`, "Which session are you?") decides a
+session's type. A closing session takes the open PRs
+and gets them merged.
 
 The two are different SESSION TYPES, not two phases of one session's life.
 
