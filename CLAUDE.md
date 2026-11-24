@@ -809,7 +809,8 @@ gate works, its exemption categories, and the unit rules for size bounds:
 - **Finish before you stop — the zero-drop rule.** A turn may run as long as
   the work requires; never yield with steps you could still complete AND are
   cleared to complete — stopping for an approval, a blocking question, plan
-  approval, or a designed hard stop is finishing correctly, not dropping
+  approval, a spec line or an approved plan step that cannot be built as
+  written, or a designed hard stop is finishing correctly, not dropping
   work. When something genuinely cannot finish this turn, every unfinished
   piece becomes a tracked row BEFORE stopping: ledger or follow-up — or an
   issue, which still owes the privacy scrub from "Where deferred work goes"
