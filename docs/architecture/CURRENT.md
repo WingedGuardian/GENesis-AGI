@@ -31,8 +31,8 @@ grown to 16 with 6 unnamed here, and nothing marked the list partial.)
 
 **Absence from this file is never absence in Genesis.** The map is deliberately
 incomplete. Verify by enumeration before any "Genesis lacks X" claim — the
-audit-by-enumeration protocol in the spec-session skill ("Auditing Existing
-Capabilities").
+audit-by-enumeration protocol in
+`.claude/skills/spec-session/references/existing-capabilities.md`.
 
 **How this file stays honest.** Every entry claims its top-level
 `src/genesis` modules in a fenced `yaml subsystem-map` block and carries a

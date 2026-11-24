@@ -30,9 +30,12 @@ rules in `spec-analyze.md`, Step 1, on the spec as it is now. Reuse the ids of
 the spec's `spec-analyze` report only when its Index line still matches the
 spec word for word; otherwise match earlier items by their first words, since
 an inserted requirement renumbers everything after it (`spec-analyze.md`,
-Step 4). Add each plan decision that
+Step 4). Once the spec has a `<spec stem>.approved.analysis.md`, take the ids
+from it instead, and apply each `## Amendments` entry to the item it names:
+that item is judged by the amendment's new text. Add each plan decision that
 obliges the build to something, and each ticket. Record the line each comes
-from.
+from. `V-n` items (the spec's `Definition of Verified`) are checked after
+merge, by the validator: list them, and do not judge them in this pass.
 
 **A checked box is not evidence.** A ticket marked done, a task list ticked
 off, a ledger row closed or a plan bullet that says "done" is a claim, and
