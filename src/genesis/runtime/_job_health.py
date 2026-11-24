@@ -369,11 +369,14 @@ def record_job_failure(
     exc: BaseException | None = None,
     error_type: str | None = None,
     emit_event: bool = True,
+    retry: bool = True,
 ) -> None:
     """Record a failed scheduled job execution (in-memory + DB).
 
     When consecutive failures reach the retry threshold (3), triggers
-    an automatic retry via the JobRetryRegistry if one is wired.
+    an automatic retry via the JobRetryRegistry if one is wired. Set
+    *retry=False* for a failure that still counts toward the streak but
+    must not trigger that retry (a partial result a re-run would not fix).
 
     *exc* is the exception object when one caused the failure. Pass it in
     preference to a pre-stringified *error*: it is the single richest artifact,
@@ -473,7 +476,7 @@ def record_job_failure(
             )
 
     consecutive = entry["consecutive_failures"]
-    if consecutive >= 3 and rt._job_retry_registry is not None:
+    if retry and consecutive >= 3 and rt._job_retry_registry is not None:
         from genesis.util.tasks import tracked_task
 
         tracked_task(

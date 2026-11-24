@@ -24,21 +24,25 @@ def _weekly_outcome(report: dict[str, Any]) -> tuple[str, str]:
     if "aborted" in report:
         return "aborted", str(report["aborted"])[:500]
     failures = {entry["phase"]: "failed" for entry in report.get("errors", ())}
+    skipped = {}
     for phase in (
         "clustering", "cross_wing", "worklist_persist", "link_repair",
         "entity_resolution", "orphan_detection", "centrality",
     ):
         detail = report.get(phase, {})
-        if "error" in detail:
+        if "not_applicable" in detail:
+            # Nothing to score on this install: not a failure, but still named.
+            # Its own key: entity resolution's "skipped" is a count, not a skip.
+            skipped[phase] = f"skipped: {detail['not_applicable']}"
+        elif "error" in detail:
             failures[phase] = "failed"
         else:
             item_failures = len(detail.get("errors", ())) + sum(detail.get("failure_counts", {}).values())
             if item_failures:
                 failures[phase] = f"{item_failures} item error(s)"
-    if failures:
-        summary = ", ".join(f"{phase} ({reason})" for phase, reason in failures.items())
-        return "partial", summary[:500]
-    return "complete", ""
+    named = {**failures, **skipped}
+    summary = ", ".join(f"{phase} ({reason})" for phase, reason in named.items())
+    return ("partial" if failures else "complete"), summary[:500]
 
 
 async def run_dream_cycle() -> None:
@@ -142,7 +146,12 @@ async def run_dream_cycle() -> None:
             if outcome == "complete":
                 rt.record_job_success("dream_cycle")
             else:
-                rt.record_job_failure("dream_cycle", error=f"{outcome}: {detail}")
+                # A partial week (phase or item errors) is not fixed by re-running
+                # the whole cycle: it still counts as a failure, but never
+                # triggers the consecutive-failure retry.
+                rt.record_job_failure(
+                    "dream_cycle", error=f"{outcome}: {detail}", retry=outcome != "partial"
+                )
     except Exception as exc:
         logger.exception("Dream cycle failed: %s", exc)
         try:

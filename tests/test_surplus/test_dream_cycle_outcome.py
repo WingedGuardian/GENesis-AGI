@@ -41,6 +41,63 @@ async def test_dream_cycle_job_health(monkeypatch, report, expected_marker):
     assert runtime._heavy_workload is None
 
 
+async def test_a_centrality_skip_is_a_complete_week_that_names_the_skip(monkeypatch):
+    runtime = MagicMock(paused=False)
+    monkeypatch.setattr(GenesisRuntime, "instance", lambda: runtime)
+    report = {
+        "errors": [],
+        # Real-shaped: entity resolution always reports its "skipped" pair count.
+        "entity_resolution": {"skipped": 3, "errors": [], "failure_counts": {}},
+        "centrality": {"not_applicable": "centrality worker is disabled"},
+    }
+    monkeypatch.setattr(dream_cycle, "run", AsyncMock(return_value=report))
+    observed = AsyncMock()
+    monkeypatch.setattr("genesis.db.crud.observations.create", observed)
+
+    await run_dream_cycle()
+
+    runtime.record_job_success.assert_called_once_with("dream_cycle")
+    runtime.record_job_failure.assert_not_called()
+    content = observed.call_args.kwargs["content"]
+    assert "weekly clustering, complete" in content
+    assert "centrality (skipped: centrality worker is disabled)" in content
+    assert "entity_resolution" not in content
+
+
+def test_entity_resolution_skip_count_never_hides_its_errors():
+    """Entity resolution's "skipped" is a count of pairs, not a skipped phase."""
+    from genesis.surplus.jobs.dream import _weekly_outcome
+
+    report = {
+        "errors": [],
+        "entity_resolution": {"skipped": 3, "errors": ["a", "b"], "failure_counts": {"audit/write": 4}},
+        "centrality": {"not_applicable": "centrality worker is disabled"},
+    }
+    assert _weekly_outcome(report) == (
+        "partial",
+        "entity_resolution (6 item error(s)), centrality (skipped: centrality worker is disabled)",
+    )
+
+
+@pytest.mark.parametrize(
+    ("report", "retry"),
+    [
+        ({"errors": [], "centrality": {"error": "centrality worker exited 4"}}, False),
+        ({"errors": [], "aborted": "low_memory"}, True),
+    ],
+)
+async def test_only_a_partial_week_skips_the_consecutive_failure_retry(monkeypatch, report, retry):
+    runtime = MagicMock(paused=False)
+    monkeypatch.setattr(GenesisRuntime, "instance", lambda: runtime)
+    monkeypatch.setattr(dream_cycle, "run", AsyncMock(return_value=report))
+    monkeypatch.setattr("genesis.db.crud.observations.create", AsyncMock())
+
+    await run_dream_cycle()
+
+    runtime.record_job_failure.assert_called_once()
+    assert runtime.record_job_failure.call_args.kwargs["retry"] is retry
+
+
 @pytest.mark.parametrize("phase", ["clustering", "worklist_persist"])
 async def test_item_failure_reaches_weekly_health_and_report(db, monkeypatch, phase):
     points = [

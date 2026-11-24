@@ -323,6 +323,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         exc: BaseException | None = None,
         error_type: str | None = None,
         emit_event: bool = True,
+        retry: bool = True,
     ) -> None:
         record_job_failure(
             self,
@@ -331,6 +332,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
             exc=exc,
             error_type=error_type,
             emit_event=emit_event,
+            retry=retry,
         )
 
     async def _load_persisted_job_health(self) -> None:

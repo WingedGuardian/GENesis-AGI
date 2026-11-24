@@ -41,6 +41,12 @@ _WORKER_TIMEOUT_S = 2 * 60 * 60
 _RECOMPUTE_LOCK = asyncio.Lock()
 
 
+class CentralityNotApplicable(GraphUnavailableError):
+    """This install has nothing to score, by configuration: the weekly phase is
+    skipped, not failed. Every other GraphUnavailableError (a crashed worker, a
+    replaced or unreadable database) is a real failure and stays one."""
+
+
 @dataclass
 class CentralityResult:
     snapshot_at: str
@@ -140,7 +146,7 @@ async def _stop_launched_worker(launch: asyncio.Task[asyncio.subprocess.Process]
 
 async def _run_worker(path: Path, run_id: str, output: BinaryIO) -> CentralityResult:
     if os.environ.get("GENESIS_DREAM_CENTRALITY_DISABLED") == "1":
-        raise GraphUnavailableError("centrality worker is disabled")
+        raise CentralityNotApplicable("centrality worker is disabled")
     memory, cpus, levers = await asyncio.gather(
         asyncio.to_thread(readings.read_memory),
         asyncio.to_thread(readings.cpu_capacity),
@@ -154,7 +160,7 @@ async def _run_worker(path: Path, run_id: str, output: BinaryIO) -> CentralityRe
     # hostmetrics still makes the final decision using live CPU usage.
     cpu_percent = int(min(100, 50 * cpus, 0.8 * levers.threshold_pct * cpus))
     if cpu_percent < 1:
-        raise GraphUnavailableError("CPU capacity is below the minimum enforceable worker quota")
+        raise CentralityNotApplicable("CPU capacity is below the minimum enforceable worker quota")
     launch = asyncio.create_task(asyncio.create_subprocess_exec(
             sys.executable, "-m", "genesis.hostmetrics", "run",
             "--name", "dream-centrality", "--ram", str(ram / 2**30),
@@ -242,13 +248,18 @@ async def run_centrality_recompute(
             cursor = await db.execute("SELECT file FROM pragma_database_list WHERE name = 'main'")
             row = await cursor.fetchone()
             if not row or not row[0]:
-                raise GraphUnavailableError("centrality requires a file-backed database")
+                raise CentralityNotApplicable("centrality requires a file-backed database")
             path = Path(row[0])
             before = await asyncio.to_thread(path.stat)
             tmp_dir = await asyncio.to_thread(big_tmp_dir)
             with tempfile.TemporaryFile(dir=tmp_dir) as output:
                 result = await _run_worker(path, run_id, output)
                 await _publish(path, before, result)
+    except CentralityNotApplicable as exc:
+        logger.info("Centrality skipped: %s", exc)
+        report["not_applicable"] = str(exc)
+        report["graph_unavailable"] = True
+        return report
     except Exception as exc:
         logger.warning("Centrality recompute failed", exc_info=True)
         report["error"] = str(exc) or type(exc).__name__
