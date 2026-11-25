@@ -792,7 +792,12 @@ agent's merge is bound to the round-4 head, the 4th round by `opened_at`
 moved off it (a fix, a merge of main, a force-push) blocks at merge unless every
 commit after it is empty, and merging that head is the owner's bang-command merge
 (`! gh pr merge …`) or a send-back. A round-4 head that cannot be placed blocks
-too. A
+too. When the owner rules "merge at head X", at any round count, post a PR comment
+carrying `<!-- genesis-pin head=<full 40-hex sha of X> -->`: an agent merge then
+passes only at X, on top of the round-4 rule, and a pin outside the PR's commits,
+or two pins naming different heads, blocks. Only a maintainer's pin counts (author
+association OWNER, MEMBER or COLLABORATOR); anyone else's is ignored. Only the owner removes or edits a pin;
+a deleted pin leaves no trace on GitHub, so that limit is stated, best effort. A
 fifth round exists only by explicit user approval, re-asked every round, and
 each of those is terminal in the same way (this replaced "round 6 and later are
 strongly discouraged", which read round 5 as ordinary; the discouragement was never a

@@ -6483,6 +6483,10 @@ def _check_past_terminal(
 
     - The budget unreadable: block, at any round count, since unknown cannot tell
       below terminal from past it.
+    - Pins (``genesis-pin`` comments, the owner's "merge at head X"; F-B2), at any
+      round count: a ``pin_error`` blocks, and otherwise ``head`` must equal every
+      pinned head exactly. A pin only restricts: past terminal the rules below
+      must hold as well, so a pin never loosens them.
     - Below terminal: pass.
     - Past terminal: pass only when ``head`` (the merge's ``--match-head-commit``)
       is the terminal head, or is the budget's current head and reaches the
@@ -6500,9 +6504,26 @@ def _check_past_terminal(
             f"the review budget is unreadable ({errors}); an agent merge needs a readable "
             f"budget at any round count. Retry, or {owner_route}."
         )
+    merging = (head or "").strip().lower()
+    pins = budget.get("pin_heads") or []
+    pin_error = budget.get("pin_error") or (None if isinstance(pins, list) else "malformed_pins")
+    if pin_error:
+        named = ", ".join(str(p) for p in pins) if isinstance(pins, list) else "unreadable"
+        return True, (
+            f"the PR's `genesis-pin` comments cannot be honoured ({pin_error}; pinned: "
+            f"{named or 'none'}). Only the owner moves or removes a pin — {owner_route}."
+        )
+    pins = [str(p).lower() for p in pins]
+    if any(merging != pin for pin in pins):
+        return True, (
+            f"an agent merges only at the owner's pinned head {', '.join(pins)} (a "
+            f"`genesis-pin` comment), and this merge is bound to {merging or 'no head'}. "
+            f"Only the owner moves or removes a pin — {owner_route}."
+        )
+    pin_note = f", merging at the pinned head {merging[:12]}" if pins else ""
     state = budget.get("terminal_state")
     if state == "below":
-        return False, "below terminal"
+        return False, "below terminal" + pin_note
     lane_limit = (
         _review_budget.GATE_DISCOVERY_ROUND_LIMIT
         if budget.get("gate_surface")
@@ -6516,14 +6537,13 @@ def _check_past_terminal(
             f"merge or send back is the owner's call — {owner_route}."
         )
     terminal = terminal.lower()
-    merging = (head or "").strip().lower()
     if merging and merging == terminal:
-        return False, f"past terminal, merging at the terminal head {terminal[:12]}"
+        return False, f"past terminal, merging at the terminal head {terminal[:12]}" + pin_note
     current = str(budget.get("current_head") or "").lower()
     if merging and merging == current and _reaches_over_empty_commits(budget, merging, terminal):
         return False, (
             f"past terminal, head {merging[:12]} reaches the terminal head "
-            f"{terminal[:12]} over empty commits only"
+            f"{terminal[:12]} over empty commits only" + pin_note
         )
     return True, (
         f"past round {lane_limit} the PR moved off its terminal head {terminal}; "

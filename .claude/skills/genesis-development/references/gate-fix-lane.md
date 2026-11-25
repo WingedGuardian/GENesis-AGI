@@ -34,7 +34,11 @@ Applies to any PR whose diff touches the enforcement-hook surface (`scripts/revi
   `opened_at`), or at a head that adds only empty commits to it, and an unreadable
   budget blocks every agent merge (`git_push_guard.py` `_check_past_terminal`, the
   `terminal-head` row of `--check-pr`). Any other head is the owner's bang-command
-  merge or a send-back.
+  merge or a send-back. An owner's "merge at head X" is pinned with a PR comment
+  carrying `<!-- genesis-pin head=<full sha> -->` from a maintainer's account (any
+  other author's pin is ignored); the merge must then be at X as well, and only
+  the owner removes a pin (a deletion leaves no trace on GitHub,
+  so that limit is best effort).
 
   **Scope: any PR whose diff touches the enforcement-hook surface** —
   `HOOK_SURFACE_PREFIXES` + `HOOK_SURFACE_FILES` in `scripts/review_budget.py`.

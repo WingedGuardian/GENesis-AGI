@@ -168,6 +168,11 @@ _CONFIRMATION_RE = re.compile(
     r"kind=confirmation\s*-->",
     re.IGNORECASE,
 )
+#: An owner's "merge at head X" ruling, posted as a PR comment (owner ruling
+#: 3f6ad6fb, F-B2). It only restricts which head an agent may merge.
+_PIN_RE = re.compile(r"<!--\s*genesis-pin\s+head=([0-9a-fA-F]{40})\s*-->", re.IGNORECASE)
+#: The GitHub ``authorAssociation`` values whose pin comments count: the repo's maintainers.
+_PIN_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 
 Runner = Callable[..., tuple[int, str, str]]
 
@@ -274,6 +279,8 @@ def _unknown(*errors: str, current_head: str = "") -> dict[str, Any]:
         "terminal_head": None,
         "terminal_error": "evidence_unknown",
         "confirmation_heads": [],
+        "pin_heads": [],
+        "pin_error": "evidence_unknown",
         "open_keys": [],
         "reflection_keys": "unknown",
         "body": None,
@@ -789,6 +796,7 @@ def evaluate_evidence(
     # head. A marker with no time cannot be placed among the others.
     confirmation_times: dict[str, datetime] = {}
     confirmation_untimed: set[str] = set()
+    pin_heads: set[str] = set()
     for item in issue_comments:
         if not isinstance(item, Mapping):
             return _unknown("malformed_comment_record", current_head=head)
@@ -817,6 +825,11 @@ def evaluate_evidence(
                 confirmation_untimed.add(marker_head)
             elif marker_head not in confirmation_times or when < confirmation_times[marker_head]:
                 confirmation_times[marker_head] = when
+        # Only a maintainer's pin counts. On a public repo anyone can comment, and a
+        # stranger's stale or disagreeing pin would block every agent merge until the
+        # owner removed it. Anyone else's pin-shaped text, or a deleted author's, is ignored.
+        if login is not None and item.get("author_association") in _PIN_ASSOCIATIONS:
+            pin_heads.update(pin.group(1).lower() for pin in _PIN_RE.finditer(body))
         for index, pattern in enumerate(identities):
             for match in pattern.finditer(body):
                 resolved, error = _resolve_sha(match.group(1), commits)
@@ -1055,6 +1068,13 @@ def evaluate_evidence(
         if terminal_error is not None:
             terminal_state, terminal_head = "unknown", None
 
+    # Every live pin must hold (F-B2): the newest does not win, so two heads disagree.
+    pin_error = None
+    if any(sha not in order for sha in pin_heads):
+        pin_error = "pin_not_in_pr"
+    elif len(pin_heads) > 1:
+        pin_error = "pins_disagree"
+
     # Live rounds only: a head a force-push removed has no position, so its place
     # in this order (and so in the trend) would be a guess.
     scored = [r["findings"] for r in rounds if r["findings"] is not None and r["head"] in order]
@@ -1184,6 +1204,8 @@ def evaluate_evidence(
             }
             for sha in sorted(confirmation_heads)
         ],
+        "pin_heads": sorted(pin_heads),
+        "pin_error": pin_error,
         "rounds": rounds,
         "round_state": round_state,
         "trend": trend,
@@ -1365,7 +1387,8 @@ _GRAPHQL_CONNECTIONS = {
     ),
     "comments": (
         "comments(first: 100, after: $after_comments) { pageInfo { hasNextPage endCursor } "
-        "nodes { fullDatabaseId body createdAt updatedAt author { login __typename } } }"
+        "nodes { fullDatabaseId body createdAt updatedAt authorAssociation "
+        "author { login __typename } } }"
     ),
     "files": (
         "files(first: 100, after: $after_files) { pageInfo { hasNextPage endCursor } "
@@ -1495,6 +1518,7 @@ def _graphql_rows(name: str, nodes: object) -> tuple[list[dict[str, Any]], bool]
                     "id": _node_id(node),
                     "login": login,
                     "type": kind,
+                    "author_association": node.get("authorAssociation"),
                     "body": node.get("body"),
                     "created_at": node.get("createdAt"),
                     "updated_at": node.get("updatedAt"),
