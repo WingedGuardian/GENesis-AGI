@@ -702,3 +702,50 @@ class TestPostRebootGrace:
         other = ConfirmationStateMachine(GuardianConfig())
         other.load_state(tmp_path / "state.json")
         assert other.state.rebooted_at == "2026-01-01T00:00:00+00:00"
+
+
+# ── #5007: a killed tick's state still has a next decision ──────────────────
+
+
+class TestKilledTickState:
+
+    def test_a_loaded_recovering_is_an_outcome_not_seen(self, sm: ConfirmationStateMachine) -> None:
+        """RECOVERING on disk is a killed tick's: it reaches _from_recovered,
+        never "recovery in progress" on every tick."""
+        sm._state.current_state = GuardianState.RECOVERING
+        sm.record_recovery_attempt("RESTART_SERVICES")
+        t = sm.process(_dead_snapshot())
+        assert t.new_state == GuardianState.CONFIRMED_DEAD and t.action_needed is True
+        sm._state.current_state = GuardianState.RECOVERING
+        assert sm.process(_healthy_snapshot()).new_state == GuardianState.HEALTHY
+
+    def test_persist_writes_to_the_path_load_state_read(
+        self, sm: ConfirmationStateMachine, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "state.json"
+        sm.persist()  # no path read yet: nothing written, nothing raised
+        sm.load_state(path)
+        sm.record_recovery_attempt("IO_TRIAGE")
+        sm.persist()
+        assert json.loads(path.read_text())["io_triage_attempts"] == 1
+
+    def test_escalation_reads_the_proposed_actions_own_counter(
+        self, sm: ConfirmationStateMachine, config: GuardianConfig
+    ) -> None:
+        sm._state.recovery_attempts = 1
+        sm._state.io_triage_attempts = config.recovery.max_io_triage_attempts
+        assert sm.should_escalate("IO_TRIAGE") is True
+        assert sm.should_escalate("RESTART_SERVICES") is False
+        sm._state.io_triage_attempts = 0
+        sm._state.recovery_attempts = config.recovery.max_escalations
+        assert sm.should_escalate("IO_TRIAGE") is False  # its own budget only (round 1)
+        assert sm.should_escalate("RESTART_SERVICES") is True
+
+
+def test_save_state_reports_whether_it_saved(tmp_path: Path) -> None:
+    sm = ConfirmationStateMachine(GuardianConfig())
+    assert sm.save_state(tmp_path / "state.json") is True
+    (tmp_path / "dir.json").mkdir()  # replace() onto a directory fails
+    assert sm.save_state(tmp_path / "dir.json") is False
+    sm.load_state(tmp_path / "dir.json")
+    assert sm.persist() is False

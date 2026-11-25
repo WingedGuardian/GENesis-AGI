@@ -237,6 +237,12 @@ Easy-to-forget mechanisms:
   in another process that commits in between makes it write nothing
   (`CredentialKeyChanged`); the ingest then re-reads and runs again, up to five
   times, so every writer in a race lands, and a sixth change reaches the caller.
+  The write's plan (its masks, target entry, sameness and a new entry's
+  candidates) is built from a read of the name's entries before the knowledge
+  writer lock, a file lock every ingest takes, and read again under it; when
+  those entries or the key changed, the plan is built again under the lock
+  (`_credential_plan`), so the value of a same-name write that committed in
+  between is masked in this write's name and tags.
   Only `reference_ops` reads the secret row: `compose_body` puts the value and
   the description back for `reference_lookup` (behind its audit log),
   `reveal_reference` returns both for the dashboard's reveal, and
@@ -2860,7 +2866,59 @@ verified: 204c69c1f 2026-11-22
   `RESTART_CONTAINER` before Gate 2 (after F.1's git-health redirect), and
   `recovery.py` refuses it as a backstop. A restart ends lock holders and lets
   a boot repair run where one is installed; a bad candidate is removed by
-  `deploy_candidates drop`. The diagnosis snapshot carries the boot repair's
+  `deploy_candidates drop`. With `recovery.live_engine: true` in the host's
+  guardian.yaml (default false, and only a real bool arms it; #2978) the
+  Guardian runs that drop itself (`guardian/live_drop.py`): before Gate 2,
+  `check.py` reads the engine's `list --json --move-refusals` and proposes the
+  drop of the newest candidate (the last one `live` holds that the manifest
+  lists), an ESCALATE to `rebuild` when a drop is half-done, or
+  `RESTART_CONTAINER` when no drop can run. A drop is proposed only when the
+  view's `drop_preview` (that drop's own plan, computed lockless; it writes
+  only unreachable git objects) names the same branch and every other
+  candidate it takes out, and Gate 2's identity section, never cut and at
+  most 3,000 UTF-16 units, lists them all; otherwise the proposal is
+  `RESTART_CONTAINER`, naming why. The approved drop is ONE call to
+  the engine's guarded form (`--expect-branch live --expect-head
+  --expect-candidate --expect-leaving <the list Gate 2 showed>
+  --restart-server --wait 0`, 120 s client timeout; a plan that takes out a
+  different set refuses, nothing changed), which
+  drops, confirms and queues the restart under one update.lock hold; the
+  Guardian then judges only whether genesis-server booted from `live`'s new
+  tip (`scripts/lib/serving_commit.py`, as `deploy_code_only.sh status` reads
+  it), with no 30 s probe: the next check judges health. It restarts once
+  itself on exit 4, on exit 1 after the manifest save when the engine's view
+  shows the drop done, and on exit 5 only while the pre-drop server still
+  runs. The attempt is recorded in the Guardian state, and saved to disk,
+  before the engine call (#5007); a clean refusal (200, 2, 97, the deploy
+  marker, or "nothing changed" by the engine's words or its view) puts back
+  the record that was there before. An outcome it did not see (timeout,
+  130/143, an unknown code) keeps it, and the next diagnosis names it:
+  while the checkout has not settled since, nothing is proposed; once the
+  drop finished, a server not booted from `live`'s tip is offered a restart
+  before any further drop. The record lasts until a healthy snapshot. While
+  it is set, any action that ran ends in RECOVERED, which waits out the
+  backoff and then moves once to CONFIRMED_DEAD; that one transition passes
+  the episode's alert latch, so the next diagnosis always comes (the
+  escalation, at max_escalations). A container restart or rollback proposed
+  while that drop may still be running says at Gate 2 that it would interrupt
+  it, and an approved action held back by the backoff says it did not run.
+  Off, the
+  behaviour above is unchanged and no candidate is read. On every install
+  (#5007): each approved action, before it runs, counts its attempt and saves
+  RECOVERED to disk (the backoff is re-stamped when it ends); when that save
+  fails, nothing runs, the checkpoint's changes are put back, the episode's
+  alert latch is cleared so the next check asks again, and one CRITICAL alert
+  names the state file. The checkpoint is written with that latch clear (on
+  disk only). A killed tick (systemd's stop or TimeoutStartSec) saves nothing
+  more, so the disk holds either that checkpoint (outcome unknown: the next
+  tick diagnoses afresh) or the previous tick's state; a RECOVERING read from disk goes on as RECOVERED. A cancelled
+  `incus exec` client is killed and reaped. An approved action held back by a
+  backoff of at most 900 s (one that ran out between two reads included) is
+  waited out inside the tick, then runs unless Genesis is back, paused, or the
+  Guardian stood down (the latch is then cleared, as on a DENY); a proposal whose own budget is spent (IO_TRIAGE's
+  counter for IO_TRIAGE, the main one for the rest) becomes ESCALATE on the
+  re-diagnosis path before Gate 1, and on every path before Gate 2. The diagnosis
+  snapshot carries the boot repair's
   `live-move repair:` journal lines and a summary of the newest
   `deploy-backups/*-live-move-repair/REPAIR.json` that is neither dismissed
   nor superseded and names `~/genesis` (6 h window on the ts in its dir name,
