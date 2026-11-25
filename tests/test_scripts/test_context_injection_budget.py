@@ -896,3 +896,46 @@ def test_the_emitter_derivation_reaches_NESTED_scripts(tmp_path) -> None:
     assert "hooks/nested.py" in found, "a nested emitter is invisible to the lock"
     assert not any("hook_output" in f for f in found), "the writer excludes itself"
     assert "unrelated.py" not in found
+
+
+# ── the identity resolver (#2862) ────────────────────────────────────────
+
+
+def test_identity_core_reads_the_seed_and_the_steering_layer(monkeypatch, capsys, tmp_path):
+    ident = tmp_path / "identity"
+    ident.mkdir()
+    (ident / "SOUL.md.example").write_text("shipped soul")
+    (ident / "STEERING.md").write_text("# Steering\n\n---\n\nshipped rule")
+    (ident / "STEERING.local.md").write_text("local rule")
+    out = _direct_part(monkeypatch, capsys, ident, "identity-core")
+    assert "shipped soul" in out
+    assert "shipped rule\n\n---\n\nlocal rule" in out
+
+
+def test_truncation_notice_names_every_file_that_was_read(monkeypatch, capsys, tmp_path):
+    ident = tmp_path / "identity"
+    ident.mkdir()
+    (ident / "SOUL.md").write_text("soul")
+    (ident / "STEERING.md").write_text("# Steering")
+    (ident / "STEERING.local.md").write_text("R" * 12_000)
+    out = _direct_part(monkeypatch, capsys, ident, "identity-core")
+    assert (
+        "read src/genesis/identity/STEERING.md and "
+        "src/genesis/identity/STEERING.local.md directly." in out
+    )
+    assert _ctx.utf16_len(out) <= _ctx._PART_BUDGET
+
+
+def test_steering_notice_is_reserved_at_its_real_length(monkeypatch, capsys, tmp_path):
+    """An oversized SOUL truncates to make room for STEERING's notice, which names
+    STEERING.local.md too; reserving only the fixed tail cut the part hard."""
+    ident = tmp_path / "identity"
+    ident.mkdir()
+    (ident / "SOUL.md").write_text("S" * 12_000)
+    # Larger than any reserve, so STEERING itself degrades to its notice.
+    (ident / "STEERING.md").write_text("# Steering\n\n---\n\n" + "R" * 2_000)
+    (ident / "STEERING.local.md").write_text("local rule")
+    out = _direct_part(monkeypatch, capsys, ident, "identity-core")
+    assert "CUT" not in out
+    assert "src/genesis/identity/STEERING.local.md directly.]_" in out
+    assert _ctx.utf16_len(out) <= _ctx._PART_BUDGET

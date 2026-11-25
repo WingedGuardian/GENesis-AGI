@@ -78,6 +78,31 @@ if _SECRETS_PATH.is_file():
 _FLAG = Path.home() / ".genesis" / "cc_context_enabled"
 _SETUP_COMPLETE = Path.home() / ".genesis" / "setup-complete"
 _IDENTITY_DIR = Path(__file__).resolve().parent.parent / "src" / "genesis" / "identity"
+# The resolver's own location, fixed: tests point _IDENTITY_DIR at a scratch dir.
+_IDENTITY_PATHS_PY = _IDENTITY_DIR / "paths.py"
+
+
+def _identity_notice(name: str, ipaths) -> str:
+    """The truncation notice for one identity file, naming every file it was read from."""
+    read = " and ".join(
+        f"src/genesis/identity/{p.name}" for p in ipaths.sources(name, _IDENTITY_DIR)
+    ) or f"src/genesis/identity/{name}"
+    return (
+        f"\n\n_[{name} truncated at {{kept}} chars — the full file exceeds "
+        f"this hook's stdout budget; read {read} directly.]_"
+    )
+
+
+def _identity_paths():
+    """The stdlib-only identity resolver, loaded by path like the secrets one."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_genesis_identity_paths", _IDENTITY_PATHS_PY)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 # Which identity files ride which part. Split across two hook entries because
 # each entry gets its own harness budget (see the cap block below).
 _IDENTITY_PARTS = {
@@ -309,7 +334,8 @@ _CONVERSATION_POINTER = (
 )
 
 #: The tail a truncated identity file appends (see the truncation branch). Sized
-#: generously; only its LENGTH is used, as a reserve.
+#: generously; only its LENGTH is used, as the reserve's floor (a notice naming a
+#: local layer as well is longer, and is reserved at its own length).
 _TRUNCATION_NOTICE_TAIL = (
     "\n\n_[CONVERSATION.md truncated at 99999 chars — the full file exceeds this "
     "hook's stdout budget; read src/genesis/identity/CONVERSATION.md directly.]_"
@@ -915,15 +941,27 @@ def _emit_body() -> tuple[str, str, str] | None:
     #     when USER leaves it no room, and an oversized USER itself truncates
     #     LOUDLY rather than silently taking the part over the cliff).
     if not is_genesis_session:
+        try:
+            _ipaths = _identity_paths()
+        except Exception as exc:
+            _ipaths = None
+            if any(_in(p) for p in _IDENTITY_PARTS):
+                _emit(
+                    "## GENESIS ALERT: the identity resolver could not be loaded\n\n"
+                    f"`{type(exc).__name__}: {exc}` — every identity file is MISSING from "
+                    "this window. Tell the user; src/genesis/identity/paths.py is broken.",
+                    block="identity-error:paths.py",
+                )
+                first = False
         for _pname, _files in _IDENTITY_PARTS.items():
-            if not _in(_pname):
+            if _ipaths is None or not _in(_pname):
                 continue
             for _idx, name in enumerate(_files):
-                path = _IDENTITY_DIR / name
-                if not path.exists():
-                    continue
                 try:
-                    content = path.read_text(encoding="utf-8").strip()
+                    content = _ipaths.read_identity(name, _IDENTITY_DIR)
+                    if content is None:
+                        continue
+                    content = content.strip()
                 except (OSError, UnicodeDecodeError) as exc:
                     # One damaged file must not cost the whole part. Say WHICH
                     # file and why, in-band: an identity file that silently
@@ -971,7 +1009,15 @@ def _emit_body() -> tuple[str, str, str] | None:
                 _reserve = (
                     emit_cost(_CONVERSATION_POINTER) + utf16_len("\n\n---\n\n")
                     if _next == "CONVERSATION.md"
-                    else utf16_len(_TRUNCATION_NOTICE_TAIL)
+                    # The next file's own notice at its widest, charged like the
+                    # pointer above (emit cost plus the divider ahead of it), and
+                    # never below the fixed tail: a notice naming a local layer is
+                    # longer than the tail, which only covered the divider by slack.
+                    else max(
+                        utf16_len(_TRUNCATION_NOTICE_TAIL),
+                        emit_cost(_identity_notice(_next, _ipaths).replace("{kept}", "99999"))
+                        + utf16_len("\n\n---\n\n"),
+                    )
                     if _next
                     else 0
                 )
@@ -982,11 +1028,7 @@ def _emit_body() -> tuple[str, str, str] | None:
                     # CONVERSATION.md is the one identity file with a pointer to
                     # fall back to; the rest are never elided, only truncated.
                     pointer=_CONVERSATION_POINTER if name == "CONVERSATION.md" else "",
-                    notice=(
-                        f"\n\n_[{name} truncated at {{kept}} chars — the full file exceeds "
-                        f"this hook's stdout budget; read src/genesis/identity/{name} "
-                        "directly.]_"
-                    ),
+                    notice=_identity_notice(name, _ipaths),
                     reserve=_reserve,
                 )
                 first = False
