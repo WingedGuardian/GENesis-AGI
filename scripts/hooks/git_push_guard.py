@@ -3580,6 +3580,15 @@ def _compare_rows(orig: str, head: str, repo: str | None) -> tuple[str, list[dic
     return data["status"], [r for r in files if isinstance(r, dict)]
 
 
+#: The blob oid of one path at each of two commits (``_blob_oids``).
+_BLOB_OIDS_QUERY = (
+    "query($owner:String!,$name:String!,$a:String!,$b:String!){"
+    "repository(owner:$owner,name:$name){"
+    "a:object(expression:$a){__typename ... on Blob{oid}} "
+    "b:object(expression:$b){__typename ... on Blob{oid}}}}"
+)
+
+
 def _blob_oids(
     repo: str | None, at_orig: tuple[str, str], at_head: tuple[str, str]
 ) -> tuple[str | None, str | None] | None:
@@ -3598,12 +3607,6 @@ def _blob_oids(
     if not slug or "/" not in slug:
         return None
     owner, name = slug.split("/", 1)
-    query = (
-        "query($owner:String!,$name:String!,$a:String!,$b:String!){"
-        "repository(owner:$owner,name:$name){"
-        "a:object(expression:$a){__typename ... on Blob{oid}} "
-        "b:object(expression:$b){__typename ... on Blob{oid}}}}"
-    )
     try:
         result = subprocess.run(
             [
@@ -3611,7 +3614,7 @@ def _blob_oids(
                 "api",
                 "graphql",
                 "-f",
-                f"query={query}",
+                f"query={_BLOB_OIDS_QUERY}",
                 "-f",
                 f"owner={owner}",
                 "-f",
@@ -3657,7 +3660,10 @@ class _FixEvidence:
     ancestors, and the finding's file differs there from every head the finding was
     posted on, so a fully reverted fix does not clear. A partial revert, or a revert
     hidden by another change to the same file (another fix, a merge of main), still
-    clears. It proves provenance, not that the change is correct. Every read failure means "not verified": the finding stays
+    clears; so does a reverted fix whose file was then moved past the compare's
+    300-file cap with its old name reused, or moved where the PR's own file list
+    (base to head) reads the move as a removal, as after a heavy rewrite before the
+    finding. Each needs a revert and a move together. It proves provenance, not that the change is correct. Every read failure means "not verified": the finding stays
     blocked and the reason says why, so ``# floor-accept`` is the way through.
 
     ``head`` is the head the merge is bound to; when the caller has none, the PR's
@@ -3725,20 +3731,51 @@ class _FixEvidence:
             return _FIX_UNCHANGED
         else:
             at_head = path
+        capped = row is None
         if not isinstance(at_head, str) or not at_head:
             return "fix could not be verified (compare row unreadable)"
+        oids = self._blobs(orig, path, head, at_head)
+        if isinstance(oids, str):
+            return oids
+        if (
+            capped
+            and oids[0] is not None
+            and oids[1] is None
+            and _pr_changed_files(self._pr_num, repo=self._repo) is not None
+        ):
+            # Past the cap, the old path is gone at the head: deleted, or renamed. The
+            # PR's own file list (base to head, not inflated by a merge of main) says
+            # which; anything it cannot confirm stays unverified.
+            dest = _pr_rename_map(self._pr_num, repo=self._repo).get(path)
+            if isinstance(dest, str) and dest:
+                oids = self._blobs(orig, path, head, dest)
+                if isinstance(oids, str):
+                    return oids
+            elif _pr_file_statuses(self._pr_num, repo=self._repo).get(path) == "removed":
+                return None
+        if oids[0] is None or oids[1] is None:
+            return (
+                f"fix could not be verified ({path} at the finding's head, or its name at "
+                "the head being merged, unreadable or absent)"
+            )
+        return _FIX_UNCHANGED if oids[0] == oids[1] else None
+
+    def _blobs(
+        self, orig: str, path: str, head: str, at_head: str
+    ) -> tuple[str | None, str | None] | str:
+        """Blob oids of ``orig:path`` and ``head:at_head``, or why they were not read."""
         if self._blob_reads >= _FIX_CHECK_MAX_BLOB_READS:
             return f"blob-read cap reached ({_FIX_CHECK_MAX_BLOB_READS} reads)"
         if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
             return "fix could not be verified (merge deadline reached)"
         self._blob_reads += 1
         oids = _blob_oids(self._repo, (orig, path), (head, at_head))
-        if oids is None or oids[0] is None or oids[1] is None:
+        if oids is None:
             return (
                 f"fix could not be verified ({path} at the finding's head, or {at_head} at "
-                "the head being merged, unreadable or absent)"
+                "the head being merged, unreadable)"
             )
-        return _FIX_UNCHANGED if oids[0] == oids[1] else None
+        return oids
 
     def _commit_list(self) -> tuple[list[dict] | None, bool]:
         if self._commits is None:

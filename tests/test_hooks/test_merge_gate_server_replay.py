@@ -532,13 +532,14 @@ def test_a_codex_p1_inline_finding_blocks(tmp_path):
     assert "merge-with" not in rows
 
 
-def test_a_maintainer_answered_p1_passes(tmp_path):
-    """The control for the test above: the same P1, answered by the owner in its own
-    review with the commit that fixed it. The inline comments reach the guard's jq
-    filter non-empty and must come out readable, with the reply's ``in_reply_to_id``
-    read as the P1 it answers, and the fix read through the real commit endpoints."""
+FINDING_HEAD = "a" * 40
+
+
+def _answered_p1_state() -> dict:
+    """A P1 posted at FINDING_HEAD and answered by the owner with the HEAD commit that
+    fixed it, every read the fix test makes recorded."""
     state = _green_state()
-    finding_head = "a" * 40
+    finding_head = FINDING_HEAD
     state["api"][f"pulls/{PR}/commits"] = [
         {
             **state["api"][f"pulls/{PR}/commits"][0],
@@ -587,10 +588,45 @@ def test_a_maintainer_answered_p1_passes(tmp_path):
     finding = {**_codex_inline("P1"), "original_commit_id": finding_head}
     state["api"][f"pulls/{PR}/comments"] = [finding, reply]
     state["api"][f"pulls/{PR}/reviews"].append(owner_review)
-    proc, rows, _ = _report(tmp_path, state)
+    return state
+
+
+def test_a_maintainer_answered_p1_passes(tmp_path):
+    """The control for the test above: the same P1, answered by the owner in its own
+    review with the commit that fixed it. The inline comments reach the guard's jq
+    filter non-empty and must come out readable, with the reply's ``in_reply_to_id``
+    read as the P1 it answers, and the fix read through the real commit endpoints."""
+    proc, rows, _ = _report(tmp_path, _answered_p1_state())
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert rows["inline-findings"].startswith("ok"), rows["inline-findings"]
     assert rows["verdict"] == "MERGEABLE (all gates pass)"
+
+
+@pytest.mark.parametrize(("at_head", "clears"), [("d" * 40, True), ("c" * 40, False)])
+def test_a_capped_compare_is_decided_by_the_blob_read(tmp_path, at_head, clears):
+    """#5000: past the compare's 300-file cap the finding's file has no row, so the
+    real GraphQL blob read decides: changed since the finding clears, the same blob
+    (a reverted fix) blocks."""
+    state = _answered_p1_state()
+    state["api"][f"compare/{FINDING_HEAD}...{HEAD}"] = {
+        "status": "ahead",
+        "files": [
+            {"filename": f"src/x{i}.py", "status": "modified", "changes": 1} for i in range(300)
+        ],
+    }
+    state["blobs"] = {
+        f"{FINDING_HEAD}:src/example/module.py": {"__typename": "Blob", "oid": "c" * 40},
+        f"{HEAD}:src/example/module.py": {"__typename": "Blob", "oid": at_head},
+    }
+    proc, rows, calls = _report(tmp_path, state)
+    assert any(f"a={FINDING_HEAD}:src/example/module.py" in c["argv"] for c in calls), (
+        "the blob read never ran"
+    )
+    if clears:
+        assert rows["inline-findings"].startswith("ok"), rows["inline-findings"]
+    else:
+        assert rows["inline-findings"].startswith("BLOCK"), rows["inline-findings"]
+        assert "unchanged since the finding was posted" in proc.stdout, proc.stdout
 
 
 def test_two_codex_p2s_block_a_critical_change(tmp_path):
@@ -1106,6 +1142,7 @@ def _live_graphql_documents() -> dict[str, str]:
     live = {
         "base_ref": base_ref[0],
         "codex_signal": guard["_CODEX_SIGNAL_QUERY"],
+        "blob_oids": guard["_BLOB_OIDS_QUERY"],
         "outside_pr": guard["_OUTSIDE_PR_QUERY"],
         "delivery_changes": _module_strings(_DELIVERY_MARKER)[0]["_CHANGES_Q"],
     }

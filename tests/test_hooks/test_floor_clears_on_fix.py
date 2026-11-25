@@ -864,7 +864,7 @@ class TestStillInHead:
             (_blobs("a" * 40, "a" * 40), False, "unchanged since"),
             (_blobs("a" * 40, None), False, "unreadable or absent"),
             (_blobs(None, "b" * 40), False, "unreadable or absent"),
-            (lambda *_a: None, False, "unreadable or absent"),
+            (lambda *_a: None, False, "unreadable"),
         ],
     )
     def test_a_pure_rename_is_decided_by_the_blobs(self, guard, monkeypatch, blobs, cleared, why):
@@ -890,6 +890,109 @@ class TestStillInHead:
         monkeypatch.setattr(guard, "_blob_oids", lambda *_a: blobs())
         block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply()])
         assert block is not cleared, msg
+
+    _CAPPED = [{"f": f"src/x{i}.py", "p": None, "s": "modified", "c": 1} for i in range(300)]
+
+    def _capped_scan(self, guard, monkeypatch, pr_files, blobs):
+        """A compare capped at 300 files without the finding's file; ``blobs`` maps the
+        head-side name to its oid (None: absent there)."""
+        monkeypatch.setenv("_TEST_GH_PR_FILES", "\n".join(json.dumps(r) for r in pr_files))
+        monkeypatch.setattr(guard, "_compare_rows", _cmp(self._CAPPED))
+        seen = []
+
+        def read(_repo, at_orig, at_head):
+            seen.append((at_orig, at_head))
+            return blobs.get("orig", "a" * 40), blobs.get(at_head[1])
+
+        monkeypatch.setattr(guard, "_blob_oids", read)
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply()])
+        return block, msg, seen
+
+    def test_a_deletion_past_the_cap_clears(self, guard, monkeypatch):
+        """Round 1 (Devin 4686732027): the fix deleted the file, and the capped
+        compare does not list it; the PR file list confirms the removal."""
+        block, msg, seen = self._capped_scan(
+            guard,
+            monkeypatch,
+            [{"filename": PATH, "previous_filename": None, "status": "removed"}],
+            {PATH: None},
+        )
+        assert not block, msg
+        assert seen == [((BASE, PATH), (MERGE, PATH))]
+
+    def test_a_rename_with_edits_past_the_cap_clears(self, guard, monkeypatch):
+        block, msg, seen = self._capped_scan(
+            guard,
+            monkeypatch,
+            [{"filename": "src/moved.py", "previous_filename": PATH, "status": "renamed"}],
+            {PATH: None, "src/moved.py": "b" * 40},
+        )
+        assert not block, msg
+        assert seen[-1] == ((BASE, PATH), (MERGE, "src/moved.py"))
+
+    def test_a_pure_rename_past_the_cap_blocks(self, guard, monkeypatch):
+        block, msg, _ = self._capped_scan(
+            guard,
+            monkeypatch,
+            [{"filename": "src/moved.py", "previous_filename": PATH, "status": "renamed"}],
+            {PATH: None, "src/moved.py": "a" * 40},
+        )
+        assert block and "unchanged since" in msg
+
+    @pytest.mark.parametrize(
+        ("pr_files", "blobs"),
+        [
+            # Gone at the head, but the PR file list neither removes nor renames it.
+            ([{"filename": PATH, "previous_filename": None, "status": "modified"}], {PATH: None}),
+            # Renamed, but the new name is unreadable or absent too.
+            (
+                [{"filename": "src/moved.py", "previous_filename": PATH, "status": "renamed"}],
+                {PATH: None, "src/moved.py": None},
+            ),
+            # Absent at the finding's head: no deletion can be credited.
+            (
+                [{"filename": PATH, "previous_filename": None, "status": "removed"}],
+                {"orig": None, PATH: None},
+            ),
+        ],
+    )
+    def test_a_capped_absence_it_cannot_confirm_blocks(self, guard, monkeypatch, pr_files, blobs):
+        block, msg, _ = self._capped_scan(guard, monkeypatch, pr_files, blobs)
+        assert block and "could not be verified" in msg
+
+    def test_only_a_capped_compare_consults_the_pr_file_list(self, guard, monkeypatch):
+        """A listed rename row is the compare's own answer: when its new name is absent,
+        the PR file list (base to head) may not overrule it, even if it says removed."""
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            json.dumps({"filename": PATH, "previous_filename": None, "status": "removed"}),
+        )
+        monkeypatch.setattr(
+            guard, "_compare_rows", _cmp([{"f": "src/new.py", "p": PATH, "s": "renamed", "c": 0}])
+        )
+        monkeypatch.setattr(guard, "_blob_oids", _blobs("a" * 40, None))
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply()])
+        assert block and "could not be verified" in msg
+
+    def test_an_unreadable_pr_file_list_keeps_a_capped_absence_open(self, guard, monkeypatch):
+        monkeypatch.setattr(guard, "_pr_changed_files", lambda *_a, **_k: None)
+        block, msg, _ = self._capped_scan(
+            guard,
+            monkeypatch,
+            [{"filename": PATH, "previous_filename": None, "status": "removed"}],
+            {PATH: None},
+        )
+        assert block and "could not be verified" in msg
+
+    def test_the_second_blob_read_counts_against_the_cap(self, guard, monkeypatch):
+        monkeypatch.setattr(guard, "_FIX_CHECK_MAX_BLOB_READS", 1)
+        block, msg, _ = self._capped_scan(
+            guard,
+            monkeypatch,
+            [{"filename": "src/moved.py", "previous_filename": PATH, "status": "renamed"}],
+            {PATH: None, "src/moved.py": "b" * 40},
+        )
+        assert block and "blob-read cap reached (1 reads)" in msg
 
     def test_a_new_file_reusing_a_renamed_name_cannot_stand_in(self, guard, monkeypatch):
         rows = [
@@ -1142,3 +1245,22 @@ class TestHeadReaders:
         monkeypatch.undo()
         monkeypatch.setattr(guard.subprocess, "run", lambda *_a, **_k: _Proc(rc, out))
         assert guard._blob_oids("o/r", (BASE, PATH), (MERGE, PATH)) == want
+
+    def test_blob_oids_sends_the_expected_request(self, guard, monkeypatch):
+        """Analysis 4686732289: the query, the variables and their -f form are pinned."""
+        monkeypatch.undo()
+        sent = []
+        monkeypatch.setattr(
+            guard.subprocess, "run", lambda argv, **_k: sent.append(argv) or _Proc(1, "")
+        )
+        guard._blob_oids("o/r", (BASE, PATH), (MERGE, "src/moved.py"))
+        (argv,) = sent
+        assert argv[:3] == ["gh", "api", "graphql"]
+        fields = dict(argv[i + 1].split("=", 1) for i in range(3, len(argv), 2) if argv[i] == "-f")
+        assert all(argv[i] == "-f" for i in range(3, len(argv), 2))
+        assert fields["owner"] == "o" and fields["name"] == "r"
+        assert fields["a"] == f"{BASE}:{PATH}" and fields["b"] == f"{MERGE}:src/moved.py"
+        q = " ".join(fields["query"].split())
+        assert "a:object(expression:$a){__typename ... on Blob{oid}}" in q
+        assert "b:object(expression:$b){__typename ... on Blob{oid}}" in q
+        assert "repository(owner:$owner,name:$name)" in q
