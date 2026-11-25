@@ -45,8 +45,10 @@ def test_build_session_keeps_the_departure_words():
         "`git merge-base HEAD origin/<parent branch>` when it is stacked",
         "never writes a `Confirmed:` line",
         "`git diff --binary <source> > <patch>`",
+        "After the parent merges, merge main in first (a pushed branch is never rebased), then use",
     ):
         assert word in text, word
+    assert "rebase onto main" not in text
 
 
 def test_reviewer_carries_the_tested_text_line_for_line():

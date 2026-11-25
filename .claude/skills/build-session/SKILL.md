@@ -333,8 +333,10 @@ test, the code as built, or an approval given for something else.**
    ended the previous part; for the first part it is where the branch started:
    `git merge-base HEAD origin/<parent branch>` when it is stacked on another
    PR, otherwise `git merge-base HEAD origin/main`. Never pass the parent
-   branch's name itself, since its head moves; after the parent merges, rebase
-   onto main before restoring.
+   branch's name itself, since its head moves. After the parent merges, merge
+   main in first (a pushed branch is never rebased), then use
+   `git merge-base HEAD origin/main`; before that merge it is the old fork
+   point, which would also undo the parent's work.
 
 **Amending a spec.** A spec line changes only by amendment: one list item under
 `## Amendments`, at the spec's end before any report section, holding an id `AM-<n>` (from 1, never
