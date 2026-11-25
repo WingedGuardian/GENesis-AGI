@@ -775,7 +775,7 @@ jobs:
             excludes+=("--rerun-exclude-path=$path")
           done < "$RERUN_EXCLUDE_LIST"
           pytest -rfE --durations=25 \
-            -n 4 --dist=loadfile --max-worker-restart=0 --reruns=1 \
+            -n 4 --dist=loadfile --max-worker-restart=0 --reruns=1 -p tests._flake_probe \
             --ignore-glob='**/test_*az*.py' \
             --ignore-glob='**/test_*shim*.py' \
             --ignore=tests/test_ui/ \
