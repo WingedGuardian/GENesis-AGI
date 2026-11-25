@@ -1,0 +1,1 @@
+- Your `USER.md` profile is now included in the 6-hourly backup, encrypted, and restored on a rebuilt box even after setup has written a fresh template there. Identity files you customise locally later (`*.local.md` layers, and seeded copies of shipped defaults) are covered the same way.

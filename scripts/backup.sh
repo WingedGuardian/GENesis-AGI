@@ -224,7 +224,7 @@ print(json.dumps(out, ensure_ascii=True, separators=(",", ":")))
     fi
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_dirs_partial":${_EXTRA_PARTIAL:-0},"extra_dirs_partial_detail":$_partial_detail,"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"payment_vault":"${_PV_STATUS:-skipped}","payment_vault_copies":${_PV_COPIES:-null},"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"identity_files":${_IDENTITY_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_dirs_partial":${_EXTRA_PARTIAL:-0},"extra_dirs_partial_detail":$_partial_detail,"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"payment_vault":"${_PV_STATUS:-skipped}","payment_vault_copies":${_PV_COPIES:-null},"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
 STATUSEOF
 }
 
@@ -1043,6 +1043,76 @@ if [ -d "$_EVAL_DIR" ]; then
     fi
 fi
 
+# --- 6e. Per-install identity files (encrypted — USER.md is the owner's profile) ---
+# The files in src/genesis/identity/ that each install writes for itself: USER.md,
+# the SOUL.md/VOICE.md copies seeded from their .example, and the <stem>.local.md
+# layers. A name counts only when it is a .local.md or its .example sibling ships
+# beside it, so a file the repo still ships as tracked (no .example yet) is left to
+# the repo, and the runtime-regenerated files are outside the pattern.
+_IDENTITY_SRC="$GENESIS_DIR/src/genesis/identity"
+_IDENTITY_COUNT=0
+mkdir -p identity
+find identity -type f ! -name '*.gpg' -delete 2>/dev/null || true
+if [ -L "$_IDENTITY_SRC" ]; then
+    # find does not descend a symlinked start point, so the listing would read as
+    # complete and empty and the prune would drop every kept copy.
+    log "WARNING: $_IDENTITY_SRC is a symlink — identity copies left as they are"
+elif [ -d "$_IDENTITY_SRC" ]; then
+    log "Backing up per-install identity files..."
+    if ! $_ENCRYPT_READY; then
+        log "WARNING: GENESIS_BACKUP_PASSPHRASE not set — skipping identity files (refusing plaintext)"
+    else
+        _identity_keep=()
+        # The listing goes through a file so a failed find is SEEN: the prune below
+        # deletes every copy missing from the list, so it runs only on a full listing.
+        _identity_list_ok=true
+        _identity_list="$(mktemp -p "$GENESIS_BIG_TMP" identity-list.XXXXXX)" || _identity_list_ok=false
+        if $_identity_list_ok; then
+            # Regular files and symlinks both: a symlink is never followed (like every
+            # other section), but its kept copy stays, with a warning, below.
+            find "$_IDENTITY_SRC" -maxdepth 1 \( -type f -o -type l \) -name '*.md' -print0 >"$_identity_list" \
+                || _identity_list_ok=false
+        fi
+        if ! $_identity_list_ok; then
+            log "WARNING: could not list $_IDENTITY_SRC — identity copies left as they are"
+        else
+            while IFS= read -r -d '' src; do
+                name="${src##*/}"
+                case "$name" in
+                    *.local.md) ;;
+                    USER.md|SOUL.md|VOICE.md) [ -f "$src.example" ] || continue ;;
+                    *) continue ;;
+                esac
+                _identity_keep+=("$name.gpg")
+                dst="identity/$name.gpg"
+                if [ -L "$src" ]; then
+                    log "WARNING: identity/$name is a symlink — not followed; its last copy is kept"
+                    continue
+                fi
+                if [ -f "$dst" ] && [ "$dst" -nt "$src" ]; then
+                    continue
+                fi
+                # A file byte-identical to its .example is a fresh seed (a rebuilt box
+                # before its restore): it never replaces a copy already kept.
+                if [ -f "$dst" ] && [ -f "$src.example" ] && cmp -s -- "$src" "$src.example"; then
+                    continue
+                fi
+                encrypt_file "$src" "$dst" stamp || log "WARNING: failed to encrypt identity/$name"
+            done <"$_identity_list"
+            # A file deleted here must not come back on restore: drop its copy.
+            while IFS= read -r -d '' old; do
+                name="${old##*/}"
+                _identity_live=false
+                for _k in "${_identity_keep[@]}"; do [ "$_k" = "$name" ] && _identity_live=true; done
+                $_identity_live || rm -f -- "$old"
+            done < <(find identity -maxdepth 1 -type f -name '*.gpg' -print0)
+        fi
+        [ -n "${_identity_list:-}" ] && rm -f -- "$_identity_list"
+        _IDENTITY_COUNT=$(find identity -maxdepth 1 -type f -name '*.gpg' 2>/dev/null | wc -l)
+        log "Identity files: $_IDENTITY_COUNT files (encrypted)"
+    fi
+fi
+
 # --- 6f. Opt-in extra directories (encrypted, Tier 2 / off-site only) ---
 # GENESIS_BACKUP_EXTRA_DIRS lists ':'-separated directories UNDER $HOME (a leading
 # `~/` is expanded) that this install wants kept — install-local data no other
@@ -1753,6 +1823,21 @@ else
         done < <(find eval -type f -name '*.gpg' -print0 2>/dev/null)
     fi
 
+    # Upload the per-install identity files (§6e) into the COMPLETE snapshot so a
+    # no-git fresh-box DR rehydrates them. Flat by construction (maxdepth 1).
+    if [ -d identity ]; then
+        backend_mkdir "${_T2_DIR}/identity"
+        while IFS= read -r -d '' f; do
+            fname=$(basename "$f")
+            if backend_put "$f" "${_T2_DIR}/identity/$fname"; then
+                log "  off-site: uploaded identity/$fname"
+            else
+                log "WARNING: off-site upload failed for identity/$fname"
+                _T2_OK=false
+            fi
+        done < <(find identity -maxdepth 1 -type f -name '*.gpg' -print0 2>/dev/null)
+    fi
+
     # Upload opt-in extra-dir archives (§6f). Flat by construction — one file
     # per directory — so restore's single-level off-site pull reads them back.
     # Only the archives THIS run built (never whatever else sits in extra/), so a
@@ -1923,7 +2008,7 @@ fi
 backend_cleanup
 
 # --- Ensure .gitignore excludes Tier 2 files ---
-# Tier 1 (git): memory/, config_overrides/, secrets/, infrastructure/, audit/
+# Tier 1 (git): memory/, identity/, config_overrides/, secrets/, infrastructure/, audit/
 # Tier 2 (off-site): data/, transcripts/, extra/
 if ! grep -q '^data/$' .gitignore 2>/dev/null; then
     cat >> .gitignore << 'GITIGNORE'
@@ -1979,7 +2064,7 @@ while IFS= read -r -d '' _partial; do
     [ "$_ppid" = "$$" ] && continue
     kill -0 "$_ppid" 2>/dev/null && continue
     rm -f -- "$_partial" && log "Removed an encryption partial left by an interrupted run: $_partial"
-done < <(find transcripts memory eval data secrets creds -type f \( -name '.genesis-partial.*' \
+done < <(find transcripts memory eval identity data secrets creds -type f \( -name '.genesis-partial.*' \
     ! -name '*.gpg' -o -path 'data/.genesis.sql.gpg.partial.*' \) -print0 2>/dev/null)
 
 # --- Commit and push (Tier 1 only) ---

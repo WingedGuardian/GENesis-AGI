@@ -106,6 +106,7 @@ _TRANSCRIPTS_FROM_SNAPSHOT=false
 _TRANSCRIPTS_PULLED=""
 _MEMORY_RESTORED=0
 _EVAL_RESTORED=0
+_IDENTITY_RESTORED=0
 _EXTRA_RESTORED=0
 # Set by _pull_from_offsite once a snapshot is selected: §4c then restores only
 # the extra archives that snapshot supplied (newline-separated names), never a
@@ -126,7 +127,7 @@ _write_status() {
     _failures_json=$(printf '%s\n' "${_FAILURES[@]:-}" | python3 -c "import json,sys; print(json.dumps([l for l in sys.stdin.read().splitlines() if l]))")
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"dry_run":$DRY_RUN,"sqlite_restored":$_SQLITE_RESTORED,"qdrant_restored":$_QDRANT_RESTORED,"transcripts_restored":$_TRANSCRIPT_RESTORED,"memory_restored":$_MEMORY_RESTORED,"eval_restored":$_EVAL_RESTORED,"extra_restored":$_EXTRA_RESTORED,"cc_memory_restored":$_CCMEM_RESTORED,"overlays_restored":$_OVERLAYS_RESTORED,"secrets_restored":$_SECRETS_RESTORED,"duration_s":$_duration,"failures":$_failures_json}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"dry_run":$DRY_RUN,"sqlite_restored":$_SQLITE_RESTORED,"qdrant_restored":$_QDRANT_RESTORED,"transcripts_restored":$_TRANSCRIPT_RESTORED,"memory_restored":$_MEMORY_RESTORED,"eval_restored":$_EVAL_RESTORED,"identity_restored":$_IDENTITY_RESTORED,"extra_restored":$_EXTRA_RESTORED,"cc_memory_restored":$_CCMEM_RESTORED,"overlays_restored":$_OVERLAYS_RESTORED,"secrets_restored":$_SECRETS_RESTORED,"duration_s":$_duration,"failures":$_failures_json}
 STATUSEOF
 }
 # ── Deploy-in-progress marker ────────────────────────────────────────
@@ -633,6 +634,7 @@ PYBOUNDARY
     _selected_pull_component secrets secrets '^secrets\.env\.gpg$'
     _selected_pull_component eval eval '^[A-Za-z0-9._-]+\.gpg$'
     _selected_pull_component eval/golden eval/golden '^[A-Za-z0-9._-]+\.gpg$'
+    _selected_pull_component identity identity '^[A-Za-z0-9._-]+\.gpg$'
     _selected_pull_component creds creds '^[A-Za-z0-9._-]+\.gpg$'
     _selected_pull_component creds/ssh creds/ssh '^[A-Za-z0-9._-]+\.gpg$'
 
@@ -729,6 +731,7 @@ _backup_has_payload() {
     _dir_has_file "$d/transcripts" && return 0
     _dir_has_file "$d/memory" && return 0
     _dir_has_file "$d/eval" && return 0
+    _dir_has_file "$d/identity" && return 0
     # §4c restores these; matched to what §4c reads (`*.tar.gpg`), not any file.
     find "$d/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print -quit 2>/dev/null | grep -q . && return 0
     _dir_has_file "$d/creds" && return 0
@@ -1431,6 +1434,56 @@ if [ -d "$BACKUP_DIR/eval" ]; then
     log "Eval golden sets: $_EVAL_RESTORED restored"
 else
     log "Eval golden sets: no backup directory"
+fi
+
+# ── 4d. Per-install identity files ───────────────────────────────────
+# USER.md, the seeded SOUL.md/VOICE.md copies and the <stem>.local.md layers
+# (backup §6e). A name is restored only when it is a .local.md or its .example
+# ships in this checkout, so a file the repo still ships as tracked is never
+# overwritten. A copy byte-identical to its .example is a fresh seed, not an edit,
+# so the backup replaces it whichever ran first on a rebuilt box.
+log "--- Identity files ---"
+if [ -d "$BACKUP_DIR/identity" ]; then
+    _IDENTITY_TARGET="$GENESIS_DIR/src/genesis/identity"
+    if [ -L "$_IDENTITY_TARGET" ]; then
+        warn "identity files: $_IDENTITY_TARGET is a symlink; not restored through it"
+    elif [ ! -d "$_IDENTITY_TARGET" ]; then
+        warn "identity files: $_IDENTITY_TARGET is missing (clone the repo first); not restored"
+    else
+        while IFS= read -r -d '' src; do
+            name="${src##*/}"
+            name="${name%.gpg}"
+            dst="$_IDENTITY_TARGET/$name"
+            case "$name" in
+                *.local.md) ;;
+                USER.md|SOUL.md|VOICE.md)
+                    if [ ! -f "$dst.example" ]; then
+                        log "Identity: $name ships tracked in this checkout; the repo copy wins"
+                        continue
+                    fi ;;
+                *) warn "identity files: unexpected payload $name; skipped"; continue ;;
+            esac
+            # Second line of defence: a file git tracks here is the repo's, whatever
+            # the layout says (a git error, e.g. no repository, leaves the rule above).
+            if git -C "$GENESIS_DIR" ls-files --error-unmatch -- "src/genesis/identity/$name" >/dev/null 2>&1; then
+                log "Identity: $name is tracked in this checkout; the repo copy wins"
+                continue
+            fi
+            if [ -f "$dst" ] && ! $FORCE && ! cmp -s -- "$dst" "$dst.example" && [ "$dst" -nt "$src" ]; then
+                continue
+            fi
+            if $DRY_RUN; then
+                log "Identity: would restore $name → $dst"
+                _IDENTITY_RESTORED=$(( _IDENTITY_RESTORED + 1 ))
+                continue
+            fi
+            decrypt_file "$src" "$dst" || { warn "identity decrypt failed: $name"; continue; }
+            _IDENTITY_RESTORED=$(( _IDENTITY_RESTORED + 1 ))
+        done < <(find "$BACKUP_DIR/identity" -maxdepth 1 -type f -name '*.gpg' -print0 2>/dev/null)
+        log "Identity files: $_IDENTITY_RESTORED restored"
+    fi
+else
+    log "Identity files: no backup directory"
 fi
 
 # ── 4c. Opt-in extra directories (backup.sh §6f) ─────────────────────

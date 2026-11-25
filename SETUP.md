@@ -227,7 +227,11 @@ watchdogs have their own off switch; see `docs/reference/network-resilience.md`.
 Backups run every 6 hours via the `genesis-backup.timer` systemd user unit
 and split into two tiers:
 
-- **Tier 1** (git → GitHub): Memory files, configs, secrets (~1MB). Automatic.
+- **Tier 1** (git → GitHub): Memory files, configs, secrets and your per-install
+  identity files (`USER.md`, and any identity file you customise locally) (~1MB).
+  Automatic; everything that can hold personal data is encrypted. Resetting an
+  identity file to its template keeps the last backed-up copy; delete the file to
+  drop it from later backups (git history in the private backups repo still holds it).
 - **Tier 2** (smbclient → NAS/remote): Qdrant snapshots, SQL dumps (~200MB+). Opt-in.
 
 Tier 2 keeps large binary files off GitHub (which has a 100MB file limit).
