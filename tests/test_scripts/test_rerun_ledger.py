@@ -154,6 +154,41 @@ def test_retries_are_named_by_their_final_outcome(tmp_path):
     assert (data["collected"], data["with_outcome"], data["missing"]) == (2, 2, 0)
 
 
+_MARKED = """
+import pytest
+from pathlib import Path
+
+@pytest.mark.flaky(reruns=3)
+def test_passes_on_third_attempt():
+    counter = Path(__file__).with_name("third.count")
+    n = int(counter.read_text()) if counter.exists() else 0
+    counter.write_text(str(n + 1))
+    assert n >= 2
+"""
+
+
+def _workflow_retry_tokens() -> list[str]:
+    import shlex
+
+    import yaml
+
+    steps = yaml.safe_load((REPO / ".github" / "workflows" / "ci.yml").read_text())["jobs"]["test"][
+        "steps"
+    ]
+    run = next(s for s in steps if s.get("name") == "Run tests")["run"]
+    return [t for t in shlex.split(run, comments=True) if "reruns" in t]
+
+
+def test_a_flaky_marker_cannot_buy_a_test_a_second_retry(tmp_path):
+    """#5024 retries once. A flaky(reruns=3) marker outranks --reruns, so the
+    workflow's own retry tokens must still fail a test that needs two retries."""
+    pytest.importorskip("pytest_rerunfailures")
+    tokens = _workflow_retry_tokens()
+    assert tokens, "the workflow passes no retry flag"
+    out = _subrun(tmp_path, {"test_marked.py": _MARKED}, *tokens, ledger=None)
+    assert out.returncode == 1, out.stdout + out.stderr
+
+
 def test_unset_means_inert(tmp_path):
     out = _subrun(tmp_path, {"test_outcomes.py": _OUTCOMES}, ledger=None)
     assert out.returncode == 1, out.stdout + out.stderr

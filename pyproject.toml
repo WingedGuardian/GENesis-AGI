@@ -127,7 +127,7 @@ test = [
     "pytest-timeout",
     # Parallel runs (`-n`); CI's `test` job runs on four workers.
     "pytest-xdist",
-    # CI retries a failed test once (`--reruns=1`, #5024); inert without the flag.
+    # CI retries a failed test once (`--force-reruns=1`, #5024); inert without the flag.
     "pytest-rerunfailures",
     # Property tests exercise hook-output budget invariants across Unicode edges.
     "hypothesis>=6.152.0",

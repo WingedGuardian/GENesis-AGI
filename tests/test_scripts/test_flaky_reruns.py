@@ -349,9 +349,9 @@ def _workflow() -> dict:
 def test_the_test_job_retries_once_and_arms_the_ledger_on_a_fixed_path():
     steps = {s.get("name"): s for s in _workflow()["jobs"]["test"]["steps"]}
     run = steps["Run tests"]
-    assert "--reruns=1" in shlex.split(
-        run["run"], comments=True
-    )  # the flag, not a comment naming it
+    tokens = shlex.split(run["run"], comments=True)  # the flags, not a comment naming them
+    assert "--force-reruns=1" in tokens
+    assert not any(t.startswith("--reruns") for t in tokens)  # marker-overridable
     # Never derived from census_prepare, which is advisory and may fail.
     assert run["env"]["GENESIS_RERUN_LEDGER"] == "${{ runner.temp }}/rerun-ledger.json"
     assert run["env"]["RERUN_EXCLUDE_LIST"] == "${{ steps.change_files.outputs.list }}"

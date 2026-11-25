@@ -1,6 +1,6 @@
 """Account for every collected test when CI retries failures (#5024).
 
-CI runs the suite with ``--reruns=1`` (pytest-rerunfailures), so a test that fails
+CI runs the suite with ``--force-reruns=1`` (pytest-rerunfailures), so a test that fails
 once and then passes no longer fails the run. Two things then need a record that
 the junit report cannot give:
 

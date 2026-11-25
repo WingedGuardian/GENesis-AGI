@@ -762,12 +762,14 @@ jobs:
           # crash and says the undispatched tests never ran. The `=` forms are
           # what full_suite_guard.py reads.
           #
-          # --reruns=1 (pytest-rerunfailures, #5024): a test that fails and then
-          # passes on one retry does not fail the run. tests/_rerun_ledger.py
-          # (loaded by tests/conftest.py, armed by GENESIS_RERUN_LEDGER below)
-          # names every retried test and fails the run when a collected test
-          # reached no outcome, which a worker crash after a queued retry can
-          # cause. --rerun-exclude-path gives every .py file the change touches
+          # --force-reruns=1 (pytest-rerunfailures, #5024): a test that fails and
+          # then passes on one retry does not fail the run. FORCE, not --reruns:
+          # a @pytest.mark.flaky(reruns=N) marker outranks --reruns, so one
+          # decorator could buy a test more retries; --force-reruns outranks
+          # every marker, and --rerun-exclude-path is still checked first.
+          # tests/_rerun_ledger.py (loaded by tests/conftest.py, armed by
+          # GENESIS_RERUN_LEDGER below) names every retried test and fails the
+          # run when a collected test reached no outcome. --rerun-exclude-path gives every .py file the change touches
           # no retry at all (listed by the step above): a change's own flaky
           # test fails its own run.
           excludes=()
@@ -775,7 +777,7 @@ jobs:
             excludes+=("--rerun-exclude-path=$path")
           done < "$RERUN_EXCLUDE_LIST"
           pytest -rfE --durations=25 \
-            -n 4 --dist=loadfile --max-worker-restart=0 --reruns=1 \
+            -n 4 --dist=loadfile --max-worker-restart=0 --force-reruns=1 \
             --ignore-glob='**/test_*az*.py' \
             --ignore-glob='**/test_*shim*.py' \
             --ignore=tests/test_ui/ \

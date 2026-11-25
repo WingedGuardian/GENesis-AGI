@@ -149,9 +149,10 @@ The per-test cost of individual tests had never been measured; CI now prints
 `--durations=25` so the slowest are visible in every run's log. Read them
 before changing either ceiling.
 
-**Retries (#5024).** CI retries a failed test once (`--reruns=1`,
-pytest-rerunfailures, pinned beside xdist). A test that fails and then passes
-does not fail the run, but it is never silent:
+**Retries (#5024).** CI retries a failed test once (`--force-reruns=1`,
+pytest-rerunfailures, pinned beside xdist). The forced count outranks any
+`@pytest.mark.flaky(reruns=N)` marker, so no test can buy a second retry. A test
+that fails and then passes does not fail the run, but it is never silent:
 
 - A change's own test files get no retry at all. The `test` job's "List the
   change's test files" step lists every `.py` file the change touches (from

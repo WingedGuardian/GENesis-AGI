@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Report the tests CI retried, and fail when a collected test reached no outcome.
 
-WHY. CI retries a failed test once (pytest-rerunfailures, ``--reruns=1``), so a
+WHY. CI retries a failed test once (pytest-rerunfailures, ``--force-reruns=1``), so a
 test that fails and then passes no longer turns the run red (#5024). The
 change's own test files are never retried (``--rerun-exclude-path``), so what is
 left for this step is to make the retries visible and to catch the one way a
