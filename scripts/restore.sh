@@ -107,6 +107,7 @@ _TRANSCRIPTS_PULLED=""
 _MEMORY_RESTORED=0
 _EVAL_RESTORED=0
 _IDENTITY_RESTORED=0
+_USER_CONFIG_RESTORED=0
 _EXTRA_RESTORED=0
 # Set by _pull_from_offsite once a snapshot is selected: §4c then restores only
 # the extra archives that snapshot supplied (newline-separated names), never a
@@ -127,7 +128,7 @@ _write_status() {
     _failures_json=$(printf '%s\n' "${_FAILURES[@]:-}" | python3 -c "import json,sys; print(json.dumps([l for l in sys.stdin.read().splitlines() if l]))")
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"dry_run":$DRY_RUN,"sqlite_restored":$_SQLITE_RESTORED,"qdrant_restored":$_QDRANT_RESTORED,"transcripts_restored":$_TRANSCRIPT_RESTORED,"memory_restored":$_MEMORY_RESTORED,"eval_restored":$_EVAL_RESTORED,"identity_restored":$_IDENTITY_RESTORED,"extra_restored":$_EXTRA_RESTORED,"cc_memory_restored":$_CCMEM_RESTORED,"overlays_restored":$_OVERLAYS_RESTORED,"secrets_restored":$_SECRETS_RESTORED,"duration_s":$_duration,"failures":$_failures_json}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"dry_run":$DRY_RUN,"sqlite_restored":$_SQLITE_RESTORED,"qdrant_restored":$_QDRANT_RESTORED,"transcripts_restored":$_TRANSCRIPT_RESTORED,"memory_restored":$_MEMORY_RESTORED,"eval_restored":$_EVAL_RESTORED,"identity_restored":$_IDENTITY_RESTORED,"user_config_restored":$_USER_CONFIG_RESTORED,"extra_restored":$_EXTRA_RESTORED,"cc_memory_restored":$_CCMEM_RESTORED,"overlays_restored":$_OVERLAYS_RESTORED,"secrets_restored":$_SECRETS_RESTORED,"duration_s":$_duration,"failures":$_failures_json}
 STATUSEOF
 }
 # ── Deploy-in-progress marker ────────────────────────────────────────
@@ -635,6 +636,7 @@ PYBOUNDARY
     _selected_pull_component eval eval '^[A-Za-z0-9._-]+\.gpg$'
     _selected_pull_component eval/golden eval/golden '^[A-Za-z0-9._-]+\.gpg$'
     _selected_pull_component identity identity '^[A-Za-z0-9._-]+\.gpg$'
+    _selected_pull_component user_config user_config '^[A-Za-z0-9._-]+\.gpg$'
     _selected_pull_component creds creds '^[A-Za-z0-9._-]+\.gpg$'
     _selected_pull_component creds/ssh creds/ssh '^[A-Za-z0-9._-]+\.gpg$'
 
@@ -732,6 +734,7 @@ _backup_has_payload() {
     _dir_has_file "$d/memory" && return 0
     _dir_has_file "$d/eval" && return 0
     _dir_has_file "$d/identity" && return 0
+    _dir_has_file "$d/user_config" && return 0
     # §4c restores these; matched to what §4c reads (`*.tar.gpg`), not any file.
     find "$d/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print -quit 2>/dev/null | grep -q . && return 0
     _dir_has_file "$d/creds" && return 0
@@ -1486,6 +1489,72 @@ else
     log "Identity files: no backup directory"
 fi
 
+# ── 4e. User config directory ────────────────────────────────────────
+# ~/.genesis/config (backup §6g): the settings overlays and the other files this
+# install set for itself. Copies are flat, `__` standing for `/`. Every decoded
+# segment is checked, and no parent on the way may be a symlink, so a payload name
+# can never write outside the directory. A newer local file is kept unless --force.
+log "--- User config ---"
+if [ -d "$BACKUP_DIR/user_config" ]; then
+    _UCFG_TARGET="$HOME/.genesis/config"
+    if [ -L "$_UCFG_TARGET" ]; then
+        warn "user config: $_UCFG_TARGET is a symlink; not restored through it"
+    else
+        while IFS= read -r -d '' src; do
+            name="${src##*/}"
+            _stem="${name%.gpg}"
+            rel="${_stem//__//}"
+            _ucfg_bad=false
+            # A control byte (a newline would end `read` below early, so only part of
+            # the name would be checked), or a '_' beside a '/' (a path the backup
+            # never writes, since it would not decode back to itself), is refused first.
+            case "$rel" in ''|*[[:cntrl:]]*|/*|*/|*_/*|*/_*) _ucfg_bad=true ;; esac
+            _ucfg_parts=()
+            $_ucfg_bad || IFS='/' read -r -a _ucfg_parts <<< "$rel"
+            for _seg in "${_ucfg_parts[@]}"; do
+                case "$_seg" in ''|.|..) _ucfg_bad=true ;; esac
+            done
+            case "$rel" in genesis.yaml|watchgod.conf|serena-shared.json) _ucfg_bad=true ;; esac
+            # Containment, checked on the resolved path as well as on the segments.
+            case "$(realpath -m -- "$_UCFG_TARGET/$rel")/" in
+                "$(realpath -m -- "$_UCFG_TARGET")"/?*) ;;
+                *) _ucfg_bad=true ;;
+            esac
+            if $_ucfg_bad; then
+                warn "user config: unexpected payload $(printf '%q' "$name"); skipped"
+                continue
+            fi
+            dst="$_UCFG_TARGET/$rel"
+            _ucfg_dir="$_UCFG_TARGET"
+            for _seg in "${_ucfg_parts[@]:0:${#_ucfg_parts[@]}-1}"; do
+                _ucfg_dir="$_ucfg_dir/$_seg"
+                if [ -L "$_ucfg_dir" ] || { [ -e "$_ucfg_dir" ] && [ ! -d "$_ucfg_dir" ]; }; then
+                    _ucfg_bad=true
+                fi
+            done
+            if $_ucfg_bad || [ -L "$dst" ]; then
+                warn "user config: $rel runs through a symlink or a file; skipped"
+                continue
+            fi
+            if [ -f "$dst" ] && [ "$dst" -nt "$src" ] && ! $FORCE; then
+                log "User config: $rel is newer here than the backup; kept (--force restores it)"
+                continue
+            fi
+            if $DRY_RUN; then
+                log "User config: would restore $rel → $dst"
+                _USER_CONFIG_RESTORED=$(( _USER_CONFIG_RESTORED + 1 ))
+                continue
+            fi
+            mkdir -p "$(dirname "$dst")"
+            decrypt_file "$src" "$dst" || { warn "user config decrypt failed: $rel"; continue; }
+            _USER_CONFIG_RESTORED=$(( _USER_CONFIG_RESTORED + 1 ))
+        done < <(find "$BACKUP_DIR/user_config" -maxdepth 1 -type f -name '*.gpg' -print0 2>/dev/null)
+        log "User config: $_USER_CONFIG_RESTORED restored"
+    fi
+else
+    log "User config: no backup directory"
+fi
+
 # ── 4c. Opt-in extra directories (backup.sh §6f) ─────────────────────
 # Each extra/<name>.tar.gpg holds ONE directory, members stored relative to
 # $HOME, restored as a unit by scripts/lib/extra_restore.py (its docstring has
@@ -1596,10 +1665,19 @@ elif find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print -quit
             _xt_skip "extra archive refused: $name: cannot normalize destination"
             continue
         fi
-        if _xt_core="$(backup_core_overlap "$_xt_resolved")"; then
+        _xt_core_rc=0
+        _xt_core="$(backup_core_overlap "$_xt_resolved")" || _xt_core_rc=$?
+        # A snapshot from before §4e existed holds ~/.genesis/config only as an extra
+        # archive; with no user_config/ payload to restore it from, the archive is it.
+        if [ "$_xt_core_rc" -eq 0 ] \
+            && [ "$_xt_resolved" = "$(realpath -m -- "$HOME/.genesis/config")" ] \
+            && ! _dir_has_file "$BACKUP_DIR/user_config"; then
+            _xt_core_rc=1
+        fi
+        if [ "$_xt_core_rc" -eq 0 ]; then
             _xt_skip "extra archive refused: $name: ~/$_xt_root overlaps $_xt_core, which the core restore owns"
             continue
-        elif [ "$?" -ne 1 ]; then
+        elif [ "$_xt_core_rc" -ne 1 ]; then
             _xt_skip "extra archive refused: $name: cannot establish core path separation"
             continue
         fi

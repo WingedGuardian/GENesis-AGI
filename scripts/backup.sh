@@ -224,7 +224,7 @@ print(json.dumps(out, ensure_ascii=True, separators=(",", ":")))
     fi
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"identity_files":${_IDENTITY_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_dirs_partial":${_EXTRA_PARTIAL:-0},"extra_dirs_partial_detail":$_partial_detail,"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"payment_vault":"${_PV_STATUS:-skipped}","payment_vault_copies":${_PV_COPIES:-null},"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"identity_files":${_IDENTITY_COUNT:-0},"user_config_files":${_USER_CONFIG_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_dirs_partial":${_EXTRA_PARTIAL:-0},"extra_dirs_partial_detail":$_partial_detail,"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"payment_vault":"${_PV_STATUS:-skipped}","payment_vault_copies":${_PV_COPIES:-null},"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
 STATUSEOF
 }
 
@@ -1113,6 +1113,79 @@ elif [ -d "$_IDENTITY_SRC" ]; then
     fi
 fi
 
+# --- 6g. User config directory (encrypted — overlays can hold addresses and IDs) ---
+# ~/.genesis/config holds what this install set for itself: the settings overlays
+# (<stem>.local.yaml, written by the settings API and the dashboard), whole-file
+# replacements and helper files. genesis.yaml is left to §8, which already
+# encrypts it; `*.bak-*` copies are left out. Same rules as §6e: a symlink is
+# never followed, a deleted file's copy is pruned, and only after a full listing.
+# The copies are FLAT (the off-site pull reads one level, and its payload names
+# allow no `/`): a nested path's `/` is written `__`, so modules/x.yaml is
+# user_config/modules__x.yaml.gpg. A real name containing `__` would be ambiguous,
+# so it is skipped with a warning.
+_USER_CONFIG_SRC="$HOME/.genesis/config"
+_USER_CONFIG_COUNT=0
+mkdir -p user_config
+find user_config -type f ! -name '*.gpg' -delete 2>/dev/null || true
+if [ -L "$_USER_CONFIG_SRC" ]; then
+    log "WARNING: $_USER_CONFIG_SRC is a symlink — user config copies left as they are"
+elif [ -d "$_USER_CONFIG_SRC" ]; then
+    log "Backing up the user config directory..."
+    if ! $_ENCRYPT_READY; then
+        log "WARNING: GENESIS_BACKUP_PASSPHRASE not set — skipping user config (refusing plaintext)"
+    else
+        _ucfg_keep=()
+        _ucfg_link_prefixes=()
+        _ucfg_list_ok=true
+        _ucfg_list="$(mktemp -p "$GENESIS_BIG_TMP" user-config-list.XXXXXX)" || _ucfg_list_ok=false
+        if $_ucfg_list_ok; then
+            find "$_USER_CONFIG_SRC" \( -type f -o -type l \) -print0 >"$_ucfg_list" || _ucfg_list_ok=false
+        fi
+        if ! $_ucfg_list_ok; then
+            log "WARNING: could not list $_USER_CONFIG_SRC — user config copies left as they are"
+        else
+            while IFS= read -r -d '' src; do
+                rel="${src#"$_USER_CONFIG_SRC"/}"
+                case "$rel" in
+                    # genesis.yaml: §8 owns it. watchgod.conf and serena-shared.json are
+                    # regenerated per box (bootstrap writes this box's paths into them).
+                    genesis.yaml|watchgod.conf|serena-shared.json|*.bak-*) continue ;;
+                    # `__` stands for `/`, so a name that already holds `__`, or puts a
+                    # `_` next to a `/`, would decode to another path.
+                    *__*|*_/*|*/_*)
+                        log "WARNING: user config $rel has '__' or a '_' beside a '/' in its path, which the flat copy cannot keep apart — not backed up"
+                        continue ;;
+                esac
+                dst="user_config/${rel//\//__}.gpg"
+                _ucfg_keep+=("$dst")
+                if [ -L "$src" ]; then
+                    log "WARNING: user config $rel is a symlink — not followed; its last copy is kept"
+                    # A symlinked subdirectory keeps the copies of what was under it.
+                    _ucfg_link_prefixes+=("user_config/${rel//\//__}__")
+                    continue
+                fi
+                if [ -f "$dst" ] && [ "$dst" -nt "$src" ]; then
+                    continue
+                fi
+                encrypt_file "$src" "$dst" stamp || log "WARNING: failed to encrypt user config $rel"
+            done <"$_ucfg_list"
+            # A file deleted here must not come back on restore (a resurrected overlay
+            # would silently change a setting): drop its copy.
+            while IFS= read -r -d '' old; do
+                _ucfg_live=false
+                for _k in "${_ucfg_keep[@]}"; do [ "$_k" = "$old" ] && _ucfg_live=true; done
+                for _k in "${_ucfg_link_prefixes[@]}"; do
+                    case "$old" in "$_k"*) _ucfg_live=true ;; esac
+                done
+                $_ucfg_live || rm -f -- "$old"
+            done < <(find user_config -maxdepth 1 -type f -name '*.gpg' -print0)
+        fi
+        [ -n "${_ucfg_list:-}" ] && rm -f -- "$_ucfg_list"
+        _USER_CONFIG_COUNT=$(find user_config -maxdepth 1 -type f -name '*.gpg' 2>/dev/null | wc -l)
+        log "User config: $_USER_CONFIG_COUNT files (encrypted)"
+    fi
+fi
+
 # --- 6f. Opt-in extra directories (encrypted, Tier 2 / off-site only) ---
 # GENESIS_BACKUP_EXTRA_DIRS lists ':'-separated directories UNDER $HOME (a leading
 # `~/` is expanded) that this install wants kept — install-local data no other
@@ -1246,6 +1319,13 @@ else
             continue
         fi
         if _core_hit="$(backup_core_overlap "$_abs")"; then
+            # The user config directory itself is covered whole by §6g (an install may
+            # still list it from before §6g existed): covered, so not a skip or a gap.
+            if [ "$_abs" = "$(realpath -m -- "$HOME/.genesis/config")" ] \
+                && [ ! -L "$HOME/.genesis/config" ] && [ -d "$HOME/.genesis/config" ]; then
+                log "NOTE: extra dir $_d is the user config directory, which §6g backs up — not archived again"
+                continue
+            fi
             # restore.sh puts an extra directory back as a unit, which would swap this
             # core path out of the way; the core backup already covers it.
             _extra_skip "overlaps $_core_hit, which the core backup restores" "$_d"
@@ -1838,6 +1918,20 @@ else
         done < <(find identity -maxdepth 1 -type f -name '*.gpg' -print0 2>/dev/null)
     fi
 
+    # Upload the user config copies (§6g): flat by construction.
+    if [ -d user_config ]; then
+        backend_mkdir "${_T2_DIR}/user_config"
+        while IFS= read -r -d '' f; do
+            fname=$(basename "$f")
+            if backend_put "$f" "${_T2_DIR}/user_config/$fname"; then
+                log "  off-site: uploaded user_config/$fname"
+            else
+                log "WARNING: off-site upload failed for user_config/$fname"
+                _T2_OK=false
+            fi
+        done < <(find user_config -maxdepth 1 -type f -name '*.gpg' -print0 2>/dev/null)
+    fi
+
     # Upload opt-in extra-dir archives (§6f). Flat by construction — one file
     # per directory — so restore's single-level off-site pull reads them back.
     # Only the archives THIS run built (never whatever else sits in extra/), so a
@@ -2008,7 +2102,7 @@ fi
 backend_cleanup
 
 # --- Ensure .gitignore excludes Tier 2 files ---
-# Tier 1 (git): memory/, identity/, config_overrides/, secrets/, infrastructure/, audit/
+# Tier 1 (git): memory/, identity/, user_config/, config_overrides/, secrets/, infrastructure/, audit/
 # Tier 2 (off-site): data/, transcripts/, extra/
 if ! grep -q '^data/$' .gitignore 2>/dev/null; then
     cat >> .gitignore << 'GITIGNORE'
@@ -2064,7 +2158,7 @@ while IFS= read -r -d '' _partial; do
     [ "$_ppid" = "$$" ] && continue
     kill -0 "$_ppid" 2>/dev/null && continue
     rm -f -- "$_partial" && log "Removed an encryption partial left by an interrupted run: $_partial"
-done < <(find transcripts memory eval identity data secrets creds -type f \( -name '.genesis-partial.*' \
+done < <(find transcripts memory eval identity user_config data secrets creds -type f \( -name '.genesis-partial.*' \
     ! -name '*.gpg' -o -path 'data/.genesis.sql.gpg.partial.*' \) -print0 2>/dev/null)
 
 # --- Commit and push (Tier 1 only) ---

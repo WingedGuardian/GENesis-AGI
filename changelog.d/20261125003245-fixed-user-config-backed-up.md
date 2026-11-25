@@ -1,0 +1,1 @@
+- Settings you change from the dashboard or by asking Genesis are now included in the 6-hourly backup, encrypted, and restored on a rebuilt box. They live in `~/.genesis/config/`, which the backup did not cover before. If you had listed that folder in `GENESIS_BACKUP_EXTRA_DIRS`, remove it: the backup now covers it and notes that the entry is no longer needed.

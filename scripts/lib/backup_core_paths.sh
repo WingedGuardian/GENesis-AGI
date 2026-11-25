@@ -83,7 +83,7 @@ _backup_core_path_array() {
     # payment_vault: §8 backs it up consistently (SQLite online backup) and
     # restore only stages it; an extra-dir tar could tear cards.db and place it.
     _backup_core_paths=(
-        "$GENESIS_DIR" "$TRANSCRIPT_DIR" "$HOME/.genesis/eval"
+        "$GENESIS_DIR" "$TRANSCRIPT_DIR" "$HOME/.genesis/eval" "$HOME/.genesis/config"
         "$HOME/.genesis/shared" "$HOME/.genesis/merge_overrides"
         "$override_store" "$HOME/.genesis/restore-creds"
         "$_BACKUP_CORE_VAULT" "$(_backup_core_home)/payment_vault"
