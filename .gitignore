@@ -65,8 +65,6 @@ src/genesis/identity/EGO_NOTEPAD.md
 src/genesis/identity/USER.md
 # Per-install identity layers (<stem>.local.md), backed up by backup.sh §6e — never public
 src/genesis/identity/*.local.md
-# The names backup.sh §6e last backed up from this checkout (its prune scope)
-src/genesis/identity/.backup-seen*
 # Task-scoped notepad (ephemeral, seeded per-task in worktrees)
 TASK_NOTEPAD.md
 config/*.local.yaml

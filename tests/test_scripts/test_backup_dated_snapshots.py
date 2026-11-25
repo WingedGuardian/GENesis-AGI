@@ -1404,11 +1404,12 @@ def _gpg(home: Path, *args: str, data: bytes | None = None) -> bytes:
     ).stdout
 
 
-def test_identity_files_backed_up_encrypted_and_pruned(backup_env, tmp_path):
+def test_identity_files_backed_up_encrypted_and_kept(backup_env, tmp_path):
     """Backup section 6e: the per-install identity files (a .local.md, or a name
     whose .example ships beside it) are encrypted into Tier 1 and the off-site
     snapshot. A name with no .example (still tracked upstream) and the regenerated
-    files are left out, and a file deleted locally loses its copy next run."""
+    files are left out. A file deleted locally keeps its copy, as memory and eval
+    copies do: a restore brings it back, where a wrong prune would lose it."""
     ident = _own_identity_dir(backup_env)
     (ident / "USER.md.example").write_text("# template\n")
     (ident / "USER.md").write_text("# owner profile\n")
@@ -1443,12 +1444,13 @@ def test_identity_files_backed_up_encrypted_and_pruned(backup_env, tmp_path):
     (ident / "STEERING.local.md").unlink()
     proc = _run_local(backup_env, offsite)
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
-    assert {p.name for p in repo_ident.iterdir()} == {"USER.md.gpg", "VOICE.md.gpg"}
+    assert {p.name for p in repo_ident.iterdir()} == want
+    assert not list(ident.glob(".backup-seen*"))  # no record of any kind beside the files
 
 
 def test_identity_unlistable_dir_keeps_every_copy(backup_env, tmp_path):
-    """The prune deletes copies missing from the listing, so a listing that failed
-    must prune nothing: an unreadable identity dir leaves the kept copies alone."""
+    """An unreadable identity dir leaves the kept copies alone, and the run reports
+    the failed listing as a gap."""
     ident = _own_identity_dir(backup_env)
     (ident / "USER.md.example").write_text("# template\n")
     (ident / "USER.md").write_text("# owner profile\n")
@@ -1470,7 +1472,7 @@ def test_identity_unlistable_dir_keeps_every_copy(backup_env, tmp_path):
 def test_identity_symlinks_are_never_followed_and_keep_their_copy(backup_env, tmp_path):
     """No symlink is followed, as in every other section: a symlinked identity
     file is not read (so it cannot pull an arbitrary file into the backup) but its
-    last copy stays; a symlinked identity dir prunes nothing."""
+    last copy stays; a symlinked identity dir leaves every copy and reports a gap."""
     ident = _own_identity_dir(backup_env)
     (ident / "USER.md.example").write_text("# template\n")
     (ident / "USER.md").write_text("# owner profile\n")
@@ -1622,22 +1624,6 @@ def test_identity_capture_gaps_are_reported(backup_env, tmp_path):
         "not captured" in proc.stdout + proc.stderr
         or "failed to encrypt" in proc.stdout + proc.stderr
     )
-
-
-def test_identity_backup_on_a_rebuilt_host_keeps_unseen_copies(backup_env, tmp_path):
-    """A host that never backed a layer up (a rebuilt box, before its restore) must not
-    prune that layer's copy; a host that did, and then deleted the file, does."""
-    ident = _own_identity_dir(backup_env)
-    (ident / "STEERING.local.md").write_text("rule\n")
-    offsite = tmp_path / "offsite"
-    offsite.mkdir()
-    assert _run_local(backup_env, offsite).returncode == 0
-    seen = ident / ".backup-seen"
-    assert seen.read_text().split() == ["STEERING.local.md.gpg"]
-    (ident / "STEERING.local.md").unlink()
-    seen.unlink()  # the rebuilt host's state: it has not seen this layer
-    assert _run_local(backup_env, offsite).returncode == 0
-    assert (_repo(backup_env) / "identity" / "STEERING.local.md.gpg").exists()
 
 
 def test_identity_stale_copy_is_reencrypted_whatever_its_mtime(backup_env, tmp_path):

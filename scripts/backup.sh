@@ -1074,8 +1074,8 @@ _identity_copy_matches() {
 mkdir -p identity
 find identity -type f ! -name '*.gpg' -delete 2>/dev/null || true
 if [ -L "$_IDENTITY_SRC" ]; then
-    # find does not descend a symlinked start point, so the listing would read as
-    # complete and empty and the prune would drop every kept copy.
+    # find does not descend a symlinked start point, so nothing would be captured:
+    # the kept copies stay as they are and the run reports the gap.
     log "WARNING: $_IDENTITY_SRC is a symlink — identity copies left as they are"
     _identity_gap "*" "identity directory is a symlink"
 elif [ -d "$_IDENTITY_SRC" ]; then
@@ -1083,9 +1083,10 @@ elif [ -d "$_IDENTITY_SRC" ]; then
     if ! $_ENCRYPT_READY; then
         log "WARNING: GENESIS_BACKUP_PASSPHRASE not set — skipping identity files (refusing plaintext)"
     else
-        _identity_keep=()
-        # The listing goes through a file so a failed find is SEEN: the prune below
-        # deletes every copy missing from the list, so it runs only on a full listing.
+        # The listing goes through a file so a failed find is SEEN and reported. No
+        # copy is ever deleted: as for memory, eval and the repo config overlays, a
+        # file deleted here comes back on a disaster-recovery restore, which is
+        # recoverable by deleting it again, where a wrong prune would lose data.
         _identity_list_ok=true
         _identity_list="$(mktemp -p "$GENESIS_BIG_TMP" identity-list.XXXXXX)" || _identity_list_ok=false
         if $_identity_list_ok; then
@@ -1115,7 +1116,6 @@ elif [ -d "$_IDENTITY_SRC" ]; then
                     _identity_gap "$name" "name restore cannot read"
                     continue
                 fi
-                _identity_keep+=("$name.gpg")
                 dst="identity/$name.gpg"
                 if [ -L "$src" ]; then
                     log "WARNING: identity/$name is a symlink — not followed; its last copy is kept"
@@ -1138,34 +1138,8 @@ elif [ -d "$_IDENTITY_SRC" ]; then
                 fi
             done <"$_identity_list"
             if [ "$_identity_read" -ne "$_identity_listed" ]; then
-                # A read that stopped early leaves a short keep list, which must never
-                # drive the prune below.
-                log "WARNING: read $_identity_read of $_identity_listed identity names — identity copies left as they are"
+                log "WARNING: read $_identity_read of $_identity_listed identity names — the rest keep their last copies"
                 _identity_gap "(listing)" "read stopped early"
-                _identity_list_ok=false
-            fi
-        fi
-        if $_identity_list_ok; then
-            # A file deleted here must not come back on restore: drop its copy. Only a
-            # name this checkout has backed up before counts as deleted: a rebuilt box
-            # or a fresh clone, backing up before its restore, has not seen the layers
-            # it is about to restore, and must not drop their copies. The record sits
-            # beside the files (gitignored), so it is lost exactly when they are.
-            _identity_seen_file="$_IDENTITY_SRC/.backup-seen"
-            while IFS= read -r -d '' old; do
-                name="${old##*/}"
-                _identity_live=false
-                for _k in "${_identity_keep[@]}"; do [ "$_k" = "$name" ] && _identity_live=true; done
-                if ! $_identity_live && [ -f "$_identity_seen_file" ] \
-                    && grep -qxF -- "$name" "$_identity_seen_file"; then
-                    rm -f -- "$old"
-                fi
-            done < <(find identity -maxdepth 1 -type f -name '*.gpg' -print0)
-            if ! { printf '%s\n' "${_identity_keep[@]+"${_identity_keep[@]}"}" >"$_identity_seen_file.tmp" \
-                && mv -f -- "$_identity_seen_file.tmp" "$_identity_seen_file"; }; then
-                # Fails safe: an old record only keeps copies a later prune would drop.
-                rm -f -- "$_identity_seen_file.tmp"
-                log "WARNING: could not record the backed-up identity names; deleted layers keep their copies until it can"
             fi
         fi
         [ -n "${_identity_list:-}" ] && rm -f -- "$_identity_list"
