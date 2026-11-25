@@ -11,7 +11,13 @@ import pytest
 from genesis.cc.reflection_bridge._bridge import CCReflectionBridge
 from genesis.cc.system_prompt import SystemPromptAssembler
 from genesis.identity.loader import IdentityLoader
-from genesis.identity.paths import POLICY, REPLACE_MARKER, read_identity, sources
+from genesis.identity.paths import (
+    POLICY,
+    REPLACE_MARKER,
+    effective_sources,
+    read_identity,
+    sources,
+)
 
 _ROOT = Path(__file__).resolve().parents[2]
 
@@ -181,3 +187,22 @@ def test_a_bom_only_local_file_is_blank(ident):
     (ident / "STEERING.md").write_text("shipped\n")
     (ident / "STEERING.local.md").write_text("﻿\n")
     assert read_identity("STEERING.md", ident) == "shipped\n"
+
+
+def test_effective_sources_drop_the_file_a_replace_layer_discards(ident):
+    (ident / "CONVERSATION.md").write_text("shipped\n")
+    (ident / "CONVERSATION.local.md").write_text("added\n")
+    assert [p.name for p in effective_sources("CONVERSATION.md", ident)] == [
+        "CONVERSATION.md",
+        "CONVERSATION.local.md",
+    ]
+    (ident / "CONVERSATION.local.md").write_text("\ufeff" + REPLACE_MARKER + "\nmine\n")
+    assert [p.name for p in effective_sources("CONVERSATION.md", ident)] == ["CONVERSATION.local.md"]
+
+
+def test_a_replace_layer_never_reads_the_shipped_file(ident):
+    """An unreadable discarded file cannot block the text that replaces it."""
+    (ident / "STEERING.md").mkdir()  # reading it would raise IsADirectoryError
+    (ident / "STEERING.local.md").write_text(REPLACE_MARKER + "\nmy rules\n")
+    assert read_identity("STEERING.md", ident) == "my rules\n"
+    assert [p.name for p in effective_sources("STEERING.md", ident)] == ["STEERING.local.md"]

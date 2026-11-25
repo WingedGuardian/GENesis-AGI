@@ -85,7 +85,7 @@ _IDENTITY_PATHS_PY = _IDENTITY_DIR / "paths.py"
 def _identity_notice(name: str, ipaths) -> str:
     """The truncation notice for one identity file, naming every file it was read from."""
     read = " and ".join(
-        f"src/genesis/identity/{p.name}" for p in ipaths.sources(name, _IDENTITY_DIR)
+        f"src/genesis/identity/{p.name}" for p in ipaths.effective_sources(name, _IDENTITY_DIR)
     ) or f"src/genesis/identity/{name}"
     return (
         f"\n\n_[{name} truncated at {{kept}} chars — the full file exceeds "
@@ -325,13 +325,21 @@ def _recovery_header(part: str, mirror: Path | None) -> str:
     )
 
 
-_CONVERSATION_POINTER = (
-    "## Conversation protocol — omitted for size\n\n"
-    "USER.md left this hook's output no room for "
-    "`src/genesis/identity/CONVERSATION.md` under the harness's per-hook stdout "
-    "cap (over it, the WHOLE output is filed away behind a 2 KB preview). Read "
-    "that file directly when conversation protocol matters."
-)
+def _conversation_pointer(ipaths) -> str:
+    """The fallback for an elided conversation protocol, naming every file whose
+    text is in force: the shipped file, its local layer, or the layer alone when
+    it replaces the shipped text. The reserve charges this same string."""
+    files = [
+        f"`src/genesis/identity/{p.name}`"
+        for p in ipaths.effective_sources("CONVERSATION.md", _IDENTITY_DIR)
+    ] or ["`src/genesis/identity/CONVERSATION.md`"]
+    return (
+        "## Conversation protocol — omitted for size\n\n"
+        f"This hook's output had no room for {' and '.join(files)} under the "
+        "harness's per-hook stdout cap (over it, the WHOLE output is filed away "
+        f"behind a 2 KB preview). Read {'that file' if len(files) == 1 else 'both, in that order,'} "
+        "directly when conversation protocol matters."
+    )
 
 #: The tail a truncated identity file appends (see the truncation branch). Sized
 #: generously; only its LENGTH is used, as the reserve's floor (a notice naming a
@@ -935,11 +943,14 @@ def _emit_body() -> tuple[str, str, str] | None:
 
     # 1. Identity files (disk, always available, no external deps), split
     # across two PARTS so each rides its own 10 K hook budget:
-    #   identity-core: SOUL + STEERING (tracked; CI ceilings pin their sizes)
-    #   identity-user: USER + CONVERSATION (USER is install-local — CI cannot
-    #     see it, so the guard is runtime: CONVERSATION degrades to a pointer
-    #     when USER leaves it no room, and an oversized USER itself truncates
-    #     LOUDLY rather than silently taking the part over the cliff).
+    #   identity-core: SOUL + STEERING (CI ceilings pin the SHIPPED files only;
+    #     a STEERING.local.md layer is install-local, so its size is guarded at
+    #     runtime by truncating LOUDLY)
+    #   identity-user: USER + CONVERSATION (USER and CONVERSATION.local.md are
+    #     install-local — CI cannot see them, so the guard is runtime:
+    #     CONVERSATION degrades to a pointer naming the files in force when there
+    #     is no room, and an oversized USER itself truncates LOUDLY rather than
+    #     silently taking the part over the cliff).
     if not is_genesis_session:
         try:
             _ipaths = _identity_paths()
@@ -1000,14 +1011,15 @@ def _emit_body() -> tuple[str, str, str] | None:
                 # exists to protect.
                 # `utf16_len`, not `len`, for the same reason `emit_cost` is used
                 # beside it: this reserve is compared against a budget billed in
-                # code units. Both operands are ASCII constants today, so the two
-                # agree exactly and nothing changes now — but a reserve that
+                # code units. The pointer is generated per install (it names the
+                # files in force) but is BMP-only text, so `len` and `utf16_len`
+                # agree today; `emit_cost` keeps that true if that changes — a reserve that
                 # measures in one unit what it protects in another is the defect
                 # this file already paid for once, and leaving two of the three
                 # branches on `len` would leave the comment above true of only
                 # one of them.
                 _reserve = (
-                    emit_cost(_CONVERSATION_POINTER) + utf16_len("\n\n---\n\n")
+                    emit_cost(_conversation_pointer(_ipaths)) + utf16_len("\n\n---\n\n")
                     if _next == "CONVERSATION.md"
                     # The next file's own notice at its widest, charged like the
                     # pointer above (emit cost plus the divider ahead of it), and
@@ -1027,7 +1039,7 @@ def _emit_body() -> tuple[str, str, str] | None:
                     divider="" if first else "\n\n---\n\n",
                     # CONVERSATION.md is the one identity file with a pointer to
                     # fall back to; the rest are never elided, only truncated.
-                    pointer=_CONVERSATION_POINTER if name == "CONVERSATION.md" else "",
+                    pointer=_conversation_pointer(_ipaths) if name == "CONVERSATION.md" else "",
                     notice=_identity_notice(name, _ipaths),
                     reserve=_reserve,
                 )

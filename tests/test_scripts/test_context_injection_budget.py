@@ -271,6 +271,24 @@ def test_huge_user_md_elides_conversation_to_pointer(monkeypatch, capsys, tmp_pa
     assert _ctx.utf16_len(out) <= _ctx._PART_BUDGET
 
 
+@pytest.mark.parametrize("replace", [False, True])
+def test_elided_conversation_pointer_names_the_files_in_force(monkeypatch, capsys, tmp_path, replace):
+    """The pointer sends the model to what is actually in force: the shipped file
+    and its local layer, or the layer alone when it replaces the shipped text."""
+    ident = tmp_path / "identity"
+    ident.mkdir()
+    (ident / "USER.md").write_text("U" * 8_000)
+    (ident / "CONVERSATION.md").write_text("C" * 3_000)
+    marker = "<!-- genesis: replace -->\n" if replace else ""
+    (ident / "CONVERSATION.local.md").write_text(marker + "L" * 3_000)
+    out = _direct_part(monkeypatch, capsys, ident, "identity-user")
+    assert "omitted for size" in out
+    assert "src/genesis/identity/CONVERSATION.local.md" in out
+    shipped = "`src/genesis/identity/CONVERSATION.md`"
+    assert (shipped in out) is (not replace), out[-800:]
+    assert _ctx.utf16_len(out) <= _ctx._PART_BUDGET
+
+
 def test_conversation_sized_to_the_real_room_is_not_elided(monkeypatch, capsys, tmp_path):
     """The audit-line headroom is reserved ONCE, by the writer.
 

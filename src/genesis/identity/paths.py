@@ -49,6 +49,29 @@ def sources(name: str, identity_dir: Path) -> list[Path]:
     return found
 
 
+def _replaces(local: Path) -> bool:
+    """Whether *local* opens with the replace marker (first line, BOM ignored)."""
+    with local.open(encoding="utf-8") as stream:
+        first = stream.readline()
+    return first.lstrip("\ufeff").strip() == REPLACE_MARKER
+
+
+def effective_sources(name: str, identity_dir: Path) -> list[Path]:
+    """The files whose text is actually in force for *name*: ``sources`` minus the
+    shipped file a replace layer discards. What a pointer or a notice should name.
+
+    An unreadable local file falls back to ``sources``: the read itself reports it.
+    """
+    found = sources(name, identity_dir)
+    if POLICY.get(name) == LAYER and found and found[-1].name != name:
+        try:
+            if _replaces(found[-1]):
+                return [found[-1]]
+        except (OSError, UnicodeDecodeError):
+            pass
+    return found
+
+
 def read_identity(name: str, identity_dir: Path) -> str | None:
     """The text a reader should use for *name*, or None when no file exists.
 
@@ -62,10 +85,10 @@ def read_identity(name: str, identity_dir: Path) -> str | None:
     if POLICY.get(name) != LAYER or found[-1].name == name:
         return found[0].read_text(encoding="utf-8")
     local = found[-1].read_text(encoding="utf-8").lstrip("\ufeff")
-    default = found[0].read_text(encoding="utf-8") if len(found) == 2 else ""
     first, _, rest = local.partition("\n")
     if first.strip() == REPLACE_MARKER:
         return rest
+    default = found[0].read_text(encoding="utf-8") if len(found) == 2 else ""
     if not local.strip():
         return default if len(found) == 2 else None
     if not default.strip():
