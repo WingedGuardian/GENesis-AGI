@@ -8,11 +8,12 @@ the junit report cannot give:
   ``<testcase>`` elements, and the first attempt is an EMPTY element that reads
   as a pass, so a reader cannot tell a flake from two passes.
 - Whether every collected test reached a result at all. Under xdist with
-  ``--max-worker-restart=0``, a worker that crashes after the plugin has queued a
-  retry of its test can leave that test with no result anywhere, and the run
-  ends green. MEASURED 2026-11-24 with pytest 9.2.0, xdist 3.8.0 and
-  pytest-rerunfailures 16.7: observed once, then 0 of 15 attempts, so it is rare
-  but real, and the plugin documents no way to turn crash recovery off.
+  ``--max-worker-restart=0`` and retries on, one probe run ended green with a
+  crashed worker's test absent from the junit report. MEASURED 2026-11-24 with
+  pytest 9.2.0, xdist 3.8.0 and pytest-rerunfailures 16.7: observed once, then 0
+  of 15 attempts. The mechanism is not established (the plugin's source reports a
+  crash under loadfile as a failure), so this check is kept for the observed
+  outcome, not for a known cause.
 
 This plugin runs on the controller only (xdist re-fires ``pytest_runtest_logreport``
 there for every worker's report, including the ``when="???"`` report of a crashed

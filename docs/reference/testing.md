@@ -161,9 +161,10 @@ does not fail the run, but it is never silent:
 - `tests/_rerun_ledger.py`, armed by `GENESIS_RERUN_LEDGER` and inert
   everywhere else, writes a ledger of every retried test and its final
   outcome. It also fails the run when a collected test reached no outcome at
-  all, judged by node id against what the workers collected. Under
-  `--max-worker-restart=0`, a worker crash after a retry was queued can drop a
-  test, and the run would otherwise end green.
+  all, judged by node id against what the workers collected. One probe run
+  under `--max-worker-restart=0` with retries ended green with a crashed test
+  missing (seen once in 16 runs, cause not established); this check keeps such
+  a run red.
 - The "Account for retried tests" step lists every retried test, and every
   test with no outcome, in the run summary.
 - On a main push, the `flaky-report` job files each retried test as a `flaky`
@@ -179,7 +180,9 @@ Known limits:
   EXISTING test flaky is still retried on that change's own run. Exclusion is
   by test file and by changed `conftest.py` directory; a changed module has no
   test path to match. The flake surfaces once it reaches main, as a `flaky`
-  issue.
+  issue. The same holds for a change to test data files or to pytest settings
+  (`pyproject.toml`, `pytest.ini`): only changed `.py` files and the
+  directories of changed `conftest.py` files are excluded.
 - A module that fails to import contributes no test ids, so it is not counted
   as "no outcome". The run still fails on the collection error itself.
 
