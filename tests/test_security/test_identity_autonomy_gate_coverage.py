@@ -122,6 +122,12 @@ IDENTITY_GATE_SITES: dict[str, tuple[str, str | None, str]] = {
 # Identity-file writers OUTSIDE loader.py that a loader-scoped sweep cannot
 # see — pinned manually (the gate-4 _EXTRA_WRAPPED_SITES pattern).
 IDENTITY_EXTRA_SITES: dict[str, tuple[str, str | None, str]] = {
+    "dashboard/routes/config.py::_save_layer": (
+        "exempt-with-reason",
+        None,
+        "owner-direct edit surface (HTTP-auth'd dashboard PUT of CONVERSATION/"
+        "STEERING into their <stem>.local.md) — owner origin by construction",
+    ),
     "dashboard/routes/config.py::config_file_update": (
         "exempt-with-reason",
         None,
@@ -132,9 +138,9 @@ IDENTITY_EXTRA_SITES: dict[str, tuple[str, str | None, str]] = {
 
 
 def test_loader_write_surface_is_pinned():
-    """SET-EQUALITY on identity/loader.py's raw-write enclosers (write_text,
-    or an os.replace swapping a file in) — a new or moved raw write method
-    fails CI and must be classified here."""
+    """SET-EQUALITY on identity/loader.py's raw-write enclosers (write_text, an
+    os.replace swapping a file in, or identity/paths.py's write_atomic) — a new
+    or moved raw write method fails CI and must be classified here."""
     tree = _parse(_SRC / "identity" / "loader.py")
     assert tree is not None
     funcs = _funcs(tree)
@@ -142,14 +148,20 @@ def test_loader_write_surface_is_pinned():
         _enclosing(funcs, node.lineno)
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
         and (
-            node.func.attr == "write_text"
-            or (
-                node.func.attr == "replace"
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "os"
+            (
+                isinstance(node.func, ast.Attribute)
+                and (
+                    node.func.attr == "write_text"
+                    or (
+                        node.func.attr == "replace"
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "os"
+                    )
+                )
             )
+            # identity/paths.py's atomic writer, which every local-layer write uses
+            or (isinstance(node.func, ast.Name) and node.func.id == "write_atomic")
         )
     }
     assert writers == _LOADER_WRITE_METHODS, (

@@ -2,18 +2,14 @@
 
 from __future__ import annotations
 
-import fcntl
 import logging
-import os
 import re
-import stat
-import tempfile
 import unicodedata
 from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 
-from genesis.identity.paths import read_identity
+from genesis.identity.paths import local_path, locked, read_identity, read_regular, write_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -459,31 +455,20 @@ class IdentityLoader:
                 len(safe_rule), _MAX_RULE_CHARS, safe_rule[:200],
             )
             return False
-        path = self._dir / "STEERING.local.md"
-        fd = os.open(self._dir, os.O_RDONLY)
+        path = local_path("STEERING.md", self._dir)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            # First, so the resolver read below never opens a symlink or a FIFO.
-            text = _read_regular_file(path)
-            in_force = self._parse_rules(read_identity("STEERING.md", self._dir) or "")
-            if _rule_key(safe_rule) in {_rule_key(r) for r in in_force}:
-                return False
-            # Every rule follows a separator, the first one too: the resolver
-            # and _parse_rules read a file's first block as a preamble, never a
-            # rule, and a rule can then never become the replace marker line.
-            new = text.rstrip() + ("\n\n" if text.strip() else "") + "---\n\n" + safe_rule + "\n"
-            tmp_fd, tmp = tempfile.mkstemp(dir=self._dir, prefix=".", suffix="." + path.name)
-            try:
-                with os.fdopen(tmp_fd, "w", encoding="utf-8") as out:
-                    out.write(new)
-                    out.flush()
-                    os.fsync(out.fileno())
-                os.replace(tmp, path)
-            except BaseException:
-                Path(tmp).unlink(missing_ok=True)
-                raise
+            with locked(self._dir):
+                # First, so the resolver read below never opens a symlink or a FIFO.
+                text = read_regular(path) or ""
+                in_force = self._parse_rules(read_identity("STEERING.md", self._dir) or "")
+                if _rule_key(safe_rule) in {_rule_key(r) for r in in_force}:
+                    return False
+                # Every rule follows a separator, the first one too: the resolver
+                # and _parse_rules read a file's first block as a preamble, never a
+                # rule, and a rule can then never become the replace marker line.
+                new = text.rstrip() + ("\n\n" if text.strip() else "") + "---\n\n" + safe_rule + "\n"
+                write_atomic(path, new)
         finally:
-            os.close(fd)
             self._cache.pop("STEERING.md", None)
         logger.info("Steering rule written to %s (%d chars): %s", path, len(safe_rule), safe_rule)
         return True
@@ -507,15 +492,3 @@ class IdentityLoader:
 def _rule_key(rule: str) -> str:
     """A rule compared for duplicates: NFKC, whitespace runs collapsed."""
     return " ".join(unicodedata.normalize("NFKC", rule).split())
-
-
-def _read_regular_file(path: Path) -> str:
-    """The text of *path*, "" when absent; never through a symlink or a non-file."""
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except FileNotFoundError:
-        return ""
-    with os.fdopen(fd, "rb") as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-            raise OSError(f"{path} is not a regular file")
-        return handle.read().decode("utf-8")

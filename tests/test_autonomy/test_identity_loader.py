@@ -173,7 +173,7 @@ class TestAddSteeringRule:
         def boom(*a, **k):
             raise OSError("disk full")
 
-        monkeypatch.setattr("genesis.identity.loader.os.replace", boom)
+        monkeypatch.setattr("genesis.identity.paths.os.replace", boom)
         with pytest.raises(OSError):
             loader.add_steering_rule("Never D")
         assert [p.name for p in loader._dir.iterdir() if "STEERING" in p.name] == ["STEERING.md"]

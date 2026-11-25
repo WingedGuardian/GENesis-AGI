@@ -8,6 +8,7 @@ Serves three categories of editable files:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from flask import jsonify, request
 
 from genesis.dashboard._blueprint import blueprint
 from genesis.env import cc_project_dir
+from genesis.identity import paths as identity_paths
 from genesis.util.resolve import resolve_refusing_loops
 
 logger = logging.getLogger(__name__)
@@ -180,9 +182,54 @@ def config_files():
     return jsonify(results)
 
 
+def _layer_name(name: str) -> str | None:
+    """*name* when it is a LAYER identity file (CONVERSATION.md, STEERING.md)."""
+    return name if identity_paths.POLICY.get(name) == identity_paths.LAYER else None
+
+
+def _misspelled_layer(name: str) -> bool:
+    """A LAYER or local-layer file asked for under a path prefix.
+
+    The identity resolvers key on the last path segment, so ``x/STEERING.md``
+    would otherwise reach the tracked file and skip the layer path entirely.
+    """
+    base = name.rsplit("/", 1)[-1]
+    return name != base and (bool(_layer_name(base)) or base.endswith(".local.md"))
+
+
+def _version(text: str | None) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
 @blueprint.route("/api/genesis/config-files/<path:name>")
 def config_file_content(name: str):
-    """Return the content of a config, identity, or memory file."""
+    """Return the content of a config, identity, or memory file.
+
+    A LAYER identity file (CONVERSATION.md, STEERING.md) returns the text the
+    model reads (the shipped file plus this install's ``<stem>.local.md``),
+    with a ``version`` a save must send back.
+    """
+    if _misspelled_layer(name):
+        return jsonify({"error": "name the identity file without a path prefix"}), 403
+    if _layer_name(name):
+        try:
+            # The non-blocking regular-file reads first, so a symlink or FIFO at
+            # the shipped or local path is refused before the resolver opens it.
+            identity_paths.read_regular(_IDENTITY_DIR / name)
+            identity_paths.read_regular(identity_paths.local_path(name, _IDENTITY_DIR))
+            content = identity_paths.read_identity(name, _IDENTITY_DIR)
+        except Exception as exc:
+            logger.error("Failed to read identity file %s: %s", name, exc, exc_info=True)
+            return jsonify({"name": name, "content": "(failed to read file)"}), 500
+        if content is None:
+            return jsonify({"error": "not found"}), 404
+        return jsonify({
+            "name": name,
+            "path": str(identity_paths.local_path(name, _IDENTITY_DIR)),
+            "content": content,
+            "syntax": "markdown",
+            "version": _version(content),
+        })
     target, syntax = _resolve_file(name)
     if target is None:
         return jsonify({"error": "not found"}), 404
@@ -210,8 +257,17 @@ def config_file_update(name: str):
         return jsonify({"error": "missing 'content' in request body"}), 400
 
     content = data["content"]
+    if not isinstance(content, str):
+        return jsonify({"error": "'content' must be a string"}), 400
     if len(content) > 1_000_000:
         return jsonify({"error": "content too large (max 1MB)"}), 413
+
+    if _misspelled_layer(name):
+        return jsonify({"error": "name the identity file without a path prefix"}), 403
+    if name.endswith(".local.md"):
+        return jsonify({"error": "edit the shipped file's name; its local layer is written for you"}), 403
+    if _layer_name(name):
+        return _save_layer(name, content, data.get("version"))
 
     target, allowed_dir = _resolve_file_for_write(name)
 
@@ -238,6 +294,49 @@ def config_file_update(name: str):
     except Exception as exc:
         logger.error("Failed to write config file %s: %s", name, exc, exc_info=True)
         return jsonify({"error": "write failed"}), 500
+
+
+def _save_layer(name: str, content: str, version: object):
+    """Save an edit to a LAYER identity file into its ``<stem>.local.md``.
+
+    The tracked file is never written. The edit is stored as the layer that
+    makes the file resolve to *content* (``identity_paths.layer_for``), under
+    the identity directory's lock, which the steering writer also takes. A save
+    whose ``version`` is not the text's current one is refused, so a rule
+    captured while the editor was open is never silently dropped.
+    """
+    shipped = _IDENTITY_DIR / name
+    local = identity_paths.local_path(name, _IDENTITY_DIR)
+    try:
+        with identity_paths.locked(_IDENTITY_DIR):
+            # Regular-file reads first: a symlink or FIFO is refused before the
+            # resolver opens it, so the lock is never held across a blocking read.
+            existing = identity_paths.read_regular(local)
+            default = identity_paths.read_regular(shipped)
+            current = identity_paths.read_identity(name, _IDENTITY_DIR)
+            if version != _version(current):
+                return jsonify({
+                    "error": f"{name} changed since you opened it; reload it and edit again",
+                }), 409
+            try:
+                layer = identity_paths.layer_for(name, default, content)
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 422
+            if layer or existing is not None:
+                identity_paths.write_atomic(local, layer)
+            saved = identity_paths.read_identity(name, _IDENTITY_DIR)
+    except Exception as exc:
+        logger.error("Failed to save identity layer %s: %s", name, exc, exc_info=True)
+        return jsonify({"error": "write failed"}), 500
+    logger.info("Dashboard saved %s into %s (%d chars)", name, local.name, len(layer))
+    return jsonify({
+        "status": "ok",
+        "name": name,
+        "path": str(local),
+        "version": _version(saved),
+        "content": saved,
+        "replaced": layer.startswith(identity_paths.REPLACE_MARKER),
+    })
 
 
 @blueprint.route("/api/genesis/config-files/<path:name>", methods=["DELETE"])
