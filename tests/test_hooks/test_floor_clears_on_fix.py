@@ -94,7 +94,7 @@ def _reply(
     }
 
 
-def _scan(guard, monkeypatch, comments, *, commits=None, files=None, **kw):
+def _scan(guard, monkeypatch, comments, *, commits=None, files=None, lane="standard", **kw):
     """``commits``/``files``: a value, or ``(rows, complete)`` to fake a failed read."""
     commits = COMMITS if commits is None else commits
     files = {FIX: [PATH]} if files is None else files
@@ -112,7 +112,7 @@ def _scan(guard, monkeypatch, comments, *, commits=None, files=None, **kw):
         return [{"f": name, "p": None, "s": "modified", "c": 1} for name in got], True
 
     monkeypatch.setattr(guard, "_fetch_comments_paged", fetch)
-    monkeypatch.setattr(guard, "_pr_lane", lambda *_a, **_k: "standard")
+    monkeypatch.setattr(guard, "_pr_lane", lambda *_a, **_k: lane)
     block, msg = guard._check_inline_review_findings("100", **kw)
     return block, msg, reads
 
@@ -776,7 +776,7 @@ def _node(cid, author="chatgpt-codex-connector", edits=(), *, total=None, kind="
         for t, login, deleted in edits
     ]
     return {
-        "databaseId": cid if db is None else db,
+        "fullDatabaseId": str(cid if db is None else db),
         "author": {"__typename": kind, "login": author},
         "userContentEdits": {"totalCount": len(rows) if total is None else total, "nodes": rows},
     }
@@ -834,7 +834,7 @@ class TestEditedFindings:
                 ),
                 "edited by x",
             ),
-            (_node(1, edits=OWNER_EDIT[:0], total=101), "too long to read"),
+            (_node(1, edits=OWNER_EDIT[:0], total=101), "an edit history too long to read"),
             (_node(1, db=999), "edit history unreadable for 1 reviewer"),
             ({}, "edit history unreadable for 1 reviewer"),
             (_node(1, kind="User"), None),
@@ -879,6 +879,176 @@ class TestEditedFindings:
         self._history(monkeypatch, {1: _node(1, edits=OWNER_EDIT)})
         block, msg, _ = _scan(guard, monkeypatch, [_finding(path="src/elsewhere.py")])
         assert not block, msg
+
+    @pytest.mark.parametrize(
+        ("raw", "ok"),
+        [
+            ("4692677031", True),  # past 2**31: the reason for fullDatabaseId
+            ("4692677032", False),
+            ("46926770x1", False),
+            ("1" * 21, False),
+            ("1" * 5000, False),  # past int()'s 4,300-digit limit: unreadable, never a crash
+            (4692677031, True),  # an int of the same value, as review_budget._node_id allows
+            (None, False),
+        ],
+    )
+    def test_the_identity_is_full_database_id(self, guard, raw, ok):
+        """Review 4692677031: databaseId is a deprecated 32-bit Int."""
+        node = _node(4692677031)
+        node["fullDatabaseId"] = raw
+        got = guard._foreign_editor(node, 4692677031)
+        assert (got is None) is ok
+        if not ok:
+            assert got is guard._HISTORY_UNREADABLE
+
+    def test_the_query_reads_full_database_id(self, guard):
+        assert "fullDatabaseId author" in guard._EDIT_HISTORY_QUERY
+        assert " databaseId" not in guard._EDIT_HISTORY_QUERY.replace("fullDatabaseId", "")
+
+    @pytest.mark.parametrize(
+        ("login", "body"),
+        [
+            ("chatgpt-codex-connector[bot]", "**Nothing to see here.**"),
+            ("coderabbitai[bot]", MINOR),
+        ],
+    )
+    def test_a_user_typed_reviewers_edited_finding_blocks(self, guard, monkeypatch, login, body):
+        """Review 4692677046: GitHub can type an App as User, and the scorer still believes it."""
+        self._history(
+            monkeypatch, {1: _node(1, login.removesuffix("[bot]"), OWNER_EDIT, kind="User")}
+        )
+        finding = _finding(body=body, login=login) | {"type": "User"}
+        block, msg, _ = _scan(guard, monkeypatch, [finding])
+        assert block and "[edited by a-maintainer]" in msg
+
+    def test_an_unlisted_user_is_still_not_read(self, guard, monkeypatch):
+        monkeypatch.setenv("_TEST_GH_EDIT_HISTORY", "__error__")
+        human = _finding(body=P1, login="someone") | {"type": "User"}
+        block, msg, _ = _scan(guard, monkeypatch, [human])
+        assert not block, msg
+
+    def test_the_watch_covers_every_comment_the_scorer_believes(self, guard, monkeypatch):
+        """Population pin: an unreadable history blocks exactly when a believed comment exists."""
+        monkeypatch.setenv("_TEST_GH_EDIT_HISTORY", "__error__")
+        believed = [
+            _finding(1, P1) | {"type": "User"},
+            _finding(2, MAJOR, login="coderabbitai[bot]") | {"type": "User"},
+            _finding(3, _devin(), login=DEVIN),
+            _finding(4, P2, login="some-bot[bot]"),
+        ]
+        for c in believed:
+            block, msg, _ = _scan(guard, monkeypatch, [c])
+            assert block and "edit history unreadable for 1" in msg, c["login"]
+
+    def test_an_excluded_devin_copys_edit_does_not_taint_its_twin(self, guard, monkeypatch):
+        """Review 4692642192: an off-diff copy never moves the group, so its edit cannot."""
+        self._history(monkeypatch, {1: _node(1, "devin-ai-integration", OWNER_EDIT)})
+        comments = [
+            _finding(1, _devin("🔴"), login=DEVIN, path="src/elsewhere.py"),
+            _finding(2, _devin("🟡"), login=DEVIN),
+        ]
+        block, msg, _ = _scan(guard, monkeypatch, comments)
+        assert not block, msg
+
+    def test_an_in_diff_edit_still_taints_an_off_diff_twin_once(
+        self, guard, monkeypatch, capsys, offdiff_lock
+    ):
+        offdiff_lock.expected()
+        self._history(monkeypatch, {2: _node(2, "devin-ai-integration", OWNER_EDIT)})
+        comments = [
+            _finding(1, _devin(), login=DEVIN, path="src/elsewhere.py"),
+            _finding(2, _devin(), login=DEVIN),
+        ]
+        block, msg, _ = _scan(guard, monkeypatch, comments)
+        assert block and "1 edited reviewer" in msg
+        # The untouched off-diff twin is never listed as an edited comment.
+        assert "[off-diff] [edited by" not in capsys.readouterr().err
+
+    def test_an_untouched_off_diff_twin_never_lets_the_edited_text_score(
+        self, guard, monkeypatch, offdiff_lock
+    ):
+        """Fix review: the Devin branch reads only untouched copies of a group."""
+        offdiff_lock.expected()
+        self._history(monkeypatch, {2: _node(2, "devin-ai-integration", OWNER_EDIT)})
+        comments = [
+            _finding(1, _devin(), login=DEVIN, path="src/elsewhere.py"),
+            _finding(2, _devin(), login=DEVIN),
+        ]
+        block, msg, _ = _scan(guard, monkeypatch, comments)
+        assert block and "0 Devin severe + 1 edited reviewer" in msg
+
+    def test_the_sigil_on_an_edited_copy_leaves_its_text_unscored(
+        self, guard, monkeypatch, offdiff_lock
+    ):
+        offdiff_lock.expected()
+        self._history(monkeypatch, {2: _node(2, "devin-ai-integration", OWNER_EDIT)})
+        comments = [
+            _finding(1, _devin("🔴"), login=DEVIN, path="src/elsewhere.py"),
+            _finding(2, _devin("🟡"), login=DEVIN),
+            _finding(3, P2),
+        ]
+        # Critical lane: two P2-weight findings block. The real P2 alone does not, so
+        # a block here means the accepted copy's edited yellow text was scored.
+        block, msg, _ = _scan(
+            guard, monkeypatch, comments, floor_accept=frozenset({2}), lane="critical"
+        )
+        assert not block, msg
+
+    def test_a_fix_reply_on_an_edited_copy_still_clears_its_untouched_twin(
+        self, guard, monkeypatch, offdiff_lock
+    ):
+        """Fix re-review SHOULD-FIX 7: an edited copy's thread is still the finding's."""
+        offdiff_lock.expected()
+        self._history(monkeypatch, {1: _node(1, "devin-ai-integration", OWNER_EDIT)})
+        comments = [
+            _finding(1, _devin(), login=DEVIN, path="src/elsewhere.py"),
+            _finding(2, _devin(), login=DEVIN),
+            _reply(to=1),
+        ]
+        block, msg, _ = _scan(guard, monkeypatch, comments)
+        assert not block, msg
+
+    def test_an_edited_finding_posted_twice_off_the_diff_counts_once(
+        self, guard, monkeypatch, offdiff_lock
+    ):
+        offdiff_lock.expected()
+        self._history(
+            monkeypatch,
+            {i: _node(i, "devin-ai-integration", OWNER_EDIT) for i in (1, 2)},
+        )
+        comments = [
+            _finding(1, _devin(), login=DEVIN, path="src/elsewhere.py"),
+            _finding(2, _devin(), login=DEVIN, path="src/elsewhere.py"),
+        ]
+        uncounted: list = []
+        block, msg, _ = _scan(guard, monkeypatch, comments, uncounted_out=uncounted)
+        assert not block, msg
+        assert uncounted[0]["exact"]["off_diff"] == 1
+
+    def test_an_edited_off_diff_finding_is_listed_and_counted(self, guard, monkeypatch, capsys):
+        """Review 4692706837: excluded, so not scored, but never dropped from the report."""
+        self._history(monkeypatch, {1: _node(1, edits=OWNER_EDIT)})
+        uncounted: list = []
+        block, msg, _ = _scan(
+            guard, monkeypatch, [_finding(path="src/elsewhere.py")], uncounted_out=uncounted
+        )
+        assert not block, msg
+        err = capsys.readouterr().err
+        assert "[off-diff] [edited by a-maintainer]" in err and "src/elsewhere.py" in err
+        assert uncounted[0]["exact"]["off_diff"] == 1
+
+    def test_an_edited_doc_finding_is_listed_and_counted(self, guard, monkeypatch, capsys):
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES", '{"filename": "docs/x.md", "previous_filename": null}'
+        )
+        self._history(monkeypatch, {1: _node(1, edits=OWNER_EDIT)})
+        uncounted: list = []
+        block, msg, _ = _scan(
+            guard, monkeypatch, [_finding(path="docs/x.md")], uncounted_out=uncounted
+        )
+        assert not block, msg
+        assert "[doc] [edited by a-maintainer]" in capsys.readouterr().err
+        assert uncounted[0]["exact"]["doc_path"] == 1
 
     def test_one_edited_devin_copy_taints_the_finding_once(self, guard, monkeypatch):
         self._history(monkeypatch, {2: _node(2, "devin-ai-integration", OWNER_EDIT)})
@@ -1042,12 +1212,12 @@ class TestEditHistoryReader:
     @pytest.mark.parametrize(
         ("rc", "out", "ids", "ok"),
         [
-            (0, json.dumps({"data": {"nodes": [{"databaseId": 1}]}}), ["N1"], True),
+            (0, json.dumps({"data": {"nodes": [{"fullDatabaseId": "1"}]}}), ["N1"], True),
             (0, json.dumps({"data": {"nodes": []}}), ["N1"], False),
             (0, json.dumps({"errors": [{"message": "x"}], "data": {"nodes": [{}]}}), ["N1"], False),
-            (1, json.dumps({"data": {"nodes": [{"databaseId": 1}]}}), ["N1"], False),
+            (1, json.dumps({"data": {"nodes": [{"fullDatabaseId": "1"}]}}), ["N1"], False),
             (0, "not json", ["N1"], False),
-            (0, json.dumps({"data": {"nodes": [{"databaseId": 1}]}}), [None], False),
+            (0, json.dumps({"data": {"nodes": [{"fullDatabaseId": "1"}]}}), [None], False),
         ],
     )
     def test_it_fails_closed(self, guard, monkeypatch, rc, out, ids, ok):

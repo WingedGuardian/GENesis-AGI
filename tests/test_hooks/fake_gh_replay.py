@@ -201,7 +201,7 @@ def _normalize(document: str) -> str:
 GRAPHQL_DOCUMENTS = {
     "edit_history": (
         "query($ids:[ID!]!){nodes(ids:$ids){... on PullRequestReviewComment{"
-        "databaseId author{__typename login} "
+        "fullDatabaseId author{__typename login} "
         "userContentEdits(first:100){totalCount nodes{editor{__typename login} "
         "deletedBy{__typename login}}}}}}"
     ),
@@ -380,7 +380,7 @@ def _graphql(opts: dict[str, list[str]], state: dict) -> tuple[int, str, str]:
                 state.get("edit_history", {}).get(
                     nid,
                     {
-                        "databaseId": c["id"],
+                        "fullDatabaseId": str(c["id"]),
                         "author": {"__typename": kind, "login": login.removesuffix("[bot]")},
                         "userContentEdits": {"totalCount": 0, "nodes": []},
                     },

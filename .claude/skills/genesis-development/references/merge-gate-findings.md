@@ -22,7 +22,7 @@
    is one of the PR's own, single-parent, descending from the head the finding was
    posted on, and touching its file or its renamed name; or the owner's
    `# floor-accept=<id>[,<id>]`. Any other reply clears nothing, and neither does
-   `# review-override`. A bot's review comment edited by anyone but that bot is a
+   `# review-override`. A reviewer's finding comment edited by anyone but that reviewer is a
    floor finding whatever it now says (off-diff and doc exclusions still apply),
    cleared only by that sigil (#5001). MEASURED over the 739 floor findings on the 862 PRs merged
    2026-10-01 to 2026-11-20, two readers agreed that 73 replies did not fix a

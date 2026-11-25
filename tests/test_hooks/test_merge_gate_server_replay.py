@@ -598,7 +598,7 @@ def test_a_finding_edited_by_the_owner_blocks(tmp_path, edited):
     if edited:
         state["edit_history"] = {
             "PRRC_9101": {
-                "databaseId": 9101,
+                "fullDatabaseId": "9101",
                 "author": {"__typename": "Bot", "login": CODEX.removesuffix("[bot]")},
                 "userContentEdits": {
                     "totalCount": 1,

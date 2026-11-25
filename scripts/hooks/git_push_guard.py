@@ -3685,7 +3685,7 @@ class _FixEvidence:
 #: One reviewer comment's author and edit history, for up to 50 node ids (#5001).
 _EDIT_HISTORY_QUERY = (
     "query($ids:[ID!]!){nodes(ids:$ids){... on PullRequestReviewComment{"
-    "databaseId author{__typename login} "
+    "fullDatabaseId author{__typename login} "
     "userContentEdits(first:100){totalCount nodes{editor{__typename login} "
     "deletedBy{__typename login}}}}}}"
 )
@@ -3708,7 +3708,7 @@ def _edit_histories(node_ids: list, rest_ids: list) -> list | None:
         return [
             given.get(
                 str(rid),
-                {"databaseId": rid, "author": clean, "userContentEdits": {"totalCount": 0, "nodes": []}},
+                {"fullDatabaseId": str(rid), "author": clean, "userContentEdits": {"totalCount": 0, "nodes": []}},
             )
             for rid in rest_ids
         ]
@@ -3740,12 +3740,22 @@ def _foreign_editor(node: object, rest_id: object) -> str | None:
     """Who other than its author edited a reviewer comment, or None when only its
     author did (or nobody). ``_HISTORY_UNREADABLE`` when the node is missing, of
     another type, another comment's, or malformed: the caller retries rather than
-    calling that an edit.
+    calling that an edit. A history longer than one read is a floor entry.
+
+    The REST id is matched against ``fullDatabaseId``, never the deprecated
+    ``databaseId``, which cannot hold a 64-bit id; it is a BigInt sent as a JSON
+    string, normalised as ``review_budget._node_id`` does.
 
     Identity is GraphQL ``(__typename, login)`` on both sides: REST spells a bot
     ``name[bot]`` and GraphQL ``name``, so mixing them would make every own edit
     look foreign (MEASURED, 2026-11-24)."""
-    if not isinstance(node, dict) or node.get("databaseId") != rest_id:
+    if not isinstance(node, dict):
+        return _HISTORY_UNREADABLE
+    raw = node.get("fullDatabaseId")
+    # Bounded before int(): past 4,300 digits int() raises.
+    if isinstance(raw, str) and len(raw) <= 20 and raw.isascii() and raw.isdigit():
+        raw = int(raw)
+    if type(raw) is not int or raw != rest_id:
         return _HISTORY_UNREADABLE
     author = node.get("author")
     if not isinstance(author, dict) or not author.get("login"):
@@ -3758,6 +3768,8 @@ def _foreign_editor(node: object, rest_id: object) -> str | None:
     if not isinstance(rows, list) or not isinstance(edits.get("totalCount"), int):
         return _HISTORY_UNREADABLE
     if edits["totalCount"] > len(rows):
+        # Owner ruling 2026-11-25: a floor entry the sigil clears, never a retry
+        # block, which no sigil reaches and a retry cannot clear.
         return "an account in an edit history too long to read"
     for row in rows:
         if not isinstance(row, dict):
@@ -3869,20 +3881,36 @@ def _check_inline_review_findings(
             return _waived_unread("an unreadable inline scan")
         return _scan_unreadable("inline review comments")
 
+    # The known-format registry decides which parser reads which login (read ONCE
+    # per scan).
+    devin_logins = scanner_sets.get("devin-marker", frozenset())
+    coderabbit_logins = scanner_sets.get("coderabbit-header", frozenset())
+    inline_review_logins = frozenset().union(
+        *(scanner_sets.get(p, frozenset()) for p in _INLINE_REVIEW_PARSERS)
+    )
+    codeql_logins = scanner_sets.get("codeql", frozenset())
+
+    def _parseable(login: str, utype: str) -> bool:
+        # WHOSE OUTPUT MAY BE PARSED FOR SEVERITY (see the classify loop).
+        return (utype == "Bot" or login in inline_review_logins) and login not in codeql_logins
+
+    def _believed(login: str, utype: str) -> bool:
+        # Every author whose comment the classify loop can score: the badge
+        # parsers' population, plus the CodeRabbit branch, which keys on the
+        # login alone (GitHub can type an App as `User`).
+        return _parseable(login, utype) or login in coderabbit_logins
+
     # #5001: a reviewer comment edited by anyone but its reviewer. Read for every
-    # top-level comment the classify loop below may believe (any Bot but CodeQL, the
-    # `parseable` population: an unknown bot's P1 badge scores too) and each bot's
-    # replies to its own comments (the Resolved route), never only the ones that
-    # score now: an edit that clears a finding is one that stops it scoring (a P1
-    # made a P3, a stripped badge). MEASURED 0 foreign edits in 4,222 comments of
-    # the three named reviewers.
-    _not_parsed = scanner_sets.get("codeql", frozenset())
+    # top-level comment the classify loop below may believe (`_believed`, the one
+    # predicate both use) and each reviewer's replies to its own comments (the
+    # Resolved route), never only the ones that score now: an edit that clears a
+    # finding is one that stops it scoring (a P1 made a P3, a stripped badge).
+    # MEASURED 0 foreign edits in 4,222 comments of the three named reviewers.
     _author_of = {c.get("id"): c.get("login") for c in raw if c.get("id") is not None}
     watched = [
         c
         for c in raw
-        if c.get("type") == "Bot"
-        and c.get("login") not in _not_parsed
+        if _believed(c.get("login") or "", c.get("type") or "")
         and (not c.get("reply_to") or _author_of.get(c.get("reply_to")) == c.get("login"))
     ]
     tampered: dict[object, str] = {}
@@ -3941,13 +3969,6 @@ def _check_inline_review_findings(
         and (c.get("body") or "").lstrip().split("\n", 1)[0].startswith(_BOT_SELF_RESOLVED_LEAD)
         and c.get("id") not in tampered
     }
-    # The known-format registry decides which parser reads which login (read ONCE
-    # per scan).
-    devin_logins = scanner_sets.get("devin-marker", frozenset())
-    coderabbit_logins = scanner_sets.get("coderabbit-header", frozenset())
-    inline_review_logins = frozenset().union(
-        *(scanner_sets.get(p, frozenset()) for p in _INLINE_REVIEW_PARSERS)
-    )
     # Every Devin-format structure is keyed by (login, finding_id), never the bare
     # id: two reviewers' ids can collide, and one reviewer's answered finding must
     # never clear another's. Same-login duplicate copies still group.
@@ -4097,12 +4118,9 @@ def _check_inline_review_findings(
     cr_doc_skipped: list[str] = []  # CodeRabbit Critical/Major on a doc path
     unmatched_bot: list[tuple[str, str]] = []  # (login, title) — read, unrecognised
     tampered_block: list[str] = []  # edited by someone else — the floor, sigil only (#5001)
-    # A Devin finding posted twice is one finding: one tampered copy taints all.
-    for copies in devin_copies.values():
-        editors = [tampered[cp.get("id")] for cp in copies if cp.get("id") in tampered]
-        for cp in copies:
-            if editors and cp.get("id") not in tampered:
-                tampered[cp.get("id")] = editors[0]
+    # (title, path, "off_diff" | "doc"): edited, but excluded the way the finding
+    # would be — surfaced, never scored.
+    tampered_excluded: list[tuple[str, str, str]] = []
     tampered_seen: set = set()
     # Which of those carry a P3 badge: informational by design (no parser
     # scores P3), so they are not format drift. Indices into unmatched_bot.
@@ -4110,7 +4128,6 @@ def _check_inline_review_findings(
     # Which logins the registry knows at all, and which of them is CodeQL: the
     # unrecognised bucket is printed in three parts (see the NOTEs below).
     known_review_logins = frozenset().union(*scanner_sets.values())
-    codeql_logins = scanner_sets.get("codeql", frozenset())
     # Off-diff findings (issue #1728): (title, path) — surfaced, never scored.
     cr_off_diff: list[tuple[str, str]] = []
     off_diff_p1: list[tuple[str, str]] = []
@@ -4174,6 +4191,24 @@ def _check_inline_review_findings(
                 return "doc", sev
         return "scored", sev
 
+    def _tamper_excluded(path: str | None) -> bool:
+        # The exclusions an edited finding keeps (the floor's reading of the doc
+        # lever: excluded only under `skip`), shared by the taint and the branch.
+        return _off_diff(path) or (_is_doc_path(path or "") and _doc_findings_mode() == "skip")
+
+    # A Devin finding posted twice is one finding: one tampered copy taints all.
+    # Only an in-scope copy taints, and only in-scope twins: an excluded copy
+    # never moves the group's verdict, so its edit must not either.
+    for copies in devin_copies.values():
+        editors = [
+            tampered[cp.get("id")]
+            for cp in copies
+            if cp.get("id") in tampered and not _tamper_excluded(cp.get("path"))
+        ]
+        for cp in copies:
+            if editors and cp.get("id") not in tampered and not _tamper_excluded(cp.get("path")):
+                tampered[cp.get("id")] = editors[0]
+
     for c in raw:
         login, utype = c.get("login") or "", c.get("type") or ""
         body = c.get("body") or ""
@@ -4199,11 +4234,20 @@ def _check_inline_review_findings(
             # current text is not the reviewer's, so nothing in it is believed. The
             # path is REST metadata an edit cannot change, so its exclusions stand.
             path = c.get("path")
-            if _off_diff(path) or (_is_doc_path(path or "") and _doc_findings_mode() == "skip"):
-                continue
             fid = _devin_finding(body)[0] if login in devin_logins else None
             group = devin_copies.get((login, fid), [c]) if fid is not None else [c]
             gkey = tuple(cp.get("id") for cp in group)
+            if _tamper_excluded(path):
+                if ("excluded", gkey) not in tampered_seen:
+                    tampered_seen.add(("excluded", gkey))
+                    tampered_excluded.append(
+                        (
+                            f"[edited by {tampered[c.get('id')]}] {_inline_title(body)}",
+                            path or "",
+                            "off_diff" if _off_diff(path) else "doc",
+                        )
+                    )
+                continue
             if gkey in tampered_seen:
                 continue
             tampered_seen.add(gkey)
@@ -4237,9 +4281,7 @@ def _check_inline_review_findings(
         # unrecognised branch: SURFACED, never scored, never blocking.
         # CodeQL is surface-only (`review_findings.KNOWN_FORMATS`): its body is
         # never searched for a severity badge, so it reaches only the CodeQL NOTE.
-        parseable = (
-            utype == "Bot" or login in inline_review_logins
-        ) and login not in codeql_logins
+        parseable = _parseable(login, utype)
         if login in devin_logins and utype == "Bot":
             # EXCLUSIVE and terminal, and placed BEFORE the badge branches below:
             # Devin quotes guard output and code in its findings, so a body can
@@ -4259,7 +4301,12 @@ def _check_inline_review_findings(
             if dkey in devin_seen:
                 continue  # another post of a finding already classified
             devin_seen.add(dkey)
-            copies = devin_copies.get(dkey, [c])
+            # An edited copy's TEXT is not the reviewer's: the tampered branch
+            # answered for it, so severity and scope are read from untouched copies
+            # only. Its reply THREAD is still the finding's, so clearing reads the
+            # whole group, as `answered` (devin_cleared) does.
+            group_all = devin_copies.get(dkey, [c])
+            copies = [cp for cp in group_all if cp.get("id") not in tampered]
             # Drift is a fact about a COMMENT, so every unreadable copy is
             # reported: before dedup can fold it into a readable sibling under
             # the same id, and before clearing, for the reason given above.
@@ -4316,8 +4363,8 @@ def _check_inline_review_findings(
             elif disp == "doc":
                 devin_doc_skipped.append(title)
             elif sev == "floor":
-                if _floor_cleared(copies, [t[0].get("path") for t in eligible if t[2] == "floor"]):
-                    if tuple(cp.get("id") for cp in copies) in floor_devin_only:
+                if _floor_cleared(group_all, [t[0].get("path") for t in eligible if t[2] == "floor"]):
+                    if tuple(cp.get("id") for cp in group_all) in floor_devin_only:
                         _list_self_withdrawn(dkey, copies, always=True)
                     continue
                 devin_block.append(title)
@@ -4813,6 +4860,16 @@ def _check_inline_review_findings(
                 f"({_safe_report_path(fpath)})",
                 file=sys.stderr,
             )
+    if tampered_excluded:
+        print(
+            f"NOTE: PR #{pr_num} — {len(tampered_excluded)} reviewer comment(s) edited "
+            f"by someone other than their reviewer, on a file outside this PR's diff "
+            f"or a skipped documentation path — NOT scored, as the finding would not be:",
+            file=sys.stderr,
+        )
+        for title, fpath, kind in tampered_excluded[:5]:
+            where = "off-diff" if kind == "off_diff" else "doc"
+            print(f"  [{where}] {title} ({_safe_report_path(fpath)})", file=sys.stderr)
     if off_diff_p1 or off_diff_p2:
         print(
             f"NOTE: PR #{pr_num} — {len(off_diff_p1)} [P1] + {len(off_diff_p2)} "
@@ -5050,6 +5107,7 @@ def _check_inline_review_findings(
                         + len(doc_skipped_p2)
                         + len(cr_doc_skipped)
                         + len(devin_doc_skipped)
+                        + sum(1 for t in tampered_excluded if t[2] == "doc")
                     ),
                     "below_major": len(cr_advisory),
                     "off_diff": (
@@ -5057,6 +5115,7 @@ def _check_inline_review_findings(
                         + len(off_diff_p1)
                         + len(off_diff_p2)
                         + len(devin_off_diff)
+                        + sum(1 for t in tampered_excluded if t[2] == "off_diff")
                     ),
                     "unanchored": (
                         len(outside_critical) + len(outside_major) + len(outside_minor)
