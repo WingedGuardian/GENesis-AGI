@@ -2906,38 +2906,62 @@ verified: 204c69c1f 2026-11-22
   **update.lock (B2, #4841 rework), also only with the flag on and the
   checkout on `live`:** no recovery action runs while `update.lock` is held,
   or unreadable while `incus info` does not report the container STOPPED
-  (read fresh each time; frozen or unknown is not stopped). The rule
+  (read fresh each time; frozen or unknown is not stopped). Every
+  `update.lock` a deploy on the checkout can take is read: the login shell's
+  `GENESIS_HOME`, genesis-server's own `Environment=`, and the
+  `GENESIS_HOME` line of its `EnvironmentFile=` files (read as plain
+  key=value, never evaluated; each deploy script resolves it from its own
+  environment); held at any reads held. A lock dir counts as absent only
+  on ENOENT: any other failed lookup, an unreadable file, or a user manager
+  that does not answer reads unreadable (exit 74; it fails closed). The rule
   (`live_drop.lock_blocks`) is read at three checkpoints: the entry of the
   approval flow (every route; any proposal, ESCALATE included, becomes an
   ESCALATE that waits), after the post-Gate-1 re-diagnosis and the `live`
   proposal, and in `RecoveryEngine.execute` after the backoff check and
   before anything is counted, alerted, snapshotted or saved (read again
-  after a pre-recovery snapshot). The server restart is queued as `flock -n
-  -o -E 75 update.lock systemctl …` (no lock dir: run it), so it never holds
-  the lock across the start, whose boot repair takes the lock itself; exit
-  75 on `live` (and the drop's exit 200 or its deploy-marker refusal) is a
-  wait too. A wait where nothing ran costs no attempt (counters, backoff stamp
+  after the pre-recovery alert, and after a pre-recovery snapshot). On
+  `live` (or a branch it cannot read) the server restart is queued as `flock
+  -n -o -E 75 update.lock systemctl …` (a confirmed-absent lock dir: run it),
+  so it never holds the lock across the start, whose boot repair takes the
+  lock itself; exit 75, a failed lookup (74) or a lock file flock cannot
+  open (66, 73), like the drop's exit 200 or its deploy-marker refusal, is
+  a wait too. Confirmed off `live` it is main's
+  plain command. A wait where nothing ran costs no attempt (counters, backoff stamp
   and drop record put back); one where work ran first (a drop that changed
-  `live`, RESOURCE_CLEAR's cleanup) keeps it. A waiting episode is CONFIRMED_DEAD
-  with three persisted fields (`waiting_on_update_lock`, `waiting_since`,
+  `live`, RESOURCE_CLEAR's cleanup) keeps it, its backoff counted from the
+  end of that work. A waiting episode is CONFIRMED_DEAD
+  with persisted fields (`waiting_on_update_lock`, `waiting_since`,
   `last_alert_at`, the last written only by `stamp_alert`), the auto-reset is
   skipped while it waits, and each tick reads the lock instead of staying
-  latched: free, or the container stopped, reopens it into a fresh diagnosis
+  latched: off `live` the wait ends quietly; on it, free, or the container
+  stopped, reopens it into a fresh diagnosis
   and both gates; held sends one EMERGENCY every 2 h and restarts nothing (the
   first alert says what already ran when a drop or RESOURCE_CLEAR's clean-up
   ran before the held restart); unreadable on a running container gets no
   plain alert: its first message, at the next tick, and then one every 2 h, is
-  an APPROVE gate for a container restart (owner ruling 91998f4f; it names
+  an APPROVE gate for a container restart. A wait that began held gets its
+  gate at its first unreadable read, at most once per wait (a persisted
+  `frozen_gate_sent`, ended with the wait), then every 2 h, so flips between
+  held and unreadable cannot repeat it (owner ruling 91998f4f; it names
   what incus reports and that the boot repair, where one is installed, #3492,
   heals a restart during a deploy; DENY or no reply keeps waiting; a spent
-  budget alerts instead). A gate that cannot be sent goes out as a plain
-  alert asking for no reply, not recorded as sent, so the next tick tries
-  again (with no Telegram channel at all, the plain alert counts). The
-  approved restart still refuses if the lock then reads held. Each wait event
+  budget alerts instead, and that alert counts as the wait's gate). A gate
+  that cannot be sent goes out as a plain alert asking for no reply; sent or
+  durably queued, it counts as the gate (the next in 2 h), otherwise it is
+  tried again after 10 min, never every tick. A held wait's plain alert
+  counts only once sent or queued. The gate waits 50 min for a reply, on
+  every path (getUpdates conflicts included), inside the unit's 3900 s
+  timeout; then the wait goes on. Before an APPROVE runs, a stand-down (maintenance, gateway pause,
+  Genesis paused) holds it and the lock is read again: held refuses, free or
+  a stopped container declines the stale approval and the episode reopens
+  at the next tick (with its full time budget), and only an unreadable lock
+  runs the approved restart. Each wait event
   sends one message (#4898 item 2).
   The re-alerts carry a host-side hint (`cgroup_ops.lock_holders`: the
   container's cgroup subtree, the `/proc/locks` FLOCK row matching
-  `update.lock`'s inode, the holder's command line; bounded at 2 s), which
+  `update.lock`'s inode, or, when that pid has exited or there is no inode,
+  the processes naming a deploy script; only the process name and pid are
+  shown, never its arguments; bounded at 2 s), which
   never changes the rule. Turning the flag off, or leaving `live`, ends the
   wait. Residual: while the lock is free, the probe and the queued restart
   hold it for an instant, so an update.sh starting in that instant fails fast

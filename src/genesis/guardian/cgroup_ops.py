@@ -214,12 +214,15 @@ _DEPLOY_NAMES = ("update.sh", "deploy_code_only", "deploy_candidates", "update.l
 
 
 def lock_holders(container: str, inode: str = "") -> list[tuple[int, str]]:
-    """(pid, cmdline) of the container's processes the host sees holding
+    """(pid, process name) of the container's processes the host sees holding
     update.lock: the FLOCK rows of /proc/locks whose inode is ``inode`` and
-    whose pid is in the container's cgroup SUBTREE (its top level lists none),
-    or, with no inode, the processes naming a deploy script. Measured readable
-    by the Guardian's host user (B2). A hint for alert text, never a rule;
-    raises OSError when the host cannot read."""
+    whose pid is a live process in the container's cgroup SUBTREE (its top
+    level lists none); else (no inode, or a row's pid exited: a flock helper
+    whose deploy shell still holds the fd) the processes whose command line
+    names a deploy script. Only the name (comm) is returned, never argv, which
+    can carry anything a holder was given. Measured readable by the Guardian's
+    host user (B2). A hint for alert text, never a rule; raises OSError when
+    the host cannot read."""
     pids: set[int] = set()
     for procs in _cgroup_path(container).rglob("cgroup.procs"):
         with contextlib.suppress(OSError):
@@ -228,23 +231,23 @@ def lock_holders(container: str, inode: str = "") -> list[tuple[int, str]]:
     # and pid from the host, not that the container's stat reports the same
     # device number (storage drivers and overlays can differ), and a device
     # mismatch would hide the real holder. Pids outside the subtree are dropped.
+    by_lock: set[int] = set()
     if inode:
         rows = [ln.split() for ln in (_PROC / "locks").read_text().splitlines()]
-        found = {
+        by_lock = {
             int(r[4]) for r in rows
             if len(r) > 5 and r[1] == "FLOCK" and r[4].isdigit() and r[5].split(":")[-1] == inode
         } & pids
-    else:
-        found = pids
+        by_lock = {pid for pid in by_lock if (_PROC / str(pid)).exists()}
     out = []
-    for pid in sorted(found):
+    for pid in sorted(by_lock or pids):
         try:
-            cmd = (_PROC / str(pid) / "cmdline").read_bytes().replace(b"\0", b" ")
+            name = (_PROC / str(pid) / "comm").read_text().strip()
+            argv = (_PROC / str(pid) / "cmdline").read_bytes().decode(errors="replace")
         except OSError:
             continue
-        text = cmd.decode(errors="replace").strip()
-        if inode or any(name in text for name in _DEPLOY_NAMES):
-            out.append((pid, text))
+        if by_lock or any(deploy in argv for deploy in _DEPLOY_NAMES):
+            out.append((pid, name))
     return out
 
 

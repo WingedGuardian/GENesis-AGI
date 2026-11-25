@@ -648,7 +648,7 @@ class LockBox(Box):
 
     async def __call__(self, *args, timeout=10.0, **kwargs):
         cmd = args[-1] if args[1:2] == ("exec",) else " ".join(args)
-        if "flock -n -E 75" in cmd:
+        if cmd == live_drop._LOCK_PROBE:
             self.calls.append(cmd)
             return (self.lock.pop(0) if len(self.lock) > 1 else self.lock[0], "", "")
         if "update_in_progress.pid" in cmd:
@@ -657,7 +657,7 @@ class LockBox(Box):
         if cmd.startswith("incus info"):
             self.calls.append(cmd)
             return (0, f"Name: genesis\nStatus: {self.status}\n", "")
-        if "flock -n -o -E 75" in cmd and self.queue:
+        if "flock" in cmd and "--no-block genesis-server" in cmd and self.queue:
             self.calls.append(cmd)
             return (self.queue, "", "")
         if "symbolic-ref" in cmd and not self.on_live:
@@ -698,11 +698,27 @@ async def test_only_a_reported_stopped_counts(answer, stopped):
         assert (await live_drop.container_status("genesis") == "stopped") is stopped
 
 
-def _sh(cmd: str, home):
+def _sh(cmd: str, home, *, login=True, unit_home=None, unit_rc=0, env_file=None):
+    """bash with a scratch HOME and a stub `systemctl` that reports the
+    genesis-server unit's Environment (``unit_home``) or fails (``unit_rc``):
+    never the real ~/.genesis. ``login``: GENESIS_HOME is set to ``home``."""
     import os
     import subprocess
 
-    env = {**os.environ, "GENESIS_HOME": str(home)}
+    root = home.parent
+    (root / "bin").mkdir(exist_ok=True)
+    (root / "user").mkdir(exist_ok=True)
+    stub = root / "bin" / "systemctl"
+    said = f"echo GENESIS_HOME={unit_home}" if unit_home else "echo"
+    files = f'echo "{env_file} (ignore_errors=yes)"' if env_file else "echo"
+    stub.write_text(
+        f"#!/bin/sh\ncase \"$*\" in *EnvironmentFiles*) {files};; *) {said};; esac\nexit {unit_rc}\n"
+    )
+    stub.chmod(0o755)
+    env = {**os.environ, "HOME": str(root / "user"), "PATH": f"{root / 'bin'}:{os.environ['PATH']}"}
+    env.pop("GENESIS_HOME", None)
+    if login:
+        env["GENESIS_HOME"] = str(home)
     return subprocess.run(["bash", "-c", cmd], env=env, capture_output=True, text=True, timeout=20)
 
 
@@ -715,7 +731,7 @@ def test_the_probe_and_the_queued_restart_under_a_real_flock(tmp_path):
     from genesis.guardian.recovery import _UNDER_LOCK
 
     home = tmp_path / "gh"
-    run = _UNDER_LOCK.format(cmd="sh -c 'ls -l /proc/$$/fd; echo ran'")
+    run = _UNDER_LOCK("sh -c 'ls -l /proc/$$/fd; echo ran'")
     assert _sh(live_drop._LOCK_PROBE, home).returncode == 0  # no lock dir: free
     assert not (home / "locks").exists()  # the probe made none
     r = _sh(run, home)
@@ -843,14 +859,25 @@ async def test_armed_the_restart_is_queued_under_update_lock():
     box = LockBox()
     with _patched(box):
         ok, _ = await _engine()._restart_services("genesis")
-    assert ok and box.sent("--no-block") == [_UNDER_LOCK.format(cmd=_RESTART)]
+    assert ok and box.sent("--no-block") == [_UNDER_LOCK(_RESTART)]
 
 
-async def test_a_held_queue_off_live_restarts_as_before():
+async def test_off_live_the_restart_is_mains_plain_command():
+    """E: confirmed off `live`, the lock is never touched, even armed."""
     box = LockBox(queue=75, on_live=False)
     with _patched(box):
         ok, _ = await _engine()._restart_services("genesis")
-    assert ok and box.sent("--no-block")[-1] == _RESTART
+    assert ok and box.sent("--no-block") == [_RESTART]
+
+
+async def test_a_queue_whose_lock_lookup_fails_never_restarts():
+    """A: the wrapper's exit 74 (lookup failed) holds the restart like 75."""
+    from genesis.guardian.recovery import _Held
+
+    box = LockBox(queue=74)
+    with _patched(box):
+        ok, detail = await _engine()._restart_services("genesis")
+    assert not ok and isinstance(detail, _Held) and box.sent("--no-block")[-1] != _RESTART
 
 
 async def test_a_held_queue_on_live_defers_with_no_attempt_and_no_failed_alert(tmp_path):
@@ -887,10 +914,18 @@ async def test_a_restart_held_after_work_ran_keeps_the_attempt(tmp_path, action)
     """A drop that changed `live` (exit 4: dropped, restart not queued), or
     RESOURCE_CLEAR's cleanup, ran before the restart was held."""
     engine, path = _loaded_engine(tmp_path)
-    sent = AsyncMock(return_value=True)
+    old = "2000-01-01T00:00:00+00:00"
+
+    async def sent_fn(alert, **_kw):
+        if alert.title.startswith("Attempting"):  # the attempt began long ago
+            engine._sm.state.last_recovery_at = old
+        return True
+
+    sent = AsyncMock(side_effect=sent_fn)
     with _patched(LockBox(drop=(4, "", ""), queue=75)), patch.object(engine._dispatcher, "send", sent):
         result = await engine.execute(_drop_diagnosis(action))
     saved = _on_disk(path)
+    assert saved["last_recovery_at"] != old  # F: the backoff runs from the work's end
     body = sent.await_args.args[0].body  # SF1: the wait alert says what already ran
     assert "Nothing was restarted or dropped" not in body
     assert f"The approved {action.value} step ran; only the genesis-server restart is held" in body
@@ -915,30 +950,47 @@ def _host(tmp_path, monkeypatch):
         "3: -> FLOCK  ADVISORY  WRITE 100 00:2f:77 0 EOF\n"  # a waiter
         "4: FLOCK  ADVISORY  WRITE 100 00:2f:78 0 EOF\n"  # another file
     )
-    for pid, argv in ((200, b"bash\0scripts/update.sh\0"), (100, b"python3\0-m\0genesis\0")):
+    (proc / "locks").write_text(
+        (proc / "locks").read_text() + "5: FLOCK  ADVISORY  WRITE 250 00:2f:79 0 EOF\n"
+    )  # 250 exited: its shell (300) still holds the fd
+    (cg / "init.scope" / "cgroup.procs").write_text("100\n200\n300\n")
+    for pid, comm, argv in (
+        (200, "flock", b"flock\0-s\0update.lock\0sh\0-c\0TOKEN=s3cret scripts/update.sh\0"),
+        (100, "python3", b"python3\0-m\0genesis\0"),
+        (300, "bash", b"bash\0scripts/deploy_code_only.sh\0"),
+    ):
         (proc / str(pid)).mkdir()
         (proc / str(pid) / "cmdline").write_bytes(argv)
+        (proc / str(pid) / "comm").write_text(comm + "\n")
     monkeypatch.setattr(cgroup_ops, "_cgroup_path", lambda _c: cg)
     monkeypatch.setattr(cgroup_ops, "_PROC", proc)
 
 
 def test_the_host_names_the_update_lock_holder_by_inode(tmp_path, monkeypatch):
     _host(tmp_path, monkeypatch)
-    assert cgroup_ops.lock_holders("genesis", "77") == [(200, "bash scripts/update.sh")]
-    assert cgroup_ops.lock_holders("genesis", "5") == []
+    """I: the process name and pid only, never argv."""
+    assert cgroup_ops.lock_holders("genesis", "77") == [(200, "flock")]
+
+
+def test_a_holder_row_whose_pid_exited_falls_back_to_the_name_match(tmp_path, monkeypatch):
+    """I: the flock helper exited; the deploy shell holding its fd is named."""
+    _host(tmp_path, monkeypatch)
+    assert cgroup_ops.lock_holders("genesis", "79") == [(200, "flock"), (300, "bash")]
 
 
 def test_without_the_inode_the_host_names_deploy_processes(tmp_path, monkeypatch):
     """A frozen guest cannot say update.lock's inode: cmdlines are the hint."""
     _host(tmp_path, monkeypatch)
-    assert cgroup_ops.lock_holders("genesis") == [(200, "bash scripts/update.sh")]
+    assert cgroup_ops.lock_holders("genesis") == [(200, "flock"), (300, "bash")]
 
 
 async def test_the_host_hint_is_text_and_bounded(tmp_path, monkeypatch):
     import time
 
     _host(tmp_path, monkeypatch)
-    assert "pid 200 (bash scripts/update.sh)" in await live_drop.host_hint("genesis", "77")
+    hint = await live_drop.host_hint("genesis", "77")
+    assert "pid 200 (flock)" in hint and "s3cret" not in hint
+    monkeypatch.setattr(cgroup_ops, "lock_holders", lambda *_a: [])
     assert "none seen" in await live_drop.host_hint("genesis", "5")
     monkeypatch.setattr(cgroup_ops, "lock_holders", lambda *_a: time.sleep(1))
     monkeypatch.setattr(live_drop, "_HINT_TIMEOUT_S", 0.05)
@@ -957,7 +1009,7 @@ async def test_the_restored_state_is_on_disk_before_the_wait_alert(tmp_path):
     engine, path = _loaded_engine(tmp_path)
     seen: list[dict] = []
 
-    async def send(alert):
+    async def send(alert, **_kw):
         seen.append(_on_disk(path))
         return True
 
@@ -966,3 +1018,130 @@ async def test_the_restored_state_is_on_disk_before_the_wait_alert(tmp_path):
     at_wait_alert = seen[-1]
     assert at_wait_alert["recovery_attempts"] == 0 and at_wait_alert["waiting_on_update_lock"]
     assert at_wait_alert["down_alert_sent"] is True
+
+
+@pytest.mark.skipif(
+    __import__("os").geteuid() == 0, reason="root searches a mode-000 dir: no failed lookup"
+)
+def test_an_unlookupable_lock_dir_is_unreadable_never_free(tmp_path):
+    """A: only a confirmed-absent lock dir (ENOENT) reads free; a parent the
+    user cannot search is a failed lookup: the probe says unreadable, and the
+    queued command never runs without the lock."""
+    from genesis.guardian.recovery import _UNDER_LOCK
+
+    run = _UNDER_LOCK("echo ran")
+    home = tmp_path / "gh"
+    (home / "locks").mkdir(parents=True)
+    home.chmod(0o000)
+    try:
+        assert _sh(live_drop._LOCK_PROBE, home).returncode not in (0, 75)
+        r = _sh(run, home)
+        assert r.returncode not in (0, 75) and "ran" not in r.stdout
+    finally:
+        home.chmod(0o755)
+    absent = tmp_path / "absent"
+    assert _sh(live_drop._LOCK_PROBE, absent).returncode == 0
+    assert "ran" in _sh(run, absent).stdout
+
+
+def test_the_lock_the_server_unit_names_is_read_too(tmp_path):
+    """B: a relocated install whose GENESIS_HOME is set for genesis-server but
+    not in the login shell: its lock is read, held there reads held; an
+    unreadable unit Environment reads unreadable."""
+    import subprocess
+    import time
+
+    from genesis.guardian.recovery import _UNDER_LOCK
+
+    unit = tmp_path / "relocated"
+    (unit / "locks").mkdir(parents=True)
+    lock = str(unit / "locks" / "update.lock")
+    login = tmp_path / "gh"
+    holder = subprocess.Popen(["flock", lock, "sleep", "30"])
+    try:
+        deadline = time.monotonic() + 10
+        while subprocess.run(["flock", "-n", lock, "true"]).returncode == 0:
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        assert _sh(live_drop._LOCK_PROBE, login, login=False, unit_home=unit).returncode == 75
+        r = _sh(_UNDER_LOCK("echo ran"), login, login=False, unit_home=unit)
+        assert r.returncode == 75 and "ran" not in r.stdout
+    finally:
+        holder.kill()
+        holder.wait()
+    assert _sh(live_drop._LOCK_PROBE, login, unit_rc=1).returncode not in (0, 75)
+
+
+@pytest.mark.parametrize("action", [RecoveryAction.RESTART_CONTAINER, RecoveryAction.SNAPSHOT_ROLLBACK])
+async def test_a_lock_taken_during_the_pre_recovery_alert_defers_without_a_snapshot(
+    tmp_path, action
+):
+    """C: the lock is read again after the last await before the action."""
+    engine, path = _loaded_engine(tmp_path)
+    ran = AsyncMock()
+    with (
+        _patched(LockBox(lock=(0, 75))),
+        patch.object(engine, "_execute_action", ran),
+        patch.object(engine._snapshots, "safe_to_snapshot", AsyncMock(return_value=False)),
+    ):
+        result = await engine.execute(_drop_diagnosis(action))
+    ran.assert_not_awaited()
+    saved = _on_disk(path)
+    assert result.waiting and saved["recovery_attempts"] == 0
+    assert saved["current_state"] == "confirmed_dead"
+
+
+async def test_a_plain_wait_alert_is_stamped_only_when_sent_or_queued():
+    """H: neither sent nor queued leaves the stamp, so a later tick retries."""
+    sm = ConfirmationStateMachine(GuardianConfig())
+    sm.mark_waiting()
+    d = MagicMock(send=AsyncMock(return_value=True), send_or_queue=AsyncMock(return_value=False))
+    await live_drop.send_wait_alert(sm, d, "t", "b")
+    assert sm.state.last_alert_at is None
+    d.send_or_queue = AsyncMock(return_value=True)
+    await live_drop.send_wait_alert(sm, d, "t", "b")
+    assert sm.state.last_alert_at is not None
+
+
+def test_the_lock_the_server_environment_file_names_is_read_too(tmp_path):
+    """Review SF4: the shipped unit sets GENESIS_HOME through EnvironmentFile=."""
+    import subprocess
+    import time
+
+    from genesis.guardian.recovery import _UNDER_LOCK
+
+    unit = tmp_path / "relocated"
+    (unit / "locks").mkdir(parents=True)
+    lock = str(unit / "locks" / "update.lock")
+    env_file = tmp_path / "server.env"
+    env_file.write_text(f"# a comment\nOTHER=1\nGENESIS_HOME={unit}\n")
+    login = tmp_path / "gh"
+    holder = subprocess.Popen(["flock", lock, "sleep", "30"])
+    try:
+        deadline = time.monotonic() + 10
+        while subprocess.run(["flock", "-n", lock, "true"]).returncode == 0:
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        assert _sh(live_drop._LOCK_PROBE, login, login=False, env_file=env_file).returncode == 75
+        r = _sh(_UNDER_LOCK("echo ran"), login, login=False, env_file=env_file)
+        assert r.returncode == 75 and "ran" not in r.stdout
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_the_wrappers_unreadable_exit_is_74_not_a_command_code(tmp_path):
+    """NOTE: 3 could be the command's own exit; 74 is reserved for the lookup."""
+    home = tmp_path / "gh"
+    assert _sh(live_drop._LOCK_PROBE, home, unit_rc=1).returncode == 74
+
+
+@pytest.mark.parametrize("rc", [66, 73, 74])
+async def test_a_lock_that_cannot_be_opened_holds_the_restart(rc):
+    """NOTE: flock's open failures and the lookup code are held, not failures."""
+    from genesis.guardian.recovery import _Held
+
+    box = LockBox(queue=rc)
+    with _patched(box):
+        ok, detail = await _engine()._restart_services("genesis")
+    assert not ok and isinstance(detail, _Held)

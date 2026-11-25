@@ -1927,22 +1927,24 @@ async def _wait_tick(
     state, who, inode = (
         await live_drop.lock_state(cname) if config.recovery.live_engine else ("", "", "")
     )
+    if not state or not await container_on_live(cname):  # G: before any reopen
+        sm.end_wait()
+        return False
     status = await live_drop.container_status(cname) if state == live_drop.UNREADABLE else ""
     if state == live_drop.FREE or status == "stopped":
         logger.info("update.lock is free or the container stopped: reopening this episode")
         sm.clear_down_alert_sent()
         return True
-    if not state or not await container_on_live(cname):
-        sm.end_wait()
-        return False
-    if not sm.realert_due(live_drop.WAIT_REALERT_S):
+    # An unreadable lock's first gate in this wait is due at once, even when the
+    # wait began held (owner ruling 91998f4f); after it, every 2 h, flips or not.
+    gate_now = state == live_drop.UNREADABLE and sm.gate_due(_GATE_RETRY_S)
+    if not (sm.realert_due(live_drop.WAIT_REALERT_S) or gate_now):
         return False
     waited = sm.waited_s()
     hours = f"{waited / 3600:.1f} h" if waited is not None else "an unknown time"
     hint = await live_drop.host_hint(cname, inode)
     if state == live_drop.UNREADABLE:
-        await _frozen_gate(config, sm, dispatcher, recovery_engine, status, hours, hint)
-        return False
+        return await _frozen_gate(config, sm, dispatcher, recovery_engine, status, hours, hint)
     await live_drop.send_wait_alert(
         sm, dispatcher, f"Genesis still down — the Guardian has waited {hours} for update.lock",
         "update.lock on `live` is held" + (f" ({who})" if who else "") + ". "
@@ -1953,9 +1955,30 @@ async def _wait_tick(
     return False
 
 
-async def _frozen_gate(config, sm, dispatcher, recovery_engine, status, hours, hint) -> None:
-    """The 2 h alert of a wait on an unreadable lock, as an APPROVE gate for a
-    container restart; the restart re-reads the lock first (C3)."""
+#: The frozen gate waits this long for a reply, inside the unit's
+#: TimeoutStartSec (3900 s) with room for an approved restart; then the tick
+#: ends and the wait goes on (2 h).
+_FROZEN_GATE_WAIT_S = 3000.0
+#: A frozen gate (or its stand-in) that could not be delivered retries this
+#: often, not every tick.
+_GATE_RETRY_S = 600.0
+
+
+def _stood_down(config: GuardianConfig, snapshot) -> bool:
+    """The tick's own stand-downs (run_check) and Genesis's pause."""
+    return bool(
+        snapshot.pause_state.paused
+        or Path(config.maintenance_file).exists()
+        or _gateway_pause_active(config)
+    )
+
+
+async def _frozen_gate(config, sm, dispatcher, recovery_engine, status, hours, hint) -> bool:
+    """The alert of a wait on an unreadable lock, as an APPROVE gate for a
+    container restart, its reply awaited at most _FROZEN_GATE_WAIT_S. Before an
+    APPROVE runs: a stand-down holds it; the lock is read again, and held
+    refuses (C3), free or a stopped container declines the stale approval and
+    reopens the episode (True); only unreadable runs the restart."""
     from genesis.guardian.diagnosis import DiagnosisResult, RecoveryAction
 
     restart = DiagnosisResult(
@@ -1968,8 +1991,9 @@ async def _frozen_gate(config, sm, dispatcher, recovery_engine, status, hours, h
         await live_drop.send_wait_alert(
             sm, dispatcher, title, "The recovery budget is spent, so the Guardian cannot "
             "restart the container: manual intervention needed. It keeps waiting.",
+            frozen=True,  # this wait's gate: the next in 2 h, never every tick
         )
-        return
+        return False
     channel = _find_telegram_channel(dispatcher)
     body = (
         f"incus reports the container {status or 'in an unknown state'} (not stopped), and "
@@ -1987,8 +2011,12 @@ async def _frozen_gate(config, sm, dispatcher, recovery_engine, status, hours, h
     )
     gate = await live_drop.send_wait_alert(sm, dispatcher, title, body, gate=channel, plain=plain)
     if channel is None or gate is None:
-        return
-    kw = await _wait_for_gate_keyword(config, sm, dispatcher, channel, gate, "frozen-lock gate")
+        return False
+    kw = await _wait_for_gate_keyword(
+        config, sm, dispatcher, channel, gate, "frozen-lock gate", deadline_s=_FROZEN_GATE_WAIT_S,
+    )
+    if kw is None:  # no reply in time: the wait goes on, its next gate in 2 h
+        return False
     if kw == "__RECOVERED__":
         await channel.send_text("✅ Genesis recovered on its own — standing down, no action taken")
         sm.process(await collect_all_signals(config))
@@ -1996,11 +2024,34 @@ async def _frozen_gate(config, sm, dispatcher, recovery_engine, status, hours, h
     elif kw != "APPROVE":
         await channel.send_text("Not restarted; the Guardian keeps waiting and asks again in 2 h.")
     else:
+        snapshot = await collect_all_signals(config)
+        if _stood_down(config, snapshot):
+            await channel.send_text(
+                "Approved RESTART_CONTAINER did not run: Genesis was paused (or the Guardian "
+                "stood down) during the wait — standing down, no action taken"
+            )
+            if snapshot.pause_state.paused:
+                sm.process(snapshot)
+            sm.clear_down_alert_sent()
+            return False
+        cname = config.container_name
+        state, _who, _inode = await live_drop.lock_state(cname)
+        stopped = state == live_drop.UNREADABLE and (
+            await live_drop.container_status(cname) == "stopped"
+        )
+        if state == live_drop.FREE or stopped:
+            await channel.send_text(
+                "update.lock now reads free (or the container stopped), so the approval is "
+                "not acted on: the Guardian diagnoses again at the next check and asks you again."
+            )
+            sm.clear_down_alert_sent()  # the next tick reopens, with its full time budget
+            return False
         result = await recovery_engine.execute(restart, owner_approved_unreadable=True)
         if getattr(result, "deferred", False) is True:
             await live_drop.send_wait_alert(
                 sm, dispatcher, title, f"Approved RESTART_CONTAINER did not run: {result.detail}"
             )
+    return False
 
 
 def _escalated_if_spent(sm: ConfirmationStateMachine, diagnosis: object) -> object:
@@ -2064,6 +2115,7 @@ async def _wait_for_gate_keyword(
     telegram_channel: TelegramAlertChannel,
     gate_msg_id: int,
     gate_label: str,
+    deadline_s: float | None = None,
 ) -> str | None:
     """Block until the user replies APPROVE/DENY to the gate message.
 
@@ -2077,11 +2129,15 @@ async def _wait_for_gate_keyword(
          bot appears alive (can't confirm Genesis is down), then back off.
     """
     keywords = frozenset({"APPROVE", "DENY"})
+    end = asyncio.get_running_loop().time() + (deadline_s or 0.0)
     consecutive_conflicts = 0
     waited_s = 0.0
     last_liveness_log = 0.0
 
     while True:
+        # A deadline (the frozen gate) holds on every path, 409s included.
+        if deadline_s is not None and asyncio.get_running_loop().time() >= end:
+            return None
         # 1. Self-cancel on genuine recovery (no fixed timeout — only health
         #    recovery ends the wait, per spec).
         recheck = await collect_all_signals(config)
@@ -2441,11 +2497,7 @@ async def _execute_recovery_with_approval(
         snapshot = await collect_all_signals(config)
         # The tick's own stand-downs (run_check) and Genesis's pause, begun
         # during the wait, hold the approved action as they hold a new tick.
-        if (
-            snapshot.pause_state.paused
-            or Path(config.maintenance_file).exists()
-            or _gateway_pause_active(config)
-        ):
+        if _stood_down(config, snapshot):
             await telegram_channel.send_text(
                 f"Approved {action} did not run: Genesis was paused (or the Guardian "
                 "stood down) during the wait — standing down, no action taken"

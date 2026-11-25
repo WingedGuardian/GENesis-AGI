@@ -104,6 +104,10 @@ class StateData:
     waiting_on_update_lock: bool = False
     waiting_since: str | None = None
     last_alert_at: str | None = None
+    # Whether this wait has sent its frozen APPROVE gate (owner ruling 91998f4f):
+    # the first unreadable read on a running container gates at once, then 2 h.
+    # A field because last_alert_at cannot tell a held re-alert from a gate.
+    frozen_gate_sent: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -135,6 +139,7 @@ class StateData:
             "waiting_on_update_lock": self.waiting_on_update_lock,
             "waiting_since": self.waiting_since,
             "last_alert_at": self.last_alert_at,
+            "frozen_gate_sent": self.frozen_gate_sent,
         }
 
     @classmethod
@@ -172,6 +177,7 @@ class StateData:
             waiting_on_update_lock=data.get("waiting_on_update_lock") is True,
             waiting_since=_text(data.get("waiting_since")),
             last_alert_at=_text(data.get("last_alert_at")),
+            frozen_gate_sent=data.get("frozen_gate_sent") is True,
         )
 
 
@@ -916,10 +922,13 @@ class ConfirmationStateMachine:
     def end_wait(self) -> None:
         self._state.waiting_on_update_lock = False
         self._state.waiting_since = None
+        self._state.frozen_gate_sent = False
 
-    def stamp_alert(self) -> None:
-        """The one writer of last_alert_at: every wait alert is recorded here."""
+    def stamp_alert(self, *, gate: bool = False) -> None:
+        """The one writer of last_alert_at: every wait alert is recorded here,
+        and ``gate``: it was this wait's frozen gate (or its stand-in)."""
         self._state.last_alert_at = datetime.now(UTC).isoformat()
+        self._state.frozen_gate_sent = self._state.frozen_gate_sent or gate
 
     def realert_due(self, every_s: float) -> bool:
         """``every_s`` since the last wait alert, or at once when this wait has
@@ -935,6 +944,21 @@ class ConfirmationStateMachine:
             return False
         start = _usable(self._state.waiting_since, now)
         return (start is not None and last < start) or (now - last).total_seconds() >= every_s
+
+    def gate_due(self, retry_s: float) -> bool:
+        """The frozen gate of this wait, sent once: due while it is not sent,
+        unless the wait's last alert is within ``retry_s`` (a stand-in that
+        could not be delivered retries no faster than that)."""
+        if self._state.frozen_gate_sent:
+            return False
+        now = datetime.now(UTC)
+        last = _usable(self._state.last_alert_at, now)
+        start = _usable(self._state.waiting_since, now)
+        return (
+            last is None
+            or (start is not None and last < start)
+            or (now - last).total_seconds() >= retry_s
+        )
 
     def waited_s(self) -> float | None:
         start = _usable(self._state.waiting_since, datetime.now(UTC))

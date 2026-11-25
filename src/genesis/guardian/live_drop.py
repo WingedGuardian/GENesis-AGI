@@ -86,10 +86,48 @@ HALF_DONE_DROP = "half_done_drop"
 
 # ── update.lock (B2, #4841 rework) ────────────────────────────────────────────
 
-#: The lock every deploy, rebuild, drop and validation hold takes. Exit 0 free,
-#: 75 held, anything else (incl. -1: no answer) unreadable. No lock dir: free.
+#: Every update.lock a deploy on this checkout can take: each deploy script
+#: takes `${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock` from its OWN
+#: environment (update.sh, deploy_code_only.sh, deploy_marker.sh; no shared
+#: resolver), so three sources are read: the login shell's value,
+#: genesis-server's Environment=, and the GENESIS_HOME line of its
+#: EnvironmentFile= files (the shipped unit sets it there; a plain key=value
+#: read, never evaluated). Fails closed: a user manager that does not answer,
+#: or an existing file it cannot read, exits 74 (unreadable). Residual: a value
+#: systemd quotes (a path with spaces) splits wrongly, a file value is only
+#: stripped of double quotes, and a deploy run with a GENESIS_HOME from none of
+#: these sources is not seen.
+_UNREADABLE_RC = 74
+_RESOLVE = (
+    'set -f; g1="${GENESIS_HOME:-$HOME/.genesis}"; g2="$HOME/.genesis"; g3=; '
+    "e=$(systemctl --user show genesis-server -p Environment --value) || exit 74; "
+    'for kv in $e; do case "$kv" in GENESIS_HOME=*) g2="${kv#GENESIS_HOME=}";; esac; done; '
+    "f=$(systemctl --user show genesis-server -p EnvironmentFiles --value) || exit 74; "
+    'for p in $f; do case "$p" in /*) if [ -r "$p" ]; then '
+    r'v=$(sed -n "s/^[[:space:]]*GENESIS_HOME=//p" "$p" | tail -n 1); v=${v%\"}; v=${v#\"}; '
+    '[ -n "$v" ] && g3=$v; elif [ -e "$p" ]; then exit 74; fi;; esac; done; '
+    '[ "$g2" = "$g1" ] && g2=; { [ "$g3" = "$g1" ] || [ "$g3" = "$g2" ]; } && g3=; '
+)
+
+
+def under_lock(cmd: str) -> str:
+    """``cmd`` run holding every update.lock (flock -n -o: never across what
+    it starts; exit 75 when one is held). A lock dir counts as absent only on
+    ENOENT; any other failed lookup (a parent it cannot search) exits 74, and
+    ``cmd`` never runs without its lock."""
+    return _RESOLVE + f"set -- {cmd}; " + (
+        'for g in "$g1" "$g2" "$g3"; do [ -n "$g" ] || continue; d="$g/locks"; '
+        'if [ -d "$d" ]; then set -- flock -n -o -E 75 "$d/update.lock" "$@"; '
+        'else m=$(LC_ALL=C stat -- "$d" 2>&1 >/dev/null) && exit 74; '
+        'case "$m" in *"No such file or directory") ;; *) exit 74;; esac; fi; done; '
+        'exec "$@"'
+    )
+
+
+#: The lock probe: exit 0 free, 75 held, anything else (74: a failed lookup;
+#: -1: no answer) unreadable.
+_LOCK_PROBE = under_lock("true")
 _LOCKS = 'd="${GENESIS_HOME:-$HOME/.genesis}/locks"; '
-_LOCK_PROBE = _LOCKS + '[ -d "$d" ] || exit 0; exec flock -n -E 75 "$d/update.lock" true'
 _LOCK_HELD = 75
 #: On HELD: update.lock's inode (for the host hint) and the deploy marker's pid.
 _HOLDER_CMD = (
@@ -382,24 +420,30 @@ def wait_alert(why: str, ran: str = "") -> tuple[str, str]:
     )
 
 
-async def send_wait_alert(sm, dispatcher, title: str, body: str, *, gate=None, plain=""):
+async def send_wait_alert(
+    sm, dispatcher, title: str, body: str, *, gate=None, plain="", frozen=False
+):
     """The ONE writer of a wait alert: send it, then stamp and save. With
     ``plain`` it is an APPROVE prompt to the Telegram channel ``gate``
-    (returning its message id); a failed send goes out as the ``plain`` text,
-    asking nothing and NOT stamped, so the next tick retries (SF2). With no
-    channel at all, ``plain`` is the alert, stamped: no reply can ever be read."""
+    (returning its message id); with no channel, or a failed send, ``plain``
+    (asking nothing) goes through send_or_queue instead. ``frozen``: it stands
+    for this wait's frozen gate. A gate or stand-in sent or durably queued is
+    stamped as the gate (the next in 2 h); one neither sent nor queued is
+    stamped as a plain alert, so it retries after StateMachine.gate_due's
+    bound, never every tick; any other alert is stamped only once delivered."""
+    frozen = frozen or bool(plain)
     if plain and gate is not None:
         sent = await gate.send_text(f"<b>{escape(title)}</b>\n{escape(body)}")
-        if sent is None:
-            await dispatcher.send(Alert(severity=AlertSeverity.EMERGENCY, title=title, body=plain))
-            return None
-    else:
-        sent = await dispatcher.send(
-            Alert(severity=AlertSeverity.EMERGENCY, title=title, body=plain or body)
-        )
-    sm.stamp_alert()
-    sm.persist()
-    return sent if plain and gate is not None else None
+        if sent is not None:
+            sm.stamp_alert(gate=True)
+            sm.persist()
+            return sent
+    alert = Alert(severity=AlertSeverity.EMERGENCY, title=title, body=plain or body)
+    delivered = await dispatcher.send_or_queue(alert)
+    if delivered or frozen:
+        sm.stamp_alert(gate=bool(delivered and frozen))
+        sm.persist()
+    return None
 
 
 async def host_hint(container: str, inode: str = "") -> str:

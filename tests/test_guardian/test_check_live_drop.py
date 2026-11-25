@@ -1126,6 +1126,13 @@ async def test_a_gateway_pause_during_the_wait_clears_the_latch_and_runs_nothing
 # ── B2: update.lock checkpoints and the wait (#4841 rework) ──────────────────
 
 
+def _disp() -> MagicMock:
+    """A dispatcher whose send_or_queue is its send (one list of alerts)."""
+    d = MagicMock(send=AsyncMock(return_value=True))
+    d.send_or_queue = d.send
+    return d
+
+
 class LockContainer(Container):
     """Container plus update.lock: ``lock`` the probe's successive exit codes
     (0 free, 75 held, else unreadable; the last repeats), ``status`` what
@@ -1137,7 +1144,7 @@ class LockContainer(Container):
 
     async def __call__(self, *args, timeout=10.0, **kwargs):
         cmd = args[-1] if args[1:2] == ("exec",) else " ".join(args)
-        if "flock -n -E 75" in cmd:
+        if cmd == live_drop._LOCK_PROBE:
             self.calls.append(cmd)
             return (self.lock.pop(0) if len(self.lock) > 1 else self.lock[0], "", "")
         if "update_in_progress.pid" in cmd:
@@ -1190,7 +1197,7 @@ async def test_one_message_per_wait_event():
     also "Investigation complete" on Telegram."""
     config = _armed()
     sm = _dead_sm(config)
-    dispatcher = MagicMock(send=AsyncMock(return_value=True))
+    dispatcher = _disp()
     snaps = MagicMock(safe_to_snapshot=AsyncMock(return_value=False))
     engine = RecoveryEngine(config, sm, snaps, dispatcher)
     _, texts, _ = await _run_gates(config, LockContainer(lock=(0, 75)), sm=sm, engine=engine)
@@ -1204,6 +1211,7 @@ async def test_one_message_per_wait_event():
 async def test_the_in_tick_backoff_wait_re_reads_the_lock():
     config = _armed()
     sm, engine, ran, (slept, sleep) = _io_deferred(config)
+    engine._dispatcher = _disp()  # the wait alert goes through send_or_queue
     with patch("asyncio.sleep", sleep):
         _, texts, _ = await _run_gates(
             config, LockContainer(lock=(0, 0, 75)), sm=sm,
@@ -1225,10 +1233,14 @@ def _waiting_sm(config, alerted_h: float = 0.0) -> ConfirmationStateMachine:
     return sm
 
 
-async def _tick(config, sm, box, *, alive=False, channel=None, no_channel=False):
+async def _tick(
+    config, sm, box, *, alive=False, channel=None, no_channel=False, undelivered=False
+):
     from genesis.guardian.check import _handle_confirmed_dead
 
-    dispatcher = MagicMock(send=AsyncMock(return_value=True))
+    dispatcher = _disp()
+    if undelivered:  # neither sent nor durably queued
+        dispatcher.send.return_value = False
     approve, channel = AsyncMock(), channel or _gate_channel()
     snaps = MagicMock(safe_to_snapshot=AsyncMock(return_value=False))
     engine = RecoveryEngine(config, sm, snaps, dispatcher)
@@ -1331,6 +1343,7 @@ async def test_the_frozen_gate_is_an_approve_gate_and_deny_keeps_waiting():
 async def test_the_frozen_gate_waits_quietly_until_due():
     config = _armed()
     sm = _waiting_sm(config, 1)
+    sm.state.frozen_gate_sent = True  # the gate of this wait went out 1 h ago
     channel = _frozen_channel()
     dispatcher, _, _ = await _tick(config, sm, LockContainer(lock=(1,)), channel=channel)
     channel.send_text.assert_not_awaited()
@@ -1386,7 +1399,7 @@ async def test_the_first_unreadable_alert_is_the_frozen_gate():
     config = _armed()
     sm = _dead_sm(config)
     snaps = MagicMock(safe_to_snapshot=AsyncMock(return_value=False))
-    dispatcher = MagicMock(send=AsyncMock(return_value=True))
+    dispatcher = _disp()
     engine = RecoveryEngine(config, sm, snaps, dispatcher)
     executed, texts, _ = await _run_gates(config, LockContainer(lock=(1,)), sm=sm, engine=engine)
     assert executed.escalation == "update_lock_unreadable" and texts == []
@@ -1413,7 +1426,151 @@ async def test_a_frozen_gate_that_cannot_be_sent_falls_back_to_a_plain_alert(tel
     alerts = [c.args[0] for c in dispatcher.send.await_args_list]
     assert len(alerts) == 1 and "Reply APPROVE" not in alerts[0].body
     assert not box.sent("incus restart")
-    if telegram == "failed":
-        assert sm.state.last_alert_at == stamp  # not stamped: the next tick retries
-    else:
-        assert sm.state.last_alert_at != stamp  # delivered; it repeats in 2 h
+    # Delivered or queued, it stands for this wait's gate: the next in 2 h.
+    assert sm.state.last_alert_at != stamp and sm.state.frozen_gate_sent is True
+    dispatcher, _, _ = await _tick(
+        config, sm, box, channel=channel, no_channel=telegram == "absent"
+    )
+    dispatcher.send.assert_not_awaited()  # the next tick does not retry
+
+
+async def test_a_gate_stand_in_that_was_neither_sent_nor_queued_retries_after_10_min():
+    """Review SHOULD-FIX 2: a bounded retry, never every 30 s tick."""
+    config = _armed()
+    sm = _waiting_sm(config, 2.5)
+    channel = _frozen_channel()
+    channel.send_text = AsyncMock(return_value=None)
+    box = LockContainer(lock=(1,))
+    d1, _, _ = await _tick(config, sm, box, channel=channel, undelivered=True)
+    assert d1.send.await_count == 1 and sm.state.frozen_gate_sent is False
+    d2, _, _ = await _tick(config, sm, box, channel=channel, undelivered=True)
+    assert d2.send.await_count == 0  # within 10 min: no retry
+    sm.state.last_alert_at = _ago(11 * 60)
+    d3, _, _ = await _tick(config, sm, box, channel=channel, undelivered=True)
+    assert d3.send.await_count == 1
+
+
+# ── owner ruling 91998f4f in full: a held wait that turns unreadable ─────────
+
+
+def _gates(channel) -> int:
+    return sum("Reply APPROVE" in c.args[0] for c in channel.send_text.await_args_list)
+
+
+async def test_a_held_wait_that_turns_unreadable_gets_its_gate_at_once_then_every_2_h():
+    config = _armed()
+    sm = _waiting_sm(config, 0.5)  # held since 0 h, its alert at 0 h; now 0.5 h
+    sm.state.waiting_since = _ago(0.5 * 3600 + 60)
+    channel = _frozen_channel("DENY")
+    await _tick(config, sm, LockContainer(lock=(1,)), channel=channel)
+    assert _gates(channel) == 1 and sm.state.frozen_gate_sent is True
+    sm.state.waiting_since = _ago(2.4 * 3600 + 60)  # time moves on: now 2.4 h
+    sm.state.last_alert_at = _ago(1.9 * 3600)  # the gate at 0.5 h
+    channel = _frozen_channel("DENY")
+    await _tick(config, sm, LockContainer(lock=(1,)), channel=channel)
+    assert _gates(channel) == 0
+    sm.state.waiting_since = _ago(2.6 * 3600 + 60)  # now 2.6 h
+    sm.state.last_alert_at = _ago(2.1 * 3600)
+    await _tick(config, sm, LockContainer(lock=(1,)), channel=channel)
+    assert _gates(channel) == 1
+
+
+async def test_flips_between_held_and_unreadable_send_one_immediate_gate():
+    """No gate storm: held -> unreadable -> held -> unreadable inside 2 h."""
+    config = _armed()
+    sm = _waiting_sm(config, 0.2)
+    channel = _frozen_channel("DENY", "DENY")
+    dispatcher = None
+    for lock in (1, 75, 1, 75, 1):
+        dispatcher, _, _ = await _tick(config, sm, LockContainer(lock=(lock,)), channel=channel)
+        dispatcher.send.assert_not_awaited()  # held re-alerts keep their 2 h cadence
+    assert _gates(channel) == 1
+
+
+def test_the_gate_marker_ends_with_the_wait_and_reads_false_from_an_older_file():
+    sm = ConfirmationStateMachine(GuardianConfig())
+    sm.mark_waiting()
+    sm.state.frozen_gate_sent = True
+    again = StateData.from_dict(json.loads(json.dumps(sm.state.to_dict())))
+    assert again.frozen_gate_sent is True
+    assert StateData.from_dict({}).frozen_gate_sent is False
+    sm.end_wait()
+    assert sm.state.frozen_gate_sent is False
+
+
+# ── #5042 round 1 ────────────────────────────────────────────────────────────
+
+
+async def test_off_live_a_free_lock_ends_the_wait_without_reopening():
+    """G: the live branch is read before the free or stopped reopen."""
+    config = _armed()
+    sm = _waiting_sm(config)
+    _, approve, _ = await _tick(config, sm, LockContainer(lock=(0,), on_live=False))
+    approve.assert_not_awaited()
+    assert sm.state.waiting_on_update_lock is False and sm.state.down_alert_sent is True
+
+
+async def test_the_frozen_gate_wait_has_a_deadline():
+    """D: no reply within about 55 min returns quietly to the persisted wait."""
+    config = _armed()
+    sm = _waiting_sm(config, 2.5)
+    channel = _frozen_channel(None, None, None)
+    box = LockContainer(lock=(1,))
+    with patch("genesis.guardian.check._FROZEN_GATE_WAIT_S", 0, create=True):
+        await _tick(config, sm, box, channel=channel)
+    assert channel.poll_for_keyword.await_count == 0  # checked at the loop's top
+    assert not box.sent("incus restart") and sm.state.waiting_on_update_lock is True
+
+
+async def test_the_gate_deadline_holds_through_getupdates_conflicts():
+    """NOTE: the 409 branch cannot skip the deadline."""
+    from genesis.guardian.alert.telegram import CONFLICT_SENTINEL
+
+    config = _armed()
+    sm = _waiting_sm(config, 2.5)
+    channel = _frozen_channel(CONFLICT_SENTINEL, CONFLICT_SENTINEL)
+    with patch("genesis.guardian.check._FROZEN_GATE_WAIT_S", 0, create=True):
+        await _tick(config, sm, LockContainer(lock=(1,)), channel=channel)
+    assert sm.state.waiting_on_update_lock is True
+
+
+def test_the_frozen_gate_deadline_leaves_room_inside_the_unit_timeout():
+    from genesis.guardian import check
+
+    assert check._FROZEN_GATE_WAIT_S == 3000
+
+
+async def test_a_frozen_approve_during_a_stand_down_runs_nothing(tmp_path):
+    config = _armed()
+    config.maintenance_file = str(tmp_path / "maintenance")
+    (tmp_path / "maintenance").write_text("1")
+    sm = _waiting_sm(config, 2.5)
+    channel = _frozen_channel("APPROVE")
+    box = LockContainer(lock=(1,))
+    await _tick(config, sm, box, channel=channel)
+    assert not box.sent("incus restart")
+    assert any("stood down" in c.args[0] for c in channel.send_text.await_args_list)
+
+
+async def test_a_frozen_approve_after_the_lock_turned_free_reopens_at_the_next_tick():
+    """D: a stale approval runs nothing; the episode reopens NEXT tick, with a
+    full time budget for the fresh diagnosis and both gates (review SF3)."""
+    config = _armed()
+    sm = _waiting_sm(config, 2.5)
+    box = LockContainer(lock=(1, 0))
+    _, approve, _ = await _tick(config, sm, box, channel=_frozen_channel("APPROVE"))
+    assert not box.sent("incus restart")
+    approve.assert_not_awaited()
+    assert sm.state.waiting_on_update_lock is False and sm.state.down_alert_sent is False
+
+
+async def test_a_spent_budget_on_an_unreadable_wait_alerts_once_then_every_2_h():
+    """Review BLOCKER: the budget alert counts as this wait's gate."""
+    config = _armed()
+    sm = _waiting_sm(config, 2.5)
+    sm.state.recovery_attempts = config.recovery.max_escalations
+    total = 0
+    for _ in range(3):
+        dispatcher, _, _ = await _tick(config, sm, LockContainer(lock=(1,)), channel=_frozen_channel())
+        total += dispatcher.send.await_count
+    assert total == 1 and sm.state.frozen_gate_sent is True

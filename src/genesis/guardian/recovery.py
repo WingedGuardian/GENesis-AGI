@@ -74,12 +74,9 @@ _REPAIR_LINE = (
 #: atomically with "the lock is free": flock holds it only for the instant a
 #: --no-block systemctl takes, never across the start, whose boot repair takes
 #: the lock itself within its budget (scripts/lib/live_move_repair.py
-#: BOOT_BUDGET_S, 60 s). Exit 75: held. No lock dir: nothing holds it. -o: the
-#: command, and anything it starts, does not inherit the lock's fd.
-_UNDER_LOCK = (
-    'd="${{GENESIS_HOME:-$HOME/.genesis}}/locks"; [ -d "$d" ] || exec {cmd}; '
-    'exec flock -n -o -E 75 "$d/update.lock" {cmd}'
-)
+#: BOOT_BUDGET_S, 60 s). Exit 75: held; 74: a lock lookup failed; a confirmed
+#: absent lock dir: nothing holds it. Only on `live` (or a branch it cannot read).
+_UNDER_LOCK = live_drop.under_lock
 
 
 class _Held(str):
@@ -263,6 +260,9 @@ class RecoveryEngine:
             likely_cause=diagnosis.likely_cause,
             proposed_action=action.value,
         ))
+        # C: the lock again after the last await before the snapshot or the action.
+        if held := await self._reread(action, approved):
+            return held
 
         # Pre-recovery snapshot (gated on config flag and disk space)
         snap_history = self._sm.state.snapshot_size_history
@@ -277,11 +277,8 @@ class RecoveryEngine:
             )
             if snap_name:
                 logger.info("Pre-recovery snapshot: %s", snap_name)
-            # The lock again: a snapshot can take minutes (B2, Q1).
-            kind, why = await live_drop.lock_blocks(self._config, owner_approved_unreadable=approved)
-            if kind:
-                self._restore()
-                return await self._lock_deferred(action, kind, why)
+            if held := await self._reread(action, approved):  # a snapshot takes minutes
+                return held
 
         # Execute the action
         try:
@@ -295,6 +292,8 @@ class RecoveryEngine:
             clean = detail.clean or action == RecoveryAction.RESTART_SERVICES
             if clean:
                 self._restore()  # SF3: only where nothing ran before the hold
+            else:  # F: the backoff runs from the end of the work that ran
+                self._sm.state.last_recovery_at = datetime.now(UTC).isoformat()
             ran = "" if clean else f"The approved {action.value} step"
             return await self._lock_deferred(action, live_drop.WAITING_ON_LOCK, detail, ran)
 
@@ -381,6 +380,15 @@ class RecoveryEngine:
         (st.recovery_attempts, st.io_triage_attempts, st.last_recovery_at,
          st.current_state, st.live_drop_attempt) = self._before
 
+    async def _reread(self, action: RecoveryAction, approved: bool) -> RecoveryResult | None:
+        """The lock read again inside execute(): blocked, the saved attempt is
+        put back and the episode waits, as at C3."""
+        kind, why = await live_drop.lock_blocks(self._config, owner_approved_unreadable=approved)
+        if not kind:
+            return None
+        self._restore()
+        return await self._lock_deferred(action, kind, why)
+
     async def _lock_deferred(
         self, action: RecoveryAction, kind: str, why: str, ran: str = "",
     ) -> RecoveryResult:
@@ -454,18 +462,18 @@ class RecoveryEngine:
             verb = "start" if state in ("failed", "inactive") else "restart"
             cmd, old = f"systemctl --user {verb} --no-block genesis-server", before
         if cmd:
-            run = _UNDER_LOCK.format(cmd=cmd) if self._config.recovery.live_engine else cmd
+            # E: confirmed off `live`, main's plain command; the lock is not read.
+            armed = self._config.recovery.live_engine and await container_on_live(container)
+            run = _UNDER_LOCK(cmd) if armed else cmd
             rc, _out, stderr = await _run_subprocess(
                 "incus", "exec", container, "--", "su", "-", "ubuntu", "-c", run, timeout=30.0,
             )
-            if run != cmd and rc == _LOCK_HELD:
-                if await container_on_live(container):
-                    return False, _held(
-                        "genesis-server was not restarted: update.lock is held on `live`. "
-                        "The Guardian diagnoses again once it is free"
-                    )
-                rc, _out, stderr = await _run_subprocess(  # off `live` the lock never holds it
-                    "incus", "exec", container, "--", "su", "-", "ubuntu", "-c", cmd, timeout=30.0,
+            # Held, a failed lookup (74), or flock unable to open the lock file
+            # (66 EX_NOINPUT, 73 EX_CANTCREAT): never run without it, and a wait.
+            if armed and rc in (_LOCK_HELD, 74, 66, 73):
+                return False, _held(
+                    "genesis-server was not restarted: update.lock is held on `live` (or "
+                    "its lookup failed). The Guardian diagnoses again once it is free"
                 )
             # A client timeout is not the result: the unit's own state decides.
             if rc != 0 and not (rc == -1 and stderr == "timeout"):
