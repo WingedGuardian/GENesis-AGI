@@ -1051,20 +1051,42 @@ fi
 # the repo, and the runtime-regenerated files are outside the pattern.
 _IDENTITY_SRC="$GENESIS_DIR/src/genesis/identity"
 _IDENTITY_COUNT=0
+# A file this run could not capture is reported like an extra directory left out:
+# in the snapshot's COMPLETE marker, the status file and the incomplete-extras alert.
+# (Collected here, folded into the extras counters once §6f has set them up.)
+_IDENTITY_GAPS=()
+_identity_gap() {
+    # "*" (the whole directory) and "(listing)" are labels; anything else is a file
+    # name, quoted so a control byte cannot break the alert or the manifest line.
+    local _n="$1"
+    case "$_n" in
+        '*'|'(listing)') ;;
+        *) _n="$(LC_ALL=C printf '%q' "$_n" | cut -c1-120)" ;;
+    esac
+    _IDENTITY_GAPS+=("identity/$_n ($2)")
+}
+_identity_copy_matches() {
+    # Whether the kept copy $1 decrypts to exactly the file $2. Unreadable reads as
+    # "differs", so the copy is re-encrypted rather than trusted.
+    gpg --batch --quiet --no-symkey-cache --passphrase-fd 3 --decrypt -- "$1" \
+        3< <(printf '%s' "$_BACKUP_PASSPHRASE") 2>/dev/null | cmp -s - "$2"
+}
 mkdir -p identity
 find identity -type f ! -name '*.gpg' -delete 2>/dev/null || true
 if [ -L "$_IDENTITY_SRC" ]; then
-    # find does not descend a symlinked start point, so the listing would read as
-    # complete and empty and the prune would drop every kept copy.
+    # find does not descend a symlinked start point, so nothing would be captured:
+    # the kept copies stay as they are and the run reports the gap.
     log "WARNING: $_IDENTITY_SRC is a symlink — identity copies left as they are"
+    _identity_gap "*" "identity directory is a symlink"
 elif [ -d "$_IDENTITY_SRC" ]; then
     log "Backing up per-install identity files..."
     if ! $_ENCRYPT_READY; then
         log "WARNING: GENESIS_BACKUP_PASSPHRASE not set — skipping identity files (refusing plaintext)"
     else
-        _identity_keep=()
-        # The listing goes through a file so a failed find is SEEN: the prune below
-        # deletes every copy missing from the list, so it runs only on a full listing.
+        # The listing goes through a file so a failed find is SEEN and reported. No
+        # copy is ever deleted: as for memory, eval and the repo config overlays, a
+        # file deleted here comes back on a disaster-recovery restore, which is
+        # recoverable by deleting it again, where a wrong prune would lose data.
         _identity_list_ok=true
         _identity_list="$(mktemp -p "$GENESIS_BIG_TMP" identity-list.XXXXXX)" || _identity_list_ok=false
         if $_identity_list_ok; then
@@ -1075,21 +1097,29 @@ elif [ -d "$_IDENTITY_SRC" ]; then
         fi
         if ! $_identity_list_ok; then
             log "WARNING: could not list $_IDENTITY_SRC — identity copies left as they are"
+            _identity_gap "*" "listing failed"
         else
+            _identity_listed=$(tr -cd '\0' <"$_identity_list" | wc -c)
+            _identity_read=0
             while IFS= read -r -d '' src; do
+                _identity_read=$((_identity_read + 1))
                 name="${src##*/}"
                 case "$name" in
                     *.local.md) ;;
                     USER.md|SOUL.md|VOICE.md) [ -f "$src.example" ] || continue ;;
                     *) continue ;;
                 esac
-                _identity_keep+=("$name.gpg")
+                # The off-site restore reads back only names matching restore.sh's
+                # payload rule; a name outside it would be uploaded and never come back.
+                if [[ ! "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]]; then
+                    log "WARNING: identity/$name has characters restore cannot read back; not backed up (rename it)"
+                    _identity_gap "$name" "name restore cannot read"
+                    continue
+                fi
                 dst="identity/$name.gpg"
                 if [ -L "$src" ]; then
                     log "WARNING: identity/$name is a symlink — not followed; its last copy is kept"
-                    continue
-                fi
-                if [ -f "$dst" ] && [ "$dst" -nt "$src" ]; then
+                    _identity_gap "$name" "symlink, last copy kept"
                     continue
                 fi
                 # A file byte-identical to its .example is a fresh seed (a rebuilt box
@@ -1097,15 +1127,20 @@ elif [ -d "$_IDENTITY_SRC" ]; then
                 if [ -f "$dst" ] && [ -f "$src.example" ] && cmp -s -- "$src" "$src.example"; then
                     continue
                 fi
-                encrypt_file "$src" "$dst" stamp || log "WARNING: failed to encrypt identity/$name"
+                # Compared by content, never by mtime: a freshly cloned backups repo
+                # gives every copy its checkout time, which says nothing about the file.
+                if [ -f "$dst" ] && _identity_copy_matches "$dst" "$src"; then
+                    continue
+                fi
+                if ! encrypt_file "$src" "$dst" stamp; then
+                    log "WARNING: failed to encrypt identity/$name — this snapshot lacks its current copy"
+                    _identity_gap "$name" "not captured"
+                fi
             done <"$_identity_list"
-            # A file deleted here must not come back on restore: drop its copy.
-            while IFS= read -r -d '' old; do
-                name="${old##*/}"
-                _identity_live=false
-                for _k in "${_identity_keep[@]}"; do [ "$_k" = "$name" ] && _identity_live=true; done
-                $_identity_live || rm -f -- "$old"
-            done < <(find identity -maxdepth 1 -type f -name '*.gpg' -print0)
+            if [ "$_identity_read" -ne "$_identity_listed" ]; then
+                log "WARNING: read $_identity_read of $_identity_listed identity names — the rest keep their last copies"
+                _identity_gap "(listing)" "read stopped early"
+            fi
         fi
         [ -n "${_identity_list:-}" ] && rm -f -- "$_identity_list"
         _IDENTITY_COUNT=$(find identity -maxdepth 1 -type f -name '*.gpg' 2>/dev/null | wc -l)
@@ -1215,6 +1250,9 @@ _EXTRA_SKIP_LABELS=()  # listed entries not archived this run (recorded in COMPL
 _EXTRA_PARTIAL=0       # archived, but a restore will refuse some of their members
 _EXTRA_PARTIAL_LABELS=()
 _EXTRA_PARTIAL_DETAIL=()
+# Identity files §6e could not capture count as entries left out of this snapshot.
+_EXTRA_SKIP_LABELS+=("${_IDENTITY_GAPS[@]+"${_IDENTITY_GAPS[@]}"}")
+_EXTRA_SKIPPED=${#_IDENTITY_GAPS[@]}
 _extra_prev=0
 if mkdir -p extra 2>/dev/null; then
     _extra_prev="$(find extra -maxdepth 1 -type f -name '*.tar.gpg' 2>/dev/null | wc -l || true)"
@@ -1908,6 +1946,11 @@ else
     if [ -d identity ]; then
         backend_mkdir "${_T2_DIR}/identity"
         while IFS= read -r -d '' f; do
+            if [ "$f" = "//find-failed" ]; then
+                log "WARNING: could not list identity/ for the off-site upload"
+                _T2_OK=false
+                continue
+            fi
             fname=$(basename "$f")
             if backend_put "$f" "${_T2_DIR}/identity/$fname"; then
                 log "  off-site: uploaded identity/$fname"
@@ -1915,7 +1958,8 @@ else
                 log "WARNING: off-site upload failed for identity/$fname"
                 _T2_OK=false
             fi
-        done < <(find identity -maxdepth 1 -type f -name '*.gpg' -print0 2>/dev/null)
+        done < <(find identity -maxdepth 1 -type f -name '*.gpg' -print0 2>/dev/null \
+            || printf '%s\0' //find-failed)
     fi
 
     # Upload the user config copies (§6g): flat by construction.
@@ -2274,10 +2318,11 @@ print(core, gap or '-')
         # target is fine — the escrowed passphrase is stale), so name the real
         # cause + fix instead of pointing at the off-site target.
         if [ "$_alert_kind" = extras ]; then
-            _send_telegram "⚠️ *Off-site copy incomplete — extra directories*
+            _send_telegram "⚠️ *Off-site copy incomplete — extra directories or identity files*
 
 The core backup reached the off-site snapshot and is restorable, but the
-extra directories are incomplete: ${_EXTRA_SKIPPED:-0} not archived this run,
+extra directories or identity files are incomplete (an identity/ entry keeps
+its last good copy): ${_EXTRA_SKIPPED:-0} not captured this run,
 ${_EXTRA_UPLOAD_FAILED:-0} not uploaded, ${_EXTRA_PARTIAL:-0} archived without members a
 restore would refuse. Missing or partial in this snapshot:
 $(printf '%s\n' "${_EXTRA_SKIP_LABELS[@]+"${_EXTRA_SKIP_LABELS[@]}"}" "${_EXTRA_PARTIAL_LABELS[@]+"${_EXTRA_PARTIAL_LABELS[@]/%/ (partial)}"}" | head -5)

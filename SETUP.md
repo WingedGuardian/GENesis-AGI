@@ -233,6 +233,8 @@ and split into two tiers:
   Automatic; everything that can hold personal data is encrypted. Resetting an
   identity file to its template keeps the last backed-up copy; delete the file to
   drop it from later backups (git history in the private backups repo still holds it).
+  A restore keeps an identity file you have edited unless you pass `--force`, which
+  first copies it to `~/.genesis/restore-displaced/`.
 - **Tier 2** (smbclient → NAS/remote): Qdrant snapshots, SQL dumps (~200MB+). Opt-in.
 
 Tier 2 keeps large binary files off GitHub (which has a 100MB file limit).
