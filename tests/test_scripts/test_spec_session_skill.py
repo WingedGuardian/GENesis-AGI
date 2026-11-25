@@ -118,6 +118,16 @@ def test_hash_changes_when_the_body_changes(tmp_path):
     assert _hash(tmp_path, _SPEC.replace("30 days", "31 days")) != base
 
 
+def test_a_fenced_delimiter_does_not_end_the_body(tmp_path):
+    """A spec showing `## Amendments` in a code example still hashes what follows it."""
+    fence = "`" * 3
+    example = f"{fence}markdown\n## Amendments\n## Spec analysis: x.md\n{fence}\n"
+    spec = _SPEC.replace("## Decided", example + "\n## Decided")
+    base = _hash(tmp_path, spec)
+    assert _hash(tmp_path, spec.replace("30 days", "60 days")) != base
+    assert _hash(tmp_path, spec + "\n## Amendments\n\n- AM-1 ...\n") == base
+
+
 def test_approval_report_is_saved_for_every_handoff():
     """Every reader of frozen ids keys on <stem>.approved.analysis.md existing, so an
     issue handoff saves it too and posts a copy, never instead of saving it."""

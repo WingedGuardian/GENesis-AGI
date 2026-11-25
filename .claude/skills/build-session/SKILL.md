@@ -326,7 +326,7 @@ test, the code as built, or an approval given for something else.**
    tell the owner the part needs a spec session.
 5. After an approved `plan-change` or `contract-discovery`, undo the failed part
    and rebuild it from the revised plan, never patch it forward: save its diff
-   as a patch under `~/.genesis/output/` (`git diff <source> > <patch>`),
+   as a patch under `~/.genesis/output/` (`git diff --binary <source> > <patch>`),
    restore the tracked files with
    `git restore --source=<source> --staged --worktree :/`, and send new
    untracked files through `genesis.trash`. The source is the commit that

@@ -234,8 +234,10 @@ Dropped: <n> findings over the cap (<severity of the lowest kept>)
 `SEC` reads `skipped` for a spec dated before the pass's start date.
 
 **The `sha256` is the hash of the spec's body**, so that a changed spec is
-noticed: the lines after its YAML frontmatter, up to the first line that is
-exactly `## Amendments` or starts `## Spec analysis:`, or to the end of the
+noticed: the lines after its YAML frontmatter, up to the first line outside a
+fenced code block (one opened and closed by a line starting with three
+backticks) that is exactly `## Amendments` or starts `## Spec analysis:`, or to
+the end of the
 file when there is neither; trailing whitespace-only lines removed; joined
 with `\n`, ending in one `\n`, encoded UTF-8. Setting `status: approved` and
 adding the first amendment, with or without a blank line before its heading,
@@ -247,9 +249,11 @@ import hashlib, sys
 lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
 if lines and lines[0] == "---":  # skip the YAML frontmatter
     lines = lines[lines.index("---", 1) + 1 :]
-body = []
+body, fenced = [], False
 for line in lines:
-    if line == "## Amendments" or line.startswith("## Spec analysis:"):
+    if line.startswith("`" * 3):  # a delimiter inside a code fence is not one
+        fenced = not fenced
+    elif not fenced and (line == "## Amendments" or line.startswith("## Spec analysis:")):
         break
     body.append(line)
 while body and not body[-1].strip():

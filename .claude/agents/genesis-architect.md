@@ -83,8 +83,11 @@ nothing more, nothing less?
    ```
 
    The verdict is also `CONTRADICTS`, with a material line, when an amendment's
-   quoted old text does not match the text above `## Amendments` once runs of
-   whitespace are read as one space; when an amendment lacks a field
+   quoted old text does not match its base once runs of whitespace are read as
+   one space: for a first amendment to an item, the text above `## Amendments`;
+   for a later one, the `New:` of the earlier `AM-n` it names, the newest
+   amendment to an item being the one the build is judged against
+   (`Old: none (new item)` has no base and is not matched); when an amendment lacks a field
    build-session's "Amending a spec" names, or reuses an `AM-n`; when its new
    text loses a clause its `Drops:` line does not quote; when an amendment that
    removes a requirement leaves its old behaviour in the code; and when the

@@ -44,6 +44,7 @@ def test_build_session_keeps_the_departure_words():
         "never as an `AM-n`, since the spec does not change",
         "`git merge-base HEAD origin/<parent branch>` when it is stacked",
         "never writes a `Confirmed:` line",
+        "`git diff --binary <source> > <patch>`",
     ):
         assert word in text, word
 
@@ -70,6 +71,8 @@ def test_reviewer_ends_on_the_verdict_line():
         "`Owner answer:` keeps the change; an answer to build the change back covers nothing"
         in flat
     )
+    assert "for a later one, the `New:` of the earlier `AM-n` it names" in flat
+    assert "(`Old: none (new item)` has no base and is not matched)" in flat
 
 
 def test_deep_review_puts_the_verdict_last():
