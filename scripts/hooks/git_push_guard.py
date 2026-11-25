@@ -3682,6 +3682,97 @@ class _FixEvidence:
         return why
 
 
+#: One reviewer comment's author and edit history, for up to 50 node ids (#5001).
+_EDIT_HISTORY_QUERY = (
+    "query($ids:[ID!]!){nodes(ids:$ids){... on PullRequestReviewComment{"
+    "databaseId author{__typename login} "
+    "userContentEdits(first:100){totalCount nodes{editor{__typename login} "
+    "deletedBy{__typename login}}}}}}"
+)
+_EDIT_HISTORY_BATCH = 50
+
+
+def _edit_histories(node_ids: list, rest_ids: list) -> list | None:
+    """The ``nodes`` answer for ``node_ids`` (at most ``_EDIT_HISTORY_BATCH``), or
+    None when the read fails or its answer is not a list of that length.
+
+    Tests inject via ``_TEST_GH_EDIT_HISTORY``: ``clean`` (no edits on any
+    comment), ``__error__`` (the read fails), or a JSON object mapping a REST
+    comment id to its node (a missing id answers ``clean``)."""
+    raw = os.environ.get("_TEST_GH_EDIT_HISTORY")
+    if raw is not None:
+        if raw == "__error__":
+            return None
+        given = {} if raw == "clean" else json.loads(raw)
+        clean = {"__typename": "Bot", "login": "reviewer"}
+        return [
+            given.get(
+                str(rid),
+                {"databaseId": rid, "author": clean, "userContentEdits": {"totalCount": 0, "nodes": []}},
+            )
+            for rid in rest_ids
+        ]
+    if not all(isinstance(n, str) and n for n in node_ids):
+        return None  # a comment with no node id cannot be looked up
+    args = ["gh", "api", "graphql", "-f", f"query={_EDIT_HISTORY_QUERY}"]
+    for n in node_ids:
+        args += ["-f", f"ids[]={n}"]
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=_gh_timeout(10))
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout or "{}")
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("errors"):
+        return None
+    nodes = (data.get("data") or {}).get("nodes") if isinstance(data.get("data"), dict) else None
+    if not isinstance(nodes, list) or len(nodes) != len(node_ids):
+        return None
+    return nodes
+
+
+#: ``_foreign_editor``'s answer for a node it cannot read: a retry, never a tamper.
+_HISTORY_UNREADABLE = "\x00unreadable"
+
+
+def _foreign_editor(node: object, rest_id: object) -> str | None:
+    """Who other than its author edited a reviewer comment, or None when only its
+    author did (or nobody). ``_HISTORY_UNREADABLE`` when the node is missing, of
+    another type, another comment's, or malformed: the caller retries rather than
+    calling that an edit.
+
+    Identity is GraphQL ``(__typename, login)`` on both sides: REST spells a bot
+    ``name[bot]`` and GraphQL ``name``, so mixing them would make every own edit
+    look foreign (MEASURED, 2026-11-24)."""
+    if not isinstance(node, dict) or node.get("databaseId") != rest_id:
+        return _HISTORY_UNREADABLE
+    author = node.get("author")
+    if not isinstance(author, dict) or not author.get("login"):
+        return "an unknown account"
+    who = (author.get("__typename"), author.get("login"))
+    edits = node.get("userContentEdits")
+    if not isinstance(edits, dict):
+        return _HISTORY_UNREADABLE
+    rows = edits.get("nodes")
+    if not isinstance(rows, list) or not isinstance(edits.get("totalCount"), int):
+        return _HISTORY_UNREADABLE
+    if edits["totalCount"] > len(rows):
+        return "an account in an edit history too long to read"
+    for row in rows:
+        if not isinstance(row, dict):
+            return _HISTORY_UNREADABLE
+        for field in ("editor", "deletedBy"):
+            actor = row.get(field)
+            if field == "deletedBy" and actor is None:
+                continue
+            if not isinstance(actor, dict) or not actor.get("login"):
+                return "an unknown account"
+            if (actor.get("__typename"), actor.get("login")) != who:
+                return str(actor.get("login"))
+    return None
+
+
 def _check_inline_review_findings(
     pr_num: str,
     *,
@@ -3771,12 +3862,57 @@ def _check_inline_review_findings(
         repo,
         ".[] | {id: .id, reply_to: .in_reply_to_id, login: .user.login, "
         "type: .user.type, assoc: .author_association, path: .path, body: .body, "
-        "review_id: .pull_request_review_id, orig: .original_commit_id}",
+        "review_id: .pull_request_review_id, orig: .original_commit_id, node: .node_id}",
     )
     if raw is None:
         if force:
             return _waived_unread("an unreadable inline scan")
         return _scan_unreadable("inline review comments")
+
+    # #5001: a reviewer comment edited by anyone but its reviewer. Read for every
+    # top-level comment the classify loop below may believe (any Bot but CodeQL, the
+    # `parseable` population: an unknown bot's P1 badge scores too) and each bot's
+    # replies to its own comments (the Resolved route), never only the ones that
+    # score now: an edit that clears a finding is one that stops it scoring (a P1
+    # made a P3, a stripped badge). MEASURED 0 foreign edits in 4,222 comments of
+    # the three named reviewers.
+    _not_parsed = scanner_sets.get("codeql", frozenset())
+    _author_of = {c.get("id"): c.get("login") for c in raw if c.get("id") is not None}
+    watched = [
+        c
+        for c in raw
+        if c.get("type") == "Bot"
+        and c.get("login") not in _not_parsed
+        and (not c.get("reply_to") or _author_of.get(c.get("reply_to")) == c.get("login"))
+    ]
+    tampered: dict[object, str] = {}
+    unread = cut = 0
+    for i in range(0, len(watched), _EDIT_HISTORY_BATCH):
+        batch = watched[i : i + _EDIT_HISTORY_BATCH]
+        if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
+            cut += len(batch)
+            continue
+        nodes = _edit_histories([c.get("node") for c in batch], [c.get("id") for c in batch])
+        if nodes is None:
+            unread += len(batch)
+            continue
+        for c, node in zip(batch, nodes, strict=True):
+            editor = _foreign_editor(node, c.get("id"))
+            if editor is _HISTORY_UNREADABLE:
+                unread += 1
+            elif editor is not None:
+                tampered[c.get("id")] = editor
+    if unread or cut:
+        # One retry block, never a floor entry per comment: a transient failure
+        # must not teach the owner to sigil fixed findings. Not waived by
+        # '# review-override' (owner ruling, 2026-11-25).
+        parts = [f"unreadable for {unread}"] if unread else []
+        if cut:
+            parts.append(f"not read before the merge deadline for {cut}")
+        return True, (
+            f"edit history {' and '.join(parts)} reviewer comment(s), so the gate "
+            f"cannot tell whether a finding was edited after it was posted; retry."
+        )
 
     # Build replied_to over ALL accumulated pages BEFORE classifying, so a P1 on an
     # early page acknowledged by a reply on a later page is treated as engaged (never
@@ -3803,6 +3939,7 @@ def _check_inline_review_findings(
         and c.get("type") == "Bot"
         and (c.get("login") or "") == _login_of.get(c.get("reply_to"))
         and (c.get("body") or "").lstrip().split("\n", 1)[0].startswith(_BOT_SELF_RESOLVED_LEAD)
+        and c.get("id") not in tampered
     }
     # The known-format registry decides which parser reads which login (read ONCE
     # per scan).
@@ -3889,7 +4026,9 @@ def _check_inline_review_findings(
                 own = [
                     r.get("body") or ""
                     for r in thread
-                    if r.get("type") == "Bot" and r.get("login") == cp.get("login")
+                    if r.get("type") == "Bot"
+                    and r.get("login") == cp.get("login")
+                    and r.get("id") not in tampered
                 ]
                 sources.append((cp, own, True))
         rested_on_devin = False
@@ -3957,6 +4096,14 @@ def _check_inline_review_findings(
     cr_unknown: list[str] = []  # a severity header naming a level we don't know
     cr_doc_skipped: list[str] = []  # CodeRabbit Critical/Major on a doc path
     unmatched_bot: list[tuple[str, str]] = []  # (login, title) — read, unrecognised
+    tampered_block: list[str] = []  # edited by someone else — the floor, sigil only (#5001)
+    # A Devin finding posted twice is one finding: one tampered copy taints all.
+    for copies in devin_copies.values():
+        editors = [tampered[cp.get("id")] for cp in copies if cp.get("id") in tampered]
+        for cp in copies:
+            if editors and cp.get("id") not in tampered:
+                tampered[cp.get("id")] = editors[0]
+    tampered_seen: set = set()
     # Which of those carry a P3 badge: informational by design (no parser
     # scores P3), so they are not format drift. Indices into unmatched_bot.
     informational: set[int] = set()
@@ -4047,6 +4194,33 @@ def _check_inline_review_findings(
         # not by an assumption about who wrote it.
         if c.get("reply_to"):
             continue  # replies aren't findings
+        if c.get("id") in tampered:
+            # FIRST, before the maintainer-reply skip and every severity parse: the
+            # current text is not the reviewer's, so nothing in it is believed. The
+            # path is REST metadata an edit cannot change, so its exclusions stand.
+            path = c.get("path")
+            if _off_diff(path) or (_is_doc_path(path or "") and _doc_findings_mode() == "skip"):
+                continue
+            fid = _devin_finding(body)[0] if login in devin_logins else None
+            group = devin_copies.get((login, fid), [c]) if fid is not None else [c]
+            gkey = tuple(cp.get("id") for cp in group)
+            if gkey in tampered_seen:
+                continue
+            tampered_seen.add(gkey)
+            named = {i for i in gkey if i in floor_accept}
+            why = (
+                f"edited by {tampered[c.get('id')]} after the reviewer posted it; "
+                "only the owner's sigil clears it"
+            )
+            if named and _is_dispatched():
+                floor_refused.update(named)
+                why = "'# floor-accept' records the owner's yes, and a dispatched session has no owner present"
+            elif named:
+                used_ids.update(named)
+                continue
+            tampered_block.append(f"[edited by {tampered[c.get('id')]}] {_inline_title(body)}")
+            floor_unmet.append((c.get("id"), why, path))
+            continue
         # WHOSE OUTPUT MAY BE PARSED FOR SEVERITY — deliberately the SAME
         # population the removed filter used to admit: a Bot, or an allowlisted
         # review account. Widening WHO IS SEEN must not widen WHO IS BELIEVED.
@@ -4711,6 +4885,7 @@ def _check_inline_review_findings(
         + _CR_BLOCKING_WEIGHT * len(cr_block)
         + len(devin_block)
         + _INLINE_P2_SCORE_WEIGHT * len(devin_minor)
+        + len(tampered_block)
     )
     if devin_analysis:
         print(
@@ -4951,12 +5126,20 @@ def _check_inline_review_findings(
             f"NOTE: PR #{pr_num} — '# floor-accept' id {unused} {state} on this PR; it waived nothing.",
             file=sys.stderr,
         )
-    floor_hits = len(p1) + len(cr_block) + len(devin_block)
+    floor_hits = len(p1) + len(cr_block) + len(devin_block) + len(tampered_block)
     if floor_hits:
         listing = "\n".join(
             [f"  [P1] {t}" for t in p1[:5]]
             + [f"  [CodeRabbit Critical/Major] {t}" for t in cr_block[:5]]
             + [f"  [Devin severe] {t}" for t in devin_block[:5]]
+            + [f"  {_one_safe_line(t)}" for t in tampered_block[:5]]
+        )
+        edited = (
+            f"\n{len(tampered_block)} reviewer comment(s) were edited by someone other "
+            "than their reviewer: a fix reply cannot clear those; only the owner's "
+            "'# floor-accept=<id>' can."
+            if tampered_block
+            else ""
         )
         reasons = "\n".join(
             f"  finding {fid} ({_safe_report_path(fpath) if fpath else 'no file'}): "
@@ -4968,6 +5151,7 @@ def _check_inline_review_findings(
         return True, (
             f"always-fix floor: {len(p1)} unresolved [P1] + {len(cr_block)} "
             f"CodeRabbit Critical/Major + {len(devin_block)} Devin severe "
+            f"+ {len(tampered_block)} edited reviewer "
             f"finding(s), none cleared by a 'Fixed in <sha>' reply naming a later PR "
             f"commit that touches the finding's file "
             f"(review score {score:.1f}). Severity blocks in EVERY lane (this "
@@ -4977,6 +5161,7 @@ def _check_inline_review_findings(
             f"Fix it and reply in-thread with a line that starts 'Fixed in <sha>.' (the "
             f"fix commit, not a merge; any explanation after it). Otherwise ask the owner, "
             f"and on their yes append '# floor-accept=<id>[,<id>]' to the merge command."
+            f"{edited}"
         )
     if force:
         # '# review-override': no floor finding this scan read is open.

@@ -604,7 +604,9 @@ gate works, its exemption categories, and the unit rules for size bounds:
   blocks a merge by itself — the always-fix floor, which stops a Codex **P1** the
   same way, in EVERY lane, before any score is consulted; a Devin non-severe
   finding weighs like a P2. Unless the configured documentation-path exclusion
-  applies. When Codex is out, a user-approved `# substitute-review` lets another
+  applies. A bot's review comment edited by anyone but that bot counts as a floor
+  finding whatever it now says (the off-diff and doc exclusions still apply), and
+  only the owner's `# floor-accept` clears it. When Codex is out, a user-approved `# substitute-review` lets another
   reviewer's review at the exact head stand in for Codex (any GitHub App reviewer,
   such as Devin or CodeRabbit, except a bot the PR's own workflow drives and CodeQL)
   — ask the user in conversation each time; the sigil records the yes.

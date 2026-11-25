@@ -177,6 +177,17 @@ def _hermetic_commit_lookup(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_edit_history(monkeypatch):
+    """Give EVERY hook test reviewer comments that nobody edited (#5001).
+
+    The inline scan reads the edit history of every reviewer comment; without
+    this pin a test carrying a bot comment would make a live GraphQL call.
+    Tests of the edit check set ``_TEST_GH_EDIT_HISTORY`` themselves."""
+    monkeypatch.setenv("_TEST_GH_EDIT_HISTORY", "clean")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_e2e_declaration(monkeypatch):
     """Keep the ADVISORY E2E read hermetic for EVERY hook test (§8.12).
 

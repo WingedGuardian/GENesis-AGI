@@ -2413,6 +2413,12 @@ The review-findings gate specifically:
      `--check-pr <N> --floor-accept <ids>` previews it and prints the merge-with line.
 
    The gate prints each open finding's id and why it is still open.
+   **An edited finding (#5001).** The gate reads GitHub's edit history for every
+   bot review comment it may score (all but CodeQL) and each bot's replies to its own
+   comments. One edited by anyone but that bot (a P1 made a P2, a stripped badge, a reply edited into
+   "Resolved") is listed `[edited by <login>]`; no fix reply clears it, only the
+   owner's `# floor-accept=<id>`; the off-diff and doc exclusions still apply. A
+   history it cannot read gives one block: retry.
    It is a RULE because it used to be an ACCIDENT: before the lanes existed the
    single threshold was 1.0 and a P1 scores exactly 1.0, so the floor held by
    arithmetic, unnamed and untested — and raising any threshold would have
