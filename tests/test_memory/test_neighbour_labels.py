@@ -279,3 +279,70 @@ def test_control_and_format_characters_are_dropped():
     label = label_text("abc‮def​ ghi\x1b[31m jkl\x00", max_words=10)
     assert label is not None
     assert all(c.isprintable() and c not in "‮​" for c in label)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        f"\ufeff[reference.credentials] Router Value: {FAKE_SECRET}",
+        f"\u200b[reference.credentials] Router Value: {FAKE_SECRET}",
+        f"[ reference.credentials] Router Value: {FAKE_SECRET}",
+        f"**[reference.credentials]** Router Value: {FAKE_SECRET}",
+        f"\uff3breference.credentials\uff3d Router Value: {FAKE_SECRET}",  # fullwidth
+        f"[reference .credentials] Router Value: {FAKE_SECRET}",
+        f"[REFERENCE.CREDENTIALS] Router Value: {FAKE_SECRET}",
+        f"\x00[reference.credentials] Router Value: {FAKE_SECRET}",
+        f"- [reference.credentials] Router Value: {FAKE_SECRET}",
+        f"&gt; [reference.credentials] Router Value: {FAKE_SECRET}",
+        f"\u200d\u00a0[reference.credentials] Router Value: {FAKE_SECRET}",
+    ],
+)
+async def test_a_disguised_credential_header_still_gets_no_label(db, content):
+    await _meta(db, "head")
+    q = FakeQdrant({"head": {"content": content}})
+    assert await neighbour_labels(db, q, ["head"], include_hidden=False, max_words=12) == {}
+
+
+@pytest.mark.parametrize(
+    "tags",
+    [
+        '["reference", "credentials"]',
+        '"credentials"',
+        '{"a": 1}',
+        7,
+        {"a": 1},
+        ("reference", "credentials"),
+        {"credentials"},
+    ],
+)
+async def test_odd_tag_shapes_never_let_a_credential_through(db, tags):
+    await _meta(db, "t")
+    q = FakeQdrant({"t": {"content": f"Router Value: {FAKE_SECRET}", "tags": tags}})
+    assert await neighbour_labels(db, q, ["t"], include_hidden=False, max_words=12) == {}
+
+
+async def test_a_malformed_origin_costs_only_its_own_label(db):
+    await _meta(db, "bad", origin=None)
+    await _meta(db, "ok")
+    q = FakeQdrant(
+        {"bad": {"content": "odd", "origin_class": ["first_party"]}, "ok": {"content": "fine note"}}
+    )
+    assert await neighbour_labels(db, q, ["bad", "ok"], include_hidden=False, max_words=6) == {
+        "ok": "fine note"
+    }
+
+
+async def test_absent_tags_do_not_block_an_ordinary_label(db):
+    await _meta(db, "n")
+    q = FakeQdrant({"n": {"content": "an ordinary note", "tags": None}})
+    assert await neighbour_labels(db, q, ["n"], include_hidden=False, max_words=6) == {
+        "n": "an ordinary note"
+    }
+
+
+async def test_a_pathological_tag_string_does_not_raise(db):
+    await _meta(db, "p")
+    q = FakeQdrant({"p": {"content": "an ordinary note", "tags": "[" * 100_000}})
+    assert await neighbour_labels(db, q, ["p"], include_hidden=False, max_words=6) == {
+        "p": "an ordinary note"
+    }

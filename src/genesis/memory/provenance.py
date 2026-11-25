@@ -15,6 +15,7 @@ retrieved from — always known at retrieval time, unlike the per-item store-tim
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import unicodedata
@@ -916,14 +917,27 @@ def _reads_as_credential(payload: dict, domain: str) -> bool:
 
     Second line behind the ``knowledge_units`` lookup: a credential point whose
     row is gone (a failed cleanup) still opens with the ``[reference.credentials]``
-    header and carries the credentials tag.
+    header and carries the credentials tag. The header test compares letters and
+    digits only, after NFKC folding, so no bracket, spacing, bullet, marker or
+    control-character spelling hides it; it can over-match a memory that opens by
+    naming that domain, which only costs that memory its label.
     """
-    head = str(payload.get("content") or "").lstrip()[: len(domain) + 2].lower()
-    if head.startswith("[" + domain):
+    opening = strip_boundary_markers(str(payload.get("content") or ""))[:200]
+    folded = "".join(c for c in unicodedata.normalize("NFKC", opening).casefold() if c.isalnum())
+    if "".join(c for c in domain if c.isalnum()) in folded[:60]:
         return True
-    tags = payload.get("tags") or ()
+    tags = payload.get("tags")
+    if tags is None:
+        return False
     if isinstance(tags, str):
-        tags = (tags,)
+        try:
+            tags = json.loads(tags)
+        except (ValueError, RecursionError):
+            tags = [tags]
+        if isinstance(tags, str):
+            tags = [tags]
+    if not isinstance(tags, (list, tuple, set, frozenset)):
+        return True  # a shape nobody writes: do not guess, show no label
     return any(str(t).strip().lower() in (domain, "credentials") for t in tags)
 
 
@@ -1015,7 +1029,7 @@ async def neighbour_labels(
         # memory whose origin is unknown in both gets no label.
         stored = stored_origin.get(mid)
         origin = stored if stored is not None else payload.get("origin_class")
-        if origin is None or item_is_blockable(
+        if not isinstance(origin, str) or item_is_blockable(
             collection="episodic_memory",
             source_pipeline=payload.get("source_pipeline"),
             origin_class=origin,
