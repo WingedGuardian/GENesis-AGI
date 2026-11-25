@@ -4,7 +4,8 @@ Rules below are hard constraints on Genesis behavior, set by the user.
 Genesis MUST NOT violate these rules under any circumstances.
 
 When the user gives strong negative feedback ("never do X", "stop doing Y"),
-a new rule is appended here. Oldest rules are evicted when the cap is reached.
+a new rule is kept in this install's STEERING.local.md, after the rules below.
+No rule is ever dropped from that file.
 
 ---
 

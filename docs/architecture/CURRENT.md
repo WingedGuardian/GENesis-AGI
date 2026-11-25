@@ -2712,8 +2712,12 @@ verified: 975d3944 2026-08-31
   tail is deliberately unbounded (user decision 2026-07-16), watched via
   that count line.
 - **identity/**: SOUL/USER/VOICE/STEERING CAPS-markdown + `IdentityLoader`
-  (wired via perception). `cc/session_config` reads SOUL+VOICE directly, not
-  via the loader. **USER.md auto-synthesis is PERMANENTLY DISABLED** — the
+  (wired via perception). Every reader resolves SOUL/VOICE/CONVERSATION/STEERING
+  through `identity/paths.py` (`.example` seed fallback; `<stem>.local.md`
+  layer, whose replace form says so in the text). `cc/session_config` reads
+  SOUL+VOICE through it, not via the loader. Captured steering rules are
+  appended to the per-install `STEERING.local.md`, never to the tracked
+  STEERING.md, with no cap or cut. **USER.md auto-synthesis is PERMANENTLY DISABLED** — the
   evolver writes system-owned `USER_KNOWLEDGE.md` instead, ledger-tracked.
 - **deliberation/**: `deliberate()` multi-model panel with explicit dissent —
   reachable ONLY via the `deliberate` MCP tool, recursion-blocked,

@@ -388,6 +388,44 @@ class TestSteeringRuleExtraction:
         loader.add_steering_rule.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_a_rule_already_in_force_is_not_reported_as_written(self, db, caplog):
+        loader = MagicMock()
+        loader.add_steering_rule.return_value = False
+        ow = MagicMock()
+        ow.write = AsyncMock(return_value="obs-1")
+        pipeline = build_triage_pipeline(
+            db=db,
+            triage_classifier=_make_triage_classifier(TriageDepth.FULL_ANALYSIS),
+            outcome_classifier=_make_outcome_classifier(OutcomeClass.APPROACH_FAILURE),
+            delta_assessor=_make_delta_assessor(),
+            observation_writer=ow,
+            identity_loader=loader,
+        )
+        with caplog.at_level("INFO", logger="genesis.learning.pipeline"):
+            await pipeline(FakeCCOutput(), "never do that again", "terminal")
+        loader.add_steering_rule.assert_called_once()
+        assert "Auto-added steering rule" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_long_rule_is_stored_whole(self, db):
+        """No 200-character cut: the directive filter already bounds a rule."""
+        loader = MagicMock()
+        ow = MagicMock()
+        ow.write = AsyncMock(return_value="obs-1")
+        pipeline = build_triage_pipeline(
+            db=db,
+            triage_classifier=_make_triage_classifier(TriageDepth.FULL_ANALYSIS),
+            outcome_classifier=_make_outcome_classifier(OutcomeClass.APPROACH_FAILURE),
+            delta_assessor=_make_delta_assessor(),
+            observation_writer=ow,
+            identity_loader=loader,
+        )
+        rule = "never " + " ".join(["internationalization-configuration"] * 8)
+        assert len(rule) > 200
+        await pipeline(FakeCCOutput(), rule, "terminal")
+        loader.add_steering_rule.assert_called_once_with(rule)
+
+    @pytest.mark.asyncio
     async def test_incident_message_does_not_write_steering(self, db):
         """2026-06-30 incident regression: a mislabeled chatty status update must
         NOT become a steering rule even on APPROACH_FAILURE via telegram."""

@@ -935,7 +935,8 @@ def _emit_body() -> tuple[str, str, str] | None:
 
     # 1. Identity files (disk, always available, no external deps), split
     # across two PARTS so each rides its own 10 K hook budget:
-    #   identity-core: SOUL + STEERING (tracked; CI ceilings pin their sizes)
+    #   identity-core: SOUL + STEERING (CI ceilings pin the tracked files' sizes;
+    #     STEERING.local.md, the captured rules, is unbounded and truncates loudly)
     #   identity-user: USER + CONVERSATION (USER is install-local — CI cannot
     #     see it, so the guard is runtime: CONVERSATION degrades to a pointer
     #     when USER leaves it no room, and an oversized USER itself truncates

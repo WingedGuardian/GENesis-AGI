@@ -54,7 +54,9 @@ def test_layer_appends_the_local_file_as_a_new_block(ident):
 def test_layer_replace_marker_drops_the_default(ident):
     (ident / "CONVERSATION.md").write_text("shipped\n")
     (ident / "CONVERSATION.local.md").write_text(f"\ufeff{REPLACE_MARKER}\nmine only\n")
-    assert read_identity("CONVERSATION.md", ident) == "mine only\n"
+    assert read_identity("CONVERSATION.md", ident) == (
+        "_[The shipped CONVERSATION.md is replaced by CONVERSATION.local.md.]_\n\nmine only\n"
+    )
 
 
 def test_layer_blank_local_file_changes_nothing(ident):
@@ -94,16 +96,14 @@ def test_reflection_bridge_reads_through_the_resolver(ident):
     assert block == "shipped soul\n\nlocal rule"
 
 
-def test_steering_writer_never_copies_local_rules_into_the_shipped_file(ident):
+def test_steering_writer_appends_to_the_local_layer(ident):
     (ident / "STEERING.md").write_text("# S\n\n---\n\nshipped rule\n")
     (ident / "STEERING.local.md").write_text("local rule\n")
     loader = IdentityLoader(ident)
     assert "local rule" in loader.steering()  # cache warmed with the layered text
     loader.add_steering_rule("new rule")
-    shipped = (ident / "STEERING.md").read_text()
-    assert "shipped rule" in shipped and "new rule" in shipped
-    assert "local rule" not in shipped
-    assert loader.steering_rules() == ["shipped rule", "new rule", "local rule"]
+    assert (ident / "STEERING.md").read_text() == "# S\n\n---\n\nshipped rule\n"
+    assert loader.steering_rules() == ["shipped rule", "local rule", "new rule"]
 
 
 def _names_a_file(node: ast.AST, names: set[str]) -> bool:
@@ -148,18 +148,15 @@ def test_no_reader_builds_a_path_to_a_resolved_file_itself():
     Scope: a path built from a literal name (see `_path_builds`). A path built
     from a variable (`identity_dir / name`) is invisible here; the readers that
     do that (the hook, the assembler, the bridge, the loader) have behaviour
-    tests above and in test_context_injection_budget.py. Two writers are known
-    exceptions until #2862 moves them: the dashboard editor, and the steering
-    writer's two functions in loader.py.
+    tests above and in test_context_injection_budget.py. The dashboard editor
+    is the known exception until #2862 moves it.
     """
     names = set(POLICY)
     skip_files = {
         _ROOT / "src/genesis/identity/paths.py",
         _ROOT / "src/genesis/dashboard/routes/config.py",
     }
-    skip_functions = {
-        _ROOT / "src/genesis/identity/loader.py": {"add_steering_rule", "_write_steering"},
-    }
+    skip_functions: dict[Path, set[str]] = {}
     offenders = []
     for base in ("src", "scripts"):
         for py in (_ROOT / base).rglob("*.py"):
