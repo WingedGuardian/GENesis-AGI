@@ -2228,23 +2228,27 @@ findings below, a gated `gh pr merge`:
 - must carry `--admin` (explicit approval flag) and be bound to the reviewed head
   via `--match-head-commit` (GitHub rejects it server-side if the head moved —
   TOCTOU defense); the `--check-pr` command supplies this;
-- must carry the `--body-file` that `--check-pr` writes, wherever this install
-  can write one (#5027). The merge arm writes its **receipt** into that file at
-  allow time: `Gate-verdict` (`MERGEABLE` or `OVERRIDDEN`), `Gate-rows`
-  (each blocking row `ok` or `waived`), `Gate-sigils` (each sigil with what it
-  waived), `Gate-stand-in` (a substitute reviewer), `Gate-session` and
-  `Gate-install` (8-hex ids). These land as trailers in the squash commit on
-  main. `--check-pr` prints the command in a `body-file :` row even when other
-  rows block, so a merge under the owner's sigils uses it too: append only the
-  sigils approved. **A merge commit on main with no `Gate-*` trailers is a
-  finding**: it did not come through the gate (or the hook was killed before it
-  could record), and it gets the same scrutiny as any unexplained merge. An
-  install whose home path a shell would rewrite cannot hold a body file; there a
-  merge runs without a receipt and the row says so. A row passed without being
-  judged (CI `unknown`, an unreadable rework contract) is recorded `unverified`,
-  never `ok`. A receipt is written just before `gh` runs. If another hook then
-  stops the command, the next attempt clears that receipt at its first check and
-  writes its own at the end. Malformed extra text in the file is refused;
+- should carry the `--body-file` that `--check-pr` writes (#5027): the merge arm
+  writes its **receipt** into that file at allow time, as trailers in the squash
+  commit on main. `Gate-rows` gives each blocking gate's own outcome: `ok`
+  (judged, passed), `n/a` (out of its scope here), `unverified` (passed unjudged:
+  a fail-open read, or a sigil that skips the gate without reading it) or
+  `waived` (a sigil let through what the gate would have blocked).
+  `Gate-verdict` is `PASSED`, `PASSED-UNVERIFIED` or `OVERRIDDEN` (any row
+  waived, or any gate a sigil skipped). `Gate-sigils`, `Gate-stand-in`,
+  `Gate-session` and `Gate-install` complete it. `--check-pr` prints the command
+  in a `body-file :` row even when other rows block, so a merge under the owner's
+  sigils uses it too: append only the sigils approved. A merge under any
+  override sigil is refused without the file whenever the gate can produce it
+  for that head, and the refusal prints the command with the file already
+  written. If the only obstacle is a PR-body line starting with a gate-only
+  trailer key, the refusal names the key: reword the line. A plain merge may
+  leave the file off, and where no file can be produced (250 or more commits,
+  an unreadable PR body) any merge goes on without one:
+  **no receipt means "no gate record", never proof of a bypass**. A receipt is written just before `gh`
+  runs; if another hook then stops the command, the next attempt clears it at
+  its first check and writes its own at the end. Malformed extra text in the
+  file is refused;
 - requires Codex to have reviewed the **current head** — Codex does NOT auto-review
   a later fix-commit, so comment `@codex review` and wait after any push.
   **A clean Codex signal counts only when its id RESOLVES to the head** (the rules

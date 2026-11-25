@@ -439,9 +439,6 @@ def api_merge_reason(
 MERGE_BODY_MAX_BYTES = 512 * 1024
 #: Either case: prepare-commit-msg stamps the id's leading hex as it found it.
 _SESSION_TRAILER = re.compile(r"^Genesis-Session: ([0-9a-fA-F]{8})$")
-#: Lines only the gate writes into a squash body (#5027): a PR body holding one
-#: could pass for a receipt to a reader that splits on the last such block.
-_RESERVED_TRAILER = re.compile(r"(?mi)^\s*(Squashed-From|Genesis-Session|Gate-[a-z-]+)\s*:")
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _NAME_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 _SHELL_INERT_PATH = re.compile(r"[A-Za-z0-9._/-]+")
@@ -473,11 +470,11 @@ def compose_squash_body(pr_body: str | None, head: str, messages: list[str | Non
     if not _FULL_SHA.match(head or ""):
         raise ValueError("head must be a full lowercase 40-hex sha")
     body = (pr_body or "").replace("\r\n", "\n").rstrip()
-    if _RESERVED_TRAILER.search(body):
+    if reserved_trailer_key(body):
         raise ValueError(
-            "the PR body carries a line in the form of a merge-receipt trailer "
-            "(Squashed-From:, Genesis-Session: or Gate-*:); remove or reword it, since "
-            "only the gate may write those into a squash commit"
+            "the PR body has a line starting with a trailer key only the gate writes "
+            "(Squashed-From:, Genesis-Session: or a Gate- receipt key); reword it, or "
+            "merge without --body-file"
         )
     sessions: list[str] = []
     for message in messages:
@@ -495,10 +492,17 @@ def compose_squash_body(pr_body: str | None, head: str, messages: list[str | Non
 #: so the decision lands in the squash commit on main with no extra API call.
 #: Every value is checked against a CLOSED grammar before it is written, so no
 #: free text (a path, a hostname, a message) can ride into a public commit.
+#: A row is ``ok`` (the gate judged it and it passed), ``n/a`` (out of the gate's
+#: scope here), ``unverified`` (it passed without being judged: a fail-open read,
+#: or a sigil that skips the gate unread) or ``waived`` (a sigil let through what
+#: the gate would have blocked). The verdict follows from the rows: OVERRIDDEN when
+#: any is waived or a sigil made a gate skip its read (that row is ``unverified``),
+#: else PASSED-UNVERIFIED when any is unverified, else PASSED.
 RECEIPT_GRAMMAR: dict[str, re.Pattern] = {
-    "Gate-verdict": re.compile(r"MERGEABLE|OVERRIDDEN"),
+    "Gate-verdict": re.compile(r"PASSED|PASSED-UNVERIFIED|OVERRIDDEN"),
     "Gate-rows": re.compile(
-        r"[a-z][a-z-]{0,31}=(ok|waived|unverified)( [a-z][a-z-]{0,31}=(ok|waived|unverified)){0,31}"
+        r"[a-z][a-z-]{0,31}=(ok|n/a|waived|unverified)"
+        r"( [a-z][a-z-]{0,31}=(ok|n/a|waived|unverified)){0,31}"
     ),
     "Gate-sigils": re.compile(
         r"none|[a-z][a-z-]{0,31}=[a-z][a-z0-9:+-]{0,63}(,[a-z][a-z-]{0,31}=[a-z][a-z0-9:+-]{0,63}){0,15}"
@@ -511,12 +515,32 @@ RECEIPT_GRAMMAR: dict[str, re.Pattern] = {
     "Gate-incomplete": re.compile(r"[A-Za-z-]{1,32}(,[A-Za-z-]{1,32}){0,7}"),
 }
 _RECEIPT_ORDER = tuple(RECEIPT_GRAMMAR)
+#: Lines only the gate writes into a squash body: a PR body line starting with one
+#: of these exact keys could pass for a receipt to a reader that picks an earlier
+#: trailer block (``git interpret-trailers --parse`` after a ``---`` line), so it
+#: is refused. In ANY case and after leading blanks, because git's trailer readers
+#: match keys case-insensitively (MEASURED: ``%(trailers:key=gate-verdict)`` reads
+#: ``Gate-verdict``). Only the exact keys: ``gate-surface:`` and the like pass.
+_RESERVED_TRAILER = re.compile(
+    r"(?mi)^[ \t]*(Squashed-From|Genesis-Session|"
+    + "|".join(re.escape(k) for k in RECEIPT_GRAMMAR)
+    + r")[ \t]*:"
+)
+
+
+def reserved_trailer_key(pr_body: str | None) -> str | None:
+    """The first gate-only trailer key a PR body line starts with, as written
+    (never the rest of the line), or None. :func:`compose_squash_body` refuses
+    such a body; the merge arm names the key so the author can reword it."""
+    m = _RESERVED_TRAILER.search((pr_body or "").replace("\r\n", "\n"))
+    return m.group(1) if m else None
 
 
 def compose_receipt(fields: dict[str, str | None]) -> str:
     """The receipt's lines, in a fixed order. A field whose value fails its
-    grammar is dropped and named in ``Gate-incomplete`` rather than written raw;
-    a field given as None (unknown) is simply absent."""
+    grammar, or is given as None (unknown), is left out and named in
+    ``Gate-incomplete`` rather than written raw. A key absent from ``fields`` (not
+    applicable, e.g. ``Gate-stand-in`` with no stand-in) is simply not written."""
     lines: list[str] = []
     bad: list[str] = []
     for key in _RECEIPT_ORDER:
@@ -584,16 +608,6 @@ def matches_with_receipt(text: str, expected: str) -> bool:
             return False
         seen.add(key)
     return True
-
-
-def receipt_dir_is_shell_inert() -> bool:
-    """Whether this install's body directory, as SPELLED (``~/tmp/merge-bodies``,
-    not its symlink target), is made of shell-inert characters. Judged on the
-    spelling so no symlink or chmod can turn the receipt requirement off: a
-    resolved target that is not inert then fails the merge on the body file
-    instead (#5027)."""
-    spelled = os.path.join(os.path.expanduser("~"), "tmp", "merge-bodies")
-    return os.path.isabs(spelled) and bool(_SHELL_INERT_PATH.fullmatch(spelled))
 
 
 def body_file_path_problem(path: str) -> str | None:

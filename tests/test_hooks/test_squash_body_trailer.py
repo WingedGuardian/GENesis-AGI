@@ -260,7 +260,7 @@ def _scheduled_marker(head=HEAD):
     )
 
 
-def _drive(monkeypatch, command, *, body=BODY, commits=None):
+def _drive(monkeypatch, command, *, body=BODY, commits=None, inline=None):
     monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)
     monkeypatch.setenv(
         "_TEST_GH_CODEX_REVIEWS",
@@ -286,7 +286,7 @@ def _drive(monkeypatch, command, *, body=BODY, commits=None):
     monkeypatch.setattr(
         _mod,
         "_check_inline_review_findings",
-        lambda n, force=False, repo=None, uncounted_out=None: (False, ""),
+        inline or (lambda n, force=False, repo=None, uncounted_out=None, **_kw: (False, "")),
     )
     monkeypatch.setattr(
         _mod,
@@ -371,23 +371,14 @@ def test_body_text_under_stale_review_override_is_now_refused(monkeypatch, capsy
     assert "shadow the" in capsys.readouterr().err
 
 
-def test_a_merge_without_a_body_file_is_refused_where_one_can_be_written(monkeypatch, capsys):
-    """#5027 supersedes the 2026-10-01 advisory: the receipt rides in the body
-    file, so a gated merge must carry it wherever this install can write one."""
-    rc = _drive(monkeypatch, _merge())
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert "a gated merge carries --body-file" in err and "--check-pr 5" in err
+def test_a_merge_without_a_body_file_still_merges(monkeypatch, capsys):
+    """Optional (owner ruling, #5027 round 1): a merge without the body file is
+    allowed and carries no receipt, which reads as 'no gate record'."""
+    assert _drive(monkeypatch, _merge()) == 0, capsys.readouterr().err
 
 
-def test_a_merge_without_a_body_file_goes_through_where_none_can_be_written(
-    monkeypatch, capsys, tmp_path
-):
-    """A home path a shell would rewrite can never hold a body file; there the
-    merge runs without a receipt rather than not at all."""
-    home = tmp_path / "My Home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
+def test_a_dispatched_session_without_a_body_file_still_merges(monkeypatch, capsys):
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
     assert _drive(monkeypatch, _merge()) == 0, capsys.readouterr().err
 
 
@@ -615,8 +606,9 @@ def test_an_allowed_merge_leaves_its_receipt_in_the_body_file(monkeypatch, capsy
     assert _drive(monkeypatch, _merge("--body-file", path)) == 0, capsys.readouterr().err
     receipt = _receipt_of(path)
     assert receipt == {
-        "Gate-verdict": "MERGEABLE",
-        "Gate-rows": " ".join(f"{r}=ok" for r in _mod._RECEIPT_ROWS),
+        "Gate-verdict": "PASSED",
+        # pin-receipts and rework are out of scope for this PR (n/a), not ok.
+        "Gate-rows": "mergeable=ok ci=ok base-branch=ok pin-receipts=n/a codex-at-head=ok body-file=ok review-body=ok inline-findings=ok scheduled-claude=ok rework=n/a",
         "Gate-sigils": "none",
         "Gate-session": "abcdef12",
         "Gate-install": "1234abcd",
@@ -645,7 +637,7 @@ def test_a_sigil_present_but_unused_does_not_mark_a_row_waived(monkeypatch, caps
     rc = _drive(monkeypatch, _merge("--body-file", path) + "  # ci-override")
     assert rc == 0, capsys.readouterr().err
     receipt = _receipt_of(path)
-    assert receipt["Gate-verdict"] == "MERGEABLE"
+    assert receipt["Gate-verdict"] == "PASSED"
     assert receipt["Gate-sigils"] == "ci-override=ci:green"
 
 
@@ -660,7 +652,7 @@ def test_a_retry_after_another_hook_stopped_the_merge_is_accepted(monkeypatch, c
 
 
 def test_a_hand_edited_receipt_is_refused(monkeypatch, capsys, ids):
-    path = _gate_file(EXPECTED.rstrip("\n") + "\nGate-verdict: MERGEABLE\nGate-note: trust me\n")
+    path = _gate_file(EXPECTED.rstrip("\n") + "\nGate-verdict: PASSED\nGate-note: trust me\n")
     rc = _drive(monkeypatch, _merge("--body-file", path))
     assert rc == 2
     assert "is not the body this gate computes" in capsys.readouterr().err
@@ -703,6 +695,8 @@ def test_the_session_id_prefers_the_payload_then_prepare_commit_msgs_order(monke
     monkeypatch.setenv("GENESIS_SESSION_ID", "not-hex")
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
     assert _mod._receipt_session({}) is None
+    monkeypatch.setenv("CLAUDE_SESSION_ID", "abcd1234-dead")  # a dead payload variable
+    assert _mod._receipt_session({}) is None
 
 
 @pytest.mark.parametrize(
@@ -713,11 +707,21 @@ def test_the_session_id_prefers_the_payload_then_prepare_commit_msgs_order(monke
         ("Gate-session", "abcdef12 extra"),
         ("Gate-rows", "ci=ok\nGate-verdict: MERGEABLE"),
         ("Gate-verdict", "MERGEABLE; rm -rf"),
+        ("Gate-verdict", "MERGEABLE"),
+        ("Gate-rows", "ci=skipped"),
     ],
-    ids=["path", "hostname", "trailing-text", "newline-injection", "verdict-text"],
+    ids=[
+        "path",
+        "hostname",
+        "trailing-text",
+        "newline-injection",
+        "verdict-text",
+        "retired-verdict-word",
+        "unknown-row-value",
+    ],
 )
 def test_no_value_outside_the_grammar_reaches_the_receipt(key, value):
-    receipt = gh_merge.compose_receipt({"Gate-verdict": "MERGEABLE", key: value})
+    receipt = gh_merge.compose_receipt({"Gate-verdict": "PASSED", key: value})
     assert value not in receipt
     assert f"Gate-incomplete: {key}" in receipt or key == "Gate-verdict"
 
@@ -775,9 +779,9 @@ def test_check_pr_prints_the_body_file_row_when_a_gate_fails(monkeypatch, capsys
 
 def test_check_pr_leaves_a_file_holding_this_body_and_a_receipt_alone(monkeypatch, capsys):
     _report_env(monkeypatch)
-    path = _gate_file(EXPECTED.rstrip("\n") + "\nGate-verdict: MERGEABLE\n")
+    path = _gate_file(EXPECTED.rstrip("\n") + "\nGate-verdict: PASSED\n")
     _mod.check_pr_report("5", repo="o/r")
-    assert Path(path).read_text().endswith("Gate-verdict: MERGEABLE\n")
+    assert Path(path).read_text().endswith("Gate-verdict: PASSED\n")
 
 
 def test_stacked_earlier_receipts_are_cleared_and_replaced_by_the_gates_own(
@@ -787,13 +791,13 @@ def test_stacked_earlier_receipts_are_cleared_and_replaced_by_the_gates_own(
     path = _gate_file(EXPECTED.rstrip("\n") + "\n" + once + "\n" + once + "\n")
     assert _drive(monkeypatch, _merge("--body-file", path)) == 0, capsys.readouterr().err
     receipt = _receipt_of(path)
-    assert receipt["Gate-verdict"] == "MERGEABLE" and receipt["Gate-session"] == "abcdef12"
+    assert receipt["Gate-verdict"] == "PASSED" and receipt["Gate-session"] == "abcdef12"
 
 
 def test_strip_receipt_leaves_anything_that_is_not_a_clean_receipt_alone():
-    bad = EXPECTED.rstrip("\n") + "\nGate-verdict: MERGEABLE\nGate-note: trust me\n"
+    bad = EXPECTED.rstrip("\n") + "\nGate-verdict: PASSED\nGate-note: trust me\n"
     assert gh_merge.strip_receipt(bad) == bad
-    good = EXPECTED.rstrip("\n") + "\nGate-verdict: MERGEABLE\n"
+    good = EXPECTED.rstrip("\n") + "\nGate-verdict: PASSED\n"
     assert gh_merge.strip_receipt(good) == EXPECTED
     assert gh_merge.strip_receipt(EXPECTED) == EXPECTED
 
@@ -805,45 +809,35 @@ def test_a_pr_body_holding_receipt_shaped_lines_is_refused(monkeypatch, capsys):
     forged = BODY + "\nGate-verdict: MERGEABLE\nGate-rows: ci=ok\n"
     rc = _drive(monkeypatch, _merge("--body-file", path), body=forged)
     assert rc == 2
-    assert "form of a merge-receipt trailer" in capsys.readouterr().err
+    assert "trailer key only the gate writes" in capsys.readouterr().err
 
 
-def test_a_symlinked_bodies_directory_cannot_lift_the_requirement(monkeypatch, capsys, tmp_path):
-    """Security W2: judged on the directory as spelled, not its target."""
-    target = tmp_path / "we ird"
-    target.mkdir()
-    bodies = Path(os.path.expanduser("~")) / "tmp" / "merge-bodies"
-    bodies.parent.mkdir(parents=True, exist_ok=True)
-    if bodies.exists():
-        bodies.rmdir()
-    bodies.symlink_to(target)
-    try:
-        assert _mod._receipt_body_file_possible("o/r", "5", HEAD) is True
-        assert _drive(monkeypatch, _merge()) == 2
-    finally:
-        bodies.unlink()
+@pytest.mark.parametrize(
+    "line", ["gate-surface: hooks", "Gate-surface: hooks", "Gate-rowsy: x", "Gate rows: x"]
+)
+def test_a_pr_body_line_that_only_resembles_a_receipt_key_composes(line):
+    """Audit A2: only the exact receipt keys are reserved."""
+    assert gh_merge.compose_squash_body(BODY + "\n" + line, HEAD, [])
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["GATE-VERDICT: PASSED", "gate-rows: ci=ok", "  Gate-rows: x", "Gate-verdict : PASSED"],
+)
+def test_a_case_or_spacing_variant_of_a_receipt_key_is_refused(line):
+    """Architect S1 (MEASURED): git's trailer readers match keys in any case, so a
+    variant spelling in the PR body could still pose as the receipt."""
+    with pytest.raises(ValueError, match="trailer key only the gate writes"):
+        gh_merge.compose_squash_body(BODY + "\n" + line, HEAD, [])
 
 
 # ── round-1 review fixes (#5027) ────────────────────────────────────────────
 
 
-def test_a_loosened_bodies_directory_cannot_switch_the_requirement_off(monkeypatch, capsys):
-    """The requirement is keyed on the path STRING; a chmod makes the merge fail
-    on the body file, never skip the receipt."""
-    _gate_file()
-    _bodies_dir().chmod(0o775)
-    try:
-        rc = _drive(monkeypatch, _merge())
-        assert rc == 2
-        assert "a gated merge carries --body-file" in capsys.readouterr().err
-    finally:
-        _bodies_dir().chmod(0o700)
-
-
 def test_an_earlier_receipt_is_stripped_before_the_slow_gates_run(monkeypatch, capsys, ids):
     """A hook killed after the early check must leave gh the bare body, never an
     earlier attempt's decision: the early check clears it at once."""
-    forged = EXPECTED.rstrip("\n") + "\nGate-verdict: MERGEABLE\nGate-sigils: none\n"
+    forged = EXPECTED.rstrip("\n") + "\nGate-verdict: PASSED\nGate-sigils: none\n"
     path = _gate_file(forged)
     seen = {}
     real_sched = _mod._check_scheduled_claude_reviewed_head
@@ -864,7 +858,7 @@ def test_a_ci_read_that_passed_fail_open_is_reported_unverified(monkeypatch, cap
     assert _drive(monkeypatch, _merge("--body-file", path)) == 0, capsys.readouterr().err
     rows = dict(r.split("=") for r in _receipt_of(path)["Gate-rows"].split())
     assert rows["ci"] == "unverified"
-    assert _receipt_of(path)["Gate-verdict"] == "MERGEABLE"
+    assert _receipt_of(path)["Gate-verdict"] == "PASSED-UNVERIFIED"
 
 
 def test_an_unchecked_rework_contract_is_reported_unverified(monkeypatch, capsys, ids):
@@ -877,61 +871,9 @@ def test_an_unchecked_rework_contract_is_reported_unverified(monkeypatch, capsys
     assert rows["rework"] == "unverified"
 
 
-@pytest.mark.parametrize(
-    "sigil,waived_rows",
-    [
-        ("stale-review-override", {"codex-at-head", "base-branch"}),
-        ("review-override", {"review-body", "inline-findings"}),
-        ("scheduled-review-override", {"scheduled-claude"}),
-        ("rework-override", {"rework"}),
-    ],
-)
-def test_each_sigil_marks_exactly_its_rows(monkeypatch, capsys, ids, sigil, waived_rows):
-    path = _gate_file()
-    rc = _drive(monkeypatch, _merge("--body-file", path) + f"  # {sigil}")
-    assert rc == 0, capsys.readouterr().err
-    receipt = _receipt_of(path)
-    rows = dict(r.split("=") for r in receipt["Gate-rows"].split())
-    assert {r for r, state in rows.items() if state == "waived"} == waived_rows
-    assert receipt["Gate-verdict"] == ("OVERRIDDEN" if waived_rows else "MERGEABLE")
-    assert receipt["Gate-sigils"].startswith(sigil.split("=")[0] + "=")
-
-
-def test_the_test_pin_alone_does_not_lift_the_requirement(monkeypatch, capsys):
-    """Outside a running pytest the pin is inert, so an environment entry cannot
-    switch the receipt off."""
-    monkeypatch.setenv("_TEST_SQUASH_BODY_FILE", "off")
-    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
-    assert _mod._receipt_body_file_possible("o/r", "5", HEAD) is True
-    monkeypatch.setenv("PYTEST_CURRENT_TEST", "x")
-    assert _mod._receipt_body_file_possible("o/r", "5", HEAD) is False
-
-
-def test_a_dispatched_session_without_a_body_file_is_refused(monkeypatch, capsys):
-    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
-    assert _drive(monkeypatch, _merge()) == 2
-
-
-@pytest.mark.parametrize(
-    "rows,waived",
-    [
-        ([("floor-accept", "floor-findings:used:7")], {"inline-findings"}),
-        ([("floor-accept", "floor-findings:unused")], set()),
-        ([("substitute-review", "codex-freshness:used")], {"codex-at-head"}),
-        ([("substitute-review", "codex-freshness")], set()),
-        ([("ci-override", "ci:pending")], {"ci"}),
-        ([("ci-override", "ci:green")], set()),
-    ],
-)
-def test_a_waiver_the_gate_records_as_used_is_the_only_one_marked(monkeypatch, rows, waived):
-    monkeypatch.setattr(_mod, "_PENDING_OVERRIDES", [{"sigil": sg, "waived": w} for sg, w in rows])
-    assert _mod._receipt_waived_rows() == waived
-
-
-def test_a_pin_gate_that_could_not_verify_and_an_out_of_scope_scheduled_gate_are_unverified(
-    monkeypatch, capsys, ids
-):
-    """Security W4: rows that passed without being judged never read `ok`."""
+def test_an_unverified_pin_gate_and_an_out_of_scope_scheduled_gate(monkeypatch, capsys, ids):
+    """Security W4 and audit B9: a pin read that failed open is unverified, never
+    `ok`; a scheduled gate out of scope here is n/a, not unverified."""
     path = _gate_file()
     monkeypatch.setattr(
         _mod, "_check_pin_receipts", lambda n, repo=None: (False, "NOTE: pin receipts not verified")
@@ -940,4 +882,279 @@ def test_a_pin_gate_that_could_not_verify_and_an_out_of_scope_scheduled_gate_are
     assert _drive(monkeypatch, _merge("--body-file", path)) == 0, capsys.readouterr().err
     rows = dict(r.split("=") for r in _receipt_of(path)["Gate-rows"].split())
     assert rows["pin-receipts"] == "unverified"
-    assert rows["scheduled-claude"] == "unverified"
+    assert rows["scheduled-claude"] == "n/a"
+    assert _receipt_of(path)["Gate-verdict"] == "PASSED-UNVERIFIED"
+
+
+# ── per-gate outcomes (#5027 round 1: owner rulings) ────────────────────────
+
+
+def _rows_of(path: str) -> dict[str, str]:
+    return dict(r.split("=") for r in _receipt_of(path)["Gate-rows"].split())
+
+
+@pytest.mark.parametrize(
+    "state,canonical,override,expected",
+    [
+        ("green", True, False, "ok"),
+        ("green", True, True, "ok"),
+        ("green", False, True, "ok"),
+        ("red", True, True, "waived"),
+        ("red", False, True, "waived"),
+        ("pending", True, True, "waived"),
+        ("pending", False, True, "waived"),
+        ("absent", True, True, "waived"),
+        ("absent", False, False, "n/a"),
+        ("absent", False, True, "n/a"),
+        ("incomplete", True, True, "waived"),
+        ("incomplete", False, False, "n/a"),
+        ("incomplete", False, True, "n/a"),
+        ("unknown", True, False, "unverified"),
+        ("unknown", True, True, "unverified"),
+        ("unknown", False, False, "unverified"),
+    ],
+)
+def test_the_ci_row_is_waived_only_where_the_state_would_have_blocked(
+    state, canonical, override, expected
+):
+    """Audit B2: every CI state the arm lets through, on and off the canonical
+    repo, with and without # ci-override (the blocked cells never reach it)."""
+    assert _mod._ci_receipt_outcome(state, canonical, override) == expected
+
+
+@pytest.mark.parametrize(
+    "state,canonical,override,row",
+    [
+        ("red", True, True, "waived"),
+        ("absent", False, False, "n/a"),
+        ("absent", True, True, "waived"),
+        ("unknown", True, True, "unverified"),
+    ],
+)
+def test_the_arm_writes_the_ci_row_it_decided(
+    monkeypatch, capsys, ids, state, canonical, override, row
+):
+    path = _gate_file()
+    monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: (state, ["t"]))
+    monkeypatch.setattr(_mod, "_scheduled_gate_applies", lambda repo: canonical)
+    cmd = _merge("--body-file", path) + ("  # ci-override" if override else "")
+    assert _drive(monkeypatch, cmd) == 0, capsys.readouterr().err
+    assert _rows_of(path)["ci"] == row
+
+
+@pytest.mark.parametrize(
+    "sigil,skipped",
+    [
+        ("stale-review-override", {"codex-at-head", "base-branch"}),
+        ("review-override", {"review-body"}),
+        ("scheduled-review-override", {"scheduled-claude"}),
+        ("rework-override", {"rework"}),
+    ],
+)
+def test_a_sigil_that_skips_a_gate_reads_unverified_and_overridden(
+    monkeypatch, capsys, ids, sigil, skipped
+):
+    """Owner ruling 49a93304: a gate the sigil skipped unread is `unverified`, never
+    `waived` (nobody knows it would have blocked), and the verdict is OVERRIDDEN."""
+    path = _gate_file()
+    rc = _drive(monkeypatch, _merge("--body-file", path) + f"  # {sigil}")
+    assert rc == 0, capsys.readouterr().err
+    receipt = _receipt_of(path)
+    rows = _rows_of(path)
+    assert {r for r, v in rows.items() if v == "unverified"} == skipped
+    assert "waived" not in rows.values()
+    assert receipt["Gate-verdict"] == "OVERRIDDEN"
+    assert receipt["Gate-sigils"].startswith(sigil + "=")
+
+
+@pytest.mark.parametrize("found,row", [([], "ok"), (["score"], "waived"), (["unread"], "waived")])
+def test_review_override_waives_inline_only_when_it_let_a_block_through(
+    monkeypatch, capsys, ids, found, row
+):
+    """Audit B8: the inline scan still runs under # review-override, so the gate
+    knows whether the sigil changed its answer."""
+    path = _gate_file()
+
+    def inline(n, force=False, repo=None, uncounted_out=None, force_waived=None, **_kw):
+        assert force and force_waived is not None
+        force_waived.extend(found)
+        return False, ""
+
+    rc = _drive(monkeypatch, _merge("--body-file", path) + "  # review-override", inline=inline)
+    assert rc == 0, capsys.readouterr().err
+    assert _rows_of(path)["inline-findings"] == row
+    assert _rows_of(path)["review-body"] == "unverified"
+
+
+@pytest.mark.parametrize("used,row", [(True, "waived"), (False, "ok")])
+def test_floor_accept_waives_the_inline_row_only_when_used(monkeypatch, capsys, ids, used, row):
+    path = _gate_file()
+
+    def inline(
+        n,
+        force=False,
+        repo=None,
+        uncounted_out=None,
+        floor_accept=(),
+        floor_accept_used=None,
+        **_kw,
+    ):
+        if used:
+            floor_accept_used.add(7)
+        return False, ""
+
+    rc = _drive(monkeypatch, _merge("--body-file", path) + "  # floor-accept=7", inline=inline)
+    assert rc == 0, capsys.readouterr().err
+    receipt = _receipt_of(path)
+    assert _rows_of(path)["inline-findings"] == row
+    assert receipt["Gate-verdict"] == ("OVERRIDDEN" if used else "PASSED")
+
+
+def test_a_used_substitute_waives_codex_and_names_the_stand_in(monkeypatch, capsys, ids):
+    path = _gate_file()
+
+    def fresh(n, force=False, repo=None, substitute=False, substitute_out=None):
+        assert substitute and not force
+        substitute_out.append({"reviewers": ["coderabbitai[bot]"]})
+        return False, "", HEAD
+
+    monkeypatch.setattr(_mod, "_check_codex_reviewed_head", fresh)
+    rc = _drive(monkeypatch, _merge("--body-file", path) + "  # substitute-review")
+    assert rc == 0, capsys.readouterr().err
+    receipt = _receipt_of(path)
+    assert _rows_of(path)["codex-at-head"] == "waived"
+    assert receipt["Gate-stand-in"] == "coderabbitai[bot]@" + HEAD[:12]
+    assert receipt["Gate-verdict"] == "OVERRIDDEN"
+
+
+def test_a_present_but_unused_substitute_leaves_codex_ok(monkeypatch, capsys, ids):
+    path = _gate_file()
+    rc = _drive(monkeypatch, _merge("--body-file", path) + "  # substitute-review")
+    assert rc == 0, capsys.readouterr().err
+    receipt = _receipt_of(path)
+    assert _rows_of(path)["codex-at-head"] == "ok"
+    assert "Gate-stand-in" not in receipt
+    assert receipt["Gate-verdict"] == "PASSED"
+
+
+@pytest.mark.parametrize(
+    "outcomes,skipped,verdict",
+    [
+        ({}, set(), "PASSED"),
+        ({"pin-receipts": "n/a", "rework": "n/a"}, set(), "PASSED"),
+        ({"ci": "unverified"}, set(), "PASSED-UNVERIFIED"),
+        ({"ci": "waived", "rework": "unverified"}, set(), "OVERRIDDEN"),
+        ({"rework": "unverified"}, {"rework"}, "OVERRIDDEN"),
+    ],
+)
+def test_the_verdict_follows_from_the_recorded_rows(monkeypatch, ids, outcomes, skipped, verdict):
+    full = {r: "ok" for r in _mod._RECEIPT_ROWS} | outcomes
+    monkeypatch.setattr(_mod, "_RECEIPT_OUTCOMES", full)
+    monkeypatch.setattr(_mod, "_RECEIPT_SKIPPED", set(skipped))
+    receipt = dict(ln.split(": ", 1) for ln in _mod._merge_receipt({}, HEAD, []).splitlines())
+    assert receipt["Gate-verdict"] == verdict
+
+
+def test_a_row_no_gate_recorded_is_named_incomplete_never_ok(monkeypatch, ids):
+    partial = {r: "ok" for r in _mod._RECEIPT_ROWS if r != "rework"}
+    monkeypatch.setattr(_mod, "_RECEIPT_OUTCOMES", partial)
+    monkeypatch.setattr(_mod, "_RECEIPT_SKIPPED", set())
+    receipt = _mod._merge_receipt({}, HEAD, [])
+    assert "Gate-rows:" not in receipt and "Gate-verdict:" not in receipt
+    assert "Gate-incomplete: Gate-verdict,Gate-rows" in receipt
+
+
+def test_every_allowed_merge_records_every_row(monkeypatch, capsys, ids):
+    path = _gate_file()
+    assert _drive(monkeypatch, _merge("--body-file", path)) == 0, capsys.readouterr().err
+    assert set(_mod._RECEIPT_OUTCOMES) == set(_mod._RECEIPT_ROWS)
+    assert "Gate-incomplete" not in _receipt_of(path)
+
+
+def test_check_pr_in_ci_says_why_no_body_file_is_written(monkeypatch, capsys):
+    """Kimi P3: in CI the head is readable; the row must not claim otherwise."""
+    _report_env(monkeypatch)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setattr(_mod, "_check_codex_reviewed_head", lambda *a, **k: (True, "x", None))
+    _mod.check_pr_report("5", repo="o/r")
+    row = next(ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("body-file"))
+    assert "not written in CI" in row and "could not be read" not in row
+
+
+# ── override merges carry the receipt where it can be produced (ruling 1101933a)
+
+
+@pytest.mark.parametrize("sigil", ["ci-override", "review-override", "floor-accept=7"])
+def test_an_override_merge_without_a_body_file_is_sent_to_the_body_file_command(
+    monkeypatch, capsys, sigil
+):
+    rc = _drive(monkeypatch, _merge() + f"  # {sigil}")
+    assert rc == 2
+    err = capsys.readouterr().err
+    path = gh_merge.body_file_path("o/r", "5", HEAD)
+    assert f"--match-head-commit {HEAD} --body-file {path}" in err
+    assert Path(path).read_text() == EXPECTED  # written, ready to use
+
+
+def test_an_unbound_override_merge_is_sent_to_a_bound_body_file_command(monkeypatch, capsys):
+    rc = _drive(monkeypatch, "gh pr merge 5 --repo o/r --squash --admin  # stale-review-override")
+    assert rc == 2
+    assert f"--match-head-commit {HEAD} --body-file " in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("line", ["Gate-verdict: PASSED", "gate-rows: ci=ok"])
+def test_an_override_merge_with_a_reserved_line_in_the_body_is_told_to_reword_it(
+    monkeypatch, capsys, line
+):
+    """Owner ruling cfdd23b2: the one cannot-produce cause the author fixes in
+    seconds is refused, not silently merged without a receipt."""
+    rc = _drive(monkeypatch, _merge() + "  # ci-override", body=BODY + "\n" + line)
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "Reword that line" in err and line.split(":")[0] in err
+    assert line not in err  # the key only, never the rest of the PR text
+
+
+def test_a_plain_merge_with_a_reserved_line_in_the_body_still_merges(monkeypatch, capsys):
+    assert _drive(monkeypatch, _merge(), body=BODY + "\nGate-verdict: PASSED") == 0
+
+
+def test_another_gates_refusal_comes_before_the_body_file_one(monkeypatch, capsys):
+    """Architect S1: the override check runs last, so a merge another gate refuses
+    gets that refusal, never a body-file round trip first."""
+    monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("red", ["t"]))
+    rc = _drive(monkeypatch, _merge() + "  # stale-review-override")
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "CI is RED" in err and "needs --body-file" not in err
+
+
+def test_an_override_merge_goes_on_without_a_receipt_where_none_can_be_produced(
+    monkeypatch, capsys
+):
+    """A commit list the gate cannot read (the 250-commit cap reads the same way)
+    means no body file can be composed: the merge runs, recording nothing."""
+    rc = _drive(monkeypatch, _merge() + "  # ci-override", commits="__error__")
+    assert rc == 0, capsys.readouterr().err
+    assert not Path(gh_merge.body_file_path("o/r", "5", HEAD)).exists()
+
+
+def test_the_test_pin_means_no_body_file_so_no_requirement(monkeypatch, capsys):
+    monkeypatch.setenv("_TEST_SQUASH_BODY_FILE", "off")
+    assert _drive(monkeypatch, _merge() + "  # ci-override") == 0, capsys.readouterr().err
+
+
+def test_a_plain_merge_without_a_body_file_pays_no_probe(monkeypatch, capsys):
+    calls = []
+    real = _mod._prepare_squash_body_file
+    monkeypatch.setattr(_mod, "_prepare_squash_body_file", lambda *a: calls.append(a) or real(*a))
+    assert _drive(monkeypatch, _merge()) == 0, capsys.readouterr().err
+    assert calls == []
+
+
+def test_the_override_merge_with_the_printed_command_gets_its_receipt(monkeypatch, capsys, ids):
+    assert _drive(monkeypatch, _merge() + "  # ci-override") == 2
+    path = gh_merge.body_file_path("o/r", "5", HEAD)
+    rc = _drive(monkeypatch, _merge("--body-file", path) + "  # ci-override")
+    assert rc == 0, capsys.readouterr().err
+    assert _receipt_of(path)["Gate-sigils"] == "ci-override=ci:green"

@@ -1937,6 +1937,34 @@ class TestCheckInlineReviewFindings:
         assert block
         assert "score" in msg.lower()
 
+    def test_review_override_reports_the_score_block_it_let_through(self, guard_module):
+        """The merge receipt (#5027) marks inline-findings waived only when the
+        sigil changed the answer: here, a score at the threshold."""
+        waived: list[str] = []
+        with self._mock(
+            guard_module, [self._codex(1, _P2_BODY), self._codex(2, _P2_BODY)]
+        ):
+            block, _ = guard_module._check_inline_review_findings(
+                "100", force=True, force_waived=waived
+            )
+        assert not block and waived == ["score"]
+
+    def test_review_override_over_nothing_reports_nothing(self, guard_module):
+        waived: list[str] = []
+        with self._mock(guard_module, [self._codex(1, _P2_BODY)]):
+            block, _ = guard_module._check_inline_review_findings(
+                "100", force=True, force_waived=waived
+            )
+        assert not block and waived == []
+
+    def test_review_override_reports_an_unread_scan(self, guard_module):
+        waived: list[str] = []
+        with self._mock(guard_module, [], rc=1):
+            block, _ = guard_module._check_inline_review_findings(
+                "100", force=True, force_waived=waived
+            )
+        assert not block and waived == ["unread"]
+
     def test_inline_p1_plus_p2_block_lists_both(self, guard_module):
         """1 P1 (1.0) + 1 P2 (0.5) = 1.5 → BLOCK; the P1 title is listed."""
         with self._mock(
