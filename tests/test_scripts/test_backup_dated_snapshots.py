@@ -33,6 +33,21 @@ def _git(*args: str, cwd: Path) -> None:
     subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True)
 
 
+def _isolated_src(gd: Path) -> None:
+    """GENESIS_DIR/src mirrors the repo's src by symlink, except an EMPTY identity
+    directory of the sandbox's own: the identity section must never read the
+    developer's per-install files (USER.md and the local layers) into test output."""
+    real_src = _BACKUP.parents[1] / "src"
+    (gd / "src" / "genesis").mkdir(parents=True)
+    for child in real_src.iterdir():
+        if child.name != "genesis":
+            (gd / "src" / child.name).symlink_to(child)
+    for child in (real_src / "genesis").iterdir():
+        if child.name != "identity":
+            (gd / "src" / "genesis" / child.name).symlink_to(child)
+    (gd / "src" / "genesis" / "identity").mkdir()
+
+
 @pytest.fixture
 def backup_env(tmp_path):
     home = tmp_path / "home"
@@ -40,7 +55,7 @@ def backup_env(tmp_path):
     (gd / "data").mkdir(parents=True)
     (gd / ".venv" / "bin").mkdir(parents=True)
     (gd / ".venv" / "bin" / "python").symlink_to(Path(sys.executable))
-    (gd / "src").symlink_to(_BACKUP.parents[1] / "src", target_is_directory=True)
+    _isolated_src(gd)
     (home / ".genesis").mkdir(parents=True)
     (home / ".gnupg").mkdir(mode=0o700)
     subprocess.run(
@@ -1372,21 +1387,10 @@ def test_smb_offsite_refuses_a_name_that_could_leave_its_quotes(backup_env):
 
 
 def _own_identity_dir(backup_env) -> Path:
-    """Give the sandbox a real identity directory: GENESIS_DIR/src is a symlink to
-    the repo's src, which the identity section must never read or write here."""
-    gd = backup_env["gd"]
-    real_src = (gd / "src").resolve()
-    (gd / "src").unlink()
-    (gd / "src").mkdir()
-    for child in real_src.iterdir():
-        if child.name != "genesis":
-            (gd / "src" / child.name).symlink_to(child)
-    (gd / "src" / "genesis").mkdir()
-    for child in (real_src / "genesis").iterdir():
-        if child.name != "identity":
-            (gd / "src" / "genesis" / child.name).symlink_to(child)
-    ident = gd / "src" / "genesis" / "identity"
-    ident.mkdir()
+    """The sandbox's own identity directory (the fixture keeps it empty and apart
+    from the repo's)."""
+    ident = backup_env["gd"] / "src" / "genesis" / "identity"
+    assert ident.is_dir() and not ident.is_symlink()
     return ident
 
 
@@ -1481,6 +1485,7 @@ def test_identity_symlinks_are_never_followed_and_keep_their_copy(backup_env, tm
     assert not (repo_ident / "evil.local.md.gpg").exists()
     assert "identity/evil.local.md is a symlink" in proc.stdout, proc.stdout[-2000:]
     assert (repo_ident / "USER.md.gpg").is_file()
+    assert _status(backup_env)["extras_complete"] is False
 
     moved = tmp_path / "identity-real"
     ident.rename(moved)
@@ -1489,6 +1494,8 @@ def test_identity_symlinks_are_never_followed_and_keep_their_copy(backup_env, tm
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     assert "is a symlink — identity copies left as they are" in proc.stdout, proc.stdout[-2000:]
     assert (repo_ident / "USER.md.gpg").is_file()
+    status = _status(backup_env)
+    assert status["extras_complete"] is False and status["extra_dirs_skipped"] >= 1, status
 
 
 def test_identity_fresh_seed_never_replaces_the_kept_profile(backup_env, tmp_path):
@@ -1548,8 +1555,10 @@ def test_identity_round_trip_restores_over_a_seed_and_keeps_newer_edits(backup_e
     (fident / "USER.md").write_text("# template\n")  # bootstrap's fresh seed, mtime now
     (fident / "SOUL.md").write_text("shipped soul\n")
     (fident / "STEERING.local.md").write_text("newer local rule\n")
-    future = time.time() + 3600
-    os.utime(fident / "STEERING.local.md", (future, future))
+    # Older than the copy on disk: a downloaded or cloned copy carries its transfer
+    # time, so mtimes cannot say which is newer, and the local edit must still win.
+    past = time.time() - 86400
+    os.utime(fident / "STEERING.local.md", (past, past))
     env = {
         **{k: v for k, v in os.environ.items() if k not in (*_SESSION_BUS_VARS, "SECRETS_PATH")},
         "HOME": str(fresh),
@@ -1575,6 +1584,78 @@ def test_identity_round_trip_restores_over_a_seed_and_keeps_newer_edits(backup_e
     assert "SOUL.md ships tracked in this checkout" in r.stdout, r.stdout[-3000:]
     status = json.loads((fresh / ".genesis" / "restore_status.json").read_text())
     assert status["identity_restored"] == 1, status
+    assert status["identity_kept"] == 1, status
+
+    r = subprocess.run(
+        ["bash", str(_RESTORE), "--from", str(_repo(backup_env)), "--force"],
+        env=env,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    assert (fident / "STEERING.local.md").read_text() == "backed-up rule\n", r.stdout[-3000:]
+    kept = list((fresh / ".genesis" / "restore-displaced").glob("*/STEERING.local.md"))
+    assert [p.read_text() for p in kept] == ["newer local rule\n"], kept
+
+
+def test_identity_capture_gaps_are_reported(backup_env, tmp_path):
+    """A file the backup cannot capture (unreadable, or a name the off-site restore
+    cannot read back) is reported as a gap, never silently left out."""
+    ident = _own_identity_dir(backup_env)
+    (ident / "STEERING.local.md").write_text("rule\n")
+    (ident / "my rules.local.md").write_text("spaced\n")
+    (ident / "-x.local.md").write_text("dashed\n")
+    (ident / "LOCKED.local.md").write_text("secret\n")
+    (ident / "LOCKED.local.md").chmod(0)
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    try:
+        proc = _run_local(backup_env, offsite)
+    finally:
+        (ident / "LOCKED.local.md").chmod(0o600)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    names = {p.name for p in (_repo(backup_env) / "identity").iterdir()}
+    assert names == {"STEERING.local.md.gpg"}, names
+    status = _status(backup_env)
+    assert status["extras_complete"] is False and status["extra_dirs_skipped"] == 3, status
+    assert (
+        "not captured" in proc.stdout + proc.stderr
+        or "failed to encrypt" in proc.stdout + proc.stderr
+    )
+
+
+def test_identity_backup_on_a_rebuilt_host_keeps_unseen_copies(backup_env, tmp_path):
+    """A host that never backed a layer up (a rebuilt box, before its restore) must not
+    prune that layer's copy; a host that did, and then deleted the file, does."""
+    ident = _own_identity_dir(backup_env)
+    (ident / "STEERING.local.md").write_text("rule\n")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    assert _run_local(backup_env, offsite).returncode == 0
+    seen = ident / ".backup-seen"
+    assert seen.read_text().split() == ["STEERING.local.md.gpg"]
+    (ident / "STEERING.local.md").unlink()
+    seen.unlink()  # the rebuilt host's state: it has not seen this layer
+    assert _run_local(backup_env, offsite).returncode == 0
+    assert (_repo(backup_env) / "identity" / "STEERING.local.md.gpg").exists()
+
+
+def test_identity_stale_copy_is_reencrypted_whatever_its_mtime(backup_env, tmp_path):
+    """A kept copy is compared by content: a freshly cloned copy is newer than the
+    file by mtime, and must still be replaced when the file changed."""
+    ident = _own_identity_dir(backup_env)
+    (ident / "STEERING.local.md").write_text("first\n")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    assert _run_local(backup_env, offsite).returncode == 0
+    copy = _repo(backup_env) / "identity" / "STEERING.local.md.gpg"
+    (ident / "STEERING.local.md").write_text("second\n")
+    past = time.time() - 86400
+    os.utime(ident / "STEERING.local.md", (past, past))
+    future = time.time() + 3600
+    os.utime(copy, (future, future))
+    assert _run_local(backup_env, offsite).returncode == 0
+    assert _gpg(backup_env["home"], "-d", str(copy)) == b"second\n"
 
 
 def test_identity_only_backup_is_a_restorable_payload(backup_env, tmp_path):
@@ -1618,6 +1699,19 @@ def test_identity_only_backup_is_a_restorable_payload(backup_env, tmp_path):
     )
     assert "no restorable payloads" not in r.stdout + r.stderr, r.stdout[-2000:]
     assert (fident / "USER.md").read_text() == "# owner profile\n", r.stdout[-3000:]
+
+    # Without the passphrase, even a dry run says so up front, as for every other
+    # encrypted payload, instead of listing files it could never decrypt.
+    env.pop("GENESIS_BACKUP_PASSPHRASE")
+    r = subprocess.run(
+        ["bash", str(_RESTORE), "--from", str(src), "--dry-run"],
+        env=env,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    assert r.returncode != 0, r.stdout[:2500]
+    assert "GENESIS_BACKUP_PASSPHRASE is unset" in r.stdout + r.stderr, r.stdout[-2000:]
 
 
 def _identity_only_restore(backup_env, tmp_path, prepare):

@@ -107,6 +107,7 @@ _TRANSCRIPTS_PULLED=""
 _MEMORY_RESTORED=0
 _EVAL_RESTORED=0
 _IDENTITY_RESTORED=0
+_IDENTITY_KEPT=0
 _EXTRA_RESTORED=0
 # Set by _pull_from_offsite once a snapshot is selected: §4c then restores only
 # the extra archives that snapshot supplied (newline-separated names), never a
@@ -127,7 +128,7 @@ _write_status() {
     _failures_json=$(printf '%s\n' "${_FAILURES[@]:-}" | python3 -c "import json,sys; print(json.dumps([l for l in sys.stdin.read().splitlines() if l]))")
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"dry_run":$DRY_RUN,"sqlite_restored":$_SQLITE_RESTORED,"qdrant_restored":$_QDRANT_RESTORED,"transcripts_restored":$_TRANSCRIPT_RESTORED,"memory_restored":$_MEMORY_RESTORED,"eval_restored":$_EVAL_RESTORED,"identity_restored":$_IDENTITY_RESTORED,"extra_restored":$_EXTRA_RESTORED,"cc_memory_restored":$_CCMEM_RESTORED,"overlays_restored":$_OVERLAYS_RESTORED,"secrets_restored":$_SECRETS_RESTORED,"duration_s":$_duration,"failures":$_failures_json}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"dry_run":$DRY_RUN,"sqlite_restored":$_SQLITE_RESTORED,"qdrant_restored":$_QDRANT_RESTORED,"transcripts_restored":$_TRANSCRIPT_RESTORED,"memory_restored":$_MEMORY_RESTORED,"eval_restored":$_EVAL_RESTORED,"identity_restored":$_IDENTITY_RESTORED,"identity_kept":$_IDENTITY_KEPT,"extra_restored":$_EXTRA_RESTORED,"cc_memory_restored":$_CCMEM_RESTORED,"overlays_restored":$_OVERLAYS_RESTORED,"secrets_restored":$_SECRETS_RESTORED,"duration_s":$_duration,"failures":$_failures_json}
 STATUSEOF
 }
 # ── Deploy-in-progress marker ────────────────────────────────────────
@@ -634,7 +635,7 @@ PYBOUNDARY
     _selected_pull_component secrets secrets '^secrets\.env\.gpg$'
     _selected_pull_component eval eval '^[A-Za-z0-9._-]+\.gpg$'
     _selected_pull_component eval/golden eval/golden '^[A-Za-z0-9._-]+\.gpg$'
-    _selected_pull_component identity identity '^[A-Za-z0-9._-]+\.gpg$'
+    _selected_pull_component identity identity '^[A-Za-z0-9_][A-Za-z0-9._-]*\.gpg$'
     _selected_pull_component creds creds '^[A-Za-z0-9._-]+\.gpg$'
     _selected_pull_component creds/ssh creds/ssh '^[A-Za-z0-9._-]+\.gpg$'
 
@@ -695,7 +696,12 @@ PYBOUNDARY
             _selected_pull_component extra extra '^[A-Za-z0-9._-]+\.tar\.gpg$'
             [ ! -d "$BACKUP_DIR/extra" ] || _EXTRA_PULLED=$(find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -printf '%f\n')
         fi
-        while IFS= read -r fname; do warn "off-site: snapshot does not hold extra directory $fname (backup skipped it that run)"; done < <(awk '$1 == "skipped" {$1=""; sub(/^ /, ""); print}' "$marker" | tr -cd '[:print:]\n')
+        while IFS= read -r fname; do
+            case "$fname" in
+                identity/*) warn "off-site: that backup run did not capture $fname; the snapshot holds its last good copy, if any" ;;
+                *) warn "off-site: snapshot does not hold extra directory $fname (backup skipped it that run)" ;;
+            esac
+        done < <(awk '$1 == "skipped" {$1=""; sub(/^ /, ""); print}' "$marker" | tr -cd '[:print:]\n')
         # The run that wrote this snapshot did not back up the card vault (§8 says so).
         if grep -q '^payment_vault' "$marker"; then
             _PV_GAP="$(awk '$1 == "payment_vault" {print $2; exit}' "$marker" | tr -cd 'a-z')"
@@ -775,7 +781,9 @@ _has_encrypted=false
 for candidate in "$BACKUP_DIR"/data/genesis.sql.gpg "$BACKUP_DIR"/secrets/secrets.env.gpg; do
     [ -f "$candidate" ] && _has_encrypted=true
 done
-if find "$BACKUP_DIR"/transcripts "$BACKUP_DIR"/memory "$BACKUP_DIR"/data/qdrant "$BACKUP_DIR"/extra "$BACKUP_DIR"/analytics -name '*.gpg' -print -quit 2>/dev/null | grep -q .; then
+# `|| true`: find exits 1 for any start point that is absent (most backups lack
+# some of these), and under pipefail that status hid a match found further on.
+if { find "$BACKUP_DIR"/transcripts "$BACKUP_DIR"/memory "$BACKUP_DIR"/data/qdrant "$BACKUP_DIR"/extra "$BACKUP_DIR"/identity "$BACKUP_DIR"/analytics -name '*.gpg' -print -quit 2>/dev/null || true; } | grep -q .; then
     _has_encrypted=true
 fi
 if $_has_encrypted && [ -z "$_BACKUP_PASSPHRASE" ]; then
@@ -1445,6 +1453,7 @@ fi
 log "--- Identity files ---"
 if [ -d "$BACKUP_DIR/identity" ]; then
     _IDENTITY_TARGET="$GENESIS_DIR/src/genesis/identity"
+    _IDENTITY_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
     if [ -L "$_IDENTITY_TARGET" ]; then
         warn "identity files: $_IDENTITY_TARGET is a symlink; not restored through it"
     elif [ ! -d "$_IDENTITY_TARGET" ]; then
@@ -1465,12 +1474,30 @@ if [ -d "$BACKUP_DIR/identity" ]; then
             esac
             # Second line of defence: a file git tracks here is the repo's, whatever
             # the layout says (a git error, e.g. no repository, leaves the rule above).
-            if git -C "$GENESIS_DIR" ls-files --error-unmatch -- "src/genesis/identity/$name" >/dev/null 2>&1; then
+            if git --literal-pathspecs -C "$GENESIS_DIR" ls-files --error-unmatch -- "src/genesis/identity/$name" >/dev/null 2>&1; then
                 log "Identity: $name is tracked in this checkout; the repo copy wins"
                 continue
             fi
-            if [ -f "$dst" ] && ! $FORCE && ! cmp -s -- "$dst" "$dst.example" && [ "$dst" -nt "$src" ]; then
-                continue
+            # Freshness cannot be read from mtimes: a downloaded or freshly cloned
+            # copy carries its transfer time. So a local file that is neither absent
+            # nor a fresh seed (byte-identical to its .example) is kept unless
+            # --force, and --force keeps a copy of it before replacing it.
+            if [ -f "$dst" ] && ! cmp -s -- "$dst" "$dst.example"; then
+                if ! $FORCE; then
+                    log "Identity: $name is already here and is not a fresh seed; kept (--force replaces it, keeping a copy)"
+                    _IDENTITY_KEPT=$(( _IDENTITY_KEPT + 1 ))
+                    continue
+                fi
+                _identity_aside="$(_backup_core_home)/restore-displaced/$_IDENTITY_STAMP"
+                if $DRY_RUN; then
+                    log "Identity: would move the local $name aside to $_identity_aside/$name"
+                else
+                    if ! { mkdir -p -- "$_identity_aside" && cp -p -- "$dst" "$_identity_aside/$name"; }; then
+                        warn "identity files: could not keep a copy of $name; not replaced"
+                        continue
+                    fi
+                    log "Identity: the replaced $name is kept at $_identity_aside/$name"
+                fi
             fi
             if $DRY_RUN; then
                 log "Identity: would restore $name → $dst"
@@ -1519,7 +1546,10 @@ elif [ -f "$_xt_manifest" ] && [ "$(head -1 "$_xt_manifest")" = "genesis-snapsho
     _xt_listed=true
     _xt_allowed="$(awk '$1 == "extra" {print $2}' "$_xt_manifest" | grep -E '^[A-Za-z0-9._-]+\.tar\.gpg$' || true)"
     while IFS= read -r _xt_sk; do
-        warn "extra directory ${_xt_sk:-(unnamed entry)} was not in the last local backup; it is not restored"
+        case "$_xt_sk" in
+            identity/*) warn "the last local backup did not capture $_xt_sk; its last good copy, if any, is restored" ;;
+            *) warn "extra directory ${_xt_sk:-(unnamed entry)} was not in the last local backup; it is not restored" ;;
+        esac
     done < <(awk '$1 == "skipped" {$1 = ""; sub(/^ /, ""); print}' "$_xt_manifest" | tr -cd '[:print:]\n')
     while IFS= read -r _xt_n; do
         if [ -n "$_xt_n" ] && [ ! -f "$BACKUP_DIR/extra/$_xt_n" ]; then
