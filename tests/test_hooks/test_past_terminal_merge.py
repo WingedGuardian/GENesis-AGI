@@ -268,6 +268,16 @@ def test_an_unbound_merge_past_terminal_blocks():
     assert blocked is True
 
 
+def test_a_short_head_never_matches_the_terminal_head():
+    blocked, _ = G._check_past_terminal("7", "o/r", T[:12], budget=_past(T))
+    assert blocked is True
+
+
+def test_the_head_comparison_ignores_case():
+    blocked, msg = G._check_past_terminal("7", "o/r", T.upper(), budget=_past(T))
+    assert blocked is False, msg
+
+
 def test_the_gate_lane_names_its_own_limit():
     blocked, msg = G._check_past_terminal("7", "o/r", N1, budget=_past(N1, gate=True))
     assert blocked is True

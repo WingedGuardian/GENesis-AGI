@@ -17615,7 +17615,11 @@ def _run_merge_and_push_gates() -> int:
                 # recompute right after the binding (commits 15 + body 6, each
                 # clamped by `_gh_timeout` to what is left): a drained budget
                 # there BLOCKS ("could not be recomputed"), never allows, and a
-                # merge without --body-file pays none of it.
+                # merge without --body-file pays none of it. Every merge then
+                # pays the past-terminal budget read (`_check_past_terminal`,
+                # one `evaluate_pr`, each gh call clamped by `_gh_timeout` to
+                # what is left): a drained budget there reads as unknown and
+                # BLOCKS, so this read is not counted in the 62s above.
                 # A timing-out fail-closed gate returns BLOCK immediately, so
                 # the additive worst case needs every call slow-but-successful.
                 mergeable = _check_mergeable(pr_num, repo=merge_repo)
