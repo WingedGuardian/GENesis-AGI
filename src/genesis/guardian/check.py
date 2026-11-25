@@ -1973,6 +1973,31 @@ def _stood_down(config: GuardianConfig, snapshot) -> bool:
     )
 
 
+async def _approval_stands(config, sm, channel, action: str) -> bool:
+    """After an APPROVE, before any action runs (Gate 2, its deferred wait and
+    the frozen gate; owner rulings eb751244, b5dff1b1): signals read again. A
+    stand-down (maintenance, gateway pause, Genesis paused) holds it, and a
+    healthy Genesis (all_alive, the predicate process() and the deferred wait
+    use; the gate wait's `not failed_signals` is the same test) stands down.
+    Either way nothing runs and the next check decides."""
+    snapshot = await collect_all_signals(config)
+    if _stood_down(config, snapshot):
+        await channel.send_text(
+            f"Approved {action} did not run: Genesis was paused (or the Guardian "
+            "stood down) during the wait — standing down, no action taken"
+        )
+        if snapshot.pause_state.paused:
+            sm.process(snapshot)  # PAUSED; a stand-down leaves the state as it is
+        sm.clear_down_alert_sent()  # nothing ran: the next check decides (as DENY)
+        return False
+    if snapshot.all_alive:
+        await channel.send_text("✅ Genesis recovered on its own — standing down, no action taken")
+        sm.process(snapshot)
+        sm.clear_down_alert_sent()
+        return False
+    return True
+
+
 async def _frozen_gate(config, sm, dispatcher, recovery_engine, status, hours, hint) -> bool:
     """The alert of a wait on an unreadable lock, as an APPROVE gate for a
     container restart, its reply awaited at most _FROZEN_GATE_WAIT_S. Before an
@@ -2024,15 +2049,7 @@ async def _frozen_gate(config, sm, dispatcher, recovery_engine, status, hours, h
     elif kw != "APPROVE":
         await channel.send_text("Not restarted; the Guardian keeps waiting and asks again in 2 h.")
     else:
-        snapshot = await collect_all_signals(config)
-        if _stood_down(config, snapshot):
-            await channel.send_text(
-                "Approved RESTART_CONTAINER did not run: Genesis was paused (or the Guardian "
-                "stood down) during the wait — standing down, no action taken"
-            )
-            if snapshot.pause_state.paused:
-                sm.process(snapshot)
-            sm.clear_down_alert_sent()
+        if not await _approval_stands(config, sm, channel, "RESTART_CONTAINER"):
             return False
         cname = config.container_name
         state, _who, _inode = await live_drop.lock_state(cname)
@@ -2476,7 +2493,9 @@ async def _execute_recovery_with_approval(
         sm.clear_down_alert_sent()
         return
 
-    # kw2 == "APPROVE" → execute the approved action.
+    # kw2 == "APPROVE" → execute the approved action, unless it no longer stands.
+    if not await _approval_stands(config, sm, telegram_channel, diagnosis.recommended_action.value):
+        return
     logger.info(
         "Gate-2 approved — executing recovery action %s",
         diagnosis.recommended_action.value,
@@ -2494,24 +2513,9 @@ async def _execute_recovery_with_approval(
         )
         if wait_s > 0:  # 0: it ran out between execute()'s read and this one
             await asyncio.sleep(wait_s + 1)
-        snapshot = await collect_all_signals(config)
         # The tick's own stand-downs (run_check) and Genesis's pause, begun
         # during the wait, hold the approved action as they hold a new tick.
-        if _stood_down(config, snapshot):
-            await telegram_channel.send_text(
-                f"Approved {action} did not run: Genesis was paused (or the Guardian "
-                "stood down) during the wait — standing down, no action taken"
-            )
-            if snapshot.pause_state.paused:
-                sm.process(snapshot)  # PAUSED; a stand-down leaves the state as it is
-            sm.clear_down_alert_sent()  # nothing ran: the next check decides (as DENY)
-            return
-        if snapshot.all_alive:
-            await telegram_channel.send_text(
-                "✅ Genesis recovered on its own — standing down, no action taken"
-            )
-            sm.process(snapshot)
-            sm.clear_down_alert_sent()
+        if not await _approval_stands(config, sm, telegram_channel, action):
             return
         result = await recovery_engine.execute(diagnosis)
     if getattr(result, "deferred", False) is True:  # both gates approved, nothing ran

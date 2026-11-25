@@ -2911,9 +2911,24 @@ verified: 204c69c1f 2026-11-22
   `GENESIS_HOME`, genesis-server's own `Environment=`, and the
   `GENESIS_HOME` line of its `EnvironmentFile=` files (read as plain
   key=value, never evaluated; each deploy script resolves it from its own
-  environment); held at any reads held. A lock dir counts as absent only
-  on ENOENT: any other failed lookup, an unreadable file, or a user manager
-  that does not answer reads unreadable (exit 74; it fails closed). The rule
+  environment), by a stdlib program run in the container as `python3 -I
+  -S -c` (nothing read from the checkout); held at any reads held. Every
+  read follows one rule: only ENOENT is absence, and any other failure, or
+  a value it cannot parse safely (a quote, a space), reads unreadable
+  (exit 74). A user manager that does not answer, or a genesis-server unit
+  systemd does not report loaded, is best effort (owner rulings 14abd7df,
+  b5dff1b1): the default and login-shell paths only, and the wait text
+  says the relocated path could not be checked. An fd scan backs it:
+  every `*/locks/update.lock` an open fd in `/proc/*/fd` points at is
+  flock-tested too, whatever its path (best effort, bounded). `/proc/locks`
+  and `lslocks` cannot do this: the deploy scripts take the lock with a
+  `flock FD` helper that exits, and the kernel then hides the lock's row
+  (measured on a real deploy); the shell's open fd still shows it. A scan cut short
+  by its bound is said in the wait text, never read as complete. One file
+  named twice (a trailing slash, a symlinked home) is locked once, by
+  device and inode. The login-shell value follows the same parse rule. The
+  resolver makes one `systemctl show` (3 s) and a 2 s scan, so a queued
+  restart keeps more than 20 s of its 30 s exec. The rule
   (`live_drop.lock_blocks`) is read at three checkpoints: the entry of the
   approval flow (every route; any proposal, ESCALATE included, becomes an
   ESCALATE that waits), after the post-Gate-1 re-diagnosis and the `live`
@@ -2955,13 +2970,19 @@ verified: 204c69c1f 2026-11-22
   Genesis paused) holds it and the lock is read again: held refuses, free or
   a stopped container declines the stale approval and the episode reopens
   at the next tick (with its full time budget), and only an unreadable lock
-  runs the approved restart. Each wait event
+  runs the approved restart. That stand-down and health check (signals
+  read again after APPROVE, before anything runs) is one check shared with
+  Gate 2's APPROVE and its deferred wait, on every install: a healthy
+  Genesis or a stand-down runs nothing. Each wait event
   sends one message (#4898 item 2).
   The re-alerts carry a host-side hint (`cgroup_ops.lock_holders`: the
   container's cgroup subtree, the `/proc/locks` FLOCK row matching
-  `update.lock`'s inode, or, when that pid has exited or there is no inode,
-  the processes naming a deploy script; only the process name and pid are
-  shown, never its arguments; bounded at 2 s), which
+  `update.lock`'s inode; with no live row (the usual case, for the reason
+  above) or no inode, the processes whose open fds point at it, where the
+  host can read them, else the processes naming a deploy script; only the process name and pid are
+  shown, never its arguments; the inode is the one at the path the probe
+  resolved; a host that could not read says "cannot tell", never "none
+  seen"; bounded at 2 s), which
   never changes the rule. Turning the flag off, or leaving `live`, ends the
   wait. Residual: while the lock is free, the probe and the queued restart
   hold it for an instant, so an update.sh starting in that instant fails fast

@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import re
+import shlex
 from dataclasses import replace
 from html import escape
 
@@ -86,53 +87,166 @@ HALF_DONE_DROP = "half_done_drop"
 
 # ── update.lock (B2, #4841 rework) ────────────────────────────────────────────
 
-#: Every update.lock a deploy on this checkout can take: each deploy script
+#: Every update.lock a deploy on this checkout can take. Each deploy script
 #: takes `${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock` from its OWN
 #: environment (update.sh, deploy_code_only.sh, deploy_marker.sh; no shared
-#: resolver), so three sources are read: the login shell's value,
-#: genesis-server's Environment=, and the GENESIS_HOME line of its
-#: EnvironmentFile= files (the shipped unit sets it there; a plain key=value
-#: read, never evaluated). Fails closed: a user manager that does not answer,
-#: or an existing file it cannot read, exits 74 (unreadable). Residual: a value
-#: systemd quotes (a path with spaces) splits wrongly, a file value is only
-#: stripped of double quotes, and a deploy run with a GENESIS_HOME from none of
-#: these sources is not seen.
-_UNREADABLE_RC = 74
-_RESOLVE = (
-    'set -f; g1="${GENESIS_HOME:-$HOME/.genesis}"; g2="$HOME/.genesis"; g3=; '
-    "e=$(systemctl --user show genesis-server -p Environment --value) || exit 74; "
-    'for kv in $e; do case "$kv" in GENESIS_HOME=*) g2="${kv#GENESIS_HOME=}";; esac; done; '
-    "f=$(systemctl --user show genesis-server -p EnvironmentFiles --value) || exit 74; "
-    'for p in $f; do case "$p" in /*) if [ -r "$p" ]; then '
-    r'v=$(sed -n "s/^[[:space:]]*GENESIS_HOME=//p" "$p" | tail -n 1); v=${v%\"}; v=${v#\"}; '
-    '[ -n "$v" ] && g3=$v; elif [ -e "$p" ]; then exit 74; fi;; esac; done; '
-    '[ "$g2" = "$g1" ] && g2=; { [ "$g3" = "$g1" ] || [ "$g3" = "$g2" ]; } && g3=; '
-)
+#: resolver), so this program, run in the container as `python3 -I -S -c`
+#: (nothing is read from the checkout), reads every source: the login shell,
+#: genesis-server's Environment= and the GENESIS_HOME line of each of its
+#: EnvironmentFile= files (plain key=value, never evaluated). One rule for
+#: every read: verified absence (ENOENT) is skipped, any other failure, or a
+#: value it cannot parse safely (a quote, a space, a non-absolute path), exits
+#: 74, unreadable. A user manager that does not answer, or a unit systemd does
+#: not report loaded, is best effort (owner rulings 14abd7df, b5dff1b1): the
+#: default and login-shell homes only, marked `unchecked=1` for the wait text.
+#: An fd scan backs the resolver: every */locks/update.lock an open fd in
+#: /proc/[0-9]*/fd points at is flock-tested too, whatever path it is at
+#: (best effort: unreadable entries skipped, at most 20000 fds or 2 s).
+#: /proc/locks and lslocks do NOT do this job: a deploy takes the lock with a
+#: `flock FD` helper that exits, and the kernel hides a lock whose owner pid
+#: is gone (MEASURED on a real deploy); the shell's open fd still shows it.
+#: GENESIS_LOCK_SCAN_UNDER (unset in production) limits the scan to a path
+#: prefix (and GENESIS_LOCK_SCAN_MAX its bound), so tests never see a real
+#: deploy's lock; a scan cut short prints `partial=1`, said like an unread
+#: unit. One file named twice (a trailing slash, a symlinked home) is locked
+#: once, by (st_dev, st_ino). Time budget inside the 30 s exec it shares with
+#: the queued restart: one `systemctl show` (3 s) plus the scan (2 s), so the
+#: restart keeps more than 20 s. Exit 0
+#: free (then the arguments, if any, run holding every lock it found: never
+#: inherited by what they start), 75 held (its inode and the deploy marker's
+#: pid printed), 74 unreadable. Residual: a deploy whose GENESIS_HOME comes
+#: from none of these sources, with its lock not yet taken, is not seen.
+_RESOLVER = r"""
+import fcntl, os, re, subprocess, sys, time
+def die(why):
+    print("unreadable=" + why.replace("\n", " "))
+    sys.exit(74)
+def absent(path):
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        return True
+    except OSError as e:
+        die(f"{path}: {e.strerror}")
+    return False
+def clean(v, where):
+    if len(v) > 1 and v[0] == v[-1] and v[0] in "\"'":
+        v = v[1:-1]
+    if not v.startswith("/") or re.search(r"[\s\"'\\$`]", v):
+        die("cannot parse GENESIS_HOME in " + where)
+    return v
+home = os.environ["HOME"]
+login = os.environ.get("GENESIS_HOME")
+homes = [clean(login, "the login shell") if login else home + "/.genesis", home + "/.genesis"]
+props = {}
+try:
+    r = subprocess.run(["systemctl", "--user", "show", "genesis-server", "-p", "LoadState",
+                        "-p", "Environment", "-p", "EnvironmentFiles"],
+                       capture_output=True, text=True, timeout=3)
+    if r.returncode == 0:
+        for ln in r.stdout.splitlines():
+            k, _, v = ln.partition("=")
+            props.setdefault(k, []).append(v.strip())
+except (OSError, subprocess.SubprocessError):
+    pass
+if props.get("LoadState") != ["loaded"]:
+    print("unchecked=1")
+    props = {}
+hits = [t for t in " ".join(props.get("Environment", [])).split()
+        if t.lstrip("\"'").startswith("GENESIS_HOME=")]
+if hits:
+    if not hits[-1].startswith("GENESIS_HOME="):
+        die("cannot parse GENESIS_HOME in the unit Environment")
+    homes.append(clean(hits[-1][13:], "the unit Environment"))
+files = " ".join(props.get("EnvironmentFiles", []))
+if not re.fullmatch(r"(?:\S+ \(ignore_errors=(?:yes|no)\)\s*)*", files):
+    die("cannot parse the unit EnvironmentFiles")
+for path in re.findall(r"(\S+) \(ignore_errors=(?:yes|no)\)", files):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        continue
+    except (OSError, ValueError) as e:
+        die(f"{path}: {e}")
+    vals = [ln.strip()[13:] for ln in text.splitlines() if ln.strip().startswith("GENESIS_HOME=")]
+    if vals:
+        homes.append(clean(vals[-1].strip(), path))
+def scanned():
+    under = os.environ.get("GENESIS_LOCK_SCAN_UNDER", "/")
+    most = int(os.environ.get("GENESIS_LOCK_SCAN_MAX", "20000"))
+    out, n, end = [], 0, time.monotonic() + 2
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            fds = os.listdir(f"/proc/{pid}/fd")
+        except OSError:
+            continue
+        for fd in fds:
+            n += 1
+            if n > most or time.monotonic() > end:
+                print("partial=1")
+                return out
+            try:
+                t = os.readlink(f"/proc/{pid}/fd/{fd}")
+            except OSError:
+                continue
+            if t.startswith(under) and t.endswith("/locks/update.lock"):
+                out.append(t[: -len("/locks/update.lock")])
+    return out
+homes += scanned()
+def held(path):
+    try:
+        print(f"inode={os.stat(path).st_ino}")
+        with open(path.rsplit("/locks/", 1)[0] + "/update_in_progress.pid", "rb") as fh:
+            print("pid=" + fh.read(64).decode(errors="replace").strip())
+    except OSError:
+        pass
+    sys.exit(75)
+fds, seen = [], set()
+for g in dict.fromkeys(homes):
+    if absent(g + "/locks"):
+        continue
+    path = g + "/locks/update.lock"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CREAT, 0o644)
+    except OSError as e:
+        die(f"{path}: {e.strerror}")
+    st = os.fstat(fd)
+    if (st.st_dev, st.st_ino) in seen:  # one file named twice: locked already
+        os.close(fd)
+        continue
+    seen.add((st.st_dev, st.st_ino))
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        held(path)
+    except OSError as e:
+        die(f"{path}: {e.strerror}")
+    fds.append(fd)
+sys.exit(subprocess.run(sys.argv[1:]).returncode if sys.argv[1:] else 0)
+"""
 
 
 def under_lock(cmd: str) -> str:
-    """``cmd`` run holding every update.lock (flock -n -o: never across what
-    it starts; exit 75 when one is held). A lock dir counts as absent only on
-    ENOENT; any other failed lookup (a parent it cannot search) exits 74, and
-    ``cmd`` never runs without its lock."""
-    return _RESOLVE + f"set -- {cmd}; " + (
-        'for g in "$g1" "$g2" "$g3"; do [ -n "$g" ] || continue; d="$g/locks"; '
-        'if [ -d "$d" ]; then set -- flock -n -o -E 75 "$d/update.lock" "$@"; '
-        'else m=$(LC_ALL=C stat -- "$d" 2>&1 >/dev/null) && exit 74; '
-        'case "$m" in *"No such file or directory") ;; *) exit 74;; esac; fi; done; '
-        'exec "$@"'
-    )
+    """``cmd`` (shell words) run holding every update.lock _RESOLVER finds;
+    exit 75 when one is held, 74 when a lookup failed: never without its lock."""
+    return f"exec python3 -I -S -c {shlex.quote(_RESOLVER)} {cmd}"
 
 
 #: The lock probe: exit 0 free, 75 held, anything else (74: a failed lookup;
 #: -1: no answer) unreadable.
-_LOCK_PROBE = under_lock("true")
-_LOCKS = 'd="${GENESIS_HOME:-$HOME/.genesis}/locks"; '
+_LOCK_PROBE = under_lock("")
 _LOCK_HELD = 75
-#: On HELD: update.lock's inode (for the host hint) and the deploy marker's pid.
-_HOLDER_CMD = (
-    _LOCKS + 'echo "inode=$(stat -c %i "$d/update.lock")"; '
-    'echo "pid=$(head -c 64 "${GENESIS_HOME:-$HOME/.genesis}/update_in_progress.pid")"'
+#: What the probe says when genesis-server's unit could not be read.
+_UNCHECKED = (
+    "the relocated update.lock path could not be checked (genesis-server's unit "
+    "could not be read); the default and login-shell paths were"
+)
+_PARTIAL = (
+    "some update.lock paths could not be checked (the open-file scan that "
+    "finds them was cut short)"
 )
 FREE, HELD, UNREADABLE = "free", "held", "unreadable"
 #: Re-alert this often while waiting: the deploy scripts' own lock-wait ceiling
@@ -342,14 +456,24 @@ def attempt_line(attempt: dict | None) -> str:
 
 
 async def lock_state(container: str) -> tuple[str, str, str]:
-    """(FREE | HELD | UNREADABLE, who holds it, update.lock's inode), read fresh."""
-    rc, _ = await _in_container(container, _LOCK_PROBE)
-    if rc != _LOCK_HELD:
-        return (FREE if rc == 0 else UNREADABLE), "", ""
-    _rc, lines = await _in_container(container, _HOLDER_CMD)
+    """(FREE | HELD | UNREADABLE, who holds it, update.lock's inode), read
+    fresh in ONE exec: the holder is the one at the path the probe resolved.
+    ``who`` also says when genesis-server's unit could not be read."""
+    rc, lines = await _in_container(container, _LOCK_PROBE)
     vals = dict(ln.split("=", 1) for ln in lines if "=" in ln)
+    note = "; ".join(
+        text for key, text in (("unchecked", _UNCHECKED), ("partial", _PARTIAL))
+        if vals.get(key) == "1"
+    )
+    if rc != _LOCK_HELD:
+        if rc == 0 and note:
+            logger.warning("update.lock read free, best effort: %s", note)
+        elif rc != 0:
+            logger.warning("update.lock unreadable: %s", shown(vals.get("unreadable", rc)))
+        return (FREE if rc == 0 else UNREADABLE), note, ""
     pid, inode = vals.get("pid", "").strip(), vals.get("inode", "").strip()
     who = f"the deploy marker names pid {pid}" if pid.isascii() and pid.isdigit() else ""
+    who = "; ".join(t for t in (who, note) if t)
     return HELD, who, (inode if inode.isascii() and inode.isdigit() else "")
 
 
@@ -387,7 +511,7 @@ async def lock_blocks(config, *, owner_approved_unreadable: bool = False) -> tup
         )
     return WAITING_ON_UNREADABLE_LOCK, (
         "update.lock cannot be read and incus does not report the container stopped: "
-        "a deploy, rebuild, drop or validation hold may be running"
+        "a deploy, rebuild, drop or validation hold may be running" + (f" ({who})" if who else "")
     )
 
 
@@ -448,7 +572,8 @@ async def send_wait_alert(
 
 async def host_hint(container: str, inode: str = "") -> str:
     """What the host sees of update.lock's holder (cgroup_ops.lock_holders), as
-    alert text; "" when the host could not look. A hint only: never a rule."""
+    alert text; "cannot tell" when the host could not look, never "none seen".
+    A hint only: never a rule."""
     from genesis.guardian import cgroup_ops
 
     try:
@@ -456,7 +581,7 @@ async def host_hint(container: str, inode: str = "") -> str:
             asyncio.to_thread(cgroup_ops.lock_holders, container, inode), _HINT_TIMEOUT_S
         )
     except (OSError, ValueError, TimeoutError):
-        return ""
+        return "Seen from the host: cannot tell (it could not read the container's processes)."
     if not found:
         return "Seen from the host: none seen (a hint, not proof)."
     named = "; ".join(f"pid {pid} ({shown(cmd, 120)})" for pid, cmd in found[:3])

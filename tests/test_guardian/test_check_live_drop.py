@@ -1146,10 +1146,8 @@ class LockContainer(Container):
         cmd = args[-1] if args[1:2] == ("exec",) else " ".join(args)
         if cmd == live_drop._LOCK_PROBE:
             self.calls.append(cmd)
-            return (self.lock.pop(0) if len(self.lock) > 1 else self.lock[0], "", "")
-        if "update_in_progress.pid" in cmd:
-            self.calls.append(cmd)
-            return (0, "inode=77\npid=4242\n", "")
+            rc = self.lock.pop(0) if len(self.lock) > 1 else self.lock[0]
+            return (rc, "inode=77\npid=4242\n" if rc == 75 else "", "")
         if cmd.startswith("incus info"):
             self.calls.append(cmd)
             return (0, f"Name: genesis\nStatus: {self.status}\n", "")
@@ -1234,7 +1232,8 @@ def _waiting_sm(config, alerted_h: float = 0.0) -> ConfirmationStateMachine:
 
 
 async def _tick(
-    config, sm, box, *, alive=False, channel=None, no_channel=False, undelivered=False
+    config, sm, box, *, alive=False, channel=None, no_channel=False, undelivered=False,
+    signals=None,
 ):
     from genesis.guardian.check import _handle_confirmed_dead
 
@@ -1244,7 +1243,7 @@ async def _tick(
     approve, channel = AsyncMock(), channel or _gate_channel()
     snaps = MagicMock(safe_to_snapshot=AsyncMock(return_value=False))
     engine = RecoveryEngine(config, sm, snaps, dispatcher)
-    signals = AsyncMock(return_value=_snapshot(alive=alive))
+    signals = signals or AsyncMock(return_value=_snapshot(alive=alive))
     with (
         patch("genesis.guardian.live_drop._run_subprocess", box),
         patch("genesis.guardian.recovery._run_subprocess", box),
@@ -1574,3 +1573,66 @@ async def test_a_spent_budget_on_an_unreadable_wait_alerts_once_then_every_2_h()
         dispatcher, _, _ = await _tick(config, sm, LockContainer(lock=(1,)), channel=_frozen_channel())
         total += dispatcher.send.await_count
     assert total == 1 and sm.state.frozen_gate_sent is True
+
+
+# ── #5042 round 2: one post-approval check for both gates ────────────────────
+
+
+def _then_alive(dead_reads: int) -> AsyncMock:
+    """collect_all_signals: down for ``dead_reads`` reads, then healthy."""
+    seq = [_snapshot(alive=False)] * dead_reads
+    return AsyncMock(side_effect=lambda _c: seq.pop(0) if seq else _snapshot(alive=True))
+
+
+async def test_a_frozen_approve_with_a_healthy_fresh_snapshot_restarts_nothing():
+    """c4699117668 / eb751244: Genesis came back while APPROVE was read."""
+    config = _armed()
+    sm = _waiting_sm(config, 2.5)
+    box = LockContainer(lock=(1,))
+    channel = _frozen_channel("APPROVE")
+    await _tick(config, sm, box, channel=channel, signals=_then_alive(1))
+    assert not box.sent("incus restart")
+    assert any("recovered on its own" in c.args[0] for c in channel.send_text.await_args_list)
+
+
+async def test_a_gate_2_approve_with_a_healthy_fresh_snapshot_runs_nothing():
+    """b5dff1b1: Gate 2's APPROVE gets the same check (every install)."""
+    _, texts, _ = await _run_gates_after_approve(_then_alive(3))
+    assert any("recovered on its own" in t for t in texts), texts
+
+
+async def test_a_gate_2_approve_during_a_stand_down_runs_nothing(tmp_path):
+    config = GuardianConfig()
+    config.maintenance_file = str(tmp_path / "maintenance")
+    (tmp_path / "maintenance").write_text("1")
+    _, texts, _ = await _run_gates_after_approve(None, config=config)
+    assert any("stood down" in t for t in texts), texts
+
+
+async def _run_gates_after_approve(signals, config=None):
+    """Both gates approve a restart; the engine must never be asked to run it."""
+    config = config or GuardianConfig()
+    engine = MagicMock()
+    engine.execute = AsyncMock()
+    channel = _gate_channel()
+    with (
+        patch("genesis.guardian.check._find_telegram_channel", return_value=channel),
+        patch(
+            "genesis.guardian.check.collect_all_signals",
+            signals or AsyncMock(return_value=_snapshot(alive=False)),
+        ),
+        patch("genesis.guardian.check.collect_diagnostics", AsyncMock(return_value={})),
+        patch("genesis.guardian.check.write_diagnosis_result"),
+        patch.object(
+            DiagnosisEngine, "diagnose",
+            AsyncMock(return_value=_diagnosis(RecoveryAction.RESTART_SERVICES)),
+        ),
+        patch("genesis.guardian.recovery._run_subprocess", Container(_view(), on_live=False)),
+        patch("genesis.guardian.live_drop._run_subprocess", Container(_view(), on_live=False)),
+    ):
+        await _execute_recovery_with_approval(
+            config, _dead_sm(config), MagicMock(send=AsyncMock()), engine,
+            _diagnosis(RecoveryAction.RESTART_SERVICES),
+        )
+    engine.execute.assert_not_awaited()
+    return False, [c.args[0] for c in channel.send_text.await_args_list], engine

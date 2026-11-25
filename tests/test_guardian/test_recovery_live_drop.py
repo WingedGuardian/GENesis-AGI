@@ -650,10 +650,8 @@ class LockBox(Box):
         cmd = args[-1] if args[1:2] == ("exec",) else " ".join(args)
         if cmd == live_drop._LOCK_PROBE:
             self.calls.append(cmd)
-            return (self.lock.pop(0) if len(self.lock) > 1 else self.lock[0], "", "")
-        if "update_in_progress.pid" in cmd:
-            self.calls.append(cmd)
-            return (0, "a banner\ninode=77\npid=4242\n", "")
+            rc = self.lock.pop(0) if len(self.lock) > 1 else self.lock[0]
+            return (rc, "a banner\ninode=77\npid=4242\n" if rc == 75 else "", "")
         if cmd.startswith("incus info"):
             self.calls.append(cmd)
             return (0, f"Name: genesis\nStatus: {self.status}\n", "")
@@ -698,7 +696,10 @@ async def test_only_a_reported_stopped_counts(answer, stopped):
         assert (await live_drop.container_status("genesis") == "stopped") is stopped
 
 
-def _sh(cmd: str, home, *, login=True, unit_home=None, unit_rc=0, env_file=None):
+def _sh(
+    cmd: str, home, *, login=True, unit_home=None, unit_rc=0, env_file=None,
+    load="loaded", env_line=None, files_line=None, login_value=None, scan_max=None,
+):
     """bash with a scratch HOME and a stub `systemctl` that reports the
     genesis-server unit's Environment (``unit_home``) or fails (``unit_rc``):
     never the real ~/.genesis. ``login``: GENESIS_HOME is set to ``home``."""
@@ -709,17 +710,45 @@ def _sh(cmd: str, home, *, login=True, unit_home=None, unit_rc=0, env_file=None)
     (root / "bin").mkdir(exist_ok=True)
     (root / "user").mkdir(exist_ok=True)
     stub = root / "bin" / "systemctl"
-    said = f"echo GENESIS_HOME={unit_home}" if unit_home else "echo"
-    files = f'echo "{env_file} (ignore_errors=yes)"' if env_file else "echo"
+    # One `systemctl show` answers all three properties as Key=value lines.
+    said = f"GENESIS_HOME={unit_home}" if unit_home else ""
+    said = said if env_line is None else env_line
+    files = f"{env_file} (ignore_errors=yes)" if env_file else ""
+    files = files if files_line is None else files_line
     stub.write_text(
-        f"#!/bin/sh\ncase \"$*\" in *EnvironmentFiles*) {files};; *) {said};; esac\nexit {unit_rc}\n"
+        "#!/bin/sh\ncase \"$*\" in\n"
+        f"  *--value*LoadState*|*LoadState*--value*) echo '{load}';;\n"
+        f"  *--value*EnvironmentFiles*|*EnvironmentFiles*--value*) echo '{files}';;\n"
+        f"  *--value*) echo '{said}';;\n"
+        "  *) cat <<'EOF'\n"
+        f"LoadState={load}\nEnvironment={said}\nEnvironmentFiles={files}\nEOF\n"
+        "  ;;\nesac\n"
+        f"exit {unit_rc}\n"
     )
     stub.chmod(0o755)
     env = {**os.environ, "HOME": str(root / "user"), "PATH": f"{root / 'bin'}:{os.environ['PATH']}"}
+    # The fd scan sees only this scratch tree: a deploy holding the real lock
+    # (one may be running) never leaks into these tests.
+    env["GENESIS_LOCK_SCAN_UNDER"] = str(root)
+    if scan_max is not None:
+        env["GENESIS_LOCK_SCAN_MAX"] = str(scan_max)
     env.pop("GENESIS_HOME", None)
     if login:
-        env["GENESIS_HOME"] = str(home)
+        env["GENESIS_HOME"] = str(home) if login_value is None else login_value
     return subprocess.run(["bash", "-c", cmd], env=env, capture_output=True, text=True, timeout=20)
+
+
+def _end(holder) -> None:
+    """Kill a lock holder's whole group: `flock path cmd` hands the lock fd to
+    cmd, which would go on holding it as an orphan."""
+    import contextlib
+    import os
+    import signal
+
+    if holder.pid > 1:  # never killpg(1): every process of this user
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(holder.pid, signal.SIGKILL)
+    holder.wait()
 
 
 def test_the_probe_and_the_queued_restart_under_a_real_flock(tmp_path):
@@ -741,7 +770,9 @@ def test_the_probe_and_the_queued_restart_under_a_real_flock(tmp_path):
     assert r.returncode == 0 and "ran" in r.stdout
     assert "update.lock" not in r.stdout  # -o: no inherited lock fd
     assert _sh(live_drop._LOCK_PROBE, home).returncode == 0  # free after exit
-    holder = subprocess.Popen(["flock", str(home / "locks" / "update.lock"), "sleep", "30"])
+    holder = subprocess.Popen(
+        ["flock", str(home / "locks" / "update.lock"), "sleep", "30"], start_new_session=True
+    )
     try:
         deadline = time.monotonic() + 10
         while _sh(live_drop._LOCK_PROBE, home).returncode != 75:
@@ -750,8 +781,7 @@ def test_the_probe_and_the_queued_restart_under_a_real_flock(tmp_path):
         r = _sh(run, home)
         assert r.returncode == 75 and "ran" not in r.stdout
     finally:
-        holder.kill()
-        holder.wait()
+        _end(holder)
 
 
 _EVERY = [a for a in RecoveryAction if a != RecoveryAction.ESCALATE]
@@ -962,6 +992,9 @@ def _host(tmp_path, monkeypatch):
         (proc / str(pid)).mkdir()
         (proc / str(pid) / "cmdline").write_bytes(argv)
         (proc / str(pid) / "comm").write_text(comm + "\n")
+        (proc / str(pid) / "fd").mkdir()
+    (proc / "300" / "fd" / "10").symlink_to("/srv/g/locks/update.lock")
+    (proc / "100" / "fd" / "3").symlink_to("/srv/g/data/genesis.db")
     monkeypatch.setattr(cgroup_ops, "_cgroup_path", lambda _c: cg)
     monkeypatch.setattr(cgroup_ops, "_PROC", proc)
 
@@ -972,16 +1005,24 @@ def test_the_host_names_the_update_lock_holder_by_inode(tmp_path, monkeypatch):
     assert cgroup_ops.lock_holders("genesis", "77") == [(200, "flock")]
 
 
-def test_a_holder_row_whose_pid_exited_falls_back_to_the_name_match(tmp_path, monkeypatch):
-    """I: the flock helper exited; the deploy shell holding its fd is named."""
+@pytest.mark.parametrize("inode", ["79", "80", ""])
+def test_with_no_live_lock_row_the_host_prefers_the_pids_holding_the_fd(
+    tmp_path, monkeypatch, inode
+):
+    """The flock helper exited (79), the kernel hides the row entirely (80,
+    measured for a normal deploy), or no inode is known: the processes whose
+    fds point at update.lock are named, before any name match."""
     _host(tmp_path, monkeypatch)
-    assert cgroup_ops.lock_holders("genesis", "79") == [(200, "flock"), (300, "bash")]
+    assert cgroup_ops.lock_holders("genesis", inode) == [(300, "bash")]
 
 
-def test_without_the_inode_the_host_names_deploy_processes(tmp_path, monkeypatch):
-    """A frozen guest cannot say update.lock's inode: cmdlines are the hint."""
+def test_with_no_fd_visible_the_host_falls_back_to_the_name_match(tmp_path, monkeypatch):
     _host(tmp_path, monkeypatch)
-    assert cgroup_ops.lock_holders("genesis") == [(200, "flock"), (300, "bash")]
+    (tmp_path / "proc" / "300" / "fd" / "10").unlink()
+    assert cgroup_ops.lock_holders("genesis", "80") == [(200, "flock"), (300, "bash")]
+
+
+
 
 
 async def test_the_host_hint_is_text_and_bounded(tmp_path, monkeypatch):
@@ -994,13 +1035,13 @@ async def test_the_host_hint_is_text_and_bounded(tmp_path, monkeypatch):
     assert "none seen" in await live_drop.host_hint("genesis", "5")
     monkeypatch.setattr(cgroup_ops, "lock_holders", lambda *_a: time.sleep(1))
     monkeypatch.setattr(live_drop, "_HINT_TIMEOUT_S", 0.05)
-    assert await live_drop.host_hint("genesis", "77") == ""
+    assert "cannot tell" in await live_drop.host_hint("genesis", "77")
 
     def broken(*_a):
         raise OSError("no")
 
     monkeypatch.setattr(cgroup_ops, "lock_holders", broken)
-    assert await live_drop.host_hint("genesis", "77") == ""
+    assert "cannot tell" in await live_drop.host_hint("genesis", "77")
 
 
 async def test_the_restored_state_is_on_disk_before_the_wait_alert(tmp_path):
@@ -1057,7 +1098,7 @@ def test_the_lock_the_server_unit_names_is_read_too(tmp_path):
     (unit / "locks").mkdir(parents=True)
     lock = str(unit / "locks" / "update.lock")
     login = tmp_path / "gh"
-    holder = subprocess.Popen(["flock", lock, "sleep", "30"])
+    holder = subprocess.Popen(["flock", lock, "sleep", "30"], start_new_session=True)
     try:
         deadline = time.monotonic() + 10
         while subprocess.run(["flock", "-n", lock, "true"]).returncode == 0:
@@ -1067,9 +1108,9 @@ def test_the_lock_the_server_unit_names_is_read_too(tmp_path):
         r = _sh(_UNDER_LOCK("echo ran"), login, login=False, unit_home=unit)
         assert r.returncode == 75 and "ran" not in r.stdout
     finally:
-        holder.kill()
-        holder.wait()
-    assert _sh(live_drop._LOCK_PROBE, login, unit_rc=1).returncode not in (0, 75)
+        _end(holder)
+    r = _sh(live_drop._LOCK_PROBE, login, unit_rc=1)  # 14abd7df: best effort
+    assert r.returncode == 0 and "unchecked=1" in r.stdout
 
 
 @pytest.mark.parametrize("action", [RecoveryAction.RESTART_CONTAINER, RecoveryAction.SNAPSHOT_ROLLBACK])
@@ -1116,7 +1157,7 @@ def test_the_lock_the_server_environment_file_names_is_read_too(tmp_path):
     env_file = tmp_path / "server.env"
     env_file.write_text(f"# a comment\nOTHER=1\nGENESIS_HOME={unit}\n")
     login = tmp_path / "gh"
-    holder = subprocess.Popen(["flock", lock, "sleep", "30"])
+    holder = subprocess.Popen(["flock", lock, "sleep", "30"], start_new_session=True)
     try:
         deadline = time.monotonic() + 10
         while subprocess.run(["flock", "-n", lock, "true"]).returncode == 0:
@@ -1126,14 +1167,20 @@ def test_the_lock_the_server_environment_file_names_is_read_too(tmp_path):
         r = _sh(_UNDER_LOCK("echo ran"), login, login=False, env_file=env_file)
         assert r.returncode == 75 and "ran" not in r.stdout
     finally:
-        holder.kill()
-        holder.wait()
+        _end(holder)
 
 
 def test_the_wrappers_unreadable_exit_is_74_not_a_command_code(tmp_path):
     """NOTE: 3 could be the command's own exit; 74 is reserved for the lookup."""
     home = tmp_path / "gh"
-    assert _sh(live_drop._LOCK_PROBE, home, unit_rc=1).returncode == 74
+    env_file = tmp_path / "sealed" / "server.env"
+    env_file.parent.mkdir()
+    env_file.write_text("GENESIS_HOME=/x\n")
+    env_file.parent.chmod(0o000)
+    try:
+        assert _sh(live_drop._LOCK_PROBE, home, env_file=env_file).returncode == 74
+    finally:
+        env_file.parent.chmod(0o755)
 
 
 @pytest.mark.parametrize("rc", [66, 73, 74])
@@ -1145,3 +1192,213 @@ async def test_a_lock_that_cannot_be_opened_holds_the_restart(rc):
     with _patched(box):
         ok, detail = await _engine()._restart_services("genesis")
     assert not ok and isinstance(detail, _Held)
+
+
+# ── #5042 round 2 ────────────────────────────────────────────────────────────
+
+_NOT_ROOT = pytest.mark.skipif(
+    __import__("os").geteuid() == 0, reason="root reads a mode-000 dir: no failed lookup"
+)
+
+
+@_NOT_ROOT
+def test_an_environment_file_behind_an_unsearchable_dir_is_unreadable(tmp_path):
+    """c4699117656 / eb751244: a named file the probe cannot read (anything
+    but ENOENT) reads unreadable; the wrapper never runs its command."""
+    from genesis.guardian.recovery import _UNDER_LOCK
+
+    env_file = tmp_path / "sealed" / "server.env"
+    env_file.parent.mkdir()
+    env_file.write_text("GENESIS_HOME=/somewhere\n")
+    env_file.parent.chmod(0o000)
+    try:
+        home = tmp_path / "gh"
+        assert _sh(live_drop._LOCK_PROBE, home, env_file=env_file).returncode == 74
+        r = _sh(_UNDER_LOCK("echo ran"), home, env_file=env_file)
+        assert r.returncode == 74 and "ran" not in r.stdout
+    finally:
+        env_file.parent.chmod(0o755)
+
+
+def test_a_named_environment_file_that_does_not_exist_is_skipped(tmp_path):
+    assert _sh(live_drop._LOCK_PROBE, tmp_path / "gh", env_file=tmp_path / "gone.env").returncode == 0
+
+
+@pytest.mark.parametrize("load", ["not-found", "masked"])
+def test_a_unit_systemd_reports_not_loaded_is_best_effort(tmp_path, load):
+    """b5dff1b1: not loaded -> the default and login-shell paths only, marked."""
+    r = _sh(live_drop._LOCK_PROBE, tmp_path / "gh", load=load, unit_home=tmp_path / "x")
+    assert r.returncode == 0 and "unchecked=1" in r.stdout
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {"env_line": '"GENESIS_HOME=/a b"'},  # systemd quotes a value with a space
+        {"files_line": "/a b.env (ignore_errors=yes)"},  # a path it cannot split
+    ],
+)
+def test_a_path_the_probe_cannot_parse_is_unreadable(tmp_path, kw):
+    assert _sh(live_drop._LOCK_PROBE, tmp_path / "gh", **kw).returncode == 74
+
+
+def test_a_quoted_home_with_a_space_in_an_environment_file_is_unreadable(tmp_path):
+    env_file = tmp_path / "server.env"
+    env_file.write_text('GENESIS_HOME="/a b"\n')
+    assert _sh(live_drop._LOCK_PROBE, tmp_path / "gh", env_file=env_file).returncode == 74
+
+
+def test_the_fd_scan_sees_a_held_update_lock_no_source_names(tmp_path):
+    """b5dff1b1: a path-independent cross-check backs the resolver: an
+    update.lock held at a path no GENESIS_HOME names still reads held, and the
+    wrapper refuses."""
+    import subprocess
+    import time
+
+    from genesis.guardian.recovery import _UNDER_LOCK
+
+    elsewhere = tmp_path / "elsewhere" / "locks"
+    elsewhere.mkdir(parents=True)
+    lock = str(elsewhere / "update.lock")
+    holder = subprocess.Popen(["flock", lock, "sleep", "30"], start_new_session=True)
+    try:
+        deadline = time.monotonic() + 10
+        while subprocess.run(["flock", "-n", lock, "true"]).returncode == 0:
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        home = tmp_path / "gh"
+        assert _sh(live_drop._LOCK_PROBE, home).returncode == 75
+        r = _sh(_UNDER_LOCK("echo ran"), home)
+        assert r.returncode == 75 and "ran" not in r.stdout
+    finally:
+        _end(holder)
+    assert _sh(live_drop._LOCK_PROBE, tmp_path / "gh").returncode == 0  # control
+
+
+async def test_the_probe_names_the_holder_in_one_exec_and_notes_an_unchecked_unit():
+    """P3: the holder comes from the resolved path the probe read, not a
+    second login-shell read; an unread unit is said in the wait text."""
+
+    class Unchecked(LockBox):
+        async def __call__(self, *args, timeout=10.0, **kwargs):
+            cmd = args[-1] if args[1:2] == ("exec",) else " ".join(args)
+            if cmd == live_drop._LOCK_PROBE:
+                self.calls.append(cmd)
+                return (75, "unchecked=1\ninode=77\npid=4242\n", "")
+            return await super().__call__(*args, timeout=timeout, **kwargs)
+
+    box = Unchecked()
+    with _patched(box):
+        state, who, inode = await live_drop.lock_state("genesis")
+    assert state == "held" and "4242" in who and inode == "77"
+    assert "could not be checked" in who
+    assert box.sent("live_drop") == [] and len(box.calls) == 1
+
+
+async def test_a_host_that_cannot_read_the_cgroup_says_cannot_tell(tmp_path, monkeypatch):
+    """P3: a failed read is never "none seen"."""
+    monkeypatch.setattr(cgroup_ops, "_cgroup_path", lambda _c: tmp_path / "no-such-cgroup")
+    hint = await live_drop.host_hint("genesis", "77")
+    assert "cannot tell" in hint and "none seen" not in hint
+
+
+def test_the_fd_scan_sees_a_lock_whose_flock_helper_exited(tmp_path):
+    """MEASURED: a deploy takes update.lock with `flock FD` and the helper
+    exits; /proc/locks and lslocks then list nothing. The shell's open fd is
+    what shows it."""
+    import subprocess
+    import time
+
+    from genesis.guardian.recovery import _UNDER_LOCK
+
+    locks = tmp_path / "deploy" / "locks"
+    locks.mkdir(parents=True)
+    lock = locks / "update.lock"
+    holder = subprocess.Popen(
+        ["bash", "-c", f'exec 9>"{lock}"; flock -n 9 || exit 1; exec sleep 30'],
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0:
+            assert holder.poll() is None and time.monotonic() < deadline
+            time.sleep(0.05)
+        home = tmp_path / "gh"
+        assert _sh(live_drop._LOCK_PROBE, home).returncode == 75
+        r = _sh(_UNDER_LOCK("echo ran"), home)
+        assert r.returncode == 75 and "ran" not in r.stdout
+    finally:
+        _end(holder)
+
+
+# ── #5042 round-2 fix review ─────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("spelling", ["slash", "symlink"])
+def test_one_lock_named_two_ways_is_locked_once(tmp_path, spelling):
+    """SF1: two spellings of one file are two open file descriptions, and the
+    second flock would conflict with the first: a false HELD forever."""
+    home = tmp_path / "gh"
+    (home / "locks").mkdir(parents=True)
+    if spelling == "slash":
+        other = f"{home}/"
+    else:
+        (tmp_path / "alias").symlink_to(home)
+        other = str(tmp_path / "alias")
+    assert _sh(live_drop._LOCK_PROBE, home, unit_home=other).returncode == 0
+    r = _sh(live_drop.under_lock("echo ran"), home, unit_home=other)
+    assert r.returncode == 0 and "ran" in r.stdout
+
+
+def test_one_lock_named_two_ways_still_reads_held(tmp_path):
+    import subprocess
+    import time
+
+    home = tmp_path / "gh"
+    (home / "locks").mkdir(parents=True)
+    lock = str(home / "locks" / "update.lock")
+    holder = subprocess.Popen(["flock", lock, "sleep", "30"], start_new_session=True)
+    try:
+        deadline = time.monotonic() + 10
+        while subprocess.run(["flock", "-n", lock, "true"]).returncode == 0:
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        assert _sh(live_drop._LOCK_PROBE, home, unit_home=f"{home}/").returncode == 75
+    finally:
+        _end(holder)
+
+
+def test_a_cut_short_fd_scan_is_marked_never_complete(tmp_path):
+    """SF2: the scan's bound must not read as a complete cross-check."""
+    r = _sh(live_drop._LOCK_PROBE, tmp_path / "gh", scan_max=0)
+    assert r.returncode == 0 and "partial=1" in r.stdout
+
+
+async def test_a_partial_scan_is_said_in_the_wait_text():
+    class Partial(LockBox):
+        async def __call__(self, *args, timeout=10.0, **kwargs):
+            cmd = args[-1] if args[1:2] == ("exec",) else " ".join(args)
+            if cmd == live_drop._LOCK_PROBE:
+                return (75, "partial=1\ninode=77\npid=4242\n", "")
+            return await super().__call__(*args, timeout=timeout, **kwargs)
+
+    with _patched(Partial()):
+        _state, who, _inode = await live_drop.lock_state("genesis")
+    assert "could not be checked" in who
+
+
+def test_only_an_exact_genesis_home_token_counts(tmp_path):
+    """NOTE: GENESIS_HOME_X= is another variable, not an unparseable home."""
+    r = _sh(live_drop._LOCK_PROBE, tmp_path / "gh", env_line="GENESIS_HOME_X=/y OTHER=GENESIS_HOME")
+    assert r.returncode == 0
+
+
+def test_the_login_shell_home_goes_through_the_same_rule(tmp_path):
+    """NOTE: a relative or quoted login value is unparseable, not resolved."""
+    assert _sh(live_drop._LOCK_PROBE, tmp_path / "gh", login_value="relative/home").returncode == 74
+
+
+def test_the_resolver_makes_one_systemctl_call_of_at_most_3_s():
+    """NOTE: the restart shares the 30 s exec with the resolver."""
+    assert live_drop._RESOLVER.count('"systemctl"') == 1
+    assert "timeout=3" in live_drop._RESOLVER
