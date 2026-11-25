@@ -83,13 +83,17 @@ _backup_core_path_array() {
     # payment_vault: §8 backs it up consistently (SQLite online backup) and
     # restore only stages it; an extra-dir tar could tear cards.db and place it.
     _backup_core_paths=(
-        "$GENESIS_DIR" "$TRANSCRIPT_DIR" "$HOME/.genesis/eval" "$HOME/.genesis/config"
+        "$GENESIS_DIR" "$TRANSCRIPT_DIR" "$HOME/.genesis/eval"
         "$HOME/.genesis/shared" "$HOME/.genesis/merge_overrides"
         "$override_store" "$HOME/.genesis/restore-creds"
         "$_BACKUP_CORE_VAULT" "$(_backup_core_home)/payment_vault"
         "$HOME/.genesis/restore_status.json" "$HOME/.ssh"
         "$HOME/.config/gh" "$HOME/.local/state/genesis-guardian"
     )
+    # The user config directory: backup.sh §6g copies it file by file, so an extra
+    # archive of it would swap it out on restore. A SYMLINKED one is not backed up
+    # by §6g (it never follows a link), so its real directory may be an extra.
+    [ -L "$HOME/.genesis/config" ] || _backup_core_paths+=("$HOME/.genesis/config")
 }
 
 backup_core_paths() {
@@ -113,12 +117,13 @@ backup_paths_overlap() {
 }
 
 backup_core_overlap() {
-    local abs="$1" core core_real
+    local abs="$1" skip="${2:-}" core core_real
     local -a _backup_core_paths=()
     [ -n "$abs" ] || return 2
     _backup_core_path_array || return 2
     for core in "${_backup_core_paths[@]}"; do
         [ -n "$core" ] || continue
+        [ -n "$skip" ] && [ "$core" = "$skip" ] && continue
         backup_capture_path core_real realpath -m -- "$core" || return 2
         if backup_paths_overlap "$abs" "$core_real"; then
             printf '%s\n' "$core"

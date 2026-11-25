@@ -1152,8 +1152,9 @@ fi
 # ~/.genesis/config holds what this install set for itself: the settings overlays
 # (<stem>.local.yaml, written by the settings API and the dashboard), whole-file
 # replacements and helper files. genesis.yaml is left to §8, which already
-# encrypts it; `*.bak-*` copies are left out. Same rules as §6e: a symlink is
-# never followed, a deleted file's copy is pruned, and only after a full listing.
+# encrypts it; per-box, in-flight and backup copies are left out (the case list
+# below). Same rules as §6e: a symlink is never followed, a copy is never deleted
+# (a deleted file comes back on restore), and every capture failure is a gap.
 # The copies are FLAT (the off-site pull reads one level, and its payload names
 # allow no `/`): a nested path's `/` is written `__`, so modules/x.yaml is
 # user_config/modules__x.yaml.gpg. A real name containing `__` would be ambiguous,
@@ -1162,58 +1163,106 @@ _USER_CONFIG_SRC="$HOME/.genesis/config"
 _USER_CONFIG_COUNT=0
 mkdir -p user_config
 find user_config -type f ! -name '*.gpg' -delete 2>/dev/null || true
+_ucfg_gap() {
+    local _n="$1"
+    case "$_n" in
+        '*'|'(listing)') ;;
+        *) _n="$(LC_ALL=C printf '%q' "$_n" | cut -c1-120)" ;;
+    esac
+    _IDENTITY_GAPS+=("user_config/$_n ($2)")
+}
+# Whether an opt-in extra dir names the real directory behind a symlinked config
+# dir: §6f archives that directory then, so the symlink leaves no gap.
+_ucfg_real_is_extra() {
+    local _real _e
+    local -a _es=()
+    _real="$(realpath -m -- "$_USER_CONFIG_SRC" 2>/dev/null)" || return 1
+    IFS=':' read -r -a _es <<< "${GENESIS_BACKUP_EXTRA_DIRS:-}"
+    for _e in "${_es[@]+"${_es[@]}"}"; do
+        # shellcheck disable=SC2088
+        case "$_e" in "~/"*) _e="$HOME/${_e#\~/}" ;; esac
+        [ -n "$_e" ] && [ "$(realpath -m -- "$_e" 2>/dev/null)" = "$_real" ] && return 0
+    done
+    return 1
+}
 if [ -L "$_USER_CONFIG_SRC" ]; then
     log "WARNING: $_USER_CONFIG_SRC is a symlink — user config copies left as they are"
+    if ! _ucfg_real_is_extra; then
+        _ucfg_gap "*" "config directory is a symlink; list its real directory in GENESIS_BACKUP_EXTRA_DIRS"
+    fi
 elif [ -d "$_USER_CONFIG_SRC" ]; then
     log "Backing up the user config directory..."
     if ! $_ENCRYPT_READY; then
         log "WARNING: GENESIS_BACKUP_PASSPHRASE not set — skipping user config (refusing plaintext)"
     else
-        _ucfg_keep=()
-        _ucfg_link_prefixes=()
+        # No copy is ever deleted (as §6e, memory and eval): a settings file deleted
+        # here comes back on a disaster-recovery restore, which deleting it again
+        # undoes, where a wrong prune would lose the setting.
         _ucfg_list_ok=true
         _ucfg_list="$(mktemp -p "$GENESIS_BIG_TMP" user-config-list.XXXXXX)" || _ucfg_list_ok=false
         if $_ucfg_list_ok; then
             find "$_USER_CONFIG_SRC" \( -type f -o -type l \) -print0 >"$_ucfg_list" || _ucfg_list_ok=false
         fi
         if ! $_ucfg_list_ok; then
+            # A partial listing is never used: the readable files keep their last copies
+            # and the run reports the gap, so the snapshot is not marked complete.
             log "WARNING: could not list $_USER_CONFIG_SRC — user config copies left as they are"
+            _ucfg_gap "*" "listing failed"
         else
+            _ucfg_listed=$(tr -cd '\0' <"$_ucfg_list" | wc -c)
+            _ucfg_read=0
             while IFS= read -r -d '' src; do
+                _ucfg_read=$((_ucfg_read + 1))
                 rel="${src#"$_USER_CONFIG_SRC"/}"
                 case "$rel" in
                     # genesis.yaml: §8 owns it. watchgod.conf and serena-shared.json are
                     # regenerated per box (bootstrap writes this box's paths into them).
-                    genesis.yaml|watchgod.conf|serena-shared.json|*.bak-*) continue ;;
+                    # codebase-managed.json holds this box's paths and is never rewritten
+                    # once present, so an old box's copy would block its configure step.
+                    # genesis.malformed-*.yaml are copies of genesis.yaml (§8's). *.tmp
+                    # and codebase-managed.json.<hex> are writers' files in flight.
+                    genesis.yaml|watchgod.conf|serena-shared.json|codebase-managed.json|codebase-managed.json.*|genesis.malformed-*|*.bak-*|*.tmp) continue ;;
                     # `__` stands for `/`, so a name that already holds `__`, or puts a
                     # `_` next to a `/`, would decode to another path.
                     *__*|*_/*|*/_*)
                         log "WARNING: user config $rel has '__' or a '_' beside a '/' in its path, which the flat copy cannot keep apart — not backed up"
+                        _ucfg_gap "$rel" "name the flat copy cannot keep apart"
                         continue ;;
                 esac
-                dst="user_config/${rel//\//__}.gpg"
-                _ucfg_keep+=("$dst")
+                _ucfg_flat="${rel//\//__}.gpg"
+                # The off-site restore reads back only names matching its payload rule.
+                if [[ ! "$_ucfg_flat" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]]; then
+                    log "WARNING: user config $rel has characters restore cannot read back; not backed up (rename it)"
+                    _ucfg_gap "$rel" "name restore cannot read"
+                    continue
+                fi
+                dst="user_config/$_ucfg_flat"
                 if [ -L "$src" ]; then
                     log "WARNING: user config $rel is a symlink — not followed; its last copy is kept"
-                    # A symlinked subdirectory keeps the copies of what was under it.
-                    _ucfg_link_prefixes+=("user_config/${rel//\//__}__")
+                    _ucfg_gap "$rel" "symlink, last copy kept"
                     continue
                 fi
-                if [ -f "$dst" ] && [ "$dst" -nt "$src" ]; then
+                # By content, never by mtime (see §6e). A copy the current passphrase
+                # cannot open (one made before a rotation) reads as "differs" and is
+                # re-encrypted, so every copy in a snapshot opens with one passphrase.
+                if [ -f "$dst" ] && _identity_copy_matches "$dst" "$src"; then
                     continue
                 fi
-                encrypt_file "$src" "$dst" stamp || log "WARNING: failed to encrypt user config $rel"
+                if ! encrypt_file "$src" "$dst" stamp; then
+                    # Vanished only when its directory can still be searched: a
+                    # permission error also fails -e, and that is a gap.
+                    if [ ! -e "$src" ] && [ ! -L "$src" ] && [ -x "$(dirname -- "$src")" ]; then
+                        log "User config: $rel was removed during the run; its last copy stays"
+                    else
+                        log "WARNING: failed to encrypt user config $rel — this snapshot lacks its current copy"
+                        _ucfg_gap "$rel" "not captured"
+                    fi
+                fi
             done <"$_ucfg_list"
-            # A file deleted here must not come back on restore (a resurrected overlay
-            # would silently change a setting): drop its copy.
-            while IFS= read -r -d '' old; do
-                _ucfg_live=false
-                for _k in "${_ucfg_keep[@]}"; do [ "$_k" = "$old" ] && _ucfg_live=true; done
-                for _k in "${_ucfg_link_prefixes[@]}"; do
-                    case "$old" in "$_k"*) _ucfg_live=true ;; esac
-                done
-                $_ucfg_live || rm -f -- "$old"
-            done < <(find user_config -maxdepth 1 -type f -name '*.gpg' -print0)
+            if [ "$_ucfg_read" -ne "$_ucfg_listed" ]; then
+                log "WARNING: read $_ucfg_read of $_ucfg_listed user config names — the rest keep their last copies"
+                _ucfg_gap "(listing)" "read stopped early"
+            fi
         fi
         [ -n "${_ucfg_list:-}" ] && rm -f -- "$_ucfg_list"
         _USER_CONFIG_COUNT=$(find user_config -maxdepth 1 -type f -name '*.gpg' 2>/dev/null | wc -l)
@@ -1359,9 +1408,10 @@ else
         if _core_hit="$(backup_core_overlap "$_abs")"; then
             # The user config directory itself is covered whole by §6g (an install may
             # still list it from before §6g existed): covered, so not a skip or a gap.
-            if [ "$_abs" = "$(realpath -m -- "$HOME/.genesis/config")" ] \
+            _cfg_real="$(realpath -m -- "$HOME/.genesis/config")"
+            if [[ "$_abs/" == "$_cfg_real"/* ]] \
                 && [ ! -L "$HOME/.genesis/config" ] && [ -d "$HOME/.genesis/config" ]; then
-                log "NOTE: extra dir $_d is the user config directory, which §6g backs up — not archived again"
+                log "NOTE: extra dir $_d is the user config directory or inside it, which §6g backs up — not archived again"
                 continue
             fi
             # restore.sh puts an extra directory back as a unit, which would swap this
@@ -1966,6 +2016,11 @@ else
     if [ -d user_config ]; then
         backend_mkdir "${_T2_DIR}/user_config"
         while IFS= read -r -d '' f; do
+            if [ "$f" = "//find-failed" ]; then
+                log "WARNING: could not list user_config/ for the off-site upload"
+                _T2_OK=false
+                continue
+            fi
             fname=$(basename "$f")
             if backend_put "$f" "${_T2_DIR}/user_config/$fname"; then
                 log "  off-site: uploaded user_config/$fname"
@@ -1973,7 +2028,8 @@ else
                 log "WARNING: off-site upload failed for user_config/$fname"
                 _T2_OK=false
             fi
-        done < <(find user_config -maxdepth 1 -type f -name '*.gpg' -print0 2>/dev/null)
+        done < <(find user_config -maxdepth 1 -type f -name '*.gpg' -print0 2>/dev/null \
+            || printf '%s\0' //find-failed)
     fi
 
     # Upload opt-in extra-dir archives (§6f). Flat by construction — one file
@@ -2318,11 +2374,11 @@ print(core, gap or '-')
         # target is fine — the escrowed passphrase is stale), so name the real
         # cause + fix instead of pointing at the off-site target.
         if [ "$_alert_kind" = extras ]; then
-            _send_telegram "⚠️ *Off-site copy incomplete — extra directories or identity files*
+            _send_telegram "⚠️ *Off-site copy incomplete — extra directories, identity or config files*
 
 The core backup reached the off-site snapshot and is restorable, but the
-extra directories or identity files are incomplete (an identity/ entry keeps
-its last good copy): ${_EXTRA_SKIPPED:-0} not captured this run,
+extra directories, identity or config files are incomplete (an identity/ or
+user_config/ entry keeps its last good copy): ${_EXTRA_SKIPPED:-0} not captured this run,
 ${_EXTRA_UPLOAD_FAILED:-0} not uploaded, ${_EXTRA_PARTIAL:-0} archived without members a
 restore would refuse. Missing or partial in this snapshot:
 $(printf '%s\n' "${_EXTRA_SKIP_LABELS[@]+"${_EXTRA_SKIP_LABELS[@]}"}" "${_EXTRA_PARTIAL_LABELS[@]+"${_EXTRA_PARTIAL_LABELS[@]/%/ (partial)}"}" | head -5)
