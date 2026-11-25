@@ -2,6 +2,10 @@
   <img src="docs/images/genesis-banner.svg" alt="Genesis" width="680">
 </p>
 
+<!-- yarkr:badges:start -->
+[![Indexed on Yarkr](https://api.yarkr.com/functions/v1/api/api/v1/badges/repos/WingedGuardian/GENesis-AGI/version.svg)](https://yarkr.com/arks/wingedguardian/genesis-agi)
+<!-- yarkr:badges:end -->
+
 <p align="center">
   <img src="docs/images/genesis-dashboard.gif" alt="Genesis Neural Monitor — live subsystem health" width="720">
 </p>
@@ -222,6 +226,40 @@ numeric id); leave both blank to run without that channel.
 Both ship off, and Genesis uses cloud APIs without them. Enable Ollama with `GENESIS_ENABLE_OLLAMA=true` (add `memory.embed_local_first: true` in `genesis.yaml` to put local embeddings first) and LM Studio with `GENESIS_ENABLE_LM_STUDIO=true`.
 
 ---
+
+<!-- yarkr:install:start -->
+## Install with Yarkr
+
+This repo is indexed on [Yarkr](https://yarkr.com/arks/wingedguardian/genesis-agi) as the ark [wingedguardian/genesis-agi](https://yarkr.com/arks/wingedguardian/genesis-agi), so its skills install into Claude Code, Codex, Cursor and other agent harnesses with one command.
+
+### CLI
+
+Install the whole ark, which Yarkr keeps equal to this repo:
+
+```bash
+npx yarkr-cli sync wingedguardian/genesis-agi
+```
+
+Or add individual skills:
+
+```bash
+npx yarkr-cli add skill:wingedguardian/genesis-agi/aws-fde-delivery
+npx yarkr-cli add skill:wingedguardian/genesis-agi/browser-automation
+npx yarkr-cli add skill:wingedguardian/genesis-agi/build-session
+```
+
+No Node.js? `curl -fsSL https://yarkr.com/install.sh | sh` (macOS, Linux) or `irm https://yarkr.com/install.ps1 | iex` (Windows PowerShell) installs `yarkr` as a standalone binary; then type `yarkr` in place of `npx yarkr-cli`.
+
+### MCP
+
+Connect your agent to the ark over MCP:
+
+```bash
+npx yarkr-cli mcp add wingedguardian/genesis-agi
+```
+
+Or point any MCP client at `https://api.yarkr.com/functions/v1/api/mcp/o/wingedguardian/genesis-agi`.
+<!-- yarkr:install:end -->
 
 ## Your Genesis
 
