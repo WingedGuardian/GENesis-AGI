@@ -235,8 +235,10 @@ Dropped: <n> findings over the cap (<severity of the lowest kept>)
 
 **The `sha256` is the hash of the spec's body**, so that a changed spec is
 noticed: the lines after its YAML frontmatter, up to the first line outside a
-fenced code block (one opened and closed by a line starting with three
-backticks) that is exactly `## Amendments` or starts `## Spec analysis:`, or to
+fenced code block (as CommonMark defines one: opened by a run of three or more
+backticks or tildes indented at most three spaces, and closed by a run of the
+same character at least as long, with nothing after it but spaces) that is
+exactly `## Amendments` or starts `## Spec analysis:`, or to
 the end of the
 file when there is neither; trailing whitespace-only lines removed; joined
 with `\n`, ending in one `\n`, encoded UTF-8. Setting `status: approved` and
@@ -245,15 +247,18 @@ leave it unchanged. Compute it with this snippet, saved to a scratch file and
 run as `python3 <file> <spec>`; the reviewer runs the same one:
 
 ```python
-import hashlib, sys
+import hashlib, re, sys
 lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
 if lines and lines[0] == "---":  # skip the YAML frontmatter
     lines = lines[lines.index("---", 1) + 1 :]
-body, fenced = [], False
+body, fence = [], ""  # the open code fence's marker run; a delimiter inside one is not one
 for line in lines:
-    if line.startswith("`" * 3):  # a delimiter inside a code fence is not one
-        fenced = not fenced
-    elif not fenced and (line == "## Amendments" or line.startswith("## Spec analysis:")):
+    m = re.match(r" {0,3}(`{3,}(?=[^`]*$)|~{3,})(.*)$", line)  # no backtick after a backtick run
+    if m and not fence:
+        fence = m.group(1)
+    elif m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not m.group(2).strip():
+        fence = ""
+    elif not fence and (line == "## Amendments" or line.startswith("## Spec analysis:")):
         break
     body.append(line)
 while body and not body[-1].strip():
