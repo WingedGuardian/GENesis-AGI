@@ -1440,3 +1440,25 @@ async def test_padded_default_channel_env_still_configured(monkeypatch):
     assert discord_webhook_configured("dev-discussion")
     assert discord_webhook_configured("discord")
     assert not discord_webhook_configured("announcements")
+
+
+@pytest.mark.asyncio
+async def test_the_relay_alert_subject_is_reserved():
+    from unittest.mock import AsyncMock
+
+    import genesis.mcp.outreach_mcp as mcp_mod
+    from genesis.outreach.types import OWNER_RELAY_ALERT_SUBJECT
+
+    old = (mcp_mod._pipeline, mcp_mod._db)
+    pipeline = AsyncMock()
+    mcp_mod._pipeline = pipeline
+    mcp_mod._db = None
+    try:
+        out = json.loads(await mcp_mod.outreach_send(
+            message="Looks official", category="alert", channel="email",
+            subject=OWNER_RELAY_ALERT_SUBJECT,
+        ))
+    finally:
+        mcp_mod._pipeline, mcp_mod._db = old
+    assert out["status"] == "refused" and out["code"] == "reserved_subject"
+    pipeline.submit.assert_not_called()

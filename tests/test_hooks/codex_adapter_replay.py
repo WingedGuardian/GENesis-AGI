@@ -87,6 +87,7 @@ PUBLISHING_GUARD_FUNCTIONS = (
     "_DryRunBlock",
     "_DryRunRef",
     "_DryRunVerdict",
+    "_FixEvidence",
     "_ReworkUnreadable",
     "_allow",
     "_api_merge_deny",
@@ -136,7 +137,7 @@ PUBLISHING_GUARD_FUNCTIONS = (
     "_seg_dash_C",
     "main",
 )
-PUBLISHING_GUARD_DIGEST = "33808eb2cb6ba30b9c2e4a09cd39b23f6b2cb056132fb583247a2aac5c35c6d5"
+PUBLISHING_GUARD_DIGEST = "1a4b817b257a803c17d3cd86c220ef63f7c47dab40d01d6f4dd087cc9e09bd37"
 
 
 def direct_publishing_allowance(request, guard):

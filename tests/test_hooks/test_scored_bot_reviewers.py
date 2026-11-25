@@ -282,7 +282,8 @@ class TestDevinDedupAndClearing:
         assert "1 unresolved" in msg or "+ 1 " in msg or "1 Devin" in msg, msg
         assert msg.count("Posted twice") == 1, msg
 
-    def test_a_maintainer_reply_clears_the_finding(self, guard):
+    def test_a_maintainer_fix_reply_clears_the_finding(self, guard, monkeypatch):
+        monkeypatch.setattr(guard._FixEvidence, "verify", lambda *_a: None)
         comments = [
             _c(1, _devin_body("🔴", "Answered by a maintainer")),
             _c(
@@ -297,7 +298,8 @@ class TestDevinDedupAndClearing:
         block, msg = _scan(guard, comments)
         assert not block, msg
 
-    def test_a_maintainer_reply_to_one_copy_clears_the_duplicate_too(self, guard):
+    def test_a_maintainer_fix_reply_to_one_copy_clears_the_duplicate_too(self, guard, monkeypatch):
+        monkeypatch.setattr(guard._FixEvidence, "verify", lambda *_a: None)
         body = _devin_body("🔴", "Reply landed on copy two")
         comments = [
             _c(1, body),
@@ -307,16 +309,17 @@ class TestDevinDedupAndClearing:
         block, msg = _scan(guard, comments)
         assert not block, f"answering one copy left its twin blocking: {msg}"
 
-    def test_devins_own_resolved_reply_clears_its_finding(self, guard):
-        """Owner 2026-09-24: a reviewer may withdraw its own finding."""
+    def test_devins_resolved_reply_with_no_commit_does_not_clear(self, guard):
+        """#4933: reviewer and builder share a login, so the marker alone proves no fix."""
         comments = [
             _c(1, _devin_body("🔴", "Self-withdrawn")),
             _c(9, "✅ **Resolved**: The path now checks the lock first.", reply_to=1),
         ]
         block, msg = _scan(guard, comments)
-        assert not block, msg
+        assert block and "no reply has a line starting 'Fixed in <sha>'" in msg
 
-    def test_devins_resolved_reply_on_a_duplicate_clears_the_group(self, guard):
+    def test_devins_resolved_reply_on_a_duplicate_clears_the_group(self, guard, monkeypatch):
+        monkeypatch.setattr(guard._FixEvidence, "verify", lambda *_a: None)
         body = _devin_body("🔴", "Resolved on the other copy")
         comments = [
             _c(1, body),
@@ -335,10 +338,11 @@ class TestDevinDedupAndClearing:
         return other.login
 
     def test_a_reply_to_one_reviewers_finding_never_clears_anothers_with_the_same_id(
-        self, guard, second_devin_format
+        self, guard, second_devin_format, monkeypatch
     ):
         """Issue #2656: findings are keyed by (login, id). Two Devin-format reviewers
         whose ids collide stay separate findings: answering one leaves the other."""
+        monkeypatch.setattr(guard._FixEvidence, "verify", lambda *_a: None)
         shared = "BUG_pr-review-job-shared_0001"
         comments = [
             _c(1, _devin_body("🔴", "Devin's own finding", fid=shared)),
@@ -386,9 +390,10 @@ class TestDevinDedupAndClearing:
         block, msg = _scan(guard, comments)
         assert block
 
-    def test_a_self_withdrawn_finding_is_surfaced_not_silent(self, guard, capsys):
-        """Devin's reviewer and builder post under ONE login, so a self-withdrawal
-        clears (owner ruling) but is always shown, never silent (owner, 2026-09-24)."""
+    def test_a_self_withdrawn_finding_is_surfaced_not_silent(self, guard, capsys, monkeypatch):
+        """Devin's reviewer and builder post under ONE login, so a self-withdrawal that
+        passes the fix test clears but is always shown, never silent (owner, 2026-09-24)."""
+        monkeypatch.setattr(guard._FixEvidence, "verify", lambda *_a: None)
         comments = [
             _c(1, _devin_body("🔴", "Severe, withdrawn by Devin")),
             _c(2, "✅ **Resolved**: done", reply_to=1),
@@ -464,9 +469,18 @@ class TestDevinScopeAndWaivers:
         skipped = "[doc Devin]" in capsys.readouterr().err
         assert skipped is (not blocks), "doc-path handling does not match p1_only"
 
-    def test_review_override_waives_devin_findings_like_every_other(self, guard):
-        block, _ = _scan(guard, [_c(1, _devin_body("🔴", "Waived"))], force=True)
-        assert not block
+    def test_review_override_leaves_a_severe_finding_blocking(self, guard):
+        """#4933: the blanket waiver no longer covers the floor."""
+        block, _ = _scan(guard, [_c(1, _devin_body("🔴", "Not waived"))], force=True)
+        assert block
+
+    def test_review_override_waives_the_score_of_non_severe_findings(self, guard):
+        comments = [
+            _c(i, _devin_body("🟡", f"Minor {i}", fid=f"BUG_pr-review-job-aaa_00{i}"))
+            for i in range(10, 16)
+        ]
+        assert _scan(guard, comments)[0], "control: this score must block unwaived"
+        assert not _scan(guard, comments, force=True)[0]
 
     def test_coderabbit_minor_still_scores_zero(self, guard):
         """Owner 2026-09-24: CodeRabbit Minor stays surface-only — a regression lock."""
@@ -631,13 +645,13 @@ class TestDuplicateCopiesUseTheStrongest:
         assert "always-fix floor" in msg and "Red second" in msg
 
     def test_an_answered_group_never_reads_the_changed_files(self, guard, capsys, monkeypatch):
-        """The scope judgement reads the PR file list, so it runs only after the
-        clearing check. With that read failing, an answered-only PR must not claim
-        diff scoping was unavailable for a finding that never needed it."""
+        """The scope judgement reads the PR file list, so below the floor it runs only
+        after the clearing check. With that read failing, an answered-only PR must not
+        claim diff scoping was unavailable for a finding that never needed it."""
         monkeypatch.setenv("_TEST_GH_PR_FILES", "__error__")
         fid = "BUG_pr-review-job-aaa_0018"
         comments = [
-            _c(1, _devin_body("🔴", "Answered red", fid=fid)),
+            _c(1, _devin_body("🟡", "Answered yellow", fid=fid)),
             _c(9, "Seen.", login="owner", utype="User", reply_to=1, assoc="OWNER"),
         ]
         block, msg = _scan(guard, comments)

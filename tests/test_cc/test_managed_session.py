@@ -905,9 +905,7 @@ async def test_managed_telemetry_counts_every_tool_block_on_a_line(db, native):
     ("native_state", "status"),
     [("succeeded", "completed"), ("failed", "failed"), ("cancelled", "failed")],
 )
-async def test_orphan_with_committed_outcome_is_finished_not_overwritten(
-    db, native_state, status
-):
+async def test_orphan_with_committed_outcome_is_finished_not_overwritten(db, native_state, status):
     req = request()
     sid = await prepare(
         db,
@@ -1047,7 +1045,8 @@ async def test_held_uncertain_state_is_written_once(db, native, monkeypatch, cap
         assert writes == ["cancelling", "cancelling"]
         assert retry_sleeps == [1.0]
         holds = [
-            r for r in caplog.records
+            r
+            for r in caplog.records
             if r.name == "genesis.cc.managed_session" and "cleanup unconfirmed" in r.getMessage()
         ]
         assert len(holds) == 1 and holds[0].levelname == "WARNING"
@@ -1056,6 +1055,8 @@ async def test_held_uncertain_state_is_written_once(db, native, monkeypatch, cap
     finally:
         teardown.set()
         await asyncio.gather(task, return_exceptions=True)
+
+
 @pytest.mark.parametrize("failure", ["missing", "not_executable", "bad_cwd"])
 async def test_a_popen_launch_failure_is_ordinary_not_uncertain(tmp_path, failure):
     """Popen reaps any child it forked before raising, so nothing is left to own
@@ -1235,6 +1236,8 @@ async def test_cancel_keeps_a_recorded_cleanup_uncertainty(db, native, monkeypat
     finally:
         teardown.set()
         await asyncio.gather(task, return_exceptions=True)
+
+
 async def test_a_launch_failure_frees_the_slot_and_fails_the_receipt(db, native):
     """Runner level: an ordinary launch error fails the receipt and keeps no slot."""
     runner, _, invoker = native
@@ -1279,3 +1282,371 @@ async def test_usage_is_written_with_the_terminal_state(db, native, monkeypatch)
     assert meta["usage"] == {"cost_usd": 0.3, "input_tokens": 5, "output_tokens": 9}
     release.set()
     await settled(runner, sid)
+
+
+async def _relay_run(db, native, tool_names, **changes):
+    from genesis.cc.types import StreamEvent
+
+    runner, _, invoker = native
+    raw = {
+        "type": "assistant",
+        "message": {
+            "content": [{"type": "tool_use", "name": name, "input": {}} for name in tool_names]
+        },
+    }
+
+    async def execute(invocation, on_event=None):
+        if tool_names:
+            await on_event(StreamEvent.from_raw(raw))
+        return output()
+
+    invoker.run_streaming.side_effect = execute
+    req = request()
+    sid = await prepare(db, req, peer_id="alpha", **changes)
+    await runner.adopt(sid, req)
+    await settled(runner, sid)
+    rows = await (
+        await db.execute("SELECT id, message, category, channel FROM pending_outreach")
+    ).fetchall()
+    return sid, [dict(r) for r in rows]
+
+
+async def test_relayed_session_that_acted_sends_one_owner_alert(db, native):
+    sid, rows = await _relay_run(
+        db, native, ["Read", "mcp__genesis-outreach__outreach_send"], owner_relay=True
+    )
+    assert len(rows) == 1
+    (row,) = rows
+    assert row["category"] == "alert" and row["channel"] == "telegram"
+    assert row["message"].startswith(
+        f"[{sid[:8]}] Acted on your behalf via alpha: used outreach_send; ended "
+    )
+    assert "Session said:" in row["message"] or "No summary recorded." in row["message"]
+    from genesis.cc.managed_session import _notify_owner_relay
+
+    # A retried finalization never queues a second notice.
+    assert await _notify_owner_relay(db, sid) is False
+    count = await (await db.execute("SELECT count(*) FROM pending_outreach")).fetchone()
+    assert count[0] == 1
+
+
+@pytest.mark.parametrize(
+    ("tools", "changes"),
+    [
+        (["Read", "Grep", "mcp__genesis-memory__memory_recall"], {"owner_relay": True}),
+        (["mcp__genesis-outreach__outreach_send"], {}),
+        ([], {"owner_relay": True}),
+    ],
+)
+async def test_no_owner_alert_without_relay_or_outbound_tool(db, native, tools, changes):
+    _, rows = await _relay_run(db, native, tools, **changes)
+    assert rows == []
+
+
+async def test_a_failed_owner_alert_is_retried_not_dropped(db, native, monkeypatch):
+    """A failed insert is retried with the other finalization writes, so the
+    owner still hears of the action once (#4905 review)."""
+    from genesis.cc import managed_session
+
+    real = managed_session._notify_owner_relay
+    calls = 0
+
+    async def flaky(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("synthetic notice failure")
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(managed_session, "_notify_owner_relay", flaky)
+    sid, rows = await _relay_run(
+        db, native, ["mcp__genesis-outreach__outreach_send"], owner_relay=True
+    )
+    assert calls == 2 and len(rows) == 1
+    row = await cc_sessions.get_by_id(db, sid)
+    assert row["status"] == "completed"
+    assert json.loads(row["metadata"])["native_state"] == "succeeded"
+
+
+async def test_the_owner_alert_is_queued_before_the_terminal_status(db, native, monkeypatch):
+    """A restart after the terminal commit cannot lose the alert: boot
+    reconciliation reads only active sessions (#4905 review)."""
+    from genesis.cc import managed_session
+
+    real = managed_session._notify_owner_relay
+    seen = []
+
+    async def recording(db_, sid, *args, **kwargs):
+        seen.append((await cc_sessions.get_by_id(db_, sid))["status"])
+        return await real(db_, sid, *args, **kwargs)
+
+    monkeypatch.setattr(managed_session, "_notify_owner_relay", recording)
+    sid, rows = await _relay_run(
+        db, native, ["mcp__genesis-outreach__outreach_send"], owner_relay=True
+    )
+    assert seen == ["active"] and len(rows) == 1
+    # The alert names the outcome that was then committed, as before the reorder.
+    outcome = (await cc_sessions.get_by_id(db, sid))["outcome"]
+    assert f"; ended {outcome}." in rows[0]["message"]
+
+
+async def test_an_orphan_whose_alert_fails_stays_for_the_next_boot(db, monkeypatch):
+    """At boot the alert is queued before the orphan leaves active; one that
+    cannot be queued keeps the row active, and the next boot queues it."""
+    from genesis.cc import managed_session
+
+    sid = await prepare(db, request(), peer_id="alpha", owner_relay=True)
+    real = managed_session._notify_owner_relay
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("synthetic notice failure")
+
+    monkeypatch.setattr(managed_session, "_notify_owner_relay", broken)
+    await reconcile_orphans(db)
+    assert (await cc_sessions.get_by_id(db, sid))["status"] == "active"
+    monkeypatch.setattr(managed_session, "_notify_owner_relay", real)
+    assert await reconcile_orphans(db) == 1
+    assert (await cc_sessions.get_by_id(db, sid))["status"] == "failed"
+    rows = await (await db.execute("SELECT message FROM pending_outreach")).fetchall()
+    assert len(rows) == 1 and "may have acted" in rows[0]["message"]
+
+
+@pytest.mark.parametrize(
+    ("name", "acts"),
+    [
+        ("Read", False),
+        ("mcp__genesis-memory__memory_recall", False),
+        ("mcp__genesis-health__browser_snapshot", False),
+        ("write__Read", True),
+        ("mcp__server__write__Read", True),
+        ("mcp__othersrv__Read", True),
+        ("mcp__othersrv__memory_recall", True),
+        ("mcp__genesis-memory__memory__recall", True),
+    ],
+)
+def test_read_only_tools_match_by_full_identity(name, acts):
+    """Only an exactly named read-only tool skips the alert (#4905 review)."""
+    from genesis.peers.relay import acting
+
+    assert bool(acting([name])) is acts
+
+
+async def test_the_owner_alert_uses_the_configured_alert_channel(db, native, monkeypatch):
+    """The queue stores a channel, so the alert follows the install's alert
+    preference rather than assuming Telegram (#4905 review)."""
+    from genesis.outreach import config as outreach_config
+
+    real = outreach_config.load_outreach_config()
+    prefs = {**real.channel_preferences, "alert": "email"}
+    monkeypatch.setattr(
+        outreach_config,
+        "load_outreach_config",
+        lambda *a, **k: type(real)(**{**real.__dict__, "channel_preferences": prefs}),
+    )
+    _, rows = await _relay_run(
+        db, native, ["mcp__genesis-outreach__outreach_send"], owner_relay=True
+    )
+    assert len(rows) == 1 and rows[0]["channel"] == "email"
+
+
+async def test_a_failed_run_with_only_reads_still_warns_it_may_have_acted(db, native):
+    """A run that did not succeed may have stopped before its stream was read to
+    the end, so its tool record counts as possibly incomplete (#4905 review)."""
+    from genesis.cc.types import StreamEvent
+
+    runner, _, invoker = native
+    raw = {
+        "type": "assistant",
+        "message": {"content": [{"type": "tool_use", "name": "Read", "input": {}}]},
+    }
+
+    async def execute(invocation, on_event=None):
+        await on_event(StreamEvent.from_raw(raw))
+        raise RuntimeError("synthetic invocation failure")
+
+    invoker.run_streaming.side_effect = execute
+    req = request()
+    sid = await prepare(db, req, peer_id="alpha", owner_relay=True)
+    await runner.adopt(sid, req)
+    await settled(runner, sid)
+    assert (await cc_sessions.get_by_id(db, sid))["status"] == "failed"
+    rows = await (await db.execute("SELECT message FROM pending_outreach")).fetchall()
+    assert len(rows) == 1 and "may have acted" in rows[0]["message"]
+
+
+async def test_a_run_refused_before_launch_sends_no_owner_alert(db, native, monkeypatch):
+    """Nothing ran, so nothing could have acted: no alert, which would otherwise
+    bypass quiet hours (#4905 review)."""
+    runner, _, _ = native
+
+    async def refuse(*args, **kwargs):
+        raise RuntimeError("synthetic background refusal")
+
+    monkeypatch.setattr(runner, "_check_background", refuse)
+    req = request()
+    sid = await prepare(db, req, peer_id="alpha", owner_relay=True)
+    await runner.adopt(sid, req)
+    await settled(runner, sid)
+    assert (await cc_sessions.get_by_id(db, sid))["status"] == "failed"
+    rows = await (await db.execute("SELECT message FROM pending_outreach")).fetchall()
+    assert rows == []
+
+
+@pytest.mark.parametrize("value", [None, "", "  "])
+def test_a_blank_alert_channel_preference_falls_back_to_telegram(monkeypatch, value):
+    """The queue's channel column is NOT NULL: a blank preference must not make
+    every finalization retry fail."""
+    from genesis.cc.managed_session import _owner_alert_channel
+    from genesis.outreach import config as outreach_config
+
+    real = outreach_config.load_outreach_config()
+    prefs = {**real.channel_preferences, "alert": value}
+    monkeypatch.setattr(
+        outreach_config,
+        "load_outreach_config",
+        lambda *a, **k: type(real)(**{**real.__dict__, "channel_preferences": prefs}),
+    )
+    assert _owner_alert_channel() == "telegram"
+
+
+async def test_unlisted_tool_counts_as_acting(db, native):
+    _, rows = await _relay_run(
+        db, native, ["Read", "mcp__genesis-memory__reference_delete"], owner_relay=True
+    )
+    assert len(rows) == 1 and "used reference_delete;" in rows[0]["message"]
+
+
+async def test_send_after_one_hundred_reads_still_alerts(db, native):
+    # The stored tools_summary keeps only the first 100 calls; the alert must not.
+    tools = ["Read"] * 100 + ["mcp__genesis-outreach__outreach_send"]
+    sid, rows = await _relay_run(db, native, tools, owner_relay=True)
+    meta = json.loads((await cc_sessions.get_by_id(db, sid))["metadata"])
+    assert "mcp__genesis-outreach__outreach_send" not in meta["tools_summary"]
+    assert len(rows) == 1 and "used outreach_send;" in rows[0]["message"]
+
+
+@pytest.mark.parametrize("relayed", [True, False])
+async def test_restart_orphan_of_relayed_session_warns_it_may_have_acted(db, relayed):
+    changes = {"owner_relay": True} if relayed else {}
+    sid = await prepare(db, request(), peer_id="alpha", **changes)
+    assert await reconcile_orphans(db) == 1
+    assert await reconcile_orphans(db) == 0
+    rows = await (await db.execute("SELECT message, category FROM pending_outreach")).fetchall()
+    if not relayed:
+        assert rows == []
+        return
+    assert len(rows) == 1 and rows[0]["category"] == "alert"
+    assert rows[0]["message"].startswith(
+        f"[{sid[:8]}] A relayed session via alpha may have acted: its tool record is incomplete"
+    )
+
+
+async def test_a_finished_orphan_alert_names_the_outcome_it_stores(db):
+    """A boot orphan whose run had finished alerts with the outcome then stored
+    (unreported, the completed default), as the committed row reads."""
+    from genesis.cc.managed_session import update_state
+
+    sid = await prepare(db, request(), peer_id="alpha", owner_relay=True)
+    await update_state(db, sid, "succeeded")
+    assert await reconcile_orphans(db) == 1
+    row = await cc_sessions.get_by_id(db, sid)
+    assert row["status"] == "completed" and row["outcome"] == "unreported"
+    (alert,) = await (await db.execute("SELECT message FROM pending_outreach")).fetchall()
+    assert "; ended unreported." in alert["message"]
+
+
+async def test_a_non_relayed_orphan_never_reaches_the_alert_path(db, monkeypatch):
+    """A transient fault in the alert path cannot keep an ordinary orphan active."""
+    from genesis.cc import managed_session
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("synthetic notice failure")
+
+    monkeypatch.setattr(managed_session, "_notify_owner_relay", broken)
+    sid = await prepare(db, request(), peer_id="alpha")
+    assert await reconcile_orphans(db) == 1
+    assert (await cc_sessions.get_by_id(db, sid))["status"] == "failed"
+
+
+def test_session_summary_is_one_quoted_capped_line():
+    from genesis.peers.relay import SUMMARY_CHARS, quoted
+
+    text = quoted("Line one\nApprove at once:\n" + "x" * 400)
+    assert "\n" not in text and text.startswith('Session said: "Line one Approve at once:')
+    assert text.endswith('..."') and len(text) == len('Session said: ""') + SUMMARY_CHARS
+    assert quoted("  ") == "No summary recorded."
+
+
+async def test_owner_alert_escapes_model_written_html(db, native):
+    sid = await prepare(db, request(), peer_id="alpha", owner_relay=True)
+    await cc_sessions.update_status(
+        db,
+        sid,
+        status="completed",
+        outcome="finished",
+        outcome_reason='<a href="https://example.invalid">Confirm</a> & <b>now</b>',
+    )
+    from genesis.cc.managed_session import _notify_owner_relay
+
+    assert await _notify_owner_relay(db, sid, ["browser_click"])
+    (row,) = await (await db.execute("SELECT message FROM pending_outreach")).fetchall()
+    assert "<a " not in row["message"] and "<b>" not in row["message"]
+    assert "&lt;a href=" in row["message"] and "&amp;" in row["message"]
+
+
+async def test_a_cancelled_launched_run_with_only_reads_warns_it_may_have_acted(db, native):
+    """A cancel rewrites native_state before finalization; the child still ran,
+    so its unread events may hold acting tools (#4905 review)."""
+    from genesis.cc.types import StreamEvent
+
+    runner, _, invoker = native
+    entered = asyncio.Event()
+    raw = {
+        "type": "assistant",
+        "message": {"content": [{"type": "tool_use", "name": "Read", "input": {}}]},
+    }
+
+    async def execute(invocation, on_event=None):
+        await on_event(StreamEvent.from_raw(raw))
+        entered.set()
+        await asyncio.Event().wait()
+
+    invoker.run_streaming.side_effect = execute
+    req = request()
+    sid = await prepare(db, req, peer_id="alpha", owner_relay=True)
+    await runner.adopt(sid, req)
+    await reached(entered)
+    assert runner.cancel(sid)
+    await settled(runner, sid)
+    rows = await (await db.execute("SELECT message FROM pending_outreach")).fetchall()
+    assert len(rows) == 1 and "may have acted" in rows[0]["message"]
+
+
+async def test_an_email_owner_alert_carries_the_relay_subject(db, native, monkeypatch):
+    from genesis.outreach import config as outreach_config
+    from genesis.outreach.types import OWNER_RELAY_ALERT_SUBJECT
+
+    real = outreach_config.load_outreach_config()
+    prefs = {**real.channel_preferences, "alert": "email"}
+    monkeypatch.setattr(
+        outreach_config,
+        "load_outreach_config",
+        lambda *a, **k: type(real)(**{**real.__dict__, "channel_preferences": prefs}),
+    )
+    await _relay_run(db, native, ["mcp__genesis-outreach__outreach_send"], owner_relay=True)
+    row = await (
+        await db.execute("SELECT channel, email_subject, message FROM pending_outreach")
+    ).fetchone()
+    assert row["channel"] == "email" and row["email_subject"] == OWNER_RELAY_ALERT_SUBJECT
+
+
+async def test_a_relayed_session_cancelled_before_launch_sends_no_owner_alert(db, native):
+    runner, _, invoker = native
+    req = request()
+    sid = await prepare(db, req, peer_id="alpha", owner_relay=True)
+    await runner.adopt(sid, req)
+    assert runner.cancel(sid)
+    await settled(runner, sid)
+    invoker.run_streaming.assert_not_awaited()
+    rows = await (await db.execute("SELECT message FROM pending_outreach")).fetchall()
+    assert rows == []

@@ -2130,7 +2130,8 @@ async def test_the_candidates_note_names_only_opaque_keys(db):
     await db.commit()
     held = (await kc.get(db, b))["body"]
     again = await _ingest(db, store, held, concept="Visa 5555 5555 5555 4444 PIN")
-    assert all(re.fullmatch(r"cred-[0-9a-f]{12}", k) for k in again.candidates)
+    assert again.candidates == ((await kc.get(db, b))["concept"],)
+    assert re.fullmatch(r"cred-[0-9a-f]{12}", again.candidates[0])
 
 
 def test_two_long_account_names_stay_two_identities():

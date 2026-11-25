@@ -1,0 +1,1 @@
+- **Per-model default effort for a channel.** `channels.yaml` takes `default_effort_by_model` (for example `{sonnet: high, opus: medium}` in your `channels.local.yaml`). Switching a Telegram session's model without naming an effort now picks that model's effort instead of keeping the old one; an explicit effort still wins. Empty by default, so nothing changes until you set it.

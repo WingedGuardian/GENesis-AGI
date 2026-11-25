@@ -1566,13 +1566,13 @@ class TestCheckInlineReviewFindings:
             f"an answered Minor was reported again: {after}"
         )
 
-    def test_maintainer_reply_still_clears_a_blocking_major(self, guard_module):
-        """The control in the other direction — hoisting must not lose the block."""
+    def test_a_reply_that_accepts_a_major_does_not_clear_it(self, guard_module):
+        """#4933: on a floor finding, only a verified fix or the sigil clears."""
         with self._mock(guard_module, [self._coderabbit(1, _CR_MAJOR_BODY)]):
             unanswered, _ = guard_module._check_inline_review_findings("100")
         assert unanswered, "control: an unanswered Major must block"
         answered = [
-            self._coderabbit(1, _CR_MAJOR_BODY),
+            self._coderabbit(1, _CR_MAJOR_BODY, path="src/benign.py"),
             {
                 "id": 2,
                 "reply_to": 1,
@@ -1583,8 +1583,9 @@ class TestCheckInlineReviewFindings:
             },
         ]
         with self._mock(guard_module, answered):
-            block, _ = guard_module._check_inline_review_findings("100")
-        assert not block
+            block, msg = guard_module._check_inline_review_findings("100")
+        assert block
+        assert "finding 1 (src/benign.py): no reply has a line starting 'Fixed in <sha>'" in msg
 
     def test_coderabbit_critical_blocks(self, guard_module):
         with self._mock(guard_module, [self._coderabbit(1, _CR_CRITICAL_BODY)]):
@@ -1818,13 +1819,9 @@ class TestCheckInlineReviewFindings:
             "a headerless CodeRabbit original was filed as an ordinary advisory"
         )
 
-    def test_coderabbit_major_replied_by_maintainer_does_not_block(self, guard_module):
-        """The line that turns a BLOCK into a PASS, which had no test.
-
-        A maintainer reply is a conscious acceptance and clears the finding — so
-        this branch can silence a real Major, and an untested branch that can
-        silence a Major is the one most worth locking.
-        """
+    def test_coderabbit_major_deferred_by_maintainer_still_blocks(self, guard_module):
+        """#4933: a reply moving a Major to a tracker is the measured way a floor
+        finding merged unfixed, so it no longer turns this BLOCK into a PASS."""
         with self._mock(
             guard_module,
             [
@@ -1840,7 +1837,7 @@ class TestCheckInlineReviewFindings:
             ],
         ):
             block, _ = guard_module._check_inline_review_findings("100")
-        assert not block
+        assert block
 
     def test_coderabbit_major_reply_from_non_maintainer_still_blocks(self, guard_module):
         """A drive-by reply must NOT be able to silence a Major."""
@@ -2106,8 +2103,10 @@ class TestCheckInlineReviewFindings:
             with self._mock(guard_module, [self._codex(1, _P1_BODY, path="src/genesis/a.py")]):
                 assert guard_module._check_inline_review_findings("100")[0] is True, mode
 
-    def test_replied_p1_is_acknowledged_by_maintainer(self, guard_module):
-        """A MAINTAINER reply (author_association OWNER/MEMBER/COLLABORATOR) acks a P1."""
+    def test_replied_p1_with_a_verified_fix_clears(self, guard_module, monkeypatch):
+        """A MAINTAINER reply (author_association OWNER/MEMBER/COLLABORATOR) whose cited
+        commit passes the fix test clears a P1. The test itself: test_floor_clears_on_fix."""
+        monkeypatch.setattr(guard_module._FixEvidence, "verify", lambda *_a: None)
         comments = [
             self._codex(1, _P1_BODY),
             {
