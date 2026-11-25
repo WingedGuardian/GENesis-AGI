@@ -13,6 +13,9 @@ Recovery actions in escalation order:
 7. ESCALATE          — alert user, stop automated recovery
 
 Each step: pre-alert → pre-snapshot → execute → wait → verify → post-alert.
+With recovery.live_engine on and the checkout on `live`, no action runs while
+update.lock blocks (live_drop.lock_blocks): execute() reads it before anything
+is counted, again after the snapshot, and the restart is queued under it (B2).
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ import shlex
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from genesis.guardian import live_drop
 from genesis.guardian._subprocess import run_subprocess as _run_subprocess
 from genesis.guardian.alert.base import Alert, AlertSeverity
 from genesis.guardian.alert.dispatcher import AlertDispatcher
@@ -31,6 +35,7 @@ from genesis.guardian.config import GuardianConfig
 from genesis.guardian.diagnosis import DiagnosisResult, RecoveryAction
 from genesis.guardian.health_signals import collect_all_signals
 from genesis.guardian.live_drop import (
+    _LOCK_HELD,
     HALF_DONE_DROP,
     booted_from,
     gone,
@@ -65,6 +70,29 @@ _REPAIR_LINE = (
     "journalctl --user -u genesis-server --since -15min -n 200 --no-pager -o cat"
     " | grep -F 'live-move repair:' | tail -n 1"
 )
+#: With recovery.live_engine on, the server restart is QUEUED under update.lock,
+#: atomically with "the lock is free": flock holds it only for the instant a
+#: --no-block systemctl takes, never across the start, whose boot repair takes
+#: the lock itself within its budget (scripts/lib/live_move_repair.py
+#: BOOT_BUDGET_S, 60 s). Exit 75: held. No lock dir: nothing holds it. -o: the
+#: command, and anything it starts, does not inherit the lock's fd.
+_UNDER_LOCK = (
+    'd="${{GENESIS_HOME:-$HOME/.genesis}}/locks"; [ -d "$d" ] || exec {cmd}; '
+    'exec flock -n -o -E 75 "$d/update.lock" {cmd}'
+)
+
+
+class _Held(str):
+    """An action's detail when update.lock held its restart back on `live`.
+    ``clean``: nothing ran before it was held, so it costs no attempt."""
+
+    clean = False
+
+
+def _held(text: str, clean: bool = False) -> _Held:
+    held = _Held(text)
+    held.clean = clean
+    return held
 
 
 async def _server_unit(container: str) -> dict[str, str] | None:
@@ -129,6 +157,7 @@ class RecoveryResult:
     detail: str
     duration_s: float
     deferred: bool = False  # approved, but held back by the backoff: nothing ran
+    waiting: bool = False  # held back by update.lock on `live` (B2): the episode waits
 
 
 class RecoveryEngine:
@@ -145,10 +174,16 @@ class RecoveryEngine:
         self._sm = state_machine
         self._snapshots = snapshots
         self._dispatcher = dispatcher
-        self._prior_attempt: dict | None = None  # the record a clean refusal restores
+        # What execute() changes before the action, as it was: ONE snapshot (SF6)
+        # that a clean refusal (the drop record), a lock deferral and a failed
+        # checkpoint (all of it) restore from.
+        self._before: tuple = (0, 0, None, None, None)
 
-    async def execute(self, diagnosis: DiagnosisResult) -> RecoveryResult:
-        """Execute the recommended recovery action."""
+    async def execute(
+        self, diagnosis: DiagnosisResult, *, owner_approved_unreadable: bool = False,
+    ) -> RecoveryResult:
+        """Execute the recommended recovery action. ``owner_approved_unreadable``:
+        the owner approved the frozen gate, so only a lock read HELD holds it."""
         action = diagnosis.recommended_action
         t0 = datetime.now(UTC)
 
@@ -175,12 +210,18 @@ class RecoveryEngine:
                 deferred=True,
             )
 
+        # C3 (B2): before anything is counted, alerted, snapshotted or saved.
+        approved = owner_approved_unreadable
+        kind, why = await live_drop.lock_blocks(self._config, owner_approved_unreadable=approved)
+        if kind:
+            return await self._lock_deferred(action, kind, why)
+
         # The outcome-unknown end state, on disk before anything runs (#5007): a
         # tick killed from here on wakes in RECOVERED with the attempt counted,
         # and a drop's attempt recorded, so its next tick has a next decision.
         st = self._sm.state
-        kept = (st.recovery_attempts, st.io_triage_attempts, st.last_recovery_at,
-                st.current_state, st.live_drop_attempt, self._prior_attempt)
+        self._before = (st.recovery_attempts, st.io_triage_attempts, st.last_recovery_at,
+                        st.current_state, st.live_drop_attempt)
         self._sm.record_recovery_attempt(action.value)
         self._sm.set_recovered()
         drop = self._approved_drop(diagnosis)
@@ -197,8 +238,7 @@ class RecoveryEngine:
             # No action starts without its checkpoint on disk: put it all back,
             # and clear the latch (a prompt that led nowhere), so the next
             # check decides again.
-            (st.recovery_attempts, st.io_triage_attempts, st.last_recovery_at,
-             st.current_state, st.live_drop_attempt, self._prior_attempt) = kept
+            self._restore()
             self._sm.clear_down_alert_sent()
             detail = (
                 f"the Guardian could not save its state before {action.value}; nothing was run"
@@ -237,6 +277,11 @@ class RecoveryEngine:
             )
             if snap_name:
                 logger.info("Pre-recovery snapshot: %s", snap_name)
+            # The lock again: a snapshot can take minutes (B2, Q1).
+            kind, why = await live_drop.lock_blocks(self._config, owner_approved_unreadable=approved)
+            if kind:
+                self._restore()
+                return await self._lock_deferred(action, kind, why)
 
         # Execute the action
         try:
@@ -245,6 +290,13 @@ class RecoveryEngine:
             logger.error("Recovery action %s failed: %s", action, exc, exc_info=True)
             success = False
             detail = str(exc)
+
+        if isinstance(detail, _Held):  # SF2: the tail (not_back, "Recovery failed") never runs
+            clean = detail.clean or action == RecoveryAction.RESTART_SERVICES
+            if clean:
+                self._restore()  # SF3: only where nothing ran before the hold
+            ran = "" if clean else f"The approved {action.value} step"
+            return await self._lock_deferred(action, live_drop.WAITING_ON_LOCK, detail, ran)
 
         # Counted above; the backoff runs from the action's end.
         self._sm.state.last_recovery_at = datetime.now(UTC).isoformat()
@@ -310,9 +362,8 @@ class RecoveryEngine:
         )
 
     def _mark_drop_attempt(self, drop: tuple) -> None:
-        """Record the drop as attempted before the engine call, keeping the
-        prior record for a clean refusal (#5007)."""
-        self._prior_attempt = self._sm.state.live_drop_attempt
+        """Record the drop as attempted before the engine call; a clean refusal
+        restores the prior record (#5007)."""
         branch, pinned, _held, tip = drop[:4]
         self._sm.state.live_drop_attempt = {
             "branch": branch, "pinned_head": pinned, "tip": tip,
@@ -321,9 +372,37 @@ class RecoveryEngine:
 
     def _refused(self, detail: str) -> tuple[bool, str]:
         """A clean refusal changed nothing: the prior attempt record is back."""
-        self._sm.state.live_drop_attempt = self._prior_attempt
+        self._sm.state.live_drop_attempt = self._before[4]
         self._sm.persist()
         return False, detail
+
+    def _restore(self) -> None:
+        st = self._sm.state
+        (st.recovery_attempts, st.io_triage_attempts, st.last_recovery_at,
+         st.current_state, st.live_drop_attempt) = self._before
+
+    async def _lock_deferred(
+        self, action: RecoveryAction, kind: str, why: str, ran: str = "",
+    ) -> RecoveryResult:
+        """Held back by update.lock on `live` (B2): the episode waits in
+        CONFIRMED_DEAD, saved with the latch SET (whatever #5007's checkpoint wrote),
+        so the next ticks reach the wait tick rather than a fresh diagnosis and
+        another alert. Saved before the alert is sent (NOTE 4)."""
+        self._sm.set_confirmed_dead()
+        self._sm.mark_down_alert_sent()
+        await self._mark_wait(kind, why, ran)
+        return RecoveryResult(action=action, success=False, detail=why, duration_s=0.0, waiting=True)
+
+    async def _mark_wait(self, kind: str, why: str, ran: str = "") -> None:
+        """Mark and save the wait, then send its one first alert: a held lock's
+        here; an unreadable lock's is the frozen APPROVE gate, sent by the next
+        tick (owner ruling 91998f4f), so nothing is sent now."""
+        self._sm.mark_waiting()
+        self._sm.persist()
+        if kind == live_drop.WAITING_ON_LOCK:
+            await live_drop.send_wait_alert(
+                self._sm, self._dispatcher, *live_drop.wait_alert(why, ran)
+            )
 
     def _approved_drop(self, diagnosis: DiagnosisResult | None) -> tuple | None:
         """The candidate an approved REVERT_CODE drops on `live`, only with
@@ -375,9 +454,19 @@ class RecoveryEngine:
             verb = "start" if state in ("failed", "inactive") else "restart"
             cmd, old = f"systemctl --user {verb} --no-block genesis-server", before
         if cmd:
+            run = _UNDER_LOCK.format(cmd=cmd) if self._config.recovery.live_engine else cmd
             rc, _out, stderr = await _run_subprocess(
-                "incus", "exec", container, "--", "su", "-", "ubuntu", "-c", cmd, timeout=30.0,
+                "incus", "exec", container, "--", "su", "-", "ubuntu", "-c", run, timeout=30.0,
             )
+            if run != cmd and rc == _LOCK_HELD:
+                if await container_on_live(container):
+                    return False, _held(
+                        "genesis-server was not restarted: update.lock is held on `live`. "
+                        "The Guardian diagnoses again once it is free"
+                    )
+                rc, _out, stderr = await _run_subprocess(  # off `live` the lock never holds it
+                    "incus", "exec", container, "--", "su", "-", "ubuntu", "-c", cmd, timeout=30.0,
+                )
             # A client timeout is not the result: the unit's own state decides.
             if rc != 0 and not (rc == -1 and stderr == "timeout"):
                 return False, f"systemctl {cmd.split()[2]} failed: {stderr}"
@@ -605,10 +694,10 @@ class RecoveryEngine:
         said = said or f"exit {rc}"
         name = f"the drop of {branch} ({pinned[:12]})"
         if rc == 200:
-            return self._refused(
+            return self._refused(_held(
                 f"{name} did not run: update.lock is held (a deploy, rebuild, drop or "
-                "validation hold); nothing was done"
-            )
+                "validation hold); nothing was done", clean=True,
+            ))
         if rc == 2:
             logger.error("Guardian bug: the engine refused the drop's arguments: %s", said)
             return self._refused(
@@ -617,9 +706,10 @@ class RecoveryEngine:
         if rc == 97:
             return self._refused(f"{name} did not run: the test fence refused it ({said})")
         if rc == 1 and "holds the deploy marker" in stderr:
-            return self._refused(
-                f"{name} did not run: a deploy is running (it holds the deploy marker)"
-            )
+            return self._refused(_held(
+                f"{name} did not run: a deploy is running (it holds the deploy marker)",
+                clean=True,
+            ))
         saved = "WAS saved" in stderr
         if rc == 1 and not saved:
             # An incus failure or an unexpected engine error also exits 1, so
@@ -672,6 +762,8 @@ class RecoveryEngine:
                     + (f"; {unfinished}" if unfinished else "")
                 )
         ok, why = await self._restart_services(container)
+        if isinstance(why, _Held):  # the drop ran: its attempt stays (SF3)
+            return False, _held(f"{done}; {why}")
         if ok:
             ok, why = await self._await_boot(container, tip)
         return ok, f"{done}; the Guardian restarted genesis-server: {why}"
@@ -774,6 +866,12 @@ class RecoveryEngine:
             cc_note = f"CC failure: {diagnosis.cc_failure_reason}\n"
         cname = self._config.container_name
 
+        if diagnosis.escalation in live_drop.WAITS:  # check.py's C1/C2 (B2)
+            await self._mark_wait(diagnosis.escalation, diagnosis.likely_cause)
+            return RecoveryResult(
+                action=RecoveryAction.ESCALATE, success=True,
+                detail="Waiting for update.lock", duration_s=0.0, waiting=True,
+            )
         if diagnosis.escalation == HALF_DONE_DROP:
             await self._dispatcher.send(Alert(
                 severity=AlertSeverity.EMERGENCY,

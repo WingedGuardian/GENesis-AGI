@@ -98,6 +98,12 @@ class StateData:
     # an action that ran ends in RECOVERED, whose one transition to
     # CONFIRMED_DEAD lets the next diagnosis past the down-alert latch.
     live_drop_attempt: dict | None = None
+    # On `live` with recovery.live_engine on (B2, #4841): this episode waits for
+    # update.lock. Each tick probes the lock instead of staying quiet; the wait
+    # ends with the episode. last_alert_at is written by stamp_alert alone.
+    waiting_on_update_lock: bool = False
+    waiting_since: str | None = None
+    last_alert_at: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -126,6 +132,9 @@ class StateData:
             "boot_id": self.boot_id,
             "rebooted_at": self.rebooted_at,
             "live_drop_attempt": self.live_drop_attempt,
+            "waiting_on_update_lock": self.waiting_on_update_lock,
+            "waiting_since": self.waiting_since,
+            "last_alert_at": self.last_alert_at,
         }
 
     @classmethod
@@ -160,7 +169,24 @@ class StateData:
             boot_id=str(data.get("boot_id") or ""),
             rebooted_at=data.get("rebooted_at") or None,
             live_drop_attempt=_drop_attempt(data.get("live_drop_attempt")),
+            waiting_on_update_lock=data.get("waiting_on_update_lock") is True,
+            waiting_since=_text(data.get("waiting_since")),
+            last_alert_at=_text(data.get("last_alert_at")),
         )
+
+
+def _text(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _usable(raw: str | None, now: datetime) -> datetime | None:
+    """A persisted stamp, or None when it is missing, unparseable, naive or in
+    the future: each would freeze a countdown that reads it."""
+    try:
+        when = datetime.fromisoformat(raw or "")
+    except (ValueError, TypeError):
+        return None
+    return when if when.tzinfo is not None and when <= now else None
 
 
 @dataclass(frozen=True)
@@ -270,12 +296,9 @@ class ConfirmationStateMachine:
         backoff counts down once from there; the state is saved every cycle."""
         now = datetime.now(UTC)
         raw = self._state.last_recovery_at
-        try:
-            last = datetime.fromisoformat(raw or "")
-            if last.tzinfo is not None and last <= now:
-                return last
-        except (ValueError, TypeError):
-            pass
+        last = _usable(raw, now)
+        if last is not None:
+            return last
         logger.warning("last_recovery_at %r is unusable; counting the backoff from now", raw)
         self._state.last_recovery_at = now.isoformat()
         return now
@@ -406,9 +429,12 @@ class ConfirmationStateMachine:
             # remains flaky.
             timeout_s = self._config.confirmation.confirmed_dead_timeout_s
             max_resets = self._config.confirmation.max_auto_resets
+            # Not while waiting for update.lock (B2): check.py probes the lock each
+            # tick, and a reset would re-diagnose into the same wait and alert again.
             if (
                 self._state.first_failure_at
                 and self._state.auto_reset_count < max_resets
+                and self._state.waiting_on_update_lock is not True
             ):
                 try:
                     first = datetime.fromisoformat(self._state.first_failure_at)
@@ -761,6 +787,7 @@ class ConfirmationStateMachine:
         self._state.signal_history.clear()
         self._clear_dialogue_state()
         self.clear_cc_unavailable()
+        self.end_wait()
         self._state.boot_id = current_boot_id
         self._state.rebooted_at = datetime.now(UTC).isoformat()
         return True
@@ -777,6 +804,7 @@ class ConfirmationStateMachine:
         self._state.last_recovery_at = None
         self._clear_dialogue_state()
         self.clear_cc_unavailable()
+        self.end_wait()
 
     # ── External state manipulation (called by recovery engine) ────────
 
@@ -872,8 +900,45 @@ class ConfirmationStateMachine:
         self._state.down_alert_sent = True
 
     def clear_down_alert_sent(self) -> None:
-        """Clear the down-alert flag — called by check.py on genuine recovery only."""
+        """Clear the down-alert flag — called by check.py on genuine recovery only.
+        The episode's wait on update.lock ends with it."""
         self._state.down_alert_sent = False
+        self.end_wait()
+
+    # ── the wait on update.lock (B2, #4841) ─────────────────────────────────
+
+    def mark_waiting(self) -> None:
+        """This episode waits for update.lock; a wait already running keeps its start."""
+        if not (self._state.waiting_on_update_lock is True and self._state.waiting_since):
+            self._state.waiting_since = datetime.now(UTC).isoformat()
+        self._state.waiting_on_update_lock = True
+
+    def end_wait(self) -> None:
+        self._state.waiting_on_update_lock = False
+        self._state.waiting_since = None
+
+    def stamp_alert(self) -> None:
+        """The one writer of last_alert_at: every wait alert is recorded here."""
+        self._state.last_alert_at = datetime.now(UTC).isoformat()
+
+    def realert_due(self, every_s: float) -> bool:
+        """``every_s`` since the last wait alert, or at once when this wait has
+        sent none (no stamp, or one older than the wait: an unreadable lock's
+        first alert is the next tick's gate). An unusable stamp counts as now
+        and is repaired: the next alert comes ``every_s`` later, never a storm."""
+        now = datetime.now(UTC)
+        if self._state.last_alert_at is None:
+            return True
+        last = _usable(self._state.last_alert_at, now)
+        if last is None:
+            self.stamp_alert()
+            return False
+        start = _usable(self._state.waiting_since, now)
+        return (start is not None and last < start) or (now - last).total_seconds() >= every_s
+
+    def waited_s(self) -> float | None:
+        start = _usable(self._state.waiting_since, datetime.now(UTC))
+        return None if start is None else (datetime.now(UTC) - start).total_seconds()
 
     def should_escalate(self, action: str = "") -> bool:
         """Max recovery attempts exceeded for the proposed action's OWN budget

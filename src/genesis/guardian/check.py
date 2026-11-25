@@ -1831,7 +1831,11 @@ async def _handle_confirmed_dead(
     # happens in state_machine.process() via the cheap signal probes, not here.
     # One exception: ``after_action``, the next decision after an action that
     # ran with a `live` drop attempt (#2978), so a drop's outcome never goes silent.
-    if sm.state.down_alert_sent and not after_action:
+    # B2: an episode waiting for update.lock on `live` reads the lock instead.
+    waiting = sm.state.waiting_on_update_lock is True
+    if sm.state.down_alert_sent and not after_action and not (
+        waiting and await _wait_tick(config, sm, dispatcher, recovery_engine)
+    ):
         logger.info(
             "Down alert already sent this episode — staying quiet until recovery "
             "(no re-diagnosis/re-alert)",
@@ -1904,6 +1908,99 @@ async def _handle_confirmed_dead(
                 ),
             ))
         raise
+
+
+async def _wait_tick(
+    config: GuardianConfig,
+    sm: ConfirmationStateMachine,
+    dispatcher: AlertDispatcher,
+    recovery_engine: RecoveryEngine,
+) -> bool:
+    """One tick of a wait for update.lock (B2): True reopens the episode (lock
+    free, or the container stopped) into a fresh diagnosis and both gates.
+    Held: an alert every 2 h, nothing restarted. Unreadable on a running
+    container: the frozen gate every 2 h. Flag off or off `live`: the wait
+    ends and main's quiet latch applies (SF4)."""
+    from genesis.guardian.recovery import container_on_live
+
+    cname = config.container_name
+    state, who, inode = (
+        await live_drop.lock_state(cname) if config.recovery.live_engine else ("", "", "")
+    )
+    status = await live_drop.container_status(cname) if state == live_drop.UNREADABLE else ""
+    if state == live_drop.FREE or status == "stopped":
+        logger.info("update.lock is free or the container stopped: reopening this episode")
+        sm.clear_down_alert_sent()
+        return True
+    if not state or not await container_on_live(cname):
+        sm.end_wait()
+        return False
+    if not sm.realert_due(live_drop.WAIT_REALERT_S):
+        return False
+    waited = sm.waited_s()
+    hours = f"{waited / 3600:.1f} h" if waited is not None else "an unknown time"
+    hint = await live_drop.host_hint(cname, inode)
+    if state == live_drop.UNREADABLE:
+        await _frozen_gate(config, sm, dispatcher, recovery_engine, status, hours, hint)
+        return False
+    await live_drop.send_wait_alert(
+        sm, dispatcher, f"Genesis still down — the Guardian has waited {hours} for update.lock",
+        "update.lock on `live` is held" + (f" ({who})" if who else "") + ". "
+        + (f"{hint} " if hint else "") + "The deploy scripts give up waiting for it after 2 h, so the run holding it is likely hung. The "
+        "Guardian keeps waiting and restarts nothing on its own: end that run, and it "
+        "diagnoses again at the next tick. You hear again in 2 h.",
+    )
+    return False
+
+
+async def _frozen_gate(config, sm, dispatcher, recovery_engine, status, hours, hint) -> None:
+    """The 2 h alert of a wait on an unreadable lock, as an APPROVE gate for a
+    container restart; the restart re-reads the lock first (C3)."""
+    from genesis.guardian.diagnosis import DiagnosisResult, RecoveryAction
+
+    restart = DiagnosisResult(
+        likely_cause=f"update.lock unreadable on `live` for {hours}; the owner approved a "
+        "container restart", confidence_pct=0, evidence=[],
+        recommended_action=RecoveryAction.RESTART_CONTAINER,
+    )
+    title = f"Genesis still down — update.lock unreadable for {hours}"
+    if _escalated_if_spent(sm, restart).recommended_action == RecoveryAction.ESCALATE:  # SF5
+        await live_drop.send_wait_alert(
+            sm, dispatcher, title, "The recovery budget is spent, so the Guardian cannot "
+            "restart the container: manual intervention needed. It keeps waiting.",
+        )
+        return
+    channel = _find_telegram_channel(dispatcher)
+    body = (
+        f"incus reports the container {status or 'in an unknown state'} (not stopped), and "
+        "update.lock cannot be read: the Guardian cannot tell whether a deploy is running. "
+        + (f"{hint} " if hint else "")
+        + "A restart during a deploy is healed by the boot repair, where one is installed "
+        "(#3492). Reply APPROVE "
+        "(within about 1 h) to restart the container; DENY, or no reply, keeps waiting, "
+        "and the Guardian asks again in 2 h."
+    )
+    plain = body.split(" Reply APPROVE")[0] + (
+        " The approval prompt could not be sent; the Guardian keeps waiting and tries again."
+        if channel is not None
+        else " No Telegram channel can read an approval reply; the Guardian keeps waiting."
+    )
+    gate = await live_drop.send_wait_alert(sm, dispatcher, title, body, gate=channel, plain=plain)
+    if channel is None or gate is None:
+        return
+    kw = await _wait_for_gate_keyword(config, sm, dispatcher, channel, gate, "frozen-lock gate")
+    if kw == "__RECOVERED__":
+        await channel.send_text("✅ Genesis recovered on its own — standing down, no action taken")
+        sm.process(await collect_all_signals(config))
+        sm.clear_down_alert_sent()
+    elif kw != "APPROVE":
+        await channel.send_text("Not restarted; the Guardian keeps waiting and asks again in 2 h.")
+    else:
+        result = await recovery_engine.execute(restart, owner_approved_unreadable=True)
+        if getattr(result, "deferred", False) is True:
+            await live_drop.send_wait_alert(
+                sm, dispatcher, title, f"Approved RESTART_CONTAINER did not run: {result.detail}"
+            )
 
 
 def _escalated_if_spent(sm: ConfirmationStateMachine, diagnosis: object) -> object:
@@ -2084,6 +2181,7 @@ async def _execute_recovery_with_approval(
     """
     from genesis.guardian.diagnosis import RecoveryAction
 
+    diagnosis = await live_drop.hold_for_lock(config, diagnosis)  # C1 (B2): every route
     if diagnosis.recommended_action == RecoveryAction.ESCALATE:
         # ESCALATE is not an automated action — it means "all automated
         # recovery options exhausted, alert the user." No approval gate
@@ -2238,6 +2336,8 @@ async def _execute_recovery_with_approval(
                     ),
                 )
 
+    # C2 (B2): the new proposal, after the live one is built; Gate 1 can wait for hours.
+    diagnosis = await live_drop.hold_for_lock(config, diagnosis)
     logger.info(
         "Gate-1 approved; diagnosis: %s (confidence=%d%%, action=%s, source=%s)",
         diagnosis.likely_cause, diagnosis.confidence_pct,
@@ -2258,7 +2358,9 @@ async def _execute_recovery_with_approval(
     diagnosis = _escalated_if_spent(sm, diagnosis)  # this proposal's own budget (#5007)
 
     if diagnosis.recommended_action == RecoveryAction.ESCALATE:
-        if diagnosis.escalation == live_drop.HALF_DONE_DROP:  # (#2978)
+        if diagnosis.escalation in live_drop.WAITS:
+            pass  # SF1: the escalation's wait alert is the one message (#4898 item 2)
+        elif diagnosis.escalation == live_drop.HALF_DONE_DROP:  # (#2978)
             await telegram_channel.send_text(
                 "Genesis is down and `live` still runs a candidate a drop removed from the "
                 "manifest. `scripts/deploy_candidates rebuild` finishes the drop; then "
@@ -2331,7 +2433,8 @@ async def _execute_recovery_with_approval(
         # then run it unless Genesis came back; no second diagnosis or prompt.
         await telegram_channel.send_text(
             f"Approved {action} did not run yet: {result.detail}. The Guardian waits it "
-            "out, then runs it unless Genesis is back by then."
+            "out, then runs it unless Genesis is back by then"
+            + (" and if update.lock allows." if config.recovery.live_engine else ".")
         )
         if wait_s > 0:  # 0: it ran out between execute()'s read and this one
             await asyncio.sleep(wait_s + 1)

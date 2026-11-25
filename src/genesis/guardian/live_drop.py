@@ -16,12 +16,15 @@ in full.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 from dataclasses import replace
+from html import escape
 
 from genesis.guardian._subprocess import run_subprocess as _run_subprocess
+from genesis.guardian.alert.base import Alert, AlertSeverity
 from genesis.guardian.alert.telegram import _utf16_units
 from genesis.guardian.diagnosis import DiagnosisResult, RecoveryAction
 
@@ -80,6 +83,27 @@ _IDENTITY_CAP = 3000
 
 #: DiagnosisResult.escalation: a drop saved the manifest and did not move `live`.
 HALF_DONE_DROP = "half_done_drop"
+
+# ── update.lock (B2, #4841 rework) ────────────────────────────────────────────
+
+#: The lock every deploy, rebuild, drop and validation hold takes. Exit 0 free,
+#: 75 held, anything else (incl. -1: no answer) unreadable. No lock dir: free.
+_LOCKS = 'd="${GENESIS_HOME:-$HOME/.genesis}/locks"; '
+_LOCK_PROBE = _LOCKS + '[ -d "$d" ] || exit 0; exec flock -n -E 75 "$d/update.lock" true'
+_LOCK_HELD = 75
+#: On HELD: update.lock's inode (for the host hint) and the deploy marker's pid.
+_HOLDER_CMD = (
+    _LOCKS + 'echo "inode=$(stat -c %i "$d/update.lock")"; '
+    'echo "pid=$(head -c 64 "${GENESIS_HOME:-$HOME/.genesis}/update_in_progress.pid")"'
+)
+FREE, HELD, UNREADABLE = "free", "held", "unreadable"
+#: Re-alert this often while waiting: the deploy scripts' own lock-wait ceiling
+#: (GENESIS_DEPLOY_LOCK_WAIT, 7200 s), past which the holder is likely hung.
+WAIT_REALERT_S = 7200
+WAITING_ON_LOCK = "update_lock_held"
+WAITING_ON_UNREADABLE_LOCK = "update_lock_unreadable"
+WAITS = (WAITING_ON_LOCK, WAITING_ON_UNREADABLE_LOCK)
+_HINT_TIMEOUT_S = 2.0
 
 
 def shown(value: object, cap: int = _SHOWN_CAP) -> str:
@@ -277,6 +301,122 @@ def attempt_line(attempt: dict | None) -> str:
         f"{attempt['pinned_head'][:12]}), attempted at {shown(attempt['at'], 40)}, when `live` "
         f"was at {attempt['tip'][:12]}"
     )
+
+
+async def lock_state(container: str) -> tuple[str, str, str]:
+    """(FREE | HELD | UNREADABLE, who holds it, update.lock's inode), read fresh."""
+    rc, _ = await _in_container(container, _LOCK_PROBE)
+    if rc != _LOCK_HELD:
+        return (FREE if rc == 0 else UNREADABLE), "", ""
+    _rc, lines = await _in_container(container, _HOLDER_CMD)
+    vals = dict(ln.split("=", 1) for ln in lines if "=" in ln)
+    pid, inode = vals.get("pid", "").strip(), vals.get("inode", "").strip()
+    who = f"the deploy marker names pid {pid}" if pid.isascii() and pid.isdigit() else ""
+    return HELD, who, (inode if inode.isascii() and inode.isdigit() else "")
+
+
+async def container_status(container: str) -> str:
+    """What incus reports (lower case: "stopped", "frozen", "running"), or ""
+    when `incus info` fails or times out. Read fresh, never cached: only
+    "stopped" means nothing in the container can hold update.lock."""
+    rc, stdout, _ = await _run_subprocess("incus", "info", container, timeout=30.0)
+    found = re.search(r"(?mi)^status:\s*(\w+)\s*$", stdout) if rc == 0 else None
+    return found.group(1).lower() if found else ""
+
+
+async def lock_blocks(config, *, owner_approved_unreadable: bool = False) -> tuple[str, str]:
+    """(WAITING_ON_LOCK | WAITING_ON_UNREADABLE_LOCK, why) when no recovery may
+    run now, else ("", ""): update.lock held on `live`, or unreadable there
+    while incus does not report the container stopped (unless the owner
+    approved the frozen gate). Only with recovery.live_engine on; the branch
+    is read only when the lock blocks."""
+    if not config.recovery.live_engine:
+        return "", ""
+    from genesis.guardian.recovery import container_on_live
+
+    container = config.container_name
+    state, who, _inode = await lock_state(container)
+    if state == FREE or (
+        state == UNREADABLE
+        and (owner_approved_unreadable or await container_status(container) == "stopped")
+    ):
+        return "", ""
+    if not await container_on_live(container):
+        return "", ""
+    if state == HELD:
+        return WAITING_ON_LOCK, "update.lock is held" + (f" ({who})" if who else "") + (
+            ": a deploy, rebuild, drop or validation hold is running"
+        )
+    return WAITING_ON_UNREADABLE_LOCK, (
+        "update.lock cannot be read and incus does not report the container stopped: "
+        "a deploy, rebuild, drop or validation hold may be running"
+    )
+
+
+async def hold_for_lock(config, diagnosis: DiagnosisResult) -> DiagnosisResult:
+    """C1/C2: any proposal (ESCALATE included) becomes the ESCALATE that waits
+    while lock_blocks says so; unchanged otherwise."""
+    kind, why = await lock_blocks(config)
+    if not kind:
+        return diagnosis
+    logger.warning("update.lock blocks on `live`: ESCALATE instead of %s", diagnosis.recommended_action)
+    return _escalation(
+        diagnosis, kind, f"the checkout is on `live` and {why}, and any recovery now would cut "
+        "into it. Nothing was touched; the Guardian diagnoses again once the lock is free",
+    )
+
+
+def wait_alert(why: str, ran: str = "") -> tuple[str, str]:
+    """The first alert of a wait on a HELD lock (an unreadable one's is the
+    frozen gate): its title and body. ``ran``: the approved step that already
+    ran before its restart was held (SF1)."""
+    done = (
+        f"{ran} ran; only the genesis-server restart is held."
+        if ran
+        else "Nothing was restarted or dropped."
+    )
+    return "Genesis down — waiting for a deploy to finish", (
+        f"{why}\n{done} The Guardian reads update.lock every tick and diagnoses again once "
+        "it is free (or incus reports the container stopped), asking your approval for what "
+        "it then proposes. While it waits you hear again every 2 h."
+    )
+
+
+async def send_wait_alert(sm, dispatcher, title: str, body: str, *, gate=None, plain=""):
+    """The ONE writer of a wait alert: send it, then stamp and save. With
+    ``plain`` it is an APPROVE prompt to the Telegram channel ``gate``
+    (returning its message id); a failed send goes out as the ``plain`` text,
+    asking nothing and NOT stamped, so the next tick retries (SF2). With no
+    channel at all, ``plain`` is the alert, stamped: no reply can ever be read."""
+    if plain and gate is not None:
+        sent = await gate.send_text(f"<b>{escape(title)}</b>\n{escape(body)}")
+        if sent is None:
+            await dispatcher.send(Alert(severity=AlertSeverity.EMERGENCY, title=title, body=plain))
+            return None
+    else:
+        sent = await dispatcher.send(
+            Alert(severity=AlertSeverity.EMERGENCY, title=title, body=plain or body)
+        )
+    sm.stamp_alert()
+    sm.persist()
+    return sent if plain and gate is not None else None
+
+
+async def host_hint(container: str, inode: str = "") -> str:
+    """What the host sees of update.lock's holder (cgroup_ops.lock_holders), as
+    alert text; "" when the host could not look. A hint only: never a rule."""
+    from genesis.guardian import cgroup_ops
+
+    try:
+        found = await asyncio.wait_for(
+            asyncio.to_thread(cgroup_ops.lock_holders, container, inode), _HINT_TIMEOUT_S
+        )
+    except (OSError, ValueError, TimeoutError):
+        return ""
+    if not found:
+        return "Seen from the host: none seen (a hint, not proof)."
+    named = "; ".join(f"pid {pid} ({shown(cmd, 120)})" for pid, cmd in found[:3])
+    return f"Seen from the host: {named} (a hint, not proof)."
 
 
 # ── what the owner approves at Gate 2 ────────────────────────────────────────

@@ -2889,8 +2889,9 @@ verified: 204c69c1f 2026-11-22
   itself on exit 4, on exit 1 after the manifest save when the engine's view
   shows the drop done, and on exit 5 only while the pre-drop server still
   runs. The attempt is recorded in the Guardian state, and saved to disk,
-  before the engine call (#5007); a clean refusal (200, 2, 97, the deploy
-  marker, or "nothing changed" by the engine's words or its view) puts back
+  before the engine call (#5007); a clean refusal (2, 97, or "nothing
+  changed" by the engine's words or its view; 200 and the deploy marker are
+  lock waits, below) puts back
   the record that was there before. An outcome it did not see (timeout,
   130/143, an unknown code) keeps it, and the next diagnosis names it:
   while the checkout has not settled since, nothing is proposed; once the
@@ -2902,6 +2903,45 @@ verified: 204c69c1f 2026-11-22
   escalation, at max_escalations). A container restart or rollback proposed
   while that drop may still be running says at Gate 2 that it would interrupt
   it, and an approved action held back by the backoff says it did not run.
+  **update.lock (B2, #4841 rework), also only with the flag on and the
+  checkout on `live`:** no recovery action runs while `update.lock` is held,
+  or unreadable while `incus info` does not report the container STOPPED
+  (read fresh each time; frozen or unknown is not stopped). The rule
+  (`live_drop.lock_blocks`) is read at three checkpoints: the entry of the
+  approval flow (every route; any proposal, ESCALATE included, becomes an
+  ESCALATE that waits), after the post-Gate-1 re-diagnosis and the `live`
+  proposal, and in `RecoveryEngine.execute` after the backoff check and
+  before anything is counted, alerted, snapshotted or saved (read again
+  after a pre-recovery snapshot). The server restart is queued as `flock -n
+  -o -E 75 update.lock systemctl …` (no lock dir: run it), so it never holds
+  the lock across the start, whose boot repair takes the lock itself; exit
+  75 on `live` (and the drop's exit 200 or its deploy-marker refusal) is a
+  wait too. A wait where nothing ran costs no attempt (counters, backoff stamp
+  and drop record put back); one where work ran first (a drop that changed
+  `live`, RESOURCE_CLEAR's cleanup) keeps it. A waiting episode is CONFIRMED_DEAD
+  with three persisted fields (`waiting_on_update_lock`, `waiting_since`,
+  `last_alert_at`, the last written only by `stamp_alert`), the auto-reset is
+  skipped while it waits, and each tick reads the lock instead of staying
+  latched: free, or the container stopped, reopens it into a fresh diagnosis
+  and both gates; held sends one EMERGENCY every 2 h and restarts nothing (the
+  first alert says what already ran when a drop or RESOURCE_CLEAR's clean-up
+  ran before the held restart); unreadable on a running container gets no
+  plain alert: its first message, at the next tick, and then one every 2 h, is
+  an APPROVE gate for a container restart (owner ruling 91998f4f; it names
+  what incus reports and that the boot repair, where one is installed, #3492,
+  heals a restart during a deploy; DENY or no reply keeps waiting; a spent
+  budget alerts instead). A gate that cannot be sent goes out as a plain
+  alert asking for no reply, not recorded as sent, so the next tick tries
+  again (with no Telegram channel at all, the plain alert counts). The
+  approved restart still refuses if the lock then reads held. Each wait event
+  sends one message (#4898 item 2).
+  The re-alerts carry a host-side hint (`cgroup_ops.lock_holders`: the
+  container's cgroup subtree, the `/proc/locks` FLOCK row matching
+  `update.lock`'s inode, the holder's command line; bounded at 2 s), which
+  never changes the rule. Turning the flag off, or leaving `live`, ends the
+  wait. Residual: while the lock is free, the probe and the queued restart
+  hold it for an instant, so an update.sh starting in that instant fails fast
+  with "update in progress" and can simply be re-run.
   Off, the
   behaviour above is unchanged and no candidate is read. On every install
   (#5007): each approved action, before it runs, counts its attempt and saves

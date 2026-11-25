@@ -16,6 +16,7 @@ All paths use the cgroup v2 layout: /sys/fs/cgroup/lxc.payload.{container}/
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import signal
@@ -203,6 +204,48 @@ def list_container_pids(container: str) -> list[int]:
     except (OSError, ValueError) as exc:
         logger.warning("Failed to list PIDs for %s: %s", container, exc)
         return []
+
+
+#: Read by lock_holders; a module value so a test can point it at a fake tree.
+_PROC = Path("/proc")
+#: Without update.lock's inode (a guest that cannot answer), processes whose
+#: command line names one of these are the hint.
+_DEPLOY_NAMES = ("update.sh", "deploy_code_only", "deploy_candidates", "update.lock")
+
+
+def lock_holders(container: str, inode: str = "") -> list[tuple[int, str]]:
+    """(pid, cmdline) of the container's processes the host sees holding
+    update.lock: the FLOCK rows of /proc/locks whose inode is ``inode`` and
+    whose pid is in the container's cgroup SUBTREE (its top level lists none),
+    or, with no inode, the processes naming a deploy script. Measured readable
+    by the Guardian's host user (B2). A hint for alert text, never a rule;
+    raises OSError when the host cannot read."""
+    pids: set[int] = set()
+    for procs in _cgroup_path(container).rglob("cgroup.procs"):
+        with contextlib.suppress(OSError):
+            pids.update(int(p) for p in procs.read_text().split() if p.isdigit())
+    # Inode only, not maj:min too: the measurement (B2) showed the holder's row
+    # and pid from the host, not that the container's stat reports the same
+    # device number (storage drivers and overlays can differ), and a device
+    # mismatch would hide the real holder. Pids outside the subtree are dropped.
+    if inode:
+        rows = [ln.split() for ln in (_PROC / "locks").read_text().splitlines()]
+        found = {
+            int(r[4]) for r in rows
+            if len(r) > 5 and r[1] == "FLOCK" and r[4].isdigit() and r[5].split(":")[-1] == inode
+        } & pids
+    else:
+        found = pids
+    out = []
+    for pid in sorted(found):
+        try:
+            cmd = (_PROC / str(pid) / "cmdline").read_bytes().replace(b"\0", b" ")
+        except OSError:
+            continue
+        text = cmd.decode(errors="replace").strip()
+        if inode or any(name in text for name in _DEPLOY_NAMES):
+            out.append((pid, text))
+    return out
 
 
 # Shared with the container watchdog; one sampler for both callers.

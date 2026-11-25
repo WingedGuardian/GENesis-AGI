@@ -749,3 +749,122 @@ def test_save_state_reports_whether_it_saved(tmp_path: Path) -> None:
     assert sm.save_state(tmp_path / "dir.json") is False
     sm.load_state(tmp_path / "dir.json")
     assert sm.persist() is False
+
+
+# ── B2: the persisted wait on update.lock (#4841 rework) ─────────────────────
+
+
+def _ago_iso(seconds: float) -> str:
+    return (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat()
+
+
+class TestUpdateLockWait:
+    def test_an_older_state_file_reads_as_not_waiting(self) -> None:
+        st = StateData.from_dict({})
+        assert st.waiting_on_update_lock is False
+        assert st.waiting_since is None and st.last_alert_at is None
+        # only a real true is a wait; a stamp of another type reads as none
+        st = StateData.from_dict({"waiting_on_update_lock": "yes", "waiting_since": 5})
+        assert st.waiting_on_update_lock is False and st.waiting_since is None
+
+    def test_the_wait_survives_a_guardian_restart(self, sm: ConfirmationStateMachine) -> None:
+        sm.mark_waiting()
+        sm.stamp_alert()
+        again = StateData.from_dict(json.loads(json.dumps(sm.state.to_dict())))
+        assert again.waiting_on_update_lock is True
+        assert again.waiting_since == sm.state.waiting_since
+        assert again.last_alert_at == sm.state.last_alert_at
+
+    def test_mark_waiting_keeps_the_start_of_a_running_wait(
+        self, sm: ConfirmationStateMachine
+    ) -> None:
+        sm.mark_waiting()
+        sm.state.waiting_since = start = _ago_iso(3600)
+        sm.mark_waiting()
+        assert sm.state.waiting_since == start and sm.state.waiting_on_update_lock is True
+
+    @pytest.mark.parametrize("end", ["clear_down_alert_sent", "reset", "reboot"])
+    def test_the_wait_ends_with_the_episode(self, sm: ConfirmationStateMachine, end: str) -> None:
+        sm.state.boot_id = "boot-a"
+        sm.mark_waiting()
+        if end == "clear_down_alert_sent":
+            sm.clear_down_alert_sent()
+        elif end == "reset":
+            sm._reset_to_healthy(datetime.now(UTC).isoformat())
+        else:
+            assert sm.reset_if_rebooted("boot-b") is True
+        assert sm.state.waiting_on_update_lock is False and sm.state.waiting_since is None
+
+    @pytest.mark.parametrize("hours,due", [(0, False), (1.9, False), (2.1, True), (4.2, True)])
+    def test_the_re_alert_is_due_every_2_h(
+        self, sm: ConfirmationStateMachine, hours: float, due: bool
+    ) -> None:
+        sm.mark_waiting()
+        sm.state.waiting_since = _ago_iso(hours * 3600 + 60)  # the wait began before it
+        sm.state.last_alert_at = _ago_iso(hours * 3600)
+        assert sm.realert_due(7200) is due
+
+    def test_a_wait_with_no_alert_yet_is_due_at_once(self, sm: ConfirmationStateMachine) -> None:
+        """Owner ruling 91998f4f: an unreadable wait's first alert is the frozen
+        gate, sent at the first wait tick. No stamp, or one older than the wait."""
+        sm.mark_waiting()
+        assert sm.realert_due(7200) is True
+        sm.state.last_alert_at = _ago_iso(7000)
+        sm.state.waiting_since = _ago_iso(60)
+        assert sm.realert_due(7200) is True
+
+    @pytest.mark.parametrize(
+        "stamp", ["not a time", "2026-01-01T00:00:00", "2999-01-01T00:00:00+00:00"]
+    )
+    def test_a_bad_alert_stamp_counts_as_now_and_is_repaired(
+        self, sm: ConfirmationStateMachine, stamp: str | None
+    ) -> None:
+        """Fails toward waiting: no alert storm, and the repaired stamp makes the
+        next one due 2 h from now."""
+        sm.mark_waiting()
+        sm.state.last_alert_at = stamp
+        assert sm.realert_due(7200) is False
+        repaired = datetime.fromisoformat(sm.state.last_alert_at)
+        assert abs((datetime.now(UTC) - repaired).total_seconds()) < 5
+
+    def test_the_auto_reset_is_suspended_while_waiting(
+        self, sm: ConfirmationStateMachine, config: GuardianConfig
+    ) -> None:
+        sm._state.current_state = GuardianState.CONFIRMED_DEAD
+        sm._state.first_failure_at = _ago_iso(config.confirmation.confirmed_dead_timeout_s + 60)
+        sm.mark_waiting()
+        t = sm.process(_dead_snapshot())
+        assert t.new_state == GuardianState.CONFIRMED_DEAD and t.action_needed is True
+        sm.end_wait()
+        assert sm.process(_dead_snapshot()).new_state == GuardianState.HEALTHY  # control
+
+    def test_only_stamp_alert_writes_last_alert_at(self) -> None:
+        """One alert writer: every wait alert is recorded by stamp_alert."""
+        import ast
+
+        src = Path(__file__).resolve().parents[2] / "src" / "genesis" / "guardian"
+        writers = []
+        for path in src.rglob("*.py"):
+            tree = ast.parse(path.read_text())
+            for fn in ast.walk(tree):
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for node in ast.walk(fn):
+                    targets = (
+                        node.targets if isinstance(node, ast.Assign)
+                        else [node.target] if isinstance(node, (ast.AugAssign, ast.AnnAssign))
+                        else []
+                    )
+                    hit = any(
+                        isinstance(t, ast.Attribute) and t.attr == "last_alert_at" for t in targets
+                    ) or (
+                        isinstance(node, ast.Call)
+                        and getattr(node.func, "id", "") == "setattr"
+                        and any(
+                            isinstance(a, ast.Constant) and a.value == "last_alert_at"
+                            for a in node.args
+                        )
+                    )
+                    if hit:
+                        writers.append(f"{path.name}:{fn.name}")
+        assert sorted(set(writers)) == ["state_machine.py:stamp_alert"], writers
