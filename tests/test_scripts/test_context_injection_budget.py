@@ -94,20 +94,22 @@ def test_conversation_md_ceiling():
     )
 
 
-def test_identity_core_ceiling():
+@pytest.mark.parametrize("name", ["SOUL.md", "STEERING.md"])
+def test_soul_and_steering_ceilings(name):
     # Same unit as the budget it guards — see test_conversation_md_ceiling.
-    size = sum(_ctx.utf16_len((_IDENTITY_DIR / n).read_text()) for n in ("SOUL.md", "STEERING.md"))
+    # Each rides a part of its own (soul, steering).
+    size = _ctx.utf16_len((_IDENTITY_DIR / name).read_text())
     assert size <= 9_000, (
-        f"SOUL.md + STEERING.md = {size} chars (ceiling 9,000) against the "
-        "identity-core part's 9,800-char budget. Trim before shipping — over the "
-        "harness cap the ENTIRE part is silently withheld from every session."
+        f"{name} = {size} chars (ceiling 9,000) against its part's 9,800-char "
+        "budget. Trim before shipping — over the harness cap the ENTIRE part is "
+        "silently withheld from every session."
     )
 
 
-# ── the four-entry wiring ───────────────────────────────────────────────
+# ── the five-entry wiring ───────────────────────────────────────────────
 
 
-def test_settings_wires_four_parts_in_order():
+def test_settings_wires_every_part_in_order():
     """The no-arg all-in-one being wired IS the old bug — make it unrepresentable."""
     settings = json.loads((_ROOT / ".claude" / "settings.json").read_text())
     commands = [
@@ -117,8 +119,21 @@ def test_settings_wires_four_parts_in_order():
     parts = []
     for c in ctx_cmds:
         assert "--part" in c, f"un-parted session_context wiring found: {c!r}"
-        parts.append(c.split("--part", 1)[1].strip())
-    assert parts == ["charter", "identity-core", "identity-user", "knowledge"], parts
+        args = c.split("--part", 1)[1].split()
+        # soul/steering ride the legacy part name plus --only, so a script from
+        # before the split still emits them (as identity-core) instead of a mis-wire.
+        if args[0] == "identity-core":
+            assert args[1:3] == ["--only", args[2]] and len(args) == 3, c
+            parts.append(args[2])
+        else:
+            assert len(args) == 1, c
+            assert args[0] not in _ctx._SPLIT_FROM_LEGACY, (
+                f"{c!r}: wire {args[0]} as `--part identity-core --only {args[0]}`, so a "
+                "pre-split script emits identity-core rather than a mis-wire"
+            )
+            parts.append(args[0])
+    assert parts == ["charter", "soul", "steering", "identity-user", "knowledge"], parts
+    assert tuple(parts) == _ctx._PARTS
 
 
 # ── per-part budget, real payloads, real subprocess ─────────────────────
@@ -158,7 +173,7 @@ def _run_part(part: str, home: Path, *, extra_env: dict | None = None) -> str:
 
 def test_identity_parts_fit_their_budgets_with_real_files(tmp_path):
     """The tracked identity payload, as actually emitted, fits per part."""
-    for part in ("identity-core", "identity-user"):
+    for part in ("soul", "steering", "identity-user", "identity-core"):
         out = _run_part(part, tmp_path / part)
         assert len(out) <= _ctx._PART_BUDGET, (part, len(out))
         # endswith, not a prefix `in`: a 16-char prefix check cannot see a line
@@ -168,7 +183,7 @@ def test_identity_parts_fit_their_budgets_with_real_files(tmp_path):
 
 
 def test_each_part_emits_its_audit_line(tmp_path):
-    for part in ("charter", "identity-core", "identity-user", "knowledge"):
+    for part in (*_ctx._PARTS, "identity-core"):
         out = _run_part(part, tmp_path / part)
         audit = out.rstrip("\n").splitlines()[-1]
         assert audit.startswith(f"_[ctx {part}:"), f"{part} missing its self-audit line"
@@ -213,7 +228,7 @@ def test_missing_part_fails_closed_to_charter_and_screams(tmp_path):
     sid = "11111111-2222-3333-4444-555555555555"
     r = _run_raw(tmp_path, sid=sid)
     assert "_[ctx charter:" in r.stdout
-    for other in ("identity-core", "identity-user", "knowledge"):
+    for other in ("soul", "steering", "identity-core", "identity-user", "knowledge"):
         assert f"_[ctx {other}:" not in r.stdout
     assert len(r.stdout) <= _ctx._PART_BUDGET, "a mis-wire must stay UNDER the cap"
     assert "MIS-WIRED" in r.stderr
@@ -232,7 +247,7 @@ def test_unknown_part_fails_closed_the_same_way(tmp_path):
 # ── runtime degrade for the install-local USER.md ───────────────────────
 
 
-def _direct_part(monkeypatch, capsys, identity_dir: Path, part: str) -> str:
+def _direct_part(monkeypatch, capsys, identity_dir: Path, part: str, *extra: str) -> str:
     monkeypatch.setattr(_ctx, "_IDENTITY_DIR", identity_dir)
     monkeypatch.setattr(_ctx, "_FLAG", identity_dir / "flag")
     (identity_dir / "flag").touch()
@@ -248,7 +263,7 @@ def _direct_part(monkeypatch, capsys, identity_dir: Path, part: str) -> str:
     # the repo-pulse spawn specifically, and when a second detached worker was
     # added beside it the patch silently stopped covering the path.
     monkeypatch.setattr(_ctx, "_spawn_boundary_workers", lambda *a, **k: None)
-    monkeypatch.setattr(_ctx.sys, "argv", ["x", "--part", part])
+    monkeypatch.setattr(_ctx.sys, "argv", ["x", "--part", part, *extra])
     monkeypatch.setattr(_ctx.sys, "stdin", __import__("io").StringIO("{}"))
     _ctx._OUT = None
     _ctx.main()
@@ -836,7 +851,7 @@ def test_all_with_a_live_session_payload_degrades_to_charter_and_screams(tmp_pat
     sid = "11111111-2222-3333-4444-555555555555"
     r = _run_raw(tmp_path, "--part", "all", sid=sid)
     assert "_[ctx charter:" in r.stdout
-    for other in ("identity-core", "identity-user", "knowledge"):
+    for other in ("soul", "steering", "identity-core", "identity-user", "knowledge"):
         assert f"_[ctx {other}:" not in r.stdout, f"{other} leaked into a mis-wired all"
     assert len(r.stdout) <= _ctx._PART_BUDGET
     assert "MIS-WIRED" in r.stderr
@@ -939,3 +954,55 @@ def test_steering_notice_is_reserved_at_its_real_length(monkeypatch, capsys, tmp
     assert "CUT" not in out
     assert "src/genesis/identity/STEERING.local.md directly.]_" in out
     assert _ctx.utf16_len(out) <= _ctx._PART_BUDGET
+
+
+# ── steering's own part, and the legacy identity-core part ─────────────
+
+
+def _soul_and_steering(tmp_path):
+    ident = tmp_path / "identity"
+    ident.mkdir()
+    (ident / "SOUL.md").write_text("the soul text")
+    (ident / "STEERING.md").write_text("# Steering\n\n---\n\nshipped rule")
+    (ident / "STEERING.local.md").write_text("---\n\nlocal rule\n")
+    return ident
+
+
+def test_soul_part_carries_soul_only(monkeypatch, capsys, tmp_path):
+    out = _direct_part(monkeypatch, capsys, _soul_and_steering(tmp_path), "soul")
+    assert "the soul text" in out
+    assert "shipped rule" not in out and "local rule" not in out
+
+
+def test_steering_part_carries_the_shipped_and_local_rules(monkeypatch, capsys, tmp_path):
+    out = _direct_part(monkeypatch, capsys, _soul_and_steering(tmp_path), "steering")
+    assert "shipped rule\n\n---\n\nlocal rule" in out
+    assert "the soul text" not in out
+
+
+def test_legacy_identity_core_part_still_carries_both(monkeypatch, capsys, tmp_path):
+    """A session whose hook wiring predates the split keeps its steering rules."""
+    out = _direct_part(monkeypatch, capsys, _soul_and_steering(tmp_path), "identity-core")
+    assert "the soul text" in out and "local rule" in out
+
+
+def test_all_emits_soul_and_steering_once(monkeypatch, capsys, tmp_path):
+    ident = _soul_and_steering(tmp_path)
+    monkeypatch.setattr(_ctx, "_hook_session_id_override", None, raising=False)
+    out = _direct_part(monkeypatch, capsys, ident, "all")
+    assert out.count("the soul text") == 1
+    assert out.count("local rule") == 1
+
+
+def test_the_wired_only_form_is_its_part(monkeypatch, capsys, tmp_path):
+    ident = _soul_and_steering(tmp_path)
+    out = _direct_part(monkeypatch, capsys, ident, "identity-core", "--only", "steering")
+    assert out.startswith("[genesis-ctx:steering")
+    assert "local rule" in out and "the soul text" not in out
+
+
+def test_an_unknown_only_value_is_a_miswire(monkeypatch, capsys, tmp_path):
+    ident = _soul_and_steering(tmp_path)
+    out = _direct_part(monkeypatch, capsys, ident, "identity-core", "--only", "bogus")
+    assert "MIS-WIRED" in out
+    assert "the soul text" not in out
