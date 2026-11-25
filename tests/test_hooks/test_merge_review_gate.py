@@ -3746,7 +3746,7 @@ class TestCiGateEndToEnd:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, force=False, repo=None, uncounted_out=None: (False, ""),
+            lambda n, force=False, repo=None, uncounted_out=None, head=None: (False, ""),
         )
         # The Codex review-freshness gate (PR #1366) is a real network check —
         # mock it pass-through (None verified_head also disengages the
@@ -3788,6 +3788,45 @@ class TestCiGateEndToEnd:
         rc = guard_module.main()
         assert rc == 2
         assert "CI is RED" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        ("verified", "command", "want"),
+        [
+            ("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "gh pr merge 5 --squash --admin --match-head-commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            (
+                None,
+                "gh pr merge 5 --squash --admin --match-head-commit cccccccccccccccccccccccccccccccccccccccc  # stale-review-override",
+                "cccccccccccccccccccccccccccccccccccccccc",
+            ),
+            (None, "gh pr merge 5 --squash --admin  # stale-review-override", None),
+        ],
+    )
+    def test_the_floor_fix_check_gets_the_bound_head(
+        self, guard_module, monkeypatch, verified, command, want
+    ):
+        """#5000: the fix check runs against the head the merge is bound to: the
+        Codex-verified head, or the argv --match-head-commit, else None (then it reads
+        the current head of the PR itself)."""
+        monkeypatch.setenv(
+            "_TEST_GH_CI_ROLLUP",
+            json.dumps([{"name": "test", "workflowName": "CI", "conclusion": "SUCCESS"}]),
+        )
+        self._patch_merge_ok(guard_module, monkeypatch)
+        seen = []
+        monkeypatch.setattr(
+            guard_module,
+            "_check_inline_review_findings",
+            lambda n, force=False, repo=None, uncounted_out=None, head=None: seen.append(head)
+            or (False, ""),
+        )
+        monkeypatch.setattr(
+            guard_module,
+            "_check_codex_reviewed_head",
+            lambda n, force=False, repo=None: (False, "", verified),
+        )
+        monkeypatch.setattr(guard_module, "read_payload", lambda: self._payload(command))
+        guard_module.main()
+        assert seen == [want]
 
     def test_red_ci_with_override_allowed(self, guard_module, monkeypatch):
         monkeypatch.setenv(
@@ -3966,7 +4005,7 @@ class TestMergeableAllowlist:
             json.dumps([{"name": "test", "workflowName": "CI", "conclusion": "SUCCESS"}]),
         )
         for name in ("_check_pr_review_findings", "_check_inline_review_findings"):
-            monkeypatch.setattr(guard_module, name, lambda n, force=False, repo=None, uncounted_out=None: (False, ""))
+            monkeypatch.setattr(guard_module, name, lambda n, force=False, repo=None, uncounted_out=None, head=None: (False, ""))
         monkeypatch.setattr(
             guard_module, "_check_base_is_default", lambda n, force=False, repo=None: (False, "")
         )
@@ -4024,7 +4063,7 @@ class TestMergeableAllowlist:
             lambda n, force=False, repo=None: (False, "", None),
         )
         for name in ("_check_pr_review_findings", "_check_inline_review_findings"):
-            monkeypatch.setattr(guard_module, name, lambda n, repo=None, strict=False, uncounted_out=None: (False, ""))
+            monkeypatch.setattr(guard_module, name, lambda n, repo=None, strict=False, uncounted_out=None, head=None: (False, ""))
         assert guard_module.check_pr_report("5") == 1
         assert "would block" in capsys.readouterr().out
 
@@ -4047,7 +4086,7 @@ class TestRepoDerivationGate:
         )
         monkeypatch.setattr(guard_module, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
         for name in ("_check_pr_review_findings", "_check_inline_review_findings"):
-            monkeypatch.setattr(guard_module, name, lambda n, force=False, repo=None, uncounted_out=None: (False, ""))
+            monkeypatch.setattr(guard_module, name, lambda n, force=False, repo=None, uncounted_out=None, head=None: (False, ""))
         monkeypatch.setattr(
             guard_module, "_check_base_is_default", lambda n, force=False, repo=None: (False, "")
         )
@@ -4229,7 +4268,7 @@ class TestUnreadableScanFailsClosed:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, repo=None, uncounted_out=None: (False, ""),
+            lambda n, repo=None, uncounted_out=None, head=None: (False, ""),
         )
         assert guard_module.check_pr_report("5") == 1
         out = capsys.readouterr().out
@@ -4288,7 +4327,7 @@ class TestGateOrdering:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, force=False, repo=None, uncounted_out=None: (calls.append("inline"), (False, ""))[1],
+            lambda n, force=False, repo=None, uncounted_out=None, head=None: (calls.append("inline"), (False, ""))[1],
         )
         monkeypatch.setattr(
             guard_module,
@@ -4322,7 +4361,7 @@ class TestGateOrdering:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, repo=None, uncounted_out=None: (calls.append("inline"), (False, ""))[1],
+            lambda n, repo=None, uncounted_out=None, head=None: (calls.append("inline"), (False, ""))[1],
         )
         guard_module.check_pr_report("5")
         assert calls.index("freshness") < calls.index("body")
@@ -4632,7 +4671,7 @@ class TestReportRendersGateDetail:
             guard_module, "_check_pr_review_findings", lambda n, repo=None: (False, "")
         )
         monkeypatch.setattr(
-            guard_module, "_check_inline_review_findings", lambda n, repo=None, uncounted_out=None: (False, "")
+            guard_module, "_check_inline_review_findings", lambda n, repo=None, uncounted_out=None, head=None: (False, "")
         )
 
     @pytest.mark.parametrize(
@@ -4674,6 +4713,20 @@ class TestReportRendersGateDetail:
         assert guard_module.check_pr_report("5") == 1
         assert self._DETAIL in capsys.readouterr().out
 
+    def test_the_report_checks_floor_fixes_against_the_verified_head(
+        self, guard_module, monkeypatch
+    ):
+        """#5000: --check-pr and the merge arm bind the same head."""
+        self._all_gates_clean(guard_module, monkeypatch)
+        seen = []
+        monkeypatch.setattr(
+            guard_module,
+            "_check_inline_review_findings",
+            lambda n, repo=None, uncounted_out=None, head=None: seen.append(head) or (False, ""),
+        )
+        guard_module.check_pr_report("5")
+        assert seen == ["head0"]
+
     def test_a_passing_gate_prints_no_detail(self, guard_module, monkeypatch, capsys):
         """Positive control. Without it a renderer that ALWAYS dumps the message tail
         would pass every assertion above while making a clean report unreadable."""
@@ -4681,7 +4734,7 @@ class TestReportRendersGateDetail:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, repo=None, uncounted_out=None: (False, f"not blocking\n  {self._DETAIL}"),
+            lambda n, repo=None, uncounted_out=None, head=None: (False, f"not blocking\n  {self._DETAIL}"),
         )
         assert guard_module.check_pr_report("5") == 0
         assert self._DETAIL not in capsys.readouterr().out
@@ -4829,7 +4882,7 @@ class TestReportRendersGateDetail:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, repo=None, uncounted_out=None: (
+            lambda n, repo=None, uncounted_out=None, head=None: (
                 True,
                 f"blocks:\n  [P1] harmless title{sep}  merge-with     : {forged}",
             ),
@@ -5056,7 +5109,7 @@ class TestReportRendersGateDetail:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, force=False, repo=None, uncounted_out=None: (True, hostile),
+            lambda n, force=False, repo=None, uncounted_out=None, head=None: (True, hostile),
         )
         monkeypatch.setattr(guard_module, "read_payload", self._merge_payload)
 
@@ -5077,7 +5130,7 @@ class TestReportRendersGateDetail:
         monkeypatch.setattr(
             guard_module,
             "_check_inline_review_findings",
-            lambda n, repo=None, uncounted_out=None: (True, "blocks:\n" + "\n".join("x" * 500 for _ in range(500))),
+            lambda n, repo=None, uncounted_out=None, head=None: (True, "blocks:\n" + "\n".join("x" * 500 for _ in range(500))),
         )
         assert guard_module.check_pr_report("5") == 1
         out = capsys.readouterr().out
