@@ -370,12 +370,10 @@ class Engine(Repo):
             raise Refusal(f"update.lock is held by another process; {hint}.") from exc
         self._update_lock_held = True
 
-    def _move_preflight(
-        self, need_manifest: bool, source: plan.Source, retire: bool = True
-    ) -> dict | None:
+    def _move_preflight(self, need_manifest: bool, source: plan.Source) -> dict | None:
         """Every refusal before a checkout move, in order. Returns the manifest.
-        ``retire=False``: the caller has refusals of its own still to run, and
-        retires the harmless update record itself once they have passed.
+        The harmless update record is retired later, by the move's before_write
+        (#5007): the checkout lock and the re-check under it still refuse.
         ``source`` is the command's one baseline (#3492), read once at its start:
         the branch, worktree and tracked-change refusals judge THAT read, so what
         was judged safe is exactly what every later re-check compares to, and
@@ -399,8 +397,6 @@ class Engine(Repo):
         if reasons:
             raise Refusal(reasons[0])
         plan.refuse_moved_source(self, source, "nothing changed")
-        if retire:
-            self._retire_harmless_update_state()
         return data
 
     def _expected_source(self, expect: tuple[str, str] | None) -> plan.Source:
@@ -506,26 +502,30 @@ class Engine(Repo):
                 f"written to {path}: {exc}"
             )
 
-    def _retire_harmless_update_state(self) -> None:
+    def _retire_harmless_update_state(self) -> bool:
         """Remove an update_state.json that guards nothing, before a move.
 
-        Called under update.lock once every refusal has passed, so the file is a
+        Called under update.lock as the move's before_write (under the checkout
+        lock, after its re-check; drop's just before the manifest write), once every
+        refusal that says nothing changed has passed, so the file is a
         leftover the shared rule calls safe (it sits at its rollback tag). The move
         is about to take HEAD off that tag, after which the same file would read as
         guarding merged code it never merged: keeping it would turn a harmless
         leftover into a false restart guard. A file the rule cannot clear again
-        here is left alone; a file it clears but this cannot remove refuses."""
+        here is left alone; a file it clears but this cannot remove refuses.
+        True when it removed one."""
         path = str(self.update_state)
         if (
             not os.path.lexists(path)
             or self._own_update_state()
             or self._update_state_refusal() is not None
         ):
-            return
+            return False
         try:
             os.unlink(path)
+            return True
         except FileNotFoundError:
-            return
+            return False
         except OSError as exc:
             raise Refusal(
                 f"{path} guards nothing but could not be removed before the move ({exc}); "
@@ -1006,7 +1006,7 @@ class Engine(Repo):
             return 0
         # On `live`: subtract-only, offline. Every refusal comes before the manifest
         # changes, so a drop that cannot take the code out never reports it gone.
-        self._move_preflight(need_manifest=True, source=source, retire=False)
+        self._move_preflight(need_manifest=True, source=source)
         live_base, p = self._drop_plan(branch, data)
         out(
             f"deploy_candidates drop {branch} (on the base `live` is on, {live_base[:12]}; nothing fetched)"
@@ -1020,10 +1020,13 @@ class Engine(Repo):
                 "(--expect-leaving); nothing changed."
             )
         self._refuse_blockers(p.tip, "the manifest still lists " + branch)
-        self._retire_harmless_update_state()  # every refusal above changed nothing
         saved: list[dict | None] = []
+        retired: list[bool] = []
 
         def save() -> None:  # under the checkout lock, after the move's last re-check
+            # Before the manifest write (#5007): a removal that refuses leaves the
+            # manifest as it was, never a half-drop.
+            retired.append(self._retire_harmless_update_state())
             saved.append(self.store.update(remove))
             out(f"  {branch} dropped from {self.store.path}.")
 
@@ -1031,8 +1034,14 @@ class Engine(Repo):
             moved = plan.move_checkout(self, p, source, save)
         except Refusal as exc:
             if not saved:
+                removed = (
+                    "; a harmless update_state.json leftover was removed"
+                    if any(retired)
+                    else ""
+                )
                 raise Refusal(
-                    f"{exc}\nThe manifest is unchanged: this drop wrote nothing and `live` did not move."
+                    f"{exc}\nThe manifest is unchanged: this drop wrote nothing to it and `live` "
+                    f"did not move{removed}."
                 ) from exc
             raise Refusal(
                 f"{exc}\nThe manifest change WAS saved ({branch} is no longer a candidate), but `live` still "
@@ -1307,7 +1316,8 @@ class Engine(Repo):
         p = self._attributed_plan(base, cands, rebuild_id, sticky, data)
         self._print_plan(p, sorted(gone))
         self._refuse_blockers(p.tip, "nothing was retired")
-        moved = plan.move_checkout(self, p, source)
+        # Retired under the checkout lock, past its refusals (#5007).
+        moved = plan.move_checkout(self, p, source, self._retire_harmless_update_state)
         state = f"`live` is at {moved.at[:12]}"
         if moved.files:
             self._sync_moved_hooks(state, moved.before, moved.at)

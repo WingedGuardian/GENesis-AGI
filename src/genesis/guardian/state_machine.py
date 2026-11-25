@@ -188,6 +188,7 @@ class ConfirmationStateMachine:
     def __init__(self, config: GuardianConfig) -> None:
         self._config = config
         self._state = StateData()
+        self._path: Path | None = None  # what load_state read: persist() writes there
 
     @property
     def state(self) -> StateData:
@@ -199,6 +200,7 @@ class ConfirmationStateMachine:
 
     def load_state(self, path: Path) -> None:
         """Load state from disk. Starts fresh on any error (F3)."""
+        self._path = path
         try:
             if path.exists():
                 data = json.loads(path.read_text())
@@ -210,15 +212,27 @@ class ConfirmationStateMachine:
             logger.warning("State file corrupted, starting fresh: %s", exc)
             self._state = StateData()
 
-    def save_state(self, path: Path) -> None:
-        """Persist state to disk atomically."""
-        path.parent.mkdir(parents=True, exist_ok=True)
+    def save_state(self, path: Path) -> bool:
+        """Persist state to disk atomically. True once it is on disk."""
         tmp = path.with_suffix(".tmp")
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_text(json.dumps(self._state.to_dict(), indent=2))
             tmp.replace(path)
         except OSError as exc:
             logger.error("Failed to save state: %s", exc, exc_info=True)
+            return False
+        return True
+
+    @property
+    def path(self) -> Path | None:
+        return self._path
+
+    def persist(self) -> bool:
+        """Save to the path load_state read, mid-tick (#5007): a tick killed
+        later still leaves this on disk. False when it could not be saved; no
+        path read (tests): nothing written, True."""
+        return self._path is None or self.save_state(self._path)
 
     def recovery_backoff_remaining_s(self, action: str = "") -> float:
         """Seconds remaining before next recovery attempt is allowed.
@@ -423,13 +437,9 @@ class ConfirmationStateMachine:
                 reason="awaiting recovery",
                 action_needed=True,
             )
-        elif old_state == GuardianState.RECOVERING:
-            return Transition(
-                old_state=old_state,
-                new_state=GuardianState.RECOVERING,
-                reason="recovery in progress",
-            )
-        elif old_state == GuardianState.RECOVERED:
+        elif old_state in (GuardianState.RECOVERING, GuardianState.RECOVERED):
+            # Each tick is a fresh process, so RECOVERING on disk is a killed
+            # tick's: an action whose outcome was not seen (#5007).
             return self._from_recovered(snapshot, now)
         else:
             # Unknown state — reset to healthy
@@ -865,6 +875,10 @@ class ConfirmationStateMachine:
         """Clear the down-alert flag — called by check.py on genuine recovery only."""
         self._state.down_alert_sent = False
 
-    def should_escalate(self) -> bool:
-        """Check if we've exceeded max recovery attempts."""
+    def should_escalate(self, action: str = "") -> bool:
+        """Max recovery attempts exceeded for the proposed action's OWN budget
+        (#5007), the counter execute() reads: IO_TRIAGE's, or the main one."""
+        if action == "IO_TRIAGE":
+            max_io = getattr(self._config.recovery, "max_io_triage_attempts", 5)
+            return self._state.io_triage_attempts >= max_io
         return self._state.recovery_attempts >= self._config.recovery.max_escalations

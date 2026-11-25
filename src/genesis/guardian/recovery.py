@@ -145,6 +145,7 @@ class RecoveryEngine:
         self._sm = state_machine
         self._snapshots = snapshots
         self._dispatcher = dispatcher
+        self._prior_attempt: dict | None = None  # the record a clean refusal restores
 
     async def execute(self, diagnosis: DiagnosisResult) -> RecoveryResult:
         """Execute the recommended recovery action."""
@@ -174,6 +175,45 @@ class RecoveryEngine:
                 deferred=True,
             )
 
+        # The outcome-unknown end state, on disk before anything runs (#5007): a
+        # tick killed from here on wakes in RECOVERED with the attempt counted,
+        # and a drop's attempt recorded, so its next tick has a next decision.
+        st = self._sm.state
+        kept = (st.recovery_attempts, st.io_triage_attempts, st.last_recovery_at,
+                st.current_state, st.live_drop_attempt, self._prior_attempt)
+        self._sm.record_recovery_attempt(action.value)
+        self._sm.set_recovered()
+        drop = self._approved_drop(diagnosis)
+        if drop is not None:
+            self._mark_drop_attempt(drop)
+        # The checkpoint carries the episode's alert latch CLEAR, on disk only: a
+        # tick killed during the action then gets a fresh diagnosis, as one
+        # killed before this ever did (a drop's also passes on after_action).
+        latch = st.down_alert_sent
+        st.down_alert_sent = False
+        saved = self._sm.persist()
+        st.down_alert_sent = latch
+        if not saved:
+            # No action starts without its checkpoint on disk: put it all back,
+            # and clear the latch (a prompt that led nowhere), so the next
+            # check decides again.
+            (st.recovery_attempts, st.io_triage_attempts, st.last_recovery_at,
+             st.current_state, st.live_drop_attempt, self._prior_attempt) = kept
+            self._sm.clear_down_alert_sent()
+            detail = (
+                f"the Guardian could not save its state before {action.value}; nothing was run"
+            )
+            await self._dispatcher.send(Alert(
+                severity=AlertSeverity.CRITICAL,
+                title=f"Recovery not started: {detail}",
+                body=(
+                    f"{detail}. State file: {self._sm.path} (see the Guardian log). "
+                    "The next check diagnoses and asks again."
+                ),
+                proposed_action=action.value,
+            ))
+            return RecoveryResult(action=action, success=False, detail=detail, duration_s=0.0)
+
         # Pre-recovery alert
         await self._dispatcher.send(Alert(
             severity=AlertSeverity.CRITICAL,
@@ -183,9 +223,6 @@ class RecoveryEngine:
             likely_cause=diagnosis.likely_cause,
             proposed_action=action.value,
         ))
-
-        # Mark state as recovering
-        self._sm.set_recovering()
 
         # Pre-recovery snapshot (gated on config flag and disk space)
         snap_history = self._sm.state.snapshot_size_history
@@ -209,8 +246,8 @@ class RecoveryEngine:
             success = False
             detail = str(exc)
 
-        # Record attempt timestamp for backoff tracking
-        self._sm.record_recovery_attempt(action.value)
+        # Counted above; the backoff runs from the action's end.
+        self._sm.state.last_recovery_at = datetime.now(UTC).isoformat()
 
         duration = (datetime.now(UTC) - t0).total_seconds()
         # After a drop on `live` (#2978) every outcome ends in RECOVERED: its one
@@ -271,6 +308,22 @@ class RecoveryEngine:
             detail=detail,
             duration_s=duration,
         )
+
+    def _mark_drop_attempt(self, drop: tuple) -> None:
+        """Record the drop as attempted before the engine call, keeping the
+        prior record for a clean refusal (#5007)."""
+        self._prior_attempt = self._sm.state.live_drop_attempt
+        branch, pinned, _held, tip = drop[:4]
+        self._sm.state.live_drop_attempt = {
+            "branch": branch, "pinned_head": pinned, "tip": tip,
+            "at": datetime.now(UTC).isoformat(),
+        }
+
+    def _refused(self, detail: str) -> tuple[bool, str]:
+        """A clean refusal changed nothing: the prior attempt record is back."""
+        self._sm.state.live_drop_attempt = self._prior_attempt
+        self._sm.persist()
+        return False, detail
 
     def _approved_drop(self, diagnosis: DiagnosisResult | None) -> tuple | None:
         """The candidate an approved REVERT_CODE drops on `live`, only with
@@ -534,8 +587,10 @@ class RecoveryEngine:
         `live`'s new tip. The Guardian restarts once itself only where the drop
         is shown done and no restart queued (exit 4; exit 1 after the manifest
         save with the engine's view showing it done) or the pre-drop server
-        still runs (exit 5). An outcome it could not see restarts nothing and is
-        recorded (state live_drop_attempt) for the next diagnosis."""
+        still runs (exit 5). An outcome it could not see restarts nothing and
+        keeps the attempt execute() recorded before the call (state
+        live_drop_attempt) for the next diagnosis; a clean refusal restores the
+        record that was there before (#5007)."""
         before = booted_from(await server_boot(container))
         cmd = _DROP_CMD.format(
             branch=shlex.quote(branch), tip=tip, pinned=pinned,
@@ -550,17 +605,21 @@ class RecoveryEngine:
         said = said or f"exit {rc}"
         name = f"the drop of {branch} ({pinned[:12]})"
         if rc == 200:
-            return False, (
+            return self._refused(
                 f"{name} did not run: update.lock is held (a deploy, rebuild, drop or "
                 "validation hold); nothing was done"
             )
         if rc == 2:
             logger.error("Guardian bug: the engine refused the drop's arguments: %s", said)
-            return False, f"{name} did not run: Guardian bug, the engine refused its usage ({said})"
+            return self._refused(
+                f"{name} did not run: Guardian bug, the engine refused its usage ({said})"
+            )
         if rc == 97:
-            return False, f"{name} did not run: the test fence refused it ({said})"
+            return self._refused(f"{name} did not run: the test fence refused it ({said})")
         if rc == 1 and "holds the deploy marker" in stderr:
-            return False, f"{name} did not run: a deploy is running (it holds the deploy marker)"
+            return self._refused(
+                f"{name} did not run: a deploy is running (it holds the deploy marker)"
+            )
         saved = "WAS saved" in stderr
         if rc == 1 and not saved:
             # An incus failure or an unexpected engine error also exits 1, so
@@ -578,12 +637,9 @@ class RecoveryEngine:
                     and any(r["branch"] == branch and r["head"] == pinned for r in view["listed"])
                 )
             if unchanged:
-                return False, f"{name} was refused, nothing changed ({said})"
-        # From here the drop may have changed `live`: the next diagnosis names it.
-        self._sm.state.live_drop_attempt = {
-            "branch": branch, "pinned_head": pinned, "tip": tip,
-            "at": datetime.now(UTC).isoformat(),
-        }
+                return self._refused(f"{name} was refused, nothing changed ({said})")
+        # From here the drop may have changed `live`: the attempt recorded before
+        # the call stays (execute), and the next diagnosis names it.
         notes = [shown(ln, 300) for ln in stdout.splitlines() if "NOTE:" in ln]
         if len(notes) > 3:
             notes = [*notes[:3], f"and {len(notes) - 3} more NOTE line(s)"]
