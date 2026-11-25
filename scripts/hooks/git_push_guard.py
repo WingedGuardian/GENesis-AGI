@@ -6090,13 +6090,18 @@ def _format_rounds(result: dict) -> str:
 
 
 def _rounds_row(
-    pr_num: str, repo: str | None = None, budget_out: list[dict] | None = None
+    pr_num: str,
+    repo: str | None = None,
+    budget_out: list[dict] | None = None,
+    read_out: list[dict] | None = None,
 ) -> str:
     """The ``rounds`` line of ``--check-pr``: ADVISORY, never a failure.
 
     ``budget_out``, when given, receives the evaluator's result if it is ``ok``, so
-    the no-change note and the ``terminal-head`` row read the same budget instead
-    of fetching it again.
+    the no-change note reads the same budget instead of fetching it again.
+    ``read_out`` receives whatever this row read, unreadable included, so the
+    ``terminal-head`` row judges the very read this row printed and the two never
+    disagree.
 
     The round budget is enforced where it acts (the review-request ask above, the
     commit gate, and at merge the ``terminal-head`` row, ``_check_past_terminal``,
@@ -6113,11 +6118,17 @@ def _rounds_row(
         return seam
     target = repo or _derive_repo_from_cwd(os.getcwd())
     if not target or _review_budget is None:
+        if read_out is not None:
+            read_out.append({"status": "unknown", "errors": ["no repository or evaluator"]})
         return "unreadable (no repository or evaluator)"
     try:
         result = _review_budget.evaluate_pr(target, pr_num, timeout_for=_gh_timeout)
     except Exception:  # noqa: BLE001 - an advisory row never takes the report down.
+        if read_out is not None:
+            read_out.append({"status": "unknown", "errors": ["lookup failed"]})
         return "unreadable (lookup failed)"
+    if read_out is not None:
+        read_out.append(result)
     if result.get("status") == "ok":
         import review_remaining  # noqa: PLC0415
 
@@ -18694,10 +18705,15 @@ def check_pr_report(
     # Advisory: never touches `failures` (see `_rounds_row`); the blocking half of
     # the budget is the `terminal-head` row just below.
     _budget_seen: list[dict] = []
-    print(f"rounds         : {_rounds_row(pr_num, repo, budget_out=_budget_seen)}")
+    _budget_read: list[dict] = []
+    print(
+        "rounds         : "
+        f"{_rounds_row(pr_num, repo, budget_out=_budget_seen, read_out=_budget_read)}"
+    )
     # BLOCKING, the same function the merge arm runs, judged at the head the
-    # merge-with line binds. It reuses the rounds row's budget when that read was ok.
-    _term_budget = _budget_seen[0] if _budget_seen else None
+    # merge-with line binds. It judges the rounds row's own read, unreadable
+    # included, so the two rows never show different budgets.
+    _term_budget = _budget_read[0] if _budget_read else None
     _term_head = verified_head or (_term_budget or {}).get("current_head")
     blocked, msg = _check_past_terminal(pr_num, repo, _term_head, budget=_term_budget)
     print(

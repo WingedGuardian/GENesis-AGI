@@ -639,10 +639,15 @@ def evaluate_evidence(
     legacy_times: dict[str, tuple[datetime, object]] = {}
     legacy_untimed: set[str] = set()
     confirmed: set[str] = set()  # heads the primary (or the identity) reviewed
+    # The latest TIMED confirmation of each head, so the gate lane's terminal head
+    # needs a review that came after its confirmation marker, not one before it.
+    confirmed_last: dict[str, datetime] = {}
     found: dict[str, dict[str, Any]] = {}  # round head -> what landed there
 
     def confirm(sha: str, before: bool, when: datetime | None = None, raw: object = None) -> None:
         confirmed.add(sha)
+        if when is not None and (sha not in confirmed_last or when > confirmed_last[sha]):
+            confirmed_last[sha] = when
         if before:
             legacy.add(sha)
             if when is None:
@@ -813,10 +818,13 @@ def evaluate_evidence(
         for marker in _CONFIRMATION_RE.finditer(body):
             marker_head = marker.group(1).lower()
             confirmation_heads.add(marker_head)
-            if when is None:
+            # Timed by the comment's LAST EDIT (``marked``), not its creation: an
+            # old comment edited to carry a marker must not date the marker before
+            # the review that would then seem to answer it.
+            if marked is None:
                 confirmation_untimed.add(marker_head)
-            elif marker_head not in confirmation_times or when < confirmation_times[marker_head]:
-                confirmation_times[marker_head] = when
+            elif marker_head not in confirmation_times or marked < confirmation_times[marker_head]:
+                confirmation_times[marker_head] = marked
         for index, pattern in enumerate(identities):
             for match in pattern.finditer(body):
                 resolved, error = _resolve_sha(match.group(1), commits)
@@ -861,7 +869,7 @@ def evaluate_evidence(
         if is_findings and not before:
             if sha is None:
                 return _unknown("codex_findings_comment_unbound", current_head=head)
-            confirm(sha, False)
+            confirm(sha, False, when)
             comment_id = item.get("id")
             events.append(
                 {
@@ -1032,19 +1040,24 @@ def evaluate_evidence(
     # lanes. Ordinary lane: the head of the STANDING_REVIEWED_HEAD_LIMIT-th round
     # by ``opened_at``, never by list position (the list is in commit-date order,
     # see below). Gate lane: the head of the earliest confirmation marker that is
-    # still a PR commit, else the GATE_DISCOVERY_ROUND_LIMIT-th round. A round or
-    # marker that cannot be placed (no time, or a tie) is ``unknown``: the merge
+    # still a PR commit and was reviewed after the marker, else the
+    # GATE_DISCOVERY_ROUND_LIMIT-th round. A round or marker that cannot be placed (no time, or a tie) is ``unknown``: the merge
     # gate blocks on it and never guesses.
     terminal_state, terminal_head, terminal_error = "below", None, None
     if commit_approval:
         terminal_state = "past"
         if gate_surface:
-            # Only a marker whose head the primary (or the identity) then
-            # reviewed: a marker is matched on text from any author, so a
-            # marker-only comment naming a later head must not move the
-            # terminal head onto it. An unreviewed marker falls back to the round rule.
+            # Only a marker whose head the primary (or the identity) reviewed
+            # AFTER the marker: a marker is matched on text from any author, so
+            # a marker-only comment must not move the terminal head, and a
+            # review from before the marker answers no confirmation request.
+            # Any other marker falls back to the round rule.
             terminal_head, terminal_error = _earliest_marker_head(
-                {s: t for s, t in confirmation_times.items() if s in confirmed},
+                {
+                    s: t
+                    for s, t in confirmation_times.items()
+                    if s in confirmed_last and confirmed_last[s] > t
+                },
                 {s for s in confirmation_untimed if s in confirmed},
                 order,
             )

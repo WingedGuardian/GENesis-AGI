@@ -30,7 +30,8 @@ Applies to any PR whose diff touches the enforcement-hook surface (`scripts/revi
   refused; the commit gate still asks). The round-2 merge-or-abandon decision
   (rule 4 below) is doctrine; no gate makes it. The merge gate does bind where it
   lands: past the limit an agent merges only at the lane's terminal head (the
-  earliest confirmation marker's head still in the PR, else the round-2 head by
+  earliest confirmation marker's head still in the PR that the primary reviewer reviewed after the
+  marker, else the round-2 head by
   `opened_at`), or at a head that adds only empty commits to it, and an unreadable
   budget blocks every agent merge (`git_push_guard.py` `_check_past_terminal`, the
   `terminal-head` row of `--check-pr`). Any other head is the owner's bang-command
