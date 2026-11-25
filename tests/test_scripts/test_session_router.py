@@ -24,6 +24,29 @@ def test_router_defaults_to_spec_and_names_one_type_per_session():
     assert "A board builder plans first and asks the owner to approve its plan" in text
 
 
+def test_the_owners_words_outrank_a_handoff_which_outranks_a_spec():
+    text = " ".join(ROUTER.read_text(encoding="utf-8").split())
+    order = (
+        "takes its type from, in this order: the owner's words naming a type",
+        "a handoff file's `For: <type> session` line;",
+        "a handed-over spec whose frontmatter status counts as approved",
+    )
+    at = [text.find(part) for part in order]
+    assert -1 not in at, order[at.index(-1)]
+    assert at == sorted(at)
+
+
+def test_a_saved_issue_is_not_checked_for_spec_sections():
+    router = " ".join(ROUTER.read_text(encoding="utf-8").split())
+    assert "`~/.genesis/output/specs/issue-<N>.md`" in router
+    analyze = SKILLS / "spec-session" / "references" / "spec-analyze.md"
+    text = " ".join(analyze.read_text(encoding="utf-8").split())
+    assert (
+        "A saved issue (`issue-<N>.md`) is not checked by this pass: its contract is the nine premise items."
+        in text
+    )
+
+
 def test_skip_list_counts_with_pr_shape_and_claude_md_points_to_it():
     repo = SKILLS.parents[1]
     skill = " ".join((SKILLS / "spec-session" / "SKILL.md").read_text(encoding="utf-8").split())
@@ -31,6 +54,11 @@ def test_skip_list_counts_with_pr_shape_and_claude_md_points_to_it():
         "a change of 10 or fewer counted lines, as `python3 scripts/pr_shape.py --base <base>` counts them"
         in skill
     )
+    assert (
+        "checks it again after its commit and before any push, and a change over 10 lines stops there,"
+        " with the commit unpushed, and goes to the owner." in skill
+    )
+    assert "except for the 10-line entry (checked after its commit, above)" in skill
     claude = " ".join((repo / "CLAUDE.md").read_text(encoding="utf-8").split())
     assert "write no code unless the change is on the spec skill's skip list" in claude
 

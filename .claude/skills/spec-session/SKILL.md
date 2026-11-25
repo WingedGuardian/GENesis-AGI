@@ -46,11 +46,15 @@ The skip list:
 - revert commits;
 - a change to install-local configuration only, outside the repo;
 - a change of 10 or fewer counted lines, as
-  `python3 scripts/pr_shape.py --base <base>` counts them.
+  `python3 scripts/pr_shape.py --base <base>` counts them; since that count
+  reads commits only, a session using this entry checks it again after its
+  commit and before any push, and a change over 10 lines stops there, with the
+  commit unpushed, and goes to the owner.
 
 Dependency bumps are not on it. A session using the list says which entry
-applies, and checks the staged diff against that entry again before its
-commit; a change that has outgrown the entry stops and goes to the owner.
+applies and, except for the 10-line entry (checked after its commit, above),
+checks the staged diff against that entry again before its commit; a change
+that has outgrown the entry stops and goes to the owner.
 
 ## The process
 
