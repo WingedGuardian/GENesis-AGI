@@ -120,6 +120,8 @@ Run every pass. Cite a line for every finding.
    2026-11-24: its frontmatter `updated:` date, or, only when it has no
    frontmatter date, the date in its file name. A spec with neither date counts
    as after it. Older specs were written before these sections were required.
+   A saved issue (`issue-<N>.md`) is not checked by this pass: its contract is
+   the nine premise items.
 
 **The cross-document rule.** Before reporting anything as undefined (`UND`) or
 missing from the spec (`INC`), look for it in every document you were given:
