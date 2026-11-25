@@ -11,11 +11,11 @@ from genesis.memory import graph_expansion
 from genesis.memory.activation import compute_activation
 from genesis.memory.graph import traverse as graph_traverse
 from genesis.memory.graph_telemetry import begin_tally, end_tally
+from genesis.memory.neighbour_labels import neighbour_labels
 from genesis.memory.provenance import (
     is_external,
     is_proactive_noise,
     label_result_dicts,
-    neighbour_labels,
     provenance_descriptor,
     wrap_external_recall,
 )
@@ -731,8 +731,8 @@ def _relation(link_type: str | None, depth: int) -> str:
     ``supports`` and ``extends`` are both written from one similarity score
     (``linker.py``), so they read as ``similar``; an untyped edge (the FalkorDB
     projection carries none) reads as ``linked``; a typed edge keeps its type.
-    At depth 2 the type belongs to the path's strongest edge, not to the root, so
-    it is shown as ``via <relation>``.
+    At depth 2 the type is that of the path's last edge (the one into the
+    neighbour), not of an edge at the root, so it is shown as ``via <relation>``.
     """
     if link_type in _SIMILAR_LINKS:
         relation = "similar"
@@ -743,6 +743,33 @@ def _relation(link_type: str | None, depth: int) -> str:
     return f"via {relation}" if depth >= 2 else relation
 
 
+def _expanding_identity() -> tuple[str | None, int | None, str | None]:
+    """(launch-time Claude Code session id, nearest ``claude`` ancestor pid, its start).
+
+    The id alone cannot name the conversation: a stdio child's
+    ``CLAUDE_CODE_SESSION_ID`` is a launch-time snapshot that a conversation
+    reset leaves stale, and the newest ``cc_sessions`` row for the process can
+    belong to a background agent of the same process rather than the
+    conversation the hook traces. ``cc_sessions`` maps each traced conversation
+    to its pid, so the followed-link read can join on the process; the start
+    time tells a reused pid apart. Attribution is then per process: every
+    conversation and agent of one Claude Code process counts together. Never
+    raises.
+    """
+    from genesis.caller_context import caller_context
+
+    snapshot = caller_context().transcript_id or None
+    try:
+        import os
+
+        from genesis.util.proc_io import claude_ancestor, read_proc_start_iso
+
+        pid = claude_ancestor(os.getpid())
+        return snapshot, pid, (read_proc_start_iso(pid) if pid else None)
+    except Exception:
+        return snapshot, None, None
+
+
 async def _label_neighbours(db, qdrant, results: list[dict], *, include_hidden: bool) -> None:
     """Give each neighbour a short ``label`` of its own text, in ONE pass.
 
@@ -751,7 +778,7 @@ async def _label_neighbours(db, qdrant, results: list[dict], *, include_hidden: 
     label. A neighbour that may not be shown (credential entry, external or
     unknown origin, garbage, missing) simply has no ``label`` key; if a read that
     keeps text out fails, no neighbour in the response gets one
-    (``provenance.neighbour_labels``). Never raises: labels are an enrichment.
+    (``memory.neighbour_labels``). Never raises: labels are an enrichment.
     """
     ids = [n.get("memory_id") for r in results for n in r.get("graph_neighbors") or ()]
     if not ids or qdrant is None:
@@ -907,17 +934,19 @@ async def memory_expand(
     # J-9 eval: implicit relevance signal — expanded memories are "used"
     if found_ids:
         try:
-            from genesis.caller_context import caller_context
             from genesis.eval.j9_hooks import emit_recall_used
 
-            # The expanding Claude Code session, so an expand can be joined to
-            # the hook hints that session was shown (recall traces carry the
-            # same id). None outside Claude Code.
+            # Who expanded, so the expand joins the hook hints that same Claude
+            # Code process was shown (see `_expanding_identity`). None outside
+            # Claude Code.
+            session_id, claude_pid, claude_started = _expanding_identity()
             await emit_recall_used(
                 memory_mod._db,
                 memory_ids=list(found_ids),
                 source="memory_expand",
-                session_id=caller_context().transcript_id or None,
+                session_id=session_id,
+                claude_pid=claude_pid,
+                claude_started=claude_started,
             )
         except Exception:
             logger.debug("eval: recall_used emit failed", exc_info=True)

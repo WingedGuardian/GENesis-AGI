@@ -145,3 +145,62 @@ async def test_breadcrumb_labels_skip_a_hidden_hint(db):
     assert dicts[0]["related_ids"] == ["aaaaaaaa", "bbbbbbbb"]  # the id itself stays (#5051)
     await P._breadcrumb_labels(db, dicts, _qdrant({LIVE: "live note", HIDDEN: "a superseded rule"}))
     assert dicts[0]["related_labels"] == {"aaaaaaaa": "live note"}
+
+
+async def test_the_vector_read_runs_after_the_pooled_read_is_released(db):
+    """Only the SQLite half of the label step runs on a pooled read connection."""
+    from unittest.mock import AsyncMock, patch
+
+    state = {"inside": False, "routed": [], "read_inside": None}
+
+    def retrieve(collection_name, ids, with_payload):
+        state["read_inside"] = state["inside"]
+        return [SimpleNamespace(id=i, payload={"content": "live note"}) for i in ids if i == LIVE]
+
+    class _Retriever:
+        _db = db
+        _qdrant = SimpleNamespace(retrieve=retrieve)
+
+        async def _embed_query(self, _q):
+            return ([0.1] * 8, True)
+
+        async def _ro_read(self, fn, *args, **kwargs):
+            state["routed"].append(fn.__name__)
+            state["inside"] = True
+            try:
+                return await fn(self._db, *args, **kwargs)
+            finally:
+                state["inside"] = False
+
+    class _Mod:
+        _retriever = _Retriever()
+        _db = db
+
+        @staticmethod
+        def _require_init():
+            return None
+
+    delivered = [
+        {
+            "memory_id": SEED,
+            "content": "a delivered memory",
+            "collection": "episodic_memory",
+            "memory_class": "fact",
+            "origin_class": None,
+            "source_pipeline": None,
+            "score": 0.1,
+            "payload": {},
+            "via_graph": False,
+        }
+    ]
+    with (
+        patch("genesis.mcp.memory.core._memory_mod", return_value=_Mod()),
+        patch("genesis.mcp.memory.core._proactive_impl", new=AsyncMock(return_value=delivered)),
+        patch.object(P, "_surface_procedure", new=AsyncMock(return_value=None)),
+    ):
+        resp = await P.proactive_context(prompt="what did we decide", session_id="s")
+
+    assert resp["status"] == "ok"
+    assert state["routed"] == ["_enrich", "_breadcrumbs", "_breadcrumb_label_plan"]
+    assert state["read_inside"] is False, "the vector read ran while a pooled slot was held"
+    assert "→ id:aaaaaaaa (live note)" in resp["lines"][0]

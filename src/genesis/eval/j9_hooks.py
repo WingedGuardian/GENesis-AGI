@@ -314,14 +314,18 @@ async def emit_recall_used(
     memory_ids: list[str],
     source: str = "memory_expand",
     session_id: str | None = None,
+    claude_pid: int | None = None,
+    claude_started: str | None = None,
 ) -> None:
     """Log that specific memories were accessed/used downstream.
 
     This provides the implicit relevance signal that
     _compute_memory_quality() in j9_aggregator expects from
     'recall_used' events. ``session_id`` is stored as given (no fallback
-    chain): ``memory_expand`` passes the Claude Code transcript id so an
-    expand joins the hook hints that same session was shown.
+    chain); ``claude_pid`` and ``claude_started`` (the expanding Claude Code
+    process and its start time, which tells a reused pid apart) go in the
+    metrics, so an expand can be joined to the hook hints that process was shown
+    through ``cc_sessions.pid`` even after a conversation reset.
     """
     try:
         await j9_eval.insert_event(
@@ -333,6 +337,8 @@ async def emit_recall_used(
                 "source": source,
                 "used": True,
                 "count": len(memory_ids),
+                **({"claude_pid": claude_pid} if claude_pid else {}),
+                **({"claude_started": claude_started} if claude_pid and claude_started else {}),
             },
             session_id=session_id,
         )

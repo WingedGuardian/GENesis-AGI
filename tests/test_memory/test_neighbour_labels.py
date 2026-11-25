@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import aiosqlite
 import pytest
 
-from genesis.memory.provenance import label_text, neighbour_labels
+from genesis.memory.neighbour_labels import label_text, neighbour_labels
 
 FAKE_SECRET = "fakeLabelSecret-Zq9x"
 

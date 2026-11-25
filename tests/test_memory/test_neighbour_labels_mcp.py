@@ -180,7 +180,9 @@ async def test_an_expand_records_the_expanding_session(mcp_state, monkeypatch):
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "fake-transcript-0001")
     seen = {}
 
-    async def _emit(db, *, memory_ids, source, session_id=None):
+    async def _emit(
+        db, *, memory_ids, source, session_id=None, claude_pid=None, claude_started=None
+    ):
         seen.update(ids=memory_ids, source=source, session_id=session_id)
 
     monkeypatch.setattr(j9_hooks, "emit_recall_used", _emit)
@@ -199,3 +201,66 @@ async def test_recall_used_event_carries_its_session_id(db):
     await emit_recall_used(db, memory_ids=[ROOT], source="memory_expand")
     rows = await db.execute_fetchall("SELECT session_id FROM eval_events ORDER BY rowid")
     assert [r[0] for r in rows] == ["t-1", None]
+
+
+# ── the expanding process is recorded for the join ────────────────────────
+
+
+async def test_an_expand_records_its_claude_process(mcp_state, monkeypatch):
+    from genesis.eval import j9_hooks
+    from genesis.mcp.memory import core as core_mod
+    from genesis.util import proc_io
+
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "launch-time-id")
+    monkeypatch.setattr(proc_io, "claude_ancestor", lambda _pid: 4242)
+    monkeypatch.setattr(proc_io, "read_proc_start_iso", lambda _pid: "2026-11-25T10:00:00+00:00")
+    seen = {}
+
+    async def _emit(
+        db, *, memory_ids, source, session_id=None, claude_pid=None, claude_started=None
+    ):
+        seen.update(session_id=session_id, claude_pid=claude_pid, claude_started=claude_started)
+
+    monkeypatch.setattr(j9_hooks, "emit_recall_used", _emit)
+    await core_mod.memory_expand(memory_ids=[ROOT])
+    assert seen == {
+        "session_id": "launch-time-id",
+        "claude_pid": 4242,
+        "claude_started": "2026-11-25T10:00:00+00:00",
+    }
+
+
+async def test_no_claude_ancestor_records_no_pid(monkeypatch):
+    from genesis.mcp.memory.core import _expanding_identity
+    from genesis.util import proc_io
+
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "launch-time-id")
+    monkeypatch.setattr(proc_io, "claude_ancestor", lambda _pid: None)
+    assert _expanding_identity() == ("launch-time-id", None, None)
+
+    def boom(_pid):
+        raise OSError("no /proc")
+
+    monkeypatch.setattr(proc_io, "claude_ancestor", boom)
+    assert _expanding_identity() == ("launch-time-id", None, None)
+
+
+async def test_recall_used_metrics_carry_the_claude_pid(db):
+    import json
+
+    from genesis.eval.j9_hooks import emit_recall_used
+
+    await db.execute(
+        "CREATE TABLE eval_events (id TEXT PRIMARY KEY, timestamp TEXT, dimension TEXT, "
+        "event_type TEXT, subject_id TEXT, session_id TEXT, metrics_json TEXT, created_at TEXT)"
+    )
+    await emit_recall_used(
+        db, memory_ids=[ROOT], session_id="t", claude_pid=4242, claude_started="s0"
+    )
+    await emit_recall_used(db, memory_ids=[ROOT], session_id="t")
+    rows = await db.execute_fetchall("SELECT metrics_json FROM eval_events ORDER BY rowid")
+    got = [json.loads(r[0]) for r in rows]
+    assert [(m.get("claude_pid"), m.get("claude_started")) for m in got] == [
+        (4242, "s0"),
+        (None, None),
+    ]
