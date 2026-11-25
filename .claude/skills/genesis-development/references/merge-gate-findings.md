@@ -175,6 +175,63 @@
    approvals are decisions rather than sigils and are deliberately not written as
    reusable receipts.
 
+## Merge receipt
+
+   The override log is local to one install. The **receipt** (#5027) is the
+   public record: the merge arm appends `Gate-*` lines to the squash body file at
+   allow time, in the same final paragraph as `Squashed-From`, so they land as
+   trailers in the squash commit on main and `git log --format=%(trailers)` reads
+   them on any clone.
+
+   | Trailer | Grammar | Meaning |
+   |---|---|---|
+   | `Gate-verdict` | `MERGEABLE` \| `OVERRIDDEN` | `OVERRIDDEN` when any row was waived; a sigil that waived nothing (CI already green) leaves `MERGEABLE` |
+   | `Gate-rows` | `<row>=ok\|waived\|unverified …` | the arm's blocking rows, in order (`_RECEIPT_ROWS`); `unverified` = passed without being judged (a fail-open read: CI `unknown`/`absent`, an unreadable rework contract) |
+   | `Gate-sigils` | `none` \| `<sigil>=<waived>,…` | each noted sigil with the override log's `waived` value |
+   | `Gate-stand-in` | `<login>[,…]@<head12>` | the substitute reviewer(s), when used |
+   | `Gate-session` | 8 hex | the merging session (`prepare-commit-msg`'s order, then the hook payload) |
+   | `Gate-install` | 8 hex | the install id, the same prefix the `Install:` commit trailer carries |
+   | `Gate-incomplete` | field names | a value that failed its grammar and was dropped, never written raw |
+
+   A row is `waived` when a sigil was in force for it. For `ci`, a substitute on
+   `codex-at-head`, and `floor-accept` on `inline-findings`, the gate records
+   whether the waiver was USED (`ci:red`, `codex-freshness:used`,
+   `floor-findings:used:…`), and only a used waiver counts. The other sigils
+   (`stale-review-override`, `review-override`, `scheduled-review-override`,
+   `rework-override`) waive their rows whenever present, so they always make the
+   verdict `OVERRIDDEN`. Every grammar is closed (`gh_merge.RECEIPT_GRAMMAR`), so no
+   path, hostname or message can reach a public commit. A field whose value is
+   unknown (no install id, no session id) is named in `Gate-incomplete`, so its
+   absence is visible.
+
+   **Read it with `git log --format=%(trailers)`**, which reads the commit's final
+   trailer block, the one the gate writes. `git interpret-trailers --parse` splits
+   on a `---` line and can land on an earlier block. A PR body holding a line in a
+   receipt trailer's form (`Squashed-From:`, `Genesis-Session:`, `Gate-*:`) is
+   refused at merge, so the PR text cannot pose as one.
+
+   **A receipt is a record, not a signature.** Nothing authenticates it. A merge
+   outside the gate (the web UI, another harness) can carry receipt-shaped lines
+   in its commit message. So "no receipt" reliably means "not through this gate",
+   while "has a receipt" means the gate wrote it only for a squash made through
+   it.
+
+   The arm requires `--body-file` wherever this install can write one. Without the
+   file the receipt has nowhere to go, and "no receipt" has to mean "not through
+   the gate". Whether one can be written is judged on the directory as SPELLED
+   (`~/tmp/merge-bodies`), never its symlink target or its permissions. A
+   directory someone made group-writable, or linked elsewhere, therefore fails the
+   merge on the body file, with the reason, and never lifts the requirement. The one exception is an
+   install whose home path a shell would rewrite, which can hold no body file; the
+   merge runs there without a receipt.
+
+   A file holding the body plus exactly one valid receipt is accepted (an earlier
+   attempt that another PreToolUse hook stopped). The arm strips that receipt at
+   the argv stage, before any network gate, so a hook killed during the slow gates
+   leaves `gh` the bare body and never an earlier decision. The gate's own receipt is written
+   last, after every check and a strict re-read. Any other extra text is refused.
+   A merge commit with no `Gate-*` trailers is a finding for the next audit.
+
 ## Scheduled-review inventory
 
   Why an inventory and not a diagnosis: the previous shape picked one cause per kind and

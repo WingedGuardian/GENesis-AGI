@@ -112,7 +112,7 @@ git commit -F <msg-file>                          # bare, not piped (see below)
 git push -u origin HEAD && gh pr create --title "..." --body-file <file>   # first push: ONE command (approve the dialog); needs a finished reviewer of this branch in this session (build-session, "a PR opens only after an independent review")
 gh pr comment <N> --body "@codex review"          # after EVERY subsequent push
 python3 scripts/hooks/git_push_guard.py --check-pr <N>
-gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --check-pr
+gh pr merge <N> --squash --admin --match-head-commit <head> --body-file <path>   # verbatim from --check-pr (the file carries the merge receipt)
 ```
 
 **Ordering and lifetime rules that are not obvious:**

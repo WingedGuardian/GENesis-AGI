@@ -439,6 +439,9 @@ def api_merge_reason(
 MERGE_BODY_MAX_BYTES = 512 * 1024
 #: Either case: prepare-commit-msg stamps the id's leading hex as it found it.
 _SESSION_TRAILER = re.compile(r"^Genesis-Session: ([0-9a-fA-F]{8})$")
+#: Lines only the gate writes into a squash body (#5027): a PR body holding one
+#: could pass for a receipt to a reader that splits on the last such block.
+_RESERVED_TRAILER = re.compile(r"(?mi)^\s*(Squashed-From|Genesis-Session|Gate-[a-z-]+)\s*:")
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _NAME_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 _SHELL_INERT_PATH = re.compile(r"[A-Za-z0-9._/-]+")
@@ -470,6 +473,12 @@ def compose_squash_body(pr_body: str | None, head: str, messages: list[str | Non
     if not _FULL_SHA.match(head or ""):
         raise ValueError("head must be a full lowercase 40-hex sha")
     body = (pr_body or "").replace("\r\n", "\n").rstrip()
+    if _RESERVED_TRAILER.search(body):
+        raise ValueError(
+            "the PR body carries a line in the form of a merge-receipt trailer "
+            "(Squashed-From:, Genesis-Session: or Gate-*:); remove or reword it, since "
+            "only the gate may write those into a squash commit"
+        )
     sessions: list[str] = []
     for message in messages:
         paragraphs = [p for p in (message or "").replace("\r\n", "\n").split("\n\n") if p.strip()]
@@ -479,6 +488,112 @@ def compose_squash_body(pr_body: str | None, head: str, messages: list[str | Non
                 sessions.append(m.group(1).lower())
     trailers = "\n".join([f"Squashed-From: {head}"] + [f"Genesis-Session: {s}" for s in sessions])
     return (body + "\n\n" if body else "") + trailers + "\n"
+
+
+#: The merge receipt (#5027): ``Gate-*`` trailer lines the merge arm appends to
+#: the squash body at allow time, in the same final paragraph as ``Squashed-From``,
+#: so the decision lands in the squash commit on main with no extra API call.
+#: Every value is checked against a CLOSED grammar before it is written, so no
+#: free text (a path, a hostname, a message) can ride into a public commit.
+RECEIPT_GRAMMAR: dict[str, re.Pattern] = {
+    "Gate-verdict": re.compile(r"MERGEABLE|OVERRIDDEN"),
+    "Gate-rows": re.compile(
+        r"[a-z][a-z-]{0,31}=(ok|waived|unverified)( [a-z][a-z-]{0,31}=(ok|waived|unverified)){0,31}"
+    ),
+    "Gate-sigils": re.compile(
+        r"none|[a-z][a-z-]{0,31}=[a-z][a-z0-9:+-]{0,63}(,[a-z][a-z-]{0,31}=[a-z][a-z0-9:+-]{0,63}){0,15}"
+    ),
+    "Gate-stand-in": re.compile(
+        r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(\[bot\])?(,[A-Za-z0-9][A-Za-z0-9-]{0,38}(\[bot\])?){0,7}@[0-9a-f]{12}"
+    ),
+    "Gate-session": re.compile(r"[0-9a-f]{8}"),
+    "Gate-install": re.compile(r"[0-9a-f]{8}"),
+    "Gate-incomplete": re.compile(r"[A-Za-z-]{1,32}(,[A-Za-z-]{1,32}){0,7}"),
+}
+_RECEIPT_ORDER = tuple(RECEIPT_GRAMMAR)
+
+
+def compose_receipt(fields: dict[str, str | None]) -> str:
+    """The receipt's lines, in a fixed order. A field whose value fails its
+    grammar is dropped and named in ``Gate-incomplete`` rather than written raw;
+    a field given as None (unknown) is simply absent."""
+    lines: list[str] = []
+    bad: list[str] = []
+    for key in _RECEIPT_ORDER:
+        if key == "Gate-incomplete" or key not in fields:
+            continue
+        if fields[key] is None:
+            bad.append(key)  # unknown: named, so an absence is visible
+            continue
+        value = str(fields[key])
+        if RECEIPT_GRAMMAR[key].fullmatch(value):
+            lines.append(f"{key}: {value}")
+        else:
+            bad.append(key)
+    if bad:
+        lines.append("Gate-incomplete: " + ",".join(bad))
+    return "\n".join(lines)
+
+
+def with_receipt(body: str, receipt: str) -> str:
+    """``body`` (a :func:`compose_squash_body` result) with the receipt lines
+    joined to its trailer paragraph."""
+    return body.rstrip("\n") + "\n" + receipt + "\n" if receipt else body
+
+
+def strip_receipt(text: str) -> str:
+    """``text`` without a trailing receipt block: the last lines, from the first
+    ``Gate-*`` line on, when every one of them parses under the grammar. Local and
+    network-free, so the merge arm can clear an earlier attempt's receipt before
+    any slow gate runs. Anything else is returned unchanged for the full check
+    to judge."""
+    lines = text.rstrip("\n").split("\n")
+    i = len(lines)
+    while i > 0 and lines[i - 1].startswith("Gate-"):
+        i -= 1
+    tail = lines[i:]
+    if not tail or i == 0:
+        return text
+    for line in tail:
+        key, sep, value = line.partition(": ")
+        if not sep or key not in RECEIPT_GRAMMAR or not RECEIPT_GRAMMAR[key].fullmatch(value):
+            return text
+    return "\n".join(lines[:i]) + "\n"
+
+
+def matches_with_receipt(text: str, expected: str) -> bool:
+    """True when ``text`` is ``expected`` alone, or ``expected`` plus exactly one
+    receipt block every line of which parses under :data:`RECEIPT_GRAMMAR`: the
+    file as an earlier attempt of this same merge left it when another hook
+    stopped the command after this gate allowed it."""
+    if text == expected:
+        return True
+    head = expected.rstrip("\n") + "\n"
+    if not text.startswith(head) or not text.endswith("\n"):
+        return False
+    lines = text[len(head) :].rstrip("\n").split("\n")
+    seen: set[str] = set()
+    for line in lines:
+        key, sep, value = line.partition(": ")
+        if (
+            not sep
+            or key not in RECEIPT_GRAMMAR
+            or key in seen
+            or not RECEIPT_GRAMMAR[key].fullmatch(value)
+        ):
+            return False
+        seen.add(key)
+    return True
+
+
+def receipt_dir_is_shell_inert() -> bool:
+    """Whether this install's body directory, as SPELLED (``~/tmp/merge-bodies``,
+    not its symlink target), is made of shell-inert characters. Judged on the
+    spelling so no symlink or chmod can turn the receipt requirement off: a
+    resolved target that is not inert then fails the merge on the body file
+    instead (#5027)."""
+    spelled = os.path.join(os.path.expanduser("~"), "tmp", "merge-bodies")
+    return os.path.isabs(spelled) and bool(_SHELL_INERT_PATH.fullmatch(spelled))
 
 
 def body_file_path_problem(path: str) -> str | None:
