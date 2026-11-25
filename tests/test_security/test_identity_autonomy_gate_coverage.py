@@ -122,11 +122,18 @@ IDENTITY_GATE_SITES: dict[str, tuple[str, str | None, str]] = {
 # Identity-file writers OUTSIDE loader.py that a loader-scoped sweep cannot
 # see — pinned manually (the gate-4 _EXTRA_WRAPPED_SITES pattern).
 IDENTITY_EXTRA_SITES: dict[str, tuple[str, str | None, str]] = {
-    "dashboard/routes/config.py::_save_layer": (
+    "dashboard/_identity_layer.py::save_layer": (
         "exempt-with-reason",
         None,
         "owner-direct edit surface (HTTP-auth'd dashboard PUT of CONVERSATION/"
-        "STEERING into their <stem>.local.md) — owner origin by construction",
+        "STEERING into their <stem>.local.md, from either editor) — owner origin "
+        "by construction",
+    ),
+    "dashboard/routes/files.py::file_write": (
+        "exempt-with-reason",
+        None,
+        "owner-direct edit surface (HTTP-auth'd dashboard file editor); its "
+        "CONVERSATION/STEERING saves route through save_layer",
     ),
     "dashboard/routes/config.py::config_file_update": (
         "exempt-with-reason",
@@ -209,15 +216,17 @@ def test_identity_gated_sites_actually_emit():
 
 
 def test_dashboard_identity_writer_still_exists():
-    """The manual pin must track reality: the dashboard PUT writer's enclosing
-    function must still exist (rename/removal updates the registry)."""
-    tree = _parse(_SRC / "dashboard" / "routes" / "config.py")
-    assert tree is not None
-    names = {name for _, _, name in _funcs(tree)}
-    assert "config_file_update" in names, (
-        "dashboard/routes/config.py::config_file_update not found — update "
-        "IDENTITY_EXTRA_SITES to the new identity-file write surface"
-    )
+    """The manual pin must track reality: every pinned writer's function must
+    still exist (a rename or removal updates the registry)."""
+    for key in IDENTITY_EXTRA_SITES:
+        rel, func = key.split("::")
+        tree = _parse(_SRC / rel)
+        assert tree is not None, f"{rel} missing or unparseable"
+        names = {name for _, _, name in _funcs(tree)}
+        assert func in names, (
+            f"{key} not found — update IDENTITY_EXTRA_SITES to the new "
+            "identity-file write surface"
+        )
 
 
 # ═══════════════════════════════ GATE 3 — autonomy ══════════════════════════

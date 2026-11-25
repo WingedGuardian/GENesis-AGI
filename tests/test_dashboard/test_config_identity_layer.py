@@ -105,7 +105,7 @@ def test_a_stale_save_is_refused_and_keeps_the_captured_rule(cfg):
 def test_a_save_without_a_version_is_refused(cfg):
     client, _ = cfg
     resp = client.put("/api/genesis/config-files/STEERING.md", json={"content": "x\n"})
-    assert resp.status_code == 409
+    assert resp.status_code == 400
 
 
 def test_the_local_file_cannot_be_written_directly(cfg):

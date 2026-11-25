@@ -285,6 +285,10 @@ names, so an overlay of a read-only file is editable (#2446).
   into `<stem>.local.md` (an append layer when the edit only adds after the
   shipped text, otherwise a replace layer), under the same directory lock as the
   steering writer; a save made against an older version of the text is refused.
+  The generic file browser (`dashboard/routes/files.py`) does the same for those
+  two files in the server's own identity directory, refuses a direct write,
+  create or rename of a `.local.md` there, and saves any other tracked file of a
+  main checkout with a warning that the deploy will refuse the dirty tree.
 - **Claude Code** — `.claude/settings.json` (tracked, hook wiring, ships to every clone);
   `.claude/settings.local.json` (gitignored); `~/.claude/settings.json` (user level;
   `scripts/setup_claude_config.py --global` applies `config/cc-global-settings.yaml`, and
