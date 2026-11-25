@@ -644,9 +644,22 @@ def evaluate_evidence(
     confirmed_last: dict[str, datetime] = {}
     found: dict[str, dict[str, Any]] = {}  # round head -> what landed there
 
-    def confirm(sha: str, before: bool, when: datetime | None = None, raw: object = None) -> None:
+    def confirm(
+        sha: str,
+        before: bool,
+        when: datetime | None = None,
+        raw: object = None,
+        *,
+        answers: bool = True,
+    ) -> None:
+        """``answers`` False: the record counts as before, but is no review that
+        could answer a confirmation request (a thread-reply wrapper)."""
         confirmed.add(sha)
-        if when is not None and (sha not in confirmed_last or when > confirmed_last[sha]):
+        if (
+            answers
+            and when is not None
+            and (sha not in confirmed_last or when > confirmed_last[sha])
+        ):
             confirmed_last[sha] = when
         if before:
             legacy.add(sha)
@@ -725,28 +738,30 @@ def evaluate_evidence(
         if sha is None:
             return _unknown("malformed_review_head", current_head=head)
         before = when is None or when < cut
+        raw_tops, raw_body = item.get("top_level"), item.get("body")
+        # A review record with no body and no top-level comment is the
+        # wrapper GitHub makes for a reply inside a thread: nobody reviewed
+        # the head it names, so it marks nothing.
+        # A row with no comment list at all reads the same way: marking less
+        # can only make the count larger. Only a COMMENTED review (or one
+        # whose state is missing or unknown) can be a wrapper: an approval,
+        # a change request or a dismissed review with no text is still a
+        # review of the head.
+        reply_only = (
+            item.get("state") not in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
+            and (raw_tops is None or (isinstance(raw_tops, list) and not raw_tops))
+            and (raw_body is None or (isinstance(raw_body, str) and not raw_body.strip()))
+        )
         if primary:
-            confirm(sha, before, when, item.get("submitted_at"))
+            # A reply wrapper keeps its old effect on the counts, but never
+            # answers a confirmation marker: it is no review of the head.
+            confirm(sha, before, when, item.get("submitted_at"), answers=not reply_only)
         elif when is None:
             # Only a test seam omits the time; a non-primary review cannot be
             # placed on either side of the cutover, and dropping it undercounts.
             return _unknown("review_time_missing", current_head=head)
         if item.get("state") != "PENDING":
             report(sha, login)
-            raw_tops, raw_body = item.get("top_level"), item.get("body")
-            # A review record with no body and no top-level comment is the
-            # wrapper GitHub makes for a reply inside a thread: nobody reviewed
-            # the head it names, so it marks nothing.
-            # A row with no comment list at all reads the same way: marking less
-            # can only make the count larger. Only a COMMENTED review (or one
-            # whose state is missing or unknown) can be a wrapper: an approval,
-            # a change request or a dismissed review with no text is still a
-            # review of the head.
-            reply_only = (
-                item.get("state") not in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
-                and (raw_tops is None or (isinstance(raw_tops, list) and not raw_tops))
-                and (raw_body is None or (isinstance(raw_body, str) and not raw_body.strip()))
-            )
             if not reply_only:
                 mark(sha, when, item.get("submitted_at"))
         if before:

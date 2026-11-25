@@ -202,6 +202,41 @@ def test_a_marker_for_an_earlier_reviewed_head_cannot_outrank_the_real_one():
     assert got["terminal_head"] == H3
 
 
+def test_a_thread_reply_after_the_marker_answers_nothing():
+    # H3 was approved before its marker. Afterwards Codex only replies inside a
+    # thread, which GitHub records as an empty COMMENTED review on H3. That wrapper
+    # is no review, so it must not answer the marker: the round-2 head stays terminal.
+    reply = {
+        "login": rf.CODEX_LOGIN,
+        "commit_id": H3,
+        "state": "COMMENTED",
+        "submitted_at": _at(5),
+        "body": "",
+        "top_level": [],
+    }
+    reviews = (_finding(H1, _at(0)), _finding(H2, _at(1)), _clean(H3, _at(2)), reply)
+    comments = (_marker(H3, _at(3)),)
+    got = _ev(head=H3, reviews=reviews, comments=comments, files=(GATE_FILE,))
+    assert got["terminal_head"] == H2
+
+
+def test_a_real_commented_review_after_the_marker_still_answers_it():
+    # The positive twin of the thread-reply case: a COMMENTED review with text is a
+    # review, so it answers the marker and H3 becomes terminal.
+    review = {
+        "login": rf.CODEX_LOGIN,
+        "commit_id": H3,
+        "state": "COMMENTED",
+        "submitted_at": _at(5),
+        "body": "Reviewed; no further findings.",
+        "top_level": [],
+    }
+    reviews = (_finding(H1, _at(0)), _finding(H2, _at(1)), _clean(H3, _at(2)), review)
+    comments = (_marker(H3, _at(3)),)
+    got = _ev(head=H3, reviews=reviews, comments=comments, files=(GATE_FILE,))
+    assert got["terminal_head"] == H3
+
+
 def test_an_edited_comment_dates_its_marker_by_the_edit():
     # A comment created at hour 1 is edited at hour 5 to carry a marker for H3,
     # which Codex reviewed at hour 4. Dated by creation the marker would look
