@@ -85,6 +85,10 @@ def pytest_runtest_logreport(report):
         return
     # A setup or teardown failure, a crashed worker's "???" report, and the call
     # phase each decide the outcome; a later passing phase never undoes a failure.
+    if report.when == "setup":
+        # A new attempt begins: whatever an earlier, retried attempt left (a
+        # teardown skip after its failed call, say) no longer counts.
+        _final.pop(report.nodeid, None)
     decides = report.outcome != "passed" or report.when == "call"
     if decides and _final.get(report.nodeid, "passed") == "passed":
         _final[report.nodeid] = report.outcome

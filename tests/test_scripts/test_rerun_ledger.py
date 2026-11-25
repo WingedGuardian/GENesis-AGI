@@ -245,3 +245,18 @@ def test_a_worker_never_writes(owned_ledger):
     ledger_mod.pytest_sessionfinish(session, 0)
     assert session.exitstatus == 0
     assert not owned_ledger.exists()
+
+
+def test_a_new_attempt_discards_what_the_retried_attempt_left(owned_ledger):
+    """Round 1 (CodeRabbit): a retried attempt's teardown skip must not become the
+    final outcome once the retry passes."""
+    ledger_mod.pytest_xdist_node_collection_finished(None, ["t.py::a"])
+    ledger_mod.pytest_runtest_logreport(_report("t.py::a", "setup", "passed"))
+    ledger_mod.pytest_runtest_logreport(_report("t.py::a", "call", "rerun"))
+    ledger_mod.pytest_runtest_logreport(_report("t.py::a", "teardown", "skipped"))
+    ledger_mod.pytest_runtest_logreport(_report("t.py::a", "setup", "passed"))
+    ledger_mod.pytest_runtest_logreport(_report("t.py::a", "call", "passed"))
+    session = _session(collected=1, exitstatus=0)
+    ledger_mod.pytest_sessionfinish(session, 0)
+    data = json.loads(owned_ledger.read_text())
+    assert data["rerun_passed"] == ["t.py::a"] and data["missing"] == 0

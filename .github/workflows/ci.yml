@@ -698,8 +698,10 @@ jobs:
           # -z: a path with a newline or non-ASCII byte stays one path. A changed
           # conftest.py shapes every test below it, so its DIRECTORY is
           # excluded too (--rerun-exclude-path matches a test file or any
-          # parent directory of one).
-          git diff -z --no-renames --diff-filter=d --name-only "$base" HEAD -- '*.py' > "$out.raw"
+          # parent directory of one). Deletions are listed on purpose: a
+          # deleted or renamed-away conftest.py changed the tests below it,
+          # and a deleted file's own path matches nothing, harmlessly.
+          git diff -z --no-renames --name-only "$base" HEAD -- '*.py' > "$out.raw"
           while IFS= read -r -d '' path; do
             printf '%s\0' "$path" >> "$out"
             if [[ "$(basename -- "$path")" == conftest.py ]]; then

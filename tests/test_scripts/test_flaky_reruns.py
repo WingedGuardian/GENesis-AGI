@@ -129,14 +129,33 @@ def _list_step(
     return run, tmp_path / "rerun-exclude.txt"
 
 
-def test_a_push_lists_the_changed_python_files_and_skips_deleted_ones(tmp_path):
+def test_a_push_lists_every_changed_python_file_deleted_ones_included(tmp_path):
+    """A deleted file's own path matches no test, harmlessly; listing it is what
+    lets a deleted conftest.py exclude its directory (round 1)."""
     repo, base = _repo(tmp_path)
     run, listing = _list_step(repo, tmp_path, "push", base)
     assert run.returncode == 0, run.stderr
     assert sorted(listing.read_bytes().split(b"\0")[:-1]) == [
+        b"tests/gone.py",
         b"tests/test_new.py",
         b"tests/test_old.py",
     ]
+
+
+def test_a_deleted_conftest_excludes_its_whole_directory(tmp_path):
+    """Round 1 (Codex P2, CodeRabbit Major, Devin): deleting a fixture file
+    changes every test below it, so those tests get no retry either."""
+    repo, _ = _repo(tmp_path)
+    (repo / "tests" / "sub").mkdir()
+    (repo / "tests" / "sub" / "conftest.py").write_text("x = 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "add conftest")
+    base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "rm", "-q", "tests/sub/conftest.py")
+    _git(repo, "commit", "-q", "-m", "delete conftest")
+    run, listing = _list_step(repo, tmp_path, "push", base)
+    assert run.returncode == 0, run.stderr
+    assert b"tests/sub" in listing.read_bytes().split(b"\0")
 
 
 def test_an_unreadable_push_tip_stops_the_job(tmp_path):
@@ -161,6 +180,7 @@ def test_a_pr_merge_commit_lists_against_its_first_parent(tmp_path):
     run, listing = _list_step(repo, tmp_path, "pull_request")
     assert run.returncode == 0, run.stderr
     assert sorted(listing.read_bytes().split(b"\0")[:-1]) == [
+        b"tests/gone.py",
         b"tests/test_new.py",
         b"tests/test_old.py",
     ]
@@ -274,10 +294,11 @@ def test_a_known_flake_is_commented_and_a_new_one_opened(tmp_path):
     assert out.returncode == 0, out.stdout + out.stderr
     calls = _calls(log)
     assert calls[0][:2] == ["issue", "list"] and "--label" in calls[0] and "flaky" in calls[0]
-    assert calls[1][:3] == ["issue", "comment", "7"]
-    assert calls[2][:2] == ["issue", "create"]
-    assert calls[2][calls[2].index("--title") + 1] == "Flaky test: tests/test_b.py::test_y"
-    assert calls[2][calls[2].index("--label") + 1] == "flaky"
+    # A first-time flake is filed before a repeat's comment (round 1).
+    assert calls[1][:2] == ["issue", "create"]
+    assert calls[1][calls[1].index("--title") + 1] == "Flaky test: tests/test_b.py::test_y"
+    assert calls[1][calls[1].index("--label") + 1] == "flaky"
+    assert calls[2][:3] == ["issue", "comment", "7"]
 
 
 def test_a_dry_run_lists_only(tmp_path):
@@ -414,3 +435,62 @@ def test_a_dispatch_off_main_is_always_a_dry_run_and_the_checkout_keeps_no_token
         s for s in report["steps"] if str(s.get("uses", "")).startswith("actions/checkout")
     )
     assert checkout["with"]["persist-credentials"] is False
+
+
+def test_an_id_with_backticks_is_filed_inside_a_fence_it_cannot_close(tmp_path):
+    """Round 1 (Devin): a real node id may hold backticks; it is filed, fenced."""
+    env, log = _fake_gh(tmp_path, [])
+    nodeid = "tests/test_a.py::test_x[`a``b`]"
+    out = _file(tmp_path, _ledger(tmp_path, rerun_passed=[nodeid]), env)
+    assert out.returncode == 0, out.stdout
+    create = next(c for c in _calls(log) if c[:2] == ["issue", "create"])
+    body = create[create.index("--body") + 1]
+    assert f"``` {nodeid} ```" in body
+
+
+def test_a_long_valid_id_is_filed(tmp_path):
+    env, log = _fake_gh(tmp_path, [])
+    nodeid = "tests/test_a.py::test_x[" + "p" * 2000 + "]"
+    out = _file(tmp_path, _ledger(tmp_path, rerun_passed=[nodeid]), env)
+    assert out.returncode == 0
+    assert any(c[:2] == ["issue", "create"] for c in _calls(log))
+
+
+def test_first_time_flakes_are_filed_before_repeats_under_the_cap(tmp_path):
+    """Round 1 (Devin): repeats only add comments; under the cap a new flake
+    must not wait behind them."""
+    repeats = [f"tests/test_a.py::t{i:02d}" for i in range(25)]
+    existing = [{"number": 100 + i, "title": f"Flaky test: {n}"} for i, n in enumerate(repeats)]
+    env, log = _fake_gh(tmp_path, existing)
+    new = "tests/test_z.py::brand_new"
+    out = _file(tmp_path, _ledger(tmp_path, rerun_passed=sorted(repeats + [new])), env)
+    assert out.returncode == 0
+    creates = [c for c in _calls(log) if c[:2] == ["issue", "create"]]
+    assert len(creates) == 1 and creates[0][creates[0].index("--title") + 1] == f"Flaky test: {new}"
+
+
+def test_a_write_that_times_out_does_not_drop_the_rest(tmp_path, monkeypatch):
+    """Round 1 (CodeRabbit): one slow call is one failed write."""
+    import importlib.util
+    import subprocess as sp
+
+    spec = importlib.util.spec_from_file_location("file_flaky_issues_t", FILER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(list(argv))
+        if argv[:3] == ["gh", "issue", "list"]:
+            return sp.CompletedProcess(argv, 0, "[]", "")
+        if argv[:3] == ["gh", "issue", "create"] and "Flaky test: tests/test_a.py::t1" in argv:
+            raise sp.TimeoutExpired(argv, 120)
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    led = _ledger(tmp_path, rerun_passed=["tests/test_a.py::t1", "tests/test_a.py::t2"])
+    rc = mod.main([str(led), "--repo", "o/r", "--run-url", "u", "--sha", "a" * 40])
+    assert rc == 1  # the timed-out write is reported as a failure
+    assert any(
+        "tests/test_a.py::t2" in " ".join(c) for c in calls if c[:3] == ["gh", "issue", "create"]
+    )

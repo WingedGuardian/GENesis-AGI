@@ -43,21 +43,33 @@ from pathlib import Path
 LABEL = "flaky"
 TITLE_PREFIX = "Flaky test: "
 TITLE_MAX = 256  # GitHub's issue title limit
-ID_MAX = 512
+ID_MAX = 8192  # well inside GitHub's 65,536-character body; the title has its own bound
 LIST_LIMIT = 1000
 # One broken shared fixture can make hundreds of tests pass only on retry in a
 # single run; that is one defect, not hundreds of issues. Past this many issue
 # writes in a run the rest are named in the log and left for the next run (the
 # step summary of the test job lists every one).
 MAX_WRITES = 20
-# Printable, no backtick (the body wraps the id in a code span), a tests/ path.
-_ID_RE = re.compile(r"tests/[^\s:`][^\x00-\x1f\x7f`]*::[^\x00-\x1f\x7f`]+")
+# Printable, a tests/ path. Backticks are allowed: the body fences the id
+# with a run longer than any it contains.
+_ID_RE = re.compile(r"tests/[^\s:][^\x00-\x1f\x7f]*::[^\x00-\x1f\x7f]+")
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess]
 
 
 def _run(argv: Sequence[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(list(argv), capture_output=True, text=True, timeout=120)
+    try:
+        return subprocess.run(list(argv), capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        # One slow call is one failed write, never the end of the run.
+        return subprocess.CompletedProcess(list(argv), 124, "", "timed out after 120 s")
+
+
+def _code(nodeid: str) -> str:
+    """``nodeid`` as an inline code span that no backtick inside it can close."""
+    longest = max((len(run) for run in re.findall(r"`+", nodeid)), default=0)
+    fence = "`" * (longest + 1)
+    return f"{fence} {nodeid} {fence}"
 
 
 def valid_id(nodeid: object) -> bool:
@@ -182,6 +194,9 @@ def main(argv: list[str] | None = None, run: Runner = _run) -> int:
             print(
                 f"::warning::skipped a retried id that is not a test node id (first 120 chars): {str(nodeid)[:120]!r}"
             )
+    # First-time flakes before repeats: repeats only add a comment, so under the
+    # cap a new flake must never wait behind them for its issue.
+    valid.sort(key=lambda n: title_for(n) in existing)
     if len(valid) > MAX_WRITES:
         print(
             f"::warning::{len(valid)} tests passed only on retry; filing the first {MAX_WRITES}, "
@@ -206,7 +221,7 @@ def main(argv: list[str] | None = None, run: Runner = _run) -> int:
             what = f"comment on #{existing[title]}"
         else:
             body = (
-                f"`{nodeid}` failed and then passed on its automatic retry in a main CI run.\n\n"
+                f"{_code(nodeid)} failed and then passed on its automatic retry in a main CI run.\n\n"
                 f"{note}\n\nOpened by the CI `flaky-report` job; later occurrences are added as comments."
             )
             argv = [
