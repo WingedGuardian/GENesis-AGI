@@ -338,8 +338,8 @@ async def test_proactive_context_routes_enrich_breadcrumbs_through_ro_read():
         resp = await P.proactive_context(prompt="what did we decide", session_id="s")
 
     assert resp["status"] == "ok"
-    # BOTH post-recall reads went through the pool seam (order: enrich then breadcrumbs).
-    assert routed == ["_enrich", "_breadcrumbs"], routed
+    # Every post-recall read went through the pool seam (enrich, breadcrumbs, labels).
+    assert routed == ["_enrich", "_breadcrumbs", "_breadcrumb_labels"], routed
 
 
 async def test_proactive_context_passes_file_keywords_as_extra_fts_terms():

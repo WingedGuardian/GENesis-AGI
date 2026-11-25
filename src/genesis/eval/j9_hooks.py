@@ -313,12 +313,15 @@ async def emit_recall_used(
     *,
     memory_ids: list[str],
     source: str = "memory_expand",
+    session_id: str | None = None,
 ) -> None:
     """Log that specific memories were accessed/used downstream.
 
     This provides the implicit relevance signal that
     _compute_memory_quality() in j9_aggregator expects from
-    'recall_used' events.
+    'recall_used' events. ``session_id`` is stored as given (no fallback
+    chain): ``memory_expand`` passes the Claude Code transcript id so an
+    expand joins the hook hints that same session was shown.
     """
     try:
         await j9_eval.insert_event(
@@ -331,6 +334,7 @@ async def emit_recall_used(
                 "used": True,
                 "count": len(memory_ids),
             },
+            session_id=session_id,
         )
     except Exception:
         logger.debug("eval: failed to emit recall_used", exc_info=True)
