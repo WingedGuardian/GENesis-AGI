@@ -149,6 +149,40 @@ The per-test cost of individual tests had never been measured; CI now prints
 `--durations=25` so the slowest are visible in every run's log. Read them
 before changing either ceiling.
 
+**Retries (#5024).** CI retries a failed test once (`--reruns=1`,
+pytest-rerunfailures, pinned beside xdist). A test that fails and then passes
+does not fail the run, but it is never silent:
+
+- A change's own test files get no retry at all. The `test` job's "List the
+  change's test files" step lists every `.py` file the change touches (from
+  the base `collected-floor` uses, failing closed where it does), and the run
+  passes each to `--rerun-exclude-path`. A change's own flaky test fails its
+  own run.
+- `tests/_rerun_ledger.py`, armed by `GENESIS_RERUN_LEDGER` and inert
+  everywhere else, writes a ledger of every retried test and its final
+  outcome. It also fails the run when a collected test reached no outcome at
+  all, judged by node id against what the workers collected. Under
+  `--max-worker-restart=0`, a worker crash after a retry was queued can drop a
+  test, and the run would otherwise end green.
+- The "Account for retried tests" step lists every retried test, and every
+  test with no outcome, in the run summary.
+- On a main push, the `flaky-report` job files each retried test as a `flaky`
+  issue titled `Flaky test: <node id>`, or comments on the open one. A
+  dispatch runs it as a dry run. Set the repository variable
+  `FLAKY_AUTOFILE` to `off` to stop the filing without a code change.
+
+A test that fails both attempts fails the run, as before. A hang still ends
+its worker (the per-test timeout above), so a retry never hides one.
+
+Known limits:
+- A change to non-test code (or a `tests/_*.py` helper) that makes an
+  EXISTING test flaky is still retried on that change's own run. Exclusion is
+  by test file and by changed `conftest.py` directory; a changed module has no
+  test path to match. The flake surfaces once it reaches main, as a `flaky`
+  issue.
+- A module that fails to import contributes no test ids, so it is not counted
+  as "no outcome". The run still fails on the collection error itself.
+
 ## Test Directory Structure
 
 Tests are organized by subsystem, mirroring `src/genesis/`:
@@ -396,8 +430,10 @@ it because nothing listens there. A PEP 578 audit hook judges every in-process
 - **TCP to this machine** (loopback, `0.0.0.0`/`::`, or one of its own
   addresses): refused when a socket is listening NOW on that port at that
   destination (the same address, or a wildcard on either side) and at least one
-  of those sockets does not belong to the pytest process or one of its
-  children. Decided at connect time, so a test's own server (in a thread or a
+  of those sockets does not belong to the pytest run's process tree: the pytest
+  process and its children, or, on an xdist worker, the controller and all its
+  children (pytest-rerunfailures' workers connect to a status socket the
+  controller listens on). Decided at connect time, so a test's own server (in a thread or a
   child) is reachable, a service that started mid-run is still fenced, a test's
   own listener on one address does not vouch for someone else's on another, and
   a port nobody listens on fails on its own.

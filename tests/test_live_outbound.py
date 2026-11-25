@@ -651,3 +651,120 @@ def test_a_relative_name_does_not_match_a_longer_file_name(tmp_path, not_ours, m
         assert outbound._unix_listen_inodes(os.fsencode(tmp_path / "not-live.sock")) == set()
     finally:
         srv.close()
+
+
+_SUBRUN_CONTROLLER_CONFTEST = (
+    _SUBRUN_CONFTEST
+    + """
+
+def pytest_configure(config):  # noqa: F811 - replaces the plain one above
+    import os
+    import socket
+
+    from tests import _live_outbound
+
+    _live_outbound.install(config)
+    if not hasattr(config, "workerinput"):
+        # The controller listens before any worker starts, as
+        # pytest-rerunfailures' crash-recovery status socket does.
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen()
+        config._controller_srv = srv
+        os.environ["CONTROLLER_PORT"] = str(srv.getsockname()[1])
+"""
+)
+
+_SUBRUN_WORKER_TESTS = """
+import os
+import socket
+
+import pytest
+
+
+def _connect(port):
+    c = socket.socket()
+    c.settimeout(5)
+    try:
+        c.connect(("127.0.0.1", int(port)))
+    finally:
+        c.close()
+
+
+def test_a_worker_reaches_its_controllers_listener():
+    assert os.environ.get("PYTEST_XDIST_WORKER"), "the fixture must run on a worker"
+    _connect(os.environ["CONTROLLER_PORT"])
+
+
+def test_a_listener_outside_the_run_is_still_refused():
+    with pytest.raises(ConnectionRefusedError):
+        _connect(os.environ["DECOY_PORT"])
+"""
+
+
+def test_an_xdist_worker_counts_its_controllers_sockets_as_the_runs_own(tmp_path):
+    """#5024: pytest-rerunfailures' workers connect to a status socket the
+    controller listens on. Rooted at the worker, the fence refused it and every
+    `-n` run ended in an INTERNALERROR before any test. The decoy is a listener in
+    a process outside the run (a child of THIS test, not of the subrun), which
+    must stay refused."""
+    pytest.importorskip("xdist")
+    decoy = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import socket, sys, time\n"
+            "s = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen()\n"
+            "print(s.getsockname()[1], flush=True); time.sleep(120)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        port = decoy.stdout.readline().strip()
+        (tmp_path / "conftest.py").write_text(_SUBRUN_CONTROLLER_CONFTEST)
+        (tmp_path / "test_worker.py").write_text(_SUBRUN_WORKER_TESTS)
+        repo = Path(__file__).resolve().parent.parent
+        env = {**os.environ, "PYTHONPATH": f"{repo}{os.pathsep}{repo / 'src'}", "DECOY_PORT": port}
+        env.pop("PYTEST_CURRENT_TEST", None)
+        env.pop("GENESIS_LIVE_OUTBOUND_REPORT", None)
+        out = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "-p",
+                "no:cacheprovider",
+                "-n",
+                "2",
+                "--dist=loadfile",
+                "--max-worker-restart=0",
+                str(tmp_path),
+            ],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    finally:
+        decoy.kill()
+        decoy.wait()
+    text = out.stdout + out.stderr
+    assert out.returncode == 0, text
+    assert "2 passed" in text, text
+
+
+def test_a_worker_whose_parent_is_not_pytest_keeps_its_own_root(monkeypatch):
+    """The widening applies only when the parent is shown to be pytest; any doubt
+    leaves the narrower fence."""
+    config = type("C", (), {"workerinput": {}})()
+    _proc_table(monkeypatch, {f"/proc/{os.getppid()}/cmdline": "bash\0-c\0something\0"})
+    assert outbound._run_root(config) == os.getpid()
+    _proc_table(monkeypatch, {f"/proc/{os.getppid()}/cmdline": OSError("gone")})
+    assert outbound._run_root(config) == os.getpid()
+
+
+def test_the_controller_and_a_plain_run_root_at_themselves():
+    assert outbound._run_root(type("C", (), {})()) == os.getpid()
