@@ -1177,6 +1177,20 @@ def test_a_poisoned_parser_blocks_only_a_named_create(tmp_path, command, dispatc
         assert "names a gated operation" in res.stderr
 
 
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [("gh issue create -R acme/widget -t x -b short", 2), ("echo hello", 0)],
+)
+def test_a_poisoned_body_reader_blocks_only_a_named_create(tmp_path, command, expected):
+    """The shared body reader loads with the parsers, so a broken copy of it leaves
+    the repair path (any other command) open."""
+    root = _tree(tmp_path, "pr_body_reader.py")
+    res = _subprocess(root / "scripts" / "hooks" / "issue_premise_gate.py", command)
+    assert res.returncode == expected, res.stderr
+    if expected == 2:
+        assert "GUARD DEGRADED (issue_premise_gate)" in res.stderr
+
+
 def test_a_poisoned_hook_input_blocks_in_the_foreground_only(tmp_path):
     root = _tree(tmp_path, "hook_input.py")
     script = root / "scripts" / "hooks" / "issue_premise_gate.py"
