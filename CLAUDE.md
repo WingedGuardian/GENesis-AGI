@@ -635,6 +635,10 @@ gate works, its exemption categories, and the unit rules for size bounds:
   lane and its threshold whenever a non-zero score passes under one, so "it did
   not block" never has to be guessed at. Table and rationale: closing-session
   skill, Pre-Merge Gate.
+  **Past the terminal round an agent merges at one head only** — the round-4 head
+  (the gate-fix lane: its confirmed head), or that head plus empty commits. Any
+  other head, and an unreadable round budget at any count, blocks at merge (the
+  `terminal-head` row): merging it is the user's own merge, or it goes back.
   A PR whose diff touches the
   enforcement-hook surface additionally runs the **gate-fix lane** — wider round 1, and
   a 2-round limit: after round 2, fix commits and one marked confirmation request

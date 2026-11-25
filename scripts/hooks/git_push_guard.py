@@ -6095,10 +6095,13 @@ def _rounds_row(
     """The ``rounds`` line of ``--check-pr``: ADVISORY, never a failure.
 
     ``budget_out``, when given, receives the evaluator's result if it is ``ok``, so
-    the no-change note reads the same budget instead of fetching it a second time.
+    the no-change note and the ``terminal-head`` row read the same budget instead
+    of fetching it again.
 
-    The round budget is enforced where it acts (the review-request ask above and
-    the commit gate); counting it here too would be a second enforcer of one rule.
+    The round budget is enforced where it acts (the review-request ask above, the
+    commit gate, and at merge the ``terminal-head`` row, ``_check_past_terminal``,
+    which blocks an unreadable budget and a merge off the terminal head). This
+    line only displays the count.
     It is printed so the round number is read from the evaluator rather than
     re-derived by hand (#1719), with findings per round so a rising count is
     visible without remembering the last one (#1957).
@@ -6411,6 +6414,123 @@ def _stepped_merges_spare_review(
     return not (stepped & names)
 
 
+def _budget_commit_index(budget: dict) -> dict[str, tuple[str, list[str]]] | None:
+    """``{sha: (tree, parents)}`` for each budget commit whose tree and parents
+    were read, or None when a row is malformed. Shared by the no-change note and
+    the past-terminal walk, so both read the commit graph one way."""
+    known: dict[str, tuple[str, list[str]]] = {}
+    for c in budget.get("commits") or []:
+        if not isinstance(c, dict):
+            return None
+        sha, tree, parents = c.get("sha"), c.get("tree"), c.get("parents")
+        if isinstance(sha, str) and isinstance(tree, str) and tree and isinstance(parents, list):
+            known[sha.lower()] = (tree, [str(p).lower() for p in parents])
+    return known
+
+
+def _reaches_over_empty_commits(budget: dict, head: str, target: str) -> bool:
+    """Whether ``head`` reaches ``target`` through single-parent commits that
+    each have their parent's tree (empty commits), read from the budget's own
+    commit graph only. A merge, a commit that changed a file, or a commit whose
+    tree or parents were not read ends the walk: False. A tree comparison alone
+    is not enough (a head rebuilt on a newer base can carry the same tree and
+    squash to different content), hence the walk."""
+    known = _budget_commit_index(budget)
+    if not known:
+        return False
+    current = head.lower()
+    target = target.lower()
+    for _ in range(len(known) + 1):
+        if current == target:
+            return True
+        info = known.get(current)
+        if info is None or len(info[1]) != 1:
+            return False
+        parent = info[1][0]
+        parent_info = known.get(parent)
+        if parent_info is None or parent_info[0] != info[0]:
+            return False
+        current = parent
+    return False
+
+
+def _terminal_budget(pr_num: str, repo: str | None) -> dict:
+    """The review budget the past-terminal row judges. ``_TEST_TERMINAL_BUDGET``
+    (a JSON object) stands in for it, so merge and report tests make no live
+    GraphQL call. Anything that fails is an unknown budget, never a raise."""
+    seam = os.environ.get("_TEST_TERMINAL_BUDGET")
+    if seam is not None:
+        try:
+            got = json.loads(seam)
+        except ValueError:
+            got = None
+        return got if isinstance(got, dict) else {"status": "unknown", "errors": ["test_seam"]}
+    target = repo or _derive_repo_from_cwd(os.getcwd())
+    if not target or _review_budget is None:
+        return {"status": "unknown", "errors": ["no repository or evaluator"]}
+    try:
+        return _review_budget.evaluate_pr(target, pr_num, timeout_for=_gh_timeout)
+    except Exception:  # noqa: BLE001 - an unreadable budget is a block, never a crash.
+        return {"status": "unknown", "errors": ["lookup failed"]}
+
+
+def _check_past_terminal(
+    pr_num: str, repo: str | None, head: str | None, budget: dict | None = None
+) -> tuple[bool, str]:
+    """``(should_block, message)``: the past-terminal merge check (owner rulings
+    3f6ad6fb and cc17ee20, 2026-11-25). BLOCKING, shared by the merge arm and the
+    ``terminal-head`` row of ``--check-pr``, so the two cannot disagree.
+
+    - The budget unreadable: block, at any round count, since unknown cannot tell
+      below terminal from past it.
+    - Below terminal: pass.
+    - Past terminal: pass only when ``head`` (the merge's ``--match-head-commit``)
+      is the terminal head, or is the budget's current head and reaches the
+      terminal head over empty commits only. Otherwise block: the owner merges
+      with a bang command, or the PR is sent back. No sigil waives it."""
+    if budget is None:
+        budget = _terminal_budget(pr_num, repo)
+    owner_route = (
+        f"the owner merges with a bang command (`! gh pr merge {pr_num} ...`), "
+        "or the PR is sent back"
+    )
+    if budget.get("status") != "ok":
+        errors = ", ".join(str(e) for e in budget.get("errors") or []) or "evidence unknown"
+        return True, (
+            f"the review budget is unreadable ({errors}); an agent merge needs a readable "
+            f"budget at any round count. Retry, or {owner_route}."
+        )
+    state = budget.get("terminal_state")
+    if state == "below":
+        return False, "below terminal"
+    lane_limit = (
+        _review_budget.GATE_DISCOVERY_ROUND_LIMIT
+        if budget.get("gate_surface")
+        else _review_budget.STANDING_REVIEWED_HEAD_LIMIT
+    )
+    terminal = budget.get("terminal_head")
+    if state != "past" or not isinstance(terminal, str) or not terminal:
+        why = budget.get("terminal_error") or f"terminal state {state!r}"
+        return True, (
+            f"past round {lane_limit} the terminal head cannot be placed ({why}); "
+            f"merge or send back is the owner's call — {owner_route}."
+        )
+    terminal = terminal.lower()
+    merging = (head or "").strip().lower()
+    if merging and merging == terminal:
+        return False, f"past terminal, merging at the terminal head {terminal[:12]}"
+    current = str(budget.get("current_head") or "").lower()
+    if merging and merging == current and _reaches_over_empty_commits(budget, merging, terminal):
+        return False, (
+            f"past terminal, head {merging[:12]} reaches the terminal head "
+            f"{terminal[:12]} over empty commits only"
+        )
+    return True, (
+        f"past round {lane_limit} the PR moved off its terminal head {terminal}; "
+        f"merge or send back is the owner's call — {owner_route}."
+    )
+
+
 def _no_change_note(
     pr_num: str, repo: str | None, budget: dict, *, clock: Callable[[], float] = time.monotonic
 ) -> str | None:
@@ -6456,13 +6576,9 @@ def _no_change_note(
         return None
     stop_at = clock() + _NO_CHANGE_BUDGET_S
 
-    known: dict[str, tuple[str, list[str]]] = {}
-    for c in budget.get("commits") or []:
-        if not isinstance(c, dict):
-            return None
-        sha, tree, parents = c.get("sha"), c.get("tree"), c.get("parents")
-        if isinstance(sha, str) and isinstance(tree, str) and tree and isinstance(parents, list):
-            known[sha.lower()] = (tree, [str(p).lower() for p in parents])
+    known = _budget_commit_index(budget)
+    if known is None:
+        return None
 
     def lookup(sha: str) -> tuple[str, str, list[str]] | None:
         if sha in known:
@@ -17849,6 +17965,23 @@ def _run_merge_and_push_gates() -> int:
                         print(f"BLOCKED: PR #{pr_num} — {body_msg}", file=sys.stderr)
                         return 2
 
+                # Past-terminal head check (owner rulings 3f6ad6fb and cc17ee20,
+                # 2026-11-25). Every route that moves a head converges here, so the
+                # merge is bound to the terminal head past round 4 (the gate lane's
+                # confirmed head), and an unreadable budget blocks at any count.
+                # It judges the command's own --match-head-commit, which GitHub
+                # enforces atomically. No sigil waives it: the owner's route is a
+                # bang-command merge, which runs no hook. One budget read, clamped
+                # to the shared deadline by `_gh_timeout`; a drained deadline reads
+                # as unknown and blocks.
+                term_block, term_msg = _check_past_terminal(pr_num, merge_repo, merge_head)
+                if term_block:
+                    print(
+                        f"BLOCKED: PR #{pr_num} — {_sanitize_gate_text(term_msg)}",
+                        file=sys.stderr,
+                    )
+                    return 2
+
                 # Unresolved review findings (review body) — AFTER freshness +
                 # binding (see the ordering note above). Waived by
                 # # review-override (the FINDINGS sigil — not the stale one).
@@ -18554,9 +18687,24 @@ def check_pr_report(
         # gate disagree on exactly one gate.
         _print_gate_detail(msg)
     failures += 1 if blocked else 0
-    # Advisory: never touches `failures` (see `_rounds_row`).
+    # Advisory: never touches `failures` (see `_rounds_row`); the blocking half of
+    # the budget is the `terminal-head` row just below.
     _budget_seen: list[dict] = []
     print(f"rounds         : {_rounds_row(pr_num, repo, budget_out=_budget_seen)}")
+    # BLOCKING, the same function the merge arm runs, judged at the head the
+    # merge-with line binds. It reuses the rounds row's budget when that read was ok.
+    _term_budget = _budget_seen[0] if _budget_seen else None
+    _term_head = verified_head or (_term_budget or {}).get("current_head")
+    blocked, msg = _check_past_terminal(pr_num, repo, _term_head, budget=_term_budget)
+    print(
+        "terminal-head  : "
+        + ("BLOCK — " if blocked else "ok (")
+        + _sanitize_gate_text(msg).splitlines()[0]
+        + ("" if blocked else ")")
+    )
+    if blocked:
+        _print_gate_detail(msg)
+    failures += 1 if blocked else 0
     # Advisory too, and printed only when it fires: a push since the last review
     # that changed no file (see `_no_change_note`). It reuses the budget above.
     if _budget_seen:
