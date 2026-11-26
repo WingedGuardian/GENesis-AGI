@@ -488,6 +488,25 @@ def test_the_owner_command_keeps_the_directory_of_a_push(monkeypatch, capsys, re
     assert f"`! cd {shlex.quote(str(repo))} && git push origin feat`" in capsys.readouterr().err
 
 
+def test_the_owner_command_applies_a_relative_git_c_once(monkeypatch, capsys, repo):
+    """Codex 4704296845: the bang command reruns the command AS TYPED from the
+    shell's own directory (before `-C`), so its relative `-C` applies once."""
+    _seams(monkeypatch, _budget(current=T))
+    cmd = f"git -C {repo.name} push origin feat"
+    assert _main(monkeypatch, cmd, str(repo.parent)) == 2
+    err = capsys.readouterr().err
+    assert f"`! cd {shlex.quote(str(repo.parent))} && git -C {repo.name} push origin feat`" in err
+    assert f"cd {shlex.quote(str(repo))} " not in err
+
+
+def test_the_owner_command_keeps_the_command_text_as_typed(monkeypatch, capsys, repo):
+    # Round-2 audit: re-quoting tokens would turn a `# note` or `"$B"` into literal text.
+    _seams(monkeypatch, _budget(current=T))
+    cmd = f'git -C {repo.name} push origin "feat" # note'
+    assert _main(monkeypatch, cmd, str(repo.parent)) == 2
+    assert f'&& {cmd}`' in capsys.readouterr().err
+
+
 def test_the_owner_command_keeps_the_directory_of_a_gh_route(monkeypatch, capsys, tmp_path):
     _seams(monkeypatch, _budget(current=MOVED))
     target = tmp_path / "other checkout"
@@ -568,6 +587,14 @@ def test_an_explicit_false_rewrite_flag_is_unset(monkeypatch):
     assert G._past_terminal_route_deny(G.analyze(off), off, CTX) is None
     on = f"gh pr comment 7 --repo {REPO} --delete-last=true --yes"
     assert G._past_terminal_route_deny(G.analyze(on), on, CTX) is not None
+
+
+def test_one_false_rewrite_flag_never_cancels_the_other(monkeypatch):
+    """CodeRabbit 4704275877: gh_bool keeps the last value it reads, so the flags
+    are judged one at a time."""
+    _seams(monkeypatch, _budget(current=T, state="below"), states={"pr:7": "OPEN"})
+    cmd = f"gh pr comment 7 --repo {REPO} --edit-last --delete-last=false --body x"
+    assert G._past_terminal_route_deny(G.analyze(cmd), cmd, CTX) is not None
 
 
 # CodeRabbit 4703812712: only a mutation's code, never a read or a string.

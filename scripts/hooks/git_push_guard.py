@@ -646,7 +646,7 @@ def _resolve_against(current, target: str):
     return os.path.normpath(os.path.join(current, target))
 
 
-def _effective_cwd(cmd: str, payload: dict, seg=None):
+def _effective_cwd(cmd: str, payload: dict, seg=None, *, apply_dash_c: bool = True):
     """The ABSOLUTE directory where a SINGLE target segment actually runs.
 
     Returns ``str`` (resolved), ``None`` (no cwd info → run in the hook's own
@@ -685,7 +685,9 @@ def _effective_cwd(cmd: str, payload: dict, seg=None):
         if seg_redirects_repo(seg):
             return _CWD_UNKNOWN
         dash_c = _seg_dash_C(getattr(seg, "argv", None))
-        if dash_c is not None:
+        # ``apply_dash_c=False``: the shell's own directory, for text that reruns
+        # the command as typed (its ``-C`` then applies once, as it did here).
+        if dash_c is not None and apply_dash_c:
             return _resolve_against(cur, dash_c)
     return cur
 
@@ -6588,7 +6590,9 @@ def _off_terminal_head(budget: dict) -> bool:
 
 def _owner_command(raw: str, cwd: str | None) -> str:
     """The command the owner reruns. A deny aborts the whole Bash call, so a
-    ``cd`` earlier in it never ran: name the segment's resolved directory."""
+    ``cd`` earlier in it never ran: name the directory the segment ran in. The
+    command text is kept as typed, so a caller passes the directory BEFORE any
+    ``git -C`` (the push path's ``shell_cwd``), and that ``-C`` applies once."""
     raw = raw.strip()
     return f"cd {shlex.quote(cwd)} && {raw}" if cwd else raw
 
@@ -6676,12 +6680,15 @@ def _open_prs_for_branch(
     return out
 
 
-def _past_terminal_push_deny(seg, cur: str | None, remote: str | None, cwd: str | None) -> str | None:
+def _past_terminal_push_deny(
+    seg, cur: str | None, remote: str | None, cwd: str | None, shell_cwd: str | None = None
+) -> str | None:
     """The refusal for a ``git push`` whose destination is the head branch of a
     past-terminal PR, or None. One PR lookup per destination branch, and one budget
     read only when that branch heads an open PR. A destination proven off origin,
     a branch with no open PR, a failed lookup, an unreadable budget and a dry run
-    (it moves nothing) are None."""
+    (it moves nothing) are None. ``shell_cwd`` is the directory before any
+    ``git -C``: the owner reruns the command as typed, so its ``-C`` applies once."""
     if _push_is_dry_run(seg) or not _push_dest_meets_origin(remote, cwd, False):
         return None
     urls = _push_dest_urls(remote, cwd=cwd) if remote else set()
@@ -6690,7 +6697,7 @@ def _past_terminal_push_deny(seg, cur: str | None, remote: str | None, cwd: str 
             budget = _terminal_budget(pr_num, repo)
             if _past_terminal(budget):
                 what = f"this push moves the head of '{branch}'"
-                return _past_terminal_route_text(what, pr_num, budget, seg.raw, cwd)
+                return _past_terminal_route_text(what, pr_num, budget, seg.raw, shell_cwd or cwd)
     return None
 
 
@@ -6803,9 +6810,11 @@ def _past_terminal_route_deny(segs, cmd: str, payload: dict) -> str | None:
             target = _route_target(seg, "comment")
             if target is None:
                 continue  # an unresolvable identity is no match (best effort)
-            flags = gh_bool(
-                gh_option_values(seg.argv, frozenset({"--delete-last", "--edit-last"})),
-                frozenset({"--delete-last", "--edit-last"}),
+            # Each flag on its own: gh_bool keeps only the LAST value it reads, so a
+            # `--delete-last=false` would otherwise cancel an `--edit-last`.
+            flags = any(
+                gh_bool(gh_option_values(seg.argv, frozenset({name})), frozenset({name}))
+                for name in ("--delete-last", "--edit-last")
             )
             if flags:
                 num, repo = target
@@ -17370,8 +17379,9 @@ def _run_merge_and_push_gates() -> int:
                 # Past terminal, a push onto the PR's head branch is denied, in any
                 # spelling (`_past_terminal_push_deny`). Dispatched sessions were
                 # denied above, so they are denied the same way.
+                _shell = _effective_cwd(cmd, payload, seg=push_segs[0], apply_dash_c=False)
                 terminal_deny = None if pcwd_unknown else _past_terminal_push_deny(
-                    push_segs[0], cur, push_remote, pcwd
+                    push_segs[0], cur, push_remote, pcwd, _shell if isinstance(_shell, str) else None
                 )
                 if terminal_deny is not None:
                     print(terminal_deny, file=sys.stderr)
