@@ -137,7 +137,12 @@ def outcome_rows(spine: list[dict], *, fallback_session_id: str | None) -> list[
             continue
         if entry.get("tool") in SENSOR_TOOLS:
             continue  # module docstring: the Stop-hook sensor's tools
-        when = _parse_ts(entry.get("timestamp"))
+        try:
+            when = _parse_ts(entry.get("timestamp"))
+        except OverflowError:
+            # A parsed time outside the UTC range cannot be stored. In
+            # particular, using now for an underflow would revive a pruned call.
+            continue
         if when is not None and when < row_cut:
             continue  # past the prune's horizon: do not resurrect it
         failed = entry.get("failure_class") is not None
