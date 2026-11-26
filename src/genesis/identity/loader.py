@@ -8,7 +8,7 @@ from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 
-from genesis.identity.paths import read_identity
+from genesis.identity.paths import effective_sources, read_identity
 
 logger = logging.getLogger(__name__)
 
@@ -429,6 +429,15 @@ class IdentityLoader:
         into two blocks on the next read→write round-trip.
         """
         path = self._dir / "STEERING.md"
+        if path.exists() and [p.name for p in effective_sources("STEERING.md", self._dir)] == [
+            "STEERING.local.md"
+        ]:
+            # A replace layer is in force, so no reader sees STEERING.md. The rule is
+            # still kept there (recoverable) until the layered writer moves it.
+            logger.warning(
+                "Steering rule saved to STEERING.md, which the STEERING.local.md replace "
+                "layer hides: it is not in force until that layer includes it"
+            )
         # Parse the file this writes, never the layered text steering() returns:
         # a STEERING.local.md rule must not be copied into the shipped file.
         rules = self._parse_rules(path.read_text(encoding="utf-8").strip() if path.exists() else "")

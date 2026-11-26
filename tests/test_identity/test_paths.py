@@ -31,26 +31,26 @@ def ident(tmp_path: Path) -> Path:
 
 def test_seed_prefers_the_install_copy_then_the_example(ident):
     assert read_identity("SOUL.md", ident) is None
-    (ident / "SOUL.md.example").write_text("shipped soul\n")
+    (ident / "SOUL.md.example").write_text("shipped soul\n", encoding="utf-8")
     assert read_identity("SOUL.md", ident) == "shipped soul\n"
-    (ident / "SOUL.md").write_text("my soul\n")
+    (ident / "SOUL.md").write_text("my soul\n", encoding="utf-8")
     assert read_identity("SOUL.md", ident) == "my soul\n"
     assert sources("SOUL.md", ident) == [ident / "SOUL.md"]
 
 
 def test_plain_never_falls_back_to_an_example(ident):
-    (ident / "USER.md.example").write_text("template\n")
+    (ident / "USER.md.example").write_text("template\n", encoding="utf-8")
     assert read_identity("USER.md", ident) is None
 
 
 def test_layer_without_a_local_file_is_the_default_verbatim(ident):
-    (ident / "STEERING.md").write_text("# Steering\n\n---\n\nrule one\n")
+    (ident / "STEERING.md").write_text("# Steering\n\n---\n\nrule one\n", encoding="utf-8")
     assert read_identity("STEERING.md", ident) == "# Steering\n\n---\n\nrule one\n"
 
 
 def test_layer_appends_the_local_file_as_a_new_block(ident):
-    (ident / "STEERING.md").write_text("# Steering\n\n---\n\nrule one\n")
-    (ident / "STEERING.local.md").write_text("\nrule two\n")
+    (ident / "STEERING.md").write_text("# Steering\n\n---\n\nrule one\n", encoding="utf-8")
+    (ident / "STEERING.local.md").write_text("\nrule two\n", encoding="utf-8")
     assert (
         read_identity("STEERING.md", ident) == "# Steering\n\n---\n\nrule one\n\n---\n\nrule two\n"
     )
@@ -58,21 +58,23 @@ def test_layer_appends_the_local_file_as_a_new_block(ident):
 
 
 def test_layer_replace_marker_drops_the_default(ident):
-    (ident / "CONVERSATION.md").write_text("shipped\n")
-    (ident / "CONVERSATION.local.md").write_text(f"\ufeff{REPLACE_MARKER}\nmine only\n")
+    (ident / "CONVERSATION.md").write_text("shipped\n", encoding="utf-8")
+    (ident / "CONVERSATION.local.md").write_text(
+        f"\ufeff{REPLACE_MARKER}\nmine only\n", encoding="utf-8"
+    )
     assert read_identity("CONVERSATION.md", ident) == "mine only\n"
 
 
 def test_layer_blank_local_file_changes_nothing(ident):
-    (ident / "CONVERSATION.md").write_text("shipped\n")
-    (ident / "CONVERSATION.local.md").write_text("\n  \n")
+    (ident / "CONVERSATION.md").write_text("shipped\n", encoding="utf-8")
+    (ident / "CONVERSATION.local.md").write_text("\n  \n", encoding="utf-8")
     assert read_identity("CONVERSATION.md", ident) == "shipped\n"
 
 
 def test_layer_local_file_alone(ident):
-    (ident / "STEERING.local.md").write_text("rule\n")
+    (ident / "STEERING.local.md").write_text("rule\n", encoding="utf-8")
     assert read_identity("STEERING.md", ident) == "rule\n"
-    (ident / "STEERING.local.md").write_text(f"{REPLACE_MARKER}\nrule\n")
+    (ident / "STEERING.local.md").write_text(f"{REPLACE_MARKER}\nrule\n", encoding="utf-8")
     assert read_identity("STEERING.md", ident) == "rule\n"
 
 
@@ -83,9 +85,9 @@ def test_read_errors_propagate(ident):
 
 
 def test_loader_and_assembler_read_through_the_resolver(ident):
-    (ident / "SOUL.md.example").write_text("shipped soul")
-    (ident / "STEERING.md").write_text("# S\n\n---\n\nshipped rule")
-    (ident / "STEERING.local.md").write_text("local rule")
+    (ident / "SOUL.md.example").write_text("shipped soul", encoding="utf-8")
+    (ident / "STEERING.md").write_text("# S\n\n---\n\nshipped rule", encoding="utf-8")
+    (ident / "STEERING.local.md").write_text("local rule", encoding="utf-8")
     loader = IdentityLoader(ident)
     assert loader.soul() == "shipped soul"
     assert loader.steering_rules() == ["shipped rule", "local rule"]
@@ -94,15 +96,15 @@ def test_loader_and_assembler_read_through_the_resolver(ident):
 
 
 def test_reflection_bridge_reads_through_the_resolver(ident):
-    (ident / "SOUL.md.example").write_text("shipped soul")
-    (ident / "STEERING.local.md").write_text("local rule")
+    (ident / "SOUL.md.example").write_text("shipped soul", encoding="utf-8")
+    (ident / "STEERING.local.md").write_text("local rule", encoding="utf-8")
     block = CCReflectionBridge._load_identity_block(SimpleNamespace(_prompt_dir=ident))
     assert block == "shipped soul\n\nlocal rule"
 
 
 def test_steering_writer_never_copies_local_rules_into_the_shipped_file(ident):
-    (ident / "STEERING.md").write_text("# S\n\n---\n\nshipped rule\n")
-    (ident / "STEERING.local.md").write_text("local rule\n")
+    (ident / "STEERING.md").write_text("# S\n\n---\n\nshipped rule\n", encoding="utf-8")
+    (ident / "STEERING.local.md").write_text("local rule\n", encoding="utf-8")
     loader = IdentityLoader(ident)
     assert "local rule" in loader.steering()  # cache warmed with the layered text
     loader.add_steering_rule("new rule")
@@ -137,8 +139,14 @@ def _path_builds(tree: ast.AST, names: set[str], skip: set[str]) -> list[int]:
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
             found = _names_a_file(node.right, names)
         elif isinstance(node, ast.Call):
-            callee = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
-            found = callee in {"Path", "joinpath", "open"} and any(_names_a_file(a, names) for a in node.args)
+            callee = (
+                node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else getattr(node.func, "id", "")
+            )
+            found = callee in {"Path", "joinpath", "open"} and any(
+                _names_a_file(a, names) for a in node.args
+            )
         elif isinstance(node, ast.JoinedStr):
             found = bool(node.values) and _names_a_file(node.values[-1], names)
         else:
@@ -184,25 +192,40 @@ def test_a_directory_in_a_files_place_is_unreadable_not_absent(ident):
 
 
 def test_a_bom_only_local_file_is_blank(ident):
-    (ident / "STEERING.md").write_text("shipped\n")
-    (ident / "STEERING.local.md").write_text("﻿\n")
+    (ident / "STEERING.md").write_text("shipped\n", encoding="utf-8")
+    (ident / "STEERING.local.md").write_text("﻿\n", encoding="utf-8")
     assert read_identity("STEERING.md", ident) == "shipped\n"
 
 
 def test_effective_sources_drop_the_file_a_replace_layer_discards(ident):
-    (ident / "CONVERSATION.md").write_text("shipped\n")
-    (ident / "CONVERSATION.local.md").write_text("added\n")
+    (ident / "CONVERSATION.md").write_text("shipped\n", encoding="utf-8")
+    (ident / "CONVERSATION.local.md").write_text("added\n", encoding="utf-8")
     assert [p.name for p in effective_sources("CONVERSATION.md", ident)] == [
         "CONVERSATION.md",
         "CONVERSATION.local.md",
     ]
-    (ident / "CONVERSATION.local.md").write_text("\ufeff" + REPLACE_MARKER + "\nmine\n")
-    assert [p.name for p in effective_sources("CONVERSATION.md", ident)] == ["CONVERSATION.local.md"]
+    (ident / "CONVERSATION.local.md").write_text(
+        "\ufeff" + REPLACE_MARKER + "\nmine\n", encoding="utf-8"
+    )
+    assert [p.name for p in effective_sources("CONVERSATION.md", ident)] == [
+        "CONVERSATION.local.md"
+    ]
 
 
 def test_a_replace_layer_never_reads_the_shipped_file(ident):
     """An unreadable discarded file cannot block the text that replaces it."""
     (ident / "STEERING.md").mkdir()  # reading it would raise IsADirectoryError
-    (ident / "STEERING.local.md").write_text(REPLACE_MARKER + "\nmy rules\n")
+    (ident / "STEERING.local.md").write_text(REPLACE_MARKER + "\nmy rules\n", encoding="utf-8")
     assert read_identity("STEERING.md", ident) == "my rules\n"
     assert [p.name for p in effective_sources("STEERING.md", ident)] == ["STEERING.local.md"]
+
+
+def test_a_rule_added_under_a_replace_layer_is_kept_and_reported(ident, caplog):
+    """Until the layered writer ships, a rule written while a replace layer is in
+    force stays in STEERING.md (recoverable) and the loss of effect is logged."""
+    (ident / "STEERING.md").write_text("# Steering\n", encoding="utf-8")
+    (ident / "STEERING.local.md").write_text(REPLACE_MARKER + "\nmine\n", encoding="utf-8")
+    with caplog.at_level("WARNING", logger="genesis.identity.loader"):
+        IdentityLoader(ident).add_steering_rule("Never do X")
+    assert "Never do X" in (ident / "STEERING.md").read_text(encoding="utf-8")
+    assert any("replace" in r.getMessage() for r in caplog.records)
