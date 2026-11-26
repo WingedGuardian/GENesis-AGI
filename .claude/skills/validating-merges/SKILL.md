@@ -176,7 +176,14 @@ evidence or mark cannot-verify just because this client cannot deploy.
 Public issues and issue/PR timeline comments go through
 `scripts/file_tracker_issue.py`; comments use --comment-on <number> with a
 --body-file. Use body files and the canonical shell restrictions, never raw gh
-or API writes. Public-by-default applies to security-related and install-local
+or API writes. For a new issue, lead with a plain-language summary of the
+finding or remaining acceptance and its impact, then complete the numbered
+premise section. Pass `--validation-pr <number> --validation-client codex` (or
+`claude-code` when measured there). The filer adds the public PR attribution
+and `source:validation` label. Use `needs-genesis-instance` when acceptance
+requires a running install. Read back the exact public body, issue URL, area,
+difficulty and source labels alongside the tracking receipt.
+Public-by-default applies to security-related and install-local
 findings too. Redact sensitive supporting evidence; keep the whole task private
 only under CLAUDE.md's concrete disclosure-harm test. A successful scan is not
 permission to publish private content. Validators do not request development reviews or

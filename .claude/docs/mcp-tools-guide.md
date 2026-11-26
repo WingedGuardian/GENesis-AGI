@@ -88,6 +88,13 @@ live in code with `tests/test_scripts/test_file_tracker_issue.py` pinning each o
 - **Validates both labels against the real sets.** `area:docs` and `area:infra` do
   not exist; a nonexistent mandatory label makes `gh issue create` fail. Use
   `area:other` when nothing fits.
+- **Checks the current premise form before contacting GitHub.** Preview and
+  create use the issue-open Action's parser on the body to be published. Start
+  with a brief summary and put the numbered premise checks below it.
+- **Records validator provenance.** Pass `--validation-pr N --validation-client
+  codex` or use `claude-code` for a Claude Code validator. This requires an
+  opening summary and adds the attribution and `source:validation` label.
+  After filing, verify the posted body and area, difficulty and source labels.
 
 **A raw `gh issue create` gets a near-match note right after it files.** The advisory
 hook `scripts/hooks/issue_dup_advisory.py` reads the new issue's URL from the command's
