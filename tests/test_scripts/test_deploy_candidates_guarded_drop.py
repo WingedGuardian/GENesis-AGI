@@ -13,10 +13,12 @@ tests/test_scripts/_deploy_candidates_world.py.
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -30,6 +32,7 @@ d='@D@'
     printf 'argv:'; printf ' %s' "$@"; printf '\n'
     for f in /proc/$$/fd/*; do printf 'fd %s\n' "$(readlink "$f")"; done
     printf 'head %s\n' "$(git -C '@ROOT@' rev-parse HEAD)"
+    printf 'at %s\n' "$(date +%s)"
     flock -n -E 75 '@LOCK@' true; printf 'lock %s\n' "$?"
 } >> "$d/log"
 case " $* " in
@@ -156,6 +159,79 @@ def test_the_restart_is_queued_after_the_confirmation_under_the_lock_with_no_loc
     finally:
         os.close(fd)
     assert not (w.home / ".genesis" / "update_in_progress.pid").exists()
+
+
+def test_the_restart_is_queued_in_a_later_second_than_the_move(dc, dc_ready, stub):
+    """serving_commit.py cannot name the boot commit when the unit started in the
+    second HEAD moved, so a down server's immediate start would read as a failed drop."""
+    w = dc_ready
+    _two_live(w, dc)
+    w.install_engine()
+    (stub / "state").write_text("failed\n")
+    res = _shell(w, stub, *_guarded(w, None, "--restart-server"), "--wait", "0")
+    assert res.returncode == 0, res.stdout + res.stderr
+    moved = w.git(w.root, "log", "-g", "-1", "--format=%gd", "--date=unix", "HEAD").stdout
+    moved_at = int(moved.strip().removeprefix("HEAD@{").removesuffix("}"))
+    assert int(_records(stub)[1]["at"]) > moved_at
+
+
+def test_the_wait_comes_before_the_confirmation(dc, dc_ready, stub, monkeypatch):
+    """A session can switch the checkout without any lock: the confirmation must
+    be the last look before the restart is queued."""
+    w = dc_ready
+    _two_live(w, dc)
+    order: list[str] = []
+    real_sleep = dc.time.sleep
+
+    def sleep(seconds: float) -> None:
+        # dc.time is the time module: subprocess's own wait(timeout) polls with
+        # time.sleep, which a slow runner reaches, so count only the engine's.
+        if sys._getframe(1).f_globals is vars(dc):
+            order.append("wait")
+        else:
+            real_sleep(seconds)
+
+    monkeypatch.setattr(dc.time, "sleep", sleep)
+    real = dc.Engine._unconfirmed_drop
+
+    def confirm(self, *args):
+        order.append("confirm")
+        return real(self, *args)
+
+    monkeypatch.setattr(dc.Engine, "_unconfirmed_drop", confirm)
+    assert w.run(dc, *_guarded(w, None, "--restart-server")) == 0  # --wait is the entry's
+    assert order == ["wait", "confirm"]
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_a_closed_output_pipe_does_not_stop_the_engine(stream, tmp_path):
+    """When the Guardian's incus client is killed at its timeout, the command in
+    the container keeps running with its output pipe gone. Past the commit point,
+    a write that raised would leave a half-done drop."""
+    say = (
+        "core.out('one'); core.out('two')"
+        if stream == "stdout"
+        else ("dc._err('one'); dc._err('two')")
+    )
+    code = (
+        "import sys; sys.path.insert(0, 'scripts'); "
+        "import deploy_candidates as dc; core = dc.core; "
+        f"{say}; open(sys.argv[1], 'w').write('survived')"
+    )
+    r, w = os.pipe()
+    os.close(r)
+    mark = tmp_path / "survived"
+    try:
+        kwargs = {stream: w, "stdout" if stream == "stderr" else "stderr": subprocess.PIPE}
+        p = subprocess.run(
+            ["python3", "-I", "-S", "-c", code, str(mark)],
+            cwd=Path(__file__).resolve().parents[2],
+            timeout=30,
+            **kwargs,
+        )
+        assert p.returncode == 0 and mark.read_text() == "survived"
+    finally:
+        os.close(w)
 
 
 def test_the_fd_probe_sees_an_inherited_lock_fd(dc_ready, stub):
@@ -305,6 +381,74 @@ def test_another_candidate_changed_before_the_write_is_refused(
     assert _calls(stub) == []
 
 
+def _preview(w: World, dc, capsys) -> dict | None:
+    capsys.readouterr()
+    assert w.run(dc, "list", "--json", "--move-refusals") == 0
+    return json.loads(capsys.readouterr().out)["drop_preview"]
+
+
+def test_a_leaving_set_changed_since_the_view_is_refused_and_nothing_changes(
+    dc, dc_ready, stub, capsys
+):
+    """Round-2 premise check E6: an ordinary re-add of a hook candidate at a new
+    approved head changes what a drop takes out of `live`, with `live`'s tip and
+    the dropped pin unchanged. --expect-leaving binds the approval to the set
+    Gate 2 showed: a different planned set refuses before any write."""
+    w = dc_ready
+    hook = "scripts/hooks/pre-commit"
+    w.candidate("feat/h", {hook: "#!/bin/sh\n# one\nexit 0\n"})
+    w.candidate("feat/y", {"y.txt": "y\n"})
+    assert w.add(dc, "feat/h", "--approve-hooks", "owner, in chat") == 0
+    assert w.add(dc, "feat/y") == 0
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    assert _preview(w, dc, capsys) == {"branch": "feat/y", "leaving": []}
+    tip, pinned = w.rev("refs/heads/live"), w.rev("refs/heads/feat/y")
+    w.candidate("feat/h", {hook: "#!/bin/sh\n# two\nexit 0\n"})
+    assert w.add(dc, "feat/h", "--approve-hooks", "owner, in chat") == 0
+    assert w.rev("refs/heads/live") == tip
+    argv = [
+        "drop", "feat/y", "--expect-branch", "live", "--expect-head", tip,
+        "--expect-candidate", pinned, "--expect-leaving",
+    ]  # fmt: skip
+    before = _snapshot(w)
+    capsys.readouterr()
+    assert w.run(dc, *argv, "[]") == 1
+    err = capsys.readouterr().err
+    assert "nothing changed" in err and "feat/h" in err, err
+    assert _snapshot(w) == before and _calls(stub) == []
+    # Control: the set the plan names now is accepted, and feat/h does leave.
+    assert w.run(dc, *argv, '["feat/h"]') == 0, capsys.readouterr()
+    assert [b for b, _ in w.live_merges()] == []
+
+
+def test_a_merge_conflict_in_the_drop_plan_is_in_the_preview(dc, dc_ready, capsys, monkeypatch):
+    """The leaving set is everything the drop's own plan excludes, so a
+    candidate that conflicts once the dropped one is gone is named too."""
+    w = dc_ready
+    _two_live(w, dc)
+    head_a = w.rev("refs/heads/feat/a")
+    real = dc.Engine.git
+
+    def git(self, *args, **kw):
+        if "merge-tree" in args and args[-1] == head_a:
+            return subprocess.CompletedProcess(args, 1, "0" * 40 + "\nx.txt\n", "")
+        return real(self, *args, **kw)
+
+    monkeypatch.setattr(dc.Engine, "git", git)
+    assert _preview(w, dc, capsys) == {"branch": "feat/b", "leaving": ["feat/a"]}
+
+
+def test_an_unplannable_drop_previews_null(dc, dc_ready, capsys, monkeypatch):
+    w = dc_ready
+    _two_live(w, dc)
+
+    def boom(*_a, **_k):
+        raise dc.Refusal("git merge-tree could not merge")
+
+    monkeypatch.setattr(dc.plan, "build_plan", boom)
+    assert _preview(w, dc, capsys) is None
+
+
 def test_the_header_names_a_restart_check_that_exists():
     """CodeRabbit c4637258286: the engine view records no restart; the header
     names the status command, which prints what the server runs."""
@@ -352,6 +496,30 @@ def test_a_live_deploy_marker_is_exit_1_and_says_so(dc, dc_ready, stub):
 
 
 # ── exit 1: dropped, but not confirmed ─────────────────────────────────────
+
+
+def test_a_refused_leaving_set_keeps_a_harmless_update_record(dc, dc_ready, stub, capsys):
+    """Round 3: the drop retired a harmless update_state.json before its
+    --expect-leaving check, so the refusal said "nothing changed" after a delete.
+    It retires the record only once every refusal of its own has passed."""
+    w = dc_ready
+    _two_live(w, dc)
+    w.git(w.root, "tag", "-f", "pre")
+    state = w.home / ".genesis" / "update_state.json"
+    record = {
+        "phase": "fetching",
+        "rollback_tag": "pre",
+        "deploy_head": w.rev("HEAD", w.root),
+        "post_merge": False,
+    }
+    state.write_text(json.dumps(record))
+    capsys.readouterr()
+    assert w.run(dc, *_guarded(w), "--expect-leaving", '["feat/a"]') == 1
+    assert "nothing changed" in capsys.readouterr().err
+    assert json.loads(state.read_text()) == record and _calls(stub) == []
+    # Control: the approved set passes, and the record is retired before the move.
+    assert w.run(dc, *_guarded(w), "--expect-leaving", "[]") == 0, capsys.readouterr()
+    assert not state.exists() and _dropped(w)
 
 
 def _after_move(w: World, what: str):
@@ -440,7 +608,17 @@ def test_the_wait_and_the_fault_marker_texts_stay_distinct():
 
 
 @pytest.mark.parametrize(
-    "case", ["restart alone", "no expect", "expect main", "no-rebuild", "empty"]
+    "case",
+    [
+        "restart alone",
+        "no expect",
+        "expect main",
+        "no-rebuild",
+        "empty",
+        "leaving alone",
+        "leaving not a list",
+        "leaving not json",
+    ],
 )
 def test_the_guarded_flags_go_together(dc, dc_ready, stub, capsys, case):
     w = dc_ready
@@ -452,6 +630,9 @@ def test_the_guarded_flags_go_together(dc, dc_ready, stub, capsys, case):
         "expect main": _guarded(w)[:3] + ["main", "--expect-head", tip, "--expect-candidate", head],
         "no-rebuild": [*_guarded(w), "--no-rebuild"],
         "empty": [*_guarded(w)[:-1], ""],
+        "leaving alone": ["drop", "feat/b", "--expect-leaving", "[]"],
+        "leaving not a list": [*_guarded(w), "--expect-leaving", '{"feat/a": 1}'],
+        "leaving not json": [*_guarded(w), "--expect-leaving", "feat/a"],
     }[case]
     before = _snapshot(w)
     capsys.readouterr()

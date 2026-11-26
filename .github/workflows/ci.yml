@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      flaky_dry_run:
+        description: "flaky-report: print the issue writes instead of making them"
+        type: boolean
+        default: true
   schedule:
     - cron: "0 6 * * 1"  # weekly Mon 06:00 UTC — surface new CVEs even without repo activity
 
@@ -637,13 +642,81 @@ jobs:
         # backend, the branch leak-scan workflow, the portability checks) run
         # here instead of skipping.
         run: bash scripts/ci/install_ripgrep.sh
+      - name: Prepare isolated test storage
+        id: census_prepare
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import os
+          import tempfile
+          from pathlib import Path
+          parent = Path(tempfile.mkdtemp(prefix="genesis-live-writes-"))
+          directory, runtime = parent / "audit", parent / "runtime"
+          directory.mkdir()
+          runtime.mkdir()
+          run_id = "-".join(os.environ[key] for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_SHA"))
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as destination:
+              destination.write(f"GENESIS_LIVE_WRITES_REPORT={directory}/rows.tsv\nGENESIS_LIVE_WRITES_RUN_ID={run_id}\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as destination:
+              destination.write(f"directory={directory}\nhypothesis_directory={runtime}/hypothesis\njunit_report={runtime}/junit.xml\nactive_file={runtime}/active-test.txt\n")
+          PY
+      # #5024: the change's own test files get no retry. This lists the .py files
+      # the change touches, from the base collected-floor uses (merge parent 1 on
+      # a PR, the pre-push tip on a main push), for `--rerun-exclude-path` below.
+      # It fails closed where collected-floor does: a PR checkout that is not a
+      # 2-parent merge, an unreadable push tip or a failed diff stops the job
+      # before the tests run, rather than retrying the change's own tests. A
+      # dispatch or a schedule has no change, so nothing is excluded.
+      - name: List the change's test files
+        id: change_files
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/rerun-exclude.txt"
+          : > "$out"
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            words="$(git rev-list --parents -n 1 HEAD | wc -w)"
+            if [[ "$words" != 3 ]]; then
+              echo "::error::retry exclusion: expected a 2-parent merge commit, got $((words - 1)) parent(s)"
+              exit 2
+            fi
+            base="$(git rev-parse 'HEAD^1')"
+          elif [[ "$EVENT_NAME" == "push" ]]; then
+            if [[ -z "${PUSH_BEFORE_SHA:-}" || "$PUSH_BEFORE_SHA" == "0000000000000000000000000000000000000000" ]] \
+               || ! git cat-file -e "${PUSH_BEFORE_SHA}^{commit}" 2>/dev/null; then
+              echo "::error::retry exclusion: the push's previous tip '${PUSH_BEFORE_SHA:-}' is not a readable commit"
+              exit 2
+            fi
+            base="$PUSH_BEFORE_SHA"
+          else
+            echo "retry exclusion: no change on a $EVENT_NAME run; every test may be retried"
+            echo "list=$out" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # -z: a path with a newline or non-ASCII byte stays one path. A changed
+          # conftest.py shapes every test below it, so its DIRECTORY is
+          # excluded too (--rerun-exclude-path matches a test file or any
+          # parent directory of one). Deletions are listed on purpose: a
+          # deleted or renamed-away conftest.py changed the tests below it,
+          # and a deleted file's own path matches nothing, harmlessly.
+          git diff -z --no-renames --name-only "$base" HEAD -- '*.py' > "$out.raw"
+          while IFS= read -r -d '' path; do
+            printf '%s\0' "$path" >> "$out"
+            if [[ "$(basename -- "$path")" == conftest.py ]]; then
+              printf '%s\0' "$(dirname -- "$path")" >> "$out"
+            fi
+          done < "$out.raw"
+          echo "retry exclusion: $(tr -cd '\0' < "$out" | wc -c) changed .py file(s) since $base"
+          echo "list=$out" >> "$GITHUB_OUTPUT"
       - name: Run tests
         # The narrator below fires on THIS step's failure, not on the job's.
         id: tests
         run: |
           # Never measure a stale report: if pytest dies before writing
           # one, the checker must find nothing rather than yesterday's.
-          rm -f junit.xml
+          rm -f "$GENESIS_JUNIT_REPORT" "$GENESIS_RERUN_LEDGER"
           # Ignore preserved AZ-era test files that import removed modules
           #
           # --durations: this suite's per-test cost has NEVER been measured.
@@ -688,18 +761,67 @@ jobs:
           # timeout kills its worker); scripts/ci/failure_summary.py names the
           # crash and says the undispatched tests never ran. The `=` forms are
           # what full_suite_guard.py reads.
+          #
+          # --force-reruns=1 (pytest-rerunfailures, #5024): a test that fails and
+          # then passes on one retry does not fail the run. FORCE, not --reruns:
+          # a @pytest.mark.flaky(reruns=N) marker outranks --reruns, so one
+          # decorator could buy a test more retries; --force-reruns outranks
+          # every marker, and --rerun-exclude-path is still checked first.
+          # tests/_rerun_ledger.py (loaded by tests/conftest.py, armed by
+          # GENESIS_RERUN_LEDGER below) names every retried test and fails the
+          # run when a collected test reached no outcome. --rerun-exclude-path gives every .py file the change touches
+          # no retry at all (listed by the step above): a change's own flaky
+          # test fails its own run.
+          excludes=()
+          while IFS= read -r -d '' path; do
+            excludes+=("--rerun-exclude-path=$path")
+          done < "$RERUN_EXCLUDE_LIST"
           pytest -rfE --durations=25 \
-            -n 4 --dist=loadfile --max-worker-restart=0 \
+            -n 4 --dist=loadfile --max-worker-restart=0 --force-reruns=1 \
             --ignore-glob='**/test_*az*.py' \
             --ignore-glob='**/test_*shim*.py' \
             --ignore=tests/test_ui/ \
-            --junit-xml=junit.xml
+            --junit-xml="$GENESIS_JUNIT_REPORT" \
+            "${excludes[@]}"
         env:
           GENESIS_TESTING: "1"
+          # Select before collection, when Hypothesis first binds its cache.
+          # Failed preparation can expose partial outputs: only raw success
+          # selects them. Every report consumer uses the same legacy fallback.
+          HYPOTHESIS_STORAGE_DIRECTORY: ${{ steps.census_prepare.outcome == 'success' && steps.census_prepare.outputs.hypothesis_directory || '' }}
+          GENESIS_JUNIT_REPORT: ${{ steps.census_prepare.outcome == 'success' && steps.census_prepare.outputs.junit_report || 'junit.xml' }}
           # The breadcrumb the conftest rewrites before every test and fsyncs.
           # It is the ONLY channel that survives a hard crash inside a test --
           # no report is written and, without -v, the log names nothing either.
-          GENESIS_ACTIVE_TEST_FILE: active-test.txt
+          GENESIS_ACTIVE_TEST_FILE: ${{ steps.census_prepare.outcome == 'success' && steps.census_prepare.outputs.active_file || 'active-test.txt' }}
+          # Fixed path, independent of census_prepare (which may fail and is
+          # advisory): the retry accounting must never lose its input.
+          GENESIS_RERUN_LEDGER: ${{ runner.temp }}/rerun-ledger.json
+          RERUN_EXCLUDE_LIST: ${{ steps.change_files.outputs.list }}
+      - name: Read the write census (measurement only)
+        id: census_readback
+        continue-on-error: true
+        if: >-
+          ${{ !cancelled() && steps.census_prepare.outcome == 'success' &&
+              (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure') }}
+        env:
+          TESTS_OUTCOME: ${{ steps.tests.outcome }}
+        run: |
+          python scripts/ci/live_writes_census.py "$GENESIS_LIVE_WRITES_REPORT" \
+            --run-id "$GENESIS_LIVE_WRITES_RUN_ID" --workers 4 --tests-outcome "$TESTS_OUTCOME"
+      - name: Preserve the write census
+        id: census_upload
+        continue-on-error: true
+        if: >-
+          ${{ !cancelled() && steps.census_prepare.outcome == 'success' &&
+              (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure') }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: live-writes-census-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.census_readback.outcome }}
+          # Audit evidence only; runtime caches stay in the sibling directory.
+          path: ${{ steps.census_prepare.outputs.directory }}/
+          if-no-files-found: ignore
+          retention-days: 14
       # The step log's tail is where pytest names the failures, and the tail
       # is what GitHub's log cap drops (measurement above). The step summary
       # is rendered by the Actions UI OUTSIDE the log, so it survives however
@@ -730,9 +852,10 @@ jobs:
       # result before continue-on-error rewrites it.
       - name: Name the failures where truncation cannot reach
         if: ${{ !cancelled() && steps.tests.outcome == 'failure' }}
-        run: python scripts/ci/failure_summary.py junit.xml >> "$GITHUB_STEP_SUMMARY"
+        run: python scripts/ci/failure_summary.py "$GENESIS_JUNIT_REPORT" >> "$GITHUB_STEP_SUMMARY"
         env:
-          GENESIS_ACTIVE_TEST_FILE: active-test.txt
+          GENESIS_JUNIT_REPORT: ${{ steps.census_prepare.outcome == 'success' && steps.census_prepare.outputs.junit_report || 'junit.xml' }}
+          GENESIS_ACTIVE_TEST_FILE: ${{ steps.census_prepare.outcome == 'success' && steps.census_prepare.outputs.active_file || 'active-test.txt' }}
       # The junit report holds every traceback in full and was previously
       # DISCARDED with the runner — the dormancy guard parsed it, then it
       # died with the VM while the truncated log held ~44% of the run.
@@ -744,10 +867,35 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: junit-test-report
-          path: junit.xml
+          path: ${{ steps.census_prepare.outcome == 'success' && steps.census_prepare.outputs.junit_report || 'junit.xml' }}
           # pytest can die before writing any report (collection crash); the
           # failure-summary step already names that case in the summary, so a
           # missing file here is information, not an upload error.
+          if-no-files-found: ignore
+          retention-days: 14
+      # #5024. Lists every test that passed only on its retry (from the ledger
+      # tests/_rerun_ledger.py writes) and fails the job when a collected test
+      # reached no outcome. A change's own tests never get here: they are not
+      # retried at all (--rerun-exclude-path above). Runs only when the tests
+      # themselves ran, so "no ledger" really means the accounting broke.
+      - name: Account for retried tests
+        if: ${{ !cancelled() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure') }}
+        env:
+          GENESIS_RERUN_LEDGER: ${{ runner.temp }}/rerun-ledger.json
+        run: |
+          rc=0
+          python scripts/ci/flaky_reruns.py "$GENESIS_RERUN_LEDGER" > "$RUNNER_TEMP/rerun-summary.md" || rc=$?
+          cat "$RUNNER_TEMP/rerun-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/rerun-summary.md"
+          exit "$rc"
+      - name: Preserve the retry ledger
+        if: ${{ !cancelled() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure') }}
+        uses: actions/upload-artifact@v7
+        with:
+          # The attempt is in the name so flaky-report reads this attempt's
+          # ledger, never an earlier attempt's.
+          name: rerun-ledger-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rerun-ledger.json
           if-no-files-found: ignore
           retention-days: 14
       # A test that stops running is invisible: it makes the suite SMALLER,
@@ -837,7 +985,14 @@ jobs:
         # [plain|html|private_redirect|brotli|error] ("requires the browser extra";
         # this job installs none). They run in dependency-audit. Within the
         # ceiling, no raise: main measured 591 at run 44079105066, + 5 = 596.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 607
+        # Dream centrality (#4982): one opt-in native case,
+        # test_dream_centrality_native.py::test_capped_child_to_cache ("uses an
+        # actual systemd resource scope"; needs GENESIS_DREAM_NATIVE_E2E=1, which
+        # no CI job sets). The only id new between main runs 45284169203 (607)
+        # and 45291106068 (608), 607 -> 608.
+        env:
+          GENESIS_JUNIT_REPORT: ${{ steps.census_prepare.outcome == 'success' && steps.census_prepare.outputs.junit_report || 'junit.xml' }}
+        run: python scripts/check_skip_ceiling.py "$GENESIS_JUNIT_REPORT" --ceiling 608
 
   test-ubuntu-2404:
     # ubuntu-latest is moving to 26.04, so `test` alone stops showing a break on
@@ -909,6 +1064,53 @@ jobs:
             tests/test_scripts/test_gnu_timeout.py
         env:
           GENESIS_TESTING: "1"
+
+  # #5024. Files every test that passed only on its retry in a main push run as
+  # a `flaky` issue, or comments on the open one (scripts/ci/file_flaky_issues.py
+  # owns the dedup and the id grammar). Main pushes only: a pull request's run is
+  # not durable, and fork PRs cannot write issues. A dispatch runs it as a dry
+  # run unless flaky_dry_run is unchecked. Its own job, so the `test` job, which
+  # runs the test code, never holds a write token, and continue-on-error so a
+  # filing failure never turns main red. The FLAKY_AUTOFILE repository variable
+  # set to `off` switches it off without a code change.
+  flaky-report:
+    needs: test
+    if: >-
+      ${{ !cancelled() && vars.FLAKY_AUTOFILE != 'off' &&
+          ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+           github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - id: ledger
+        uses: actions/download-artifact@v7
+        continue-on-error: true
+        with:
+          name: rerun-ledger-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ledger
+      - name: File the retried tests
+        if: ${{ steps.ledger.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Real filing only from main: a dispatch on another branch is always a
+          # dry run, whatever the input says (an unmerged branch's tests never
+          # open issues).
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && (inputs.flaky_dry_run != false || github.ref != 'refs/heads/main') }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          args=(--repo "$GITHUB_REPOSITORY" --run-url "$RUN_URL" --sha "$GITHUB_SHA")
+          if [[ "$DRY_RUN" == "true" ]]; then args+=(--dry-run); fi
+          python scripts/ci/file_flaky_issues.py "$RUNNER_TEMP/ledger/rerun-ledger.json" "${args[@]}"
 
   collected-floor:
     # Tests that stop being collected make the suite SMALLER, not red. This job

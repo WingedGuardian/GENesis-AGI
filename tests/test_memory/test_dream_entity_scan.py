@@ -88,6 +88,22 @@ async def test_low_evidence_pair_flagged_not_merged(db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_failed_audit_write_is_visible_in_phase_health(db, monkeypatch):
+    await db.execute(
+        """CREATE TRIGGER fail_fixture_audit BEFORE INSERT ON entity_resolution_audit
+           BEGIN SELECT RAISE(ABORT, 'fixture audit failure'); END""",
+    )
+    a = _point("a", confidence=0.5, retrieved_count=0, created_at=NOW)
+    b = _point("b", confidence=0.5, retrieved_count=0, created_at=NOW - timedelta(days=40))
+
+    report = await _run(db, a, b, 0.95, monkeypatch)
+
+    assert report["failure_counts"] == {"audit/write": 1}
+    assert report["auto_merged"] == 0
+    assert await _audit_rows(db) == []
+
+
+@pytest.mark.asyncio
 async def test_strong_pair_still_auto_merges(db, monkeypatch):
     """Near-identical, close-in-time, confident pair still auto-merges."""
     a = _point("a", confidence=0.8, retrieved_count=0, created_at=NOW)
@@ -99,6 +115,29 @@ async def test_strong_pair_still_auto_merges(db, monkeypatch):
     assert report["low_evidence_skipped"] == 0
     rows = await _audit_rows(db)
     assert rows[0]["action"] == "auto_merge"
+
+
+@pytest.mark.asyncio
+async def test_unavailable_challenge_keeps_both_memories_and_records_audit(db, monkeypatch):
+    from genesis.qdrant import collections as qdrant_collections
+
+    a = _point("a", confidence=0.9, retrieved_count=0, created_at=NOW)
+    b = _point("b", confidence=0.9, retrieved_count=0, created_at=NOW)
+    monkeypatch.setattr("genesis.memory.entity_resolution.check_semantic_overlap", AsyncMock(
+        return_value={"relationship": "duplicate", "reasoning": "primary duplicate"},
+    ))
+    monkeypatch.setattr("genesis.memory.adversarial_review.check_entity_duplicate", AsyncMock(
+        return_value={"relationship": "distinct", "reasoning": "upstream unavailable", "error": "provider"},
+    ))
+
+    report = await _run(db, a, b, 0.94, monkeypatch)
+
+    assert report["errors"] == [{"error": "challenge/provider"}]
+    assert report.get("challenge_overrides", 0) == 0
+    qdrant_collections.update_payload.assert_not_called()
+    assert await _audit_rows(db) == [{
+        "action": "flagged", "llm_verdict": "challenge_unavailable", "survivor_id": None,
+    }]
 
 
 @pytest.mark.asyncio

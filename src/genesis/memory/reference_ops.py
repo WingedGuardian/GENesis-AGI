@@ -220,8 +220,9 @@ def split_secret(
     (default: the body's first line; any other first line is held text),
     DETAIL_PLACEHOLDER and the value placeholder line (``mask_value_tags``
     adds the Tags line from the masked tags_json). All text after the header
-    is held: ``value`` and ``detail``, when a writer passes them, exactly as
-    given; otherwise the description before the first ``Value:`` line, and
+    is held: ``value`` and ``detail``, when a writer passes them, as given
+    (the description trimmed of edge whitespace, a whitespace-only value held
+    empty); otherwise the description before the first ``Value:`` line, and
     everything after it, trailer lines included, as the value (no marker: the
     whole rest, the description None so a stored one is kept; so is an empty
     description block). A

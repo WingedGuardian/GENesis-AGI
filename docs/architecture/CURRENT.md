@@ -31,8 +31,8 @@ grown to 16 with 6 unnamed here, and nothing marked the list partial.)
 
 **Absence from this file is never absence in Genesis.** The map is deliberately
 incomplete. Verify by enumeration before any "Genesis lacks X" claim — the
-audit-by-enumeration protocol in the spec-session skill ("Auditing Existing
-Capabilities").
+audit-by-enumeration protocol in
+`.claude/skills/spec-session/references/existing-capabilities.md`.
 
 **How this file stays honest.** Every entry claims its top-level
 `src/genesis` modules in a fenced `yaml subsystem-map` block and carries a
@@ -73,11 +73,13 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 5a3de4eee 2026-11-07
+verified: e063fcd73 2026-11-25
 ```
 
-The 2026-11-07 verification covers the request-owned memory thread boundaries
-below; other memory descriptions retain their individually cited verification dates.
+The 2026-11-25 verification covers labelled graph neighbours. The 2026-11-22
+verification covers weekly dream centrality. The 2026-11-07
+verification covers the request-owned memory thread boundaries below.
+Other memory descriptions retain their individually cited verification dates.
 
 **Shared-owner prerequisite (not activated):** nine thread boundaries in
 `memory/store.py`, `retrieval.py`, `intent.py` and `proactive.py` retain actual
@@ -236,6 +238,12 @@ Easy-to-forget mechanisms:
   in another process that commits in between makes it write nothing
   (`CredentialKeyChanged`); the ingest then re-reads and runs again, up to five
   times, so every writer in a race lands, and a sixth change reaches the caller.
+  The write's plan (its masks, target entry, sameness and a new entry's
+  candidates) is built from a read of the name's entries before the knowledge
+  writer lock, a file lock every ingest takes, and read again under it; when
+  those entries or the key changed, the plan is built again under the lock
+  (`_credential_plan`), so the value of a same-name write that committed in
+  between is masked in this write's name and tags.
   Only `reference_ops` reads the secret row: `compose_body` puts the value and
   the description back for `reference_lookup` (behind its audit log),
   `reveal_reference` returns both for the dashboard's reveal, and
@@ -336,7 +344,25 @@ weekly clustering (Sun 4am) persists a value-ranked worklist to
 **shadow-hardwired** (`dry_run=True`) — the live flip is a separate user-gated
 change (#892). `_CapacityBreaker` aborts on consecutive provider exhaustion.
 `_cross_wing_scan` writes `memory_links` even under dry_run — intentional
-additive layer, not a leak.
+additive layer, not a leak. Weekly betweenness scoring also runs in dry runs.
+`dream_centrality_worker.py` snapshots the primary database in one admitted
+read-only transaction, closes it, then builds and scores the NetworkX graph
+in a separate user scope. The worker budget is 5% of effective memory and
+half the effective CPU capacity, up to one core and 80% of the configured
+resource-budget CPU allowance. A two-hour deadline bounds a hung worker.
+The worker verifies its own kernel limits before reading the database. The
+parent publishes the full nonzero ranking in an owned transaction after
+validating the complete result. Failure before commit leaves the last good
+cache available to the importance shield. `GENESIS_DREAM_CENTRALITY_DISABLED=1`
+skips the worker and records the phase as unavailable.
+
+The scheduled weekly report distinguishes complete, partial and aborted runs.
+Only a complete run advances job health's last success. A failed phase or
+preflight records a bounded problem summary. A discovery exception continues
+through the scheduler's typed failure and reflex path, even after a semantic
+partial result. Job-health counters count the current disposition. Failed
+worklist inserts are counted as a partial result. Worklist replacement still
+follows the existing weekly scan policy.
 
 **Importance shield (Phase 2c)** — `memory/dream_shield.py` +
 `memory/dream_shield_config.py` (config: `config/dream_shield.yaml` + local
@@ -349,11 +375,11 @@ centrality ≥ the nonzero percentile. Thresholds freeze into each slice; the
 drain re-checks live members via `shield_filter_live` (catches salience that
 rose mid-week) and counts `shield_missing_thresholds` — which must be 0 before
 any live flip. Centrality persistence widened from top-500 to all-nonzero
-(`dream_centrality.py`, `graph.centrality_scores(top_n=None)`) so the shield has
+(`dream_centrality.py`) so the shield has
 a real bridge-node population; `centrality_cache` gains its first reader.
 
-**Graph backend is a SEAM (`memory/graphstore.py`)** — traversal and centrality
-run through a `GraphStore` protocol with two implementations: the default
+**Graph backend is a SEAM (`memory/graphstore.py`)** — interactive traversal and
+centrality run through a `GraphStore` protocol with two implementations: the default
 `NetworkxGraphStore` (the in-process MultiDiGraph projection of `memory_links`)
 and `FalkorGraphStore` (below);
 opt-in `RequestDatabase` traversal declines NetworkX before projection and uses
@@ -610,6 +636,33 @@ ignores `valid_at` (the bake-off oracle's as-of shape would hide the 5.7% of
 rows with a NULL `valid_at`). Consequence to carry into MW-5: this also shrinks
 the graph `centrality_scores` runs on, hence the shield's bridge-node
 population.
+
+**Labelled neighbours (2026-11-25, memory spec MW-11)** — `memory_expand` and
+`memory_recall` neighbours carry a `relation` (`supports`/`extends` read as
+`similar`, an untyped FalkorDB edge as `linked`, a typed edge as its type;
+depth 2 as `via <relation>`, the type of the path's last edge) and, where the
+text may be shown, a `label`: a few words of the neighbour's own text
+(`memory/neighbour_labels.py`: indexed SQLite lookups decide what may be
+labelled, then one batched Qdrant `retrieve` off the loop reads the text; the
+hook runs only the SQLite half on its pooled read connection). The proactive hook's breadcrumbs get the same labels
+(`→ id:x (six words)`, `related_ids` unchanged). No label for a credential entry
+(the reference store's row test, plus the point's own credential header or tag:
+older entries still hold the value in their text), external or unknown-origin
+text (the injection gate's predicate, stored origin first; no origin at all
+counts as unknown), garbage, a missing point, or a hidden memory the caller did not
+ask for; the hook never labels a hidden one. A failed credential, origin or
+(without opt-in) visibility read withholds every label in the response. An expand
+records its launch-time Claude Code session id, its nearest `claude` process pid
+and that process's start time (`claude_pid`, `claude_started`) on its
+`recall_used` event, and the hook's recall trace records the hint ids shown
+(`hints`). Nothing reads them together yet: the followed-link read (a one-off
+query, 14 days after deploy) can join the two on the process, since
+`cc_sessions.pid` maps each traced conversation to it, and falls back to the
+session id where a row has no pid. The session id alone goes stale after a
+conversation reset, and a process's newest `cc_sessions` row can be a background
+agent's. Attribution is per process: one Claude Code process's conversations and
+agents count together. MEASURED on a live install: hook
+label step p50 6-13 ms, max 14-28 ms over 20 prompts per run.
 
 **Merge link rewiring** — the live merge (`_synthesize_and_deprecate`) COPIES
 each original's external `memory_links` edges onto the synthesis
@@ -1740,7 +1793,9 @@ other intake evidence retains its dated basis.
   `remove_unit` tombstones a source when its last unit is deleted (invariant:
   only that method may tombstone). The conversational path
   (`knowledge_ingest_source` MCP) requires explicit user confirmation —
-  contrast the intake bypass in entry 4.
+  contrast the intake bypass in entry 4. A distilled batch's credential units
+  go through the credential chokepoint; its other units are stored as written
+  (uploaded documents are not redacted, owner ruling 2026-11-23).
 - **inbox/**: file-drop monitor with approval-gated dispatch.
   Explicit owner-requested disposition review uses the manual-only Tier-1
   `inbox-review` skill, reached by the attended-request pointer in `CLAUDE.md`.
@@ -2197,9 +2252,10 @@ the shared banner is not an assertion about all concurrent sessions.
   orphaned uncertainty, original physical obligations and one-time accounting.
   Matching terminal leader states alone do not prove controller process end.
   The same-connection final drain observes callback-created evidence before
-  commit. The acknowledgement grants no retry or acceptance. The automatic
-  reconciliation caller remains separate (#3728); cutover,
-  native qualification and production capacity remain separate gates.
+  commit. The acknowledgement grants no retry or acceptance. The captured runner
+  sweeps unresolved original owners before claiming after strict readiness.
+  Unproved ownership stays held. Cutover, native qualification and production
+  capacity remain separate gates.
   Explicit request/revoke/status operations use the existing provider-state
   grant and bind actual work, retained debt, evidence, provider and runner/
   watchdog source, policy, boot and bounded dual-clock deadlines. Invalid grant
@@ -2838,7 +2894,59 @@ verified: 204c69c1f 2026-11-22
   `RESTART_CONTAINER` before Gate 2 (after F.1's git-health redirect), and
   `recovery.py` refuses it as a backstop. A restart ends lock holders and lets
   a boot repair run where one is installed; a bad candidate is removed by
-  `deploy_candidates drop`. The diagnosis snapshot carries the boot repair's
+  `deploy_candidates drop`. With `recovery.live_engine: true` in the host's
+  guardian.yaml (default false, and only a real bool arms it; #2978) the
+  Guardian runs that drop itself (`guardian/live_drop.py`): before Gate 2,
+  `check.py` reads the engine's `list --json --move-refusals` and proposes the
+  drop of the newest candidate (the last one `live` holds that the manifest
+  lists), an ESCALATE to `rebuild` when a drop is half-done, or
+  `RESTART_CONTAINER` when no drop can run. A drop is proposed only when the
+  view's `drop_preview` (that drop's own plan, computed lockless; it writes
+  only unreachable git objects) names the same branch and every other
+  candidate it takes out, and Gate 2's identity section, never cut and at
+  most 3,000 UTF-16 units, lists them all; otherwise the proposal is
+  `RESTART_CONTAINER`, naming why. The approved drop is ONE call to
+  the engine's guarded form (`--expect-branch live --expect-head
+  --expect-candidate --expect-leaving <the list Gate 2 showed>
+  --restart-server --wait 0`, 120 s client timeout; a plan that takes out a
+  different set refuses, nothing changed), which
+  drops, confirms and queues the restart under one update.lock hold; the
+  Guardian then judges only whether genesis-server booted from `live`'s new
+  tip (`scripts/lib/serving_commit.py`, as `deploy_code_only.sh status` reads
+  it), with no 30 s probe: the next check judges health. It restarts once
+  itself on exit 4, on exit 1 after the manifest save when the engine's view
+  shows the drop done, and on exit 5 only while the pre-drop server still
+  runs. The attempt is recorded in the Guardian state, and saved to disk,
+  before the engine call (#5007); a clean refusal (200, 2, 97, the deploy
+  marker, or "nothing changed" by the engine's words or its view) puts back
+  the record that was there before. An outcome it did not see (timeout,
+  130/143, an unknown code) keeps it, and the next diagnosis names it:
+  while the checkout has not settled since, nothing is proposed; once the
+  drop finished, a server not booted from `live`'s tip is offered a restart
+  before any further drop. The record lasts until a healthy snapshot. While
+  it is set, any action that ran ends in RECOVERED, which waits out the
+  backoff and then moves once to CONFIRMED_DEAD; that one transition passes
+  the episode's alert latch, so the next diagnosis always comes (the
+  escalation, at max_escalations). A container restart or rollback proposed
+  while that drop may still be running says at Gate 2 that it would interrupt
+  it, and an approved action held back by the backoff says it did not run.
+  Off, the
+  behaviour above is unchanged and no candidate is read. On every install
+  (#5007): each approved action, before it runs, counts its attempt and saves
+  RECOVERED to disk (the backoff is re-stamped when it ends); when that save
+  fails, nothing runs, the checkpoint's changes are put back, the episode's
+  alert latch is cleared so the next check asks again, and one CRITICAL alert
+  names the state file. The checkpoint is written with that latch clear (on
+  disk only). A killed tick (systemd's stop or TimeoutStartSec) saves nothing
+  more, so the disk holds either that checkpoint (outcome unknown: the next
+  tick diagnoses afresh) or the previous tick's state; a RECOVERING read from disk goes on as RECOVERED. A cancelled
+  `incus exec` client is killed and reaped. An approved action held back by a
+  backoff of at most 900 s (one that ran out between two reads included) is
+  waited out inside the tick, then runs unless Genesis is back, paused, or the
+  Guardian stood down (the latch is then cleared, as on a DENY); a proposal whose own budget is spent (IO_TRIAGE's
+  counter for IO_TRIAGE, the main one for the rest) becomes ESCALATE on the
+  re-diagnosis path before Gate 1, and on every path before Gate 2. The diagnosis
+  snapshot carries the boot repair's
   `live-move repair:` journal lines and a summary of the newest
   `deploy-backups/*-live-move-repair/REPAIR.json` that is neither dismissed
   nor superseded and names `~/genesis` (6 h window on the ts in its dir name,
@@ -3256,7 +3364,9 @@ verified: 41c7343b3 2026-11-15
   own `tick_overdue`.
 - **scheduled-job telemetry (WS-2 M9)**: `runtime/_job_health.py` keeps the
   cumulative `job_health` row AND now appends per-run `job_run_events` (era
-  attribution the cumulative row can't give). Writes are debounced off the
+  attribution the cumulative row can't give). Each terminal outcome updates
+  its own cumulative counter. Startup cleanup preserves the totals.
+  Run-event writes are debounced off the
   persisted `job_health` anchors — a success only when ≥1h since the last, a
   failure on streak onset + hourly heartbeat — so a stuck sub-hourly poll costs
   ~24 rows/day. `duration_ms` is honest-or-NULL (only from an explicit
@@ -3276,9 +3386,11 @@ verified: 41c7343b3 2026-11-15
   `util/tasks.normalized_frames` — a second normalizer would split one bug
   into two fingerprints. **The funnel (2026-07-23):** `record_job_failure`
   gained an `exc=` param and, when an exception caused the failure, ALSO emits
-  a throttled `job.failed` event (via `util/tasks.emit_sync`, sharing the
-  run-event throttle -> ~24/day/job). This bridges the ~50 background-job loops
-  that wrote only to `job_health` onto the event bus, where the reflex arc (a
+  a throttled `job.failed` event (via `util/tasks.emit_sync`). Its hour
+  window starts at the previous typed signal within a failure episode, so a
+  semantic failure cannot suppress the first exception signal. This bridges
+  the ~50 background-job loops that wrote only to `job_health` onto the event
+  bus, where the reflex arc (a
   bus subscriber) can reach the largest class of internal defects - previously
   invisible. Semantic/no-exception failures stay off the bus; callers that emit
   their own domain `.failed` pass `emit_event=False` to avoid double-counting.
@@ -4792,7 +4904,9 @@ CLI. Its `codex_exec_argv`/`codex_child_env` give every Codex run Genesis
 starts unattended (the executor's adversarial verifier, the contribution
 reviewer) a child environment from `caller_context.dispatched_child_env`:
 `GENESIS_CC_SESSION=1`, supervised marker dropped, origin kept.
-`tests/test_codex_dispatch_marker.py` fails on a `codex` literal anywhere else.
+`tests/test_codex_dispatch_marker.py` checks other `codex` literals and allows
+known read-only references, including the inventory socket path and event
+metadata. The inventory event's keyword details still go through the scan.
 The marker is inert until the Codex project config forwards it to the Genesis
 MCP launcher; it exists so an unmarked Codex run can mean the owner's own
 client, as an unmarked Claude Code session does.

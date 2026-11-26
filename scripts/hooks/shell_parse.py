@@ -1488,6 +1488,9 @@ _KNOWN_SIGILS = (
     # Kept so stale worktrees parsing the former terminal sigil do not become
     # order-dependent during an update. Current gates never authorize on it.
     "final-round-accept",  # legacy review-terminal compatibility
+    # git_push_guard: `floor-accept=<id>[,<id>]`, the owner's yes for named floor
+    # findings. Read through trailing_sigil_ids; the bare token waives nothing.
+    "floor-accept",
 )
 
 
@@ -1522,8 +1525,14 @@ def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
     return _override_scan(seg, sigil, strict=False) and _override_scan(seg, sigil, strict=True)
 
 
-def _override_scan(seg: str, sigil: str, *, strict: bool) -> bool:
-    """One reading of :func:`_has_trailing_override`. Not strict: main's scan."""
+def _override_scan(
+    seg: str, sigil: str, *, strict: bool, found: list[str] | None = None
+) -> bool:
+    """One reading of :func:`_has_trailing_override`. Not strict: main's scan.
+
+    ``found``, when given, receives the matched token, so a valued sigil is read
+    from the exact token this scan accepted.
+    """
     quote: str | None = None
     prev_ws = True
     i, n = 0, len(seg)
@@ -1565,6 +1574,8 @@ def _override_scan(seg: str, sigil: str, *, strict: bool) -> bool:
         if c == "#" and prev_ws:
             for tok in seg[i + 1 :].split():
                 if _token_is_sigil(tok, sigil):
+                    if found is not None:
+                        found.append(tok)
                     return True  # the queried sigil, reached within the leading run
                 if not any(_token_is_sigil(tok, s) for s in _KNOWN_SIGILS):
                     return False  # a prose token ends the leading run of sigils
@@ -1578,6 +1589,26 @@ def _override_scan(seg: str, sigil: str, *, strict: bool) -> bool:
 def has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
     """Public alias of :func:`_has_trailing_override` for sibling hooks."""
     return _has_trailing_override(seg, sigil)
+
+
+def trailing_sigil_ids(seg: str, sigil: str) -> tuple[frozenset[int], bool]:
+    """``(ids, malformed)`` from a genuine trailing ``# <sigil>=<id>[,<id>]``.
+
+    Same comment-position rules as :func:`has_trailing_override`. Only the exact
+    comma-separated decimal form yields ids: a bare sigil, ``sigil:``, a trailing
+    comma or any other value yields none and reports ``malformed``, so a mistyped
+    acceptance can never read as an acceptance of something else.
+    """
+    token: list[str] = []
+    if not (
+        _override_scan(seg, sigil, strict=False)
+        and _override_scan(seg, sigil, strict=True, found=token)
+    ):
+        return frozenset(), False
+    match = re.fullmatch(re.escape(sigil) + r"=([0-9]{1,20}(?:,[0-9]{1,20})*)", token[0])
+    if match is None:
+        return frozenset(), True
+    return frozenset(int(i) for i in match.group(1).split(",")), False
 
 
 def _ansi_c_spans(text: str, _locale: list[int] | None = None) -> list[tuple[int, int, str, bool]]:

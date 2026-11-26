@@ -18,7 +18,7 @@ import logging
 import secrets
 import uuid
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from genesis.db.crud import knowledge as knowledge_crud
 from genesis.knowledge.lifetime import unreferenced, writer
@@ -153,11 +153,16 @@ async def ingest_knowledge_unit(
     as searched (its identifier masked and capped).
     """
     # A credential write is a compare-and-swap against its own read of the key
-    # (``knowledge_crud.KeyObservation``): if a same-key writer, in this process
-    # or another, commits between that read and the unit's statement (or a
-    # concurrent first save takes the name), nothing is written and the whole
-    # ingest runs again from a fresh read (a new stored secret to pair with, a
-    # new point), up to ``_REREADS`` times; one more change raises
+    # (``knowledge_crud.KeyObservation``). A change, in this process, to the
+    # entries its name resolves to or to the key it observed is met under the
+    # writer lock by building the write again there (``_credential_plan``),
+    # never by an error. The lock is a file lock, so other processes' ingests
+    # wait on it too. A same-key writer it does not see (a write to a key the
+    # caller gave, or one that takes no writer lock, such as a delete) that
+    # commits between the read and the unit's statement (or a concurrent first
+    # save that takes the name) makes nothing be written, and the whole ingest
+    # runs again from a fresh read (a new stored secret to pair with, a new
+    # point), up to ``_REREADS`` times; one more change raises
     # ``CredentialKeyChanged`` to the caller.
     kwargs = dict(
         store=store, db=db, content=content, project=project, domain=domain,
@@ -329,101 +334,24 @@ async def _ingest_once(
         # A write with no identifier is a new entry, named "credential" (#4416:
         # minted, never refused).
         nameless = not flat.strip()
-        target, identity, entries = (None, reference_ops.name_hash(flat), []) if nameless else (
-            await _resolve_by_name(db, project, domain, flat, secret_value, carded=carded, insert_only=insert_only)
+        # Everything from here to the unit's body (the header a read-back body
+        # keeps, the sameness of an upload, the target, the masks, the tags and
+        # the held meta) is built from the entries the name resolves to: from
+        # this read, before the writer lock, and again UNDER it when those
+        # entries or the key changed in between (``_credential_plan``), so
+        # every writer in a race lands, masked against the others.
+        name_read = (flat, secret_value, carded, nameless)
+        build = functools.partial(
+            _credential_plan, db, project=project, domain=domain, given=given, header=header,
+            split=split, split_large=large, held=(content, secret_value, secret_detail),
+            flat=flat, carded=carded, insert_only=insert_only, keyed=keyed,
+            entry_key=entry_key, prose=prose, nameless=nameless, meta=meta, tags_json=tags_json,
         )
-        candidates = _ambiguous(entries, secret_value, carded=carded, insert_only=insert_only)
-        first, sep, _ = given.partition("\n")
-        if sep and first != header and any(
-            first == (entry.body or "").partition("\n")[0] for entry in entries
-        ):
-            # A body read back and saved again starts with the header STORED
-            # for the entry its name resolves to (its name masked): that line
-            # is the header, never description text (comment 4579950912). The
-            # value is the same either way, so the resolution stands.
-            header = first
-            split = functools.partial(split, header=header)
-            content, secret_value, secret_detail = await asyncio.to_thread(split) if large else split()
-        if insert_only and secret_value is not None:
-            for entry in entries:
-                # An untrusted write of the credential an untrusted entry already
-                # holds (a re-upload) is that entry: the one sameness rule.
-                if knowledge_crud.same_untrusted(entry, secret_value, secret_detail, json.dumps({"identifier": flat})):
-                    return _stored(entry.id, entry.concept)
-        if keyed is not None:
-            concept, observed = entry_key, keyed
-        elif target is not None:
-            concept = target.concept
-            observed = await knowledge_crud.observe_credential_key(
-                db, project_type=project, domain=domain, concept=concept,
-            )
-            # An update keeps the full name the entry records (the same name,
-            # perhaps in another case or spacing), from its meta.
-            recorded = reference_ops.recorded_name(target.concept, target.body, target.meta)
-            if recorded:
-                flat = meta["identifier"] = recorded
-        else:
-            concept, observed = await _mint_key(db, project, domain)
-        write_identity = None if keyed is not None else (
-            identity,
-            reference_ops.UNTRUSTED if insert_only else reference_ops.UNNAMED if nameless
-            else reference_ops.CARDED if carded else reference_ops.TRUSTED,
-        )
-        if secret_value == "" and observed.value is not None:
-            # An empty value line on a key that holds one keeps it.
-            secret_value = None
-        known_secret = (secret_value if secret_value is not None else observed.value) or ""
-        known_detail = secret_detail if secret_detail is not None else observed.detail
-        # Whether the value the probes are built from was free prose: this
-        # write's, or the stored one it keeps.
-        value_prose = prose if secret_value is not None else knowledge_crud._meta_fields(observed.meta)[3]
-        # The secrets this write must not repeat beside its own: the value it
-        # replaces and every value and recorded masked span of the entries the
-        # name resolves to (any origin), never a description. Stated limit: a
-        # name that spells a secret of an entry under another name is not
-        # masked with it. The pure-Python work runs off the event loop when any
-        # value it reads is large.
-        also = _secrets_of(observed, entries, known_secret, value_prose)
-        # Every probe of the value and of the secrets the capture rules find in
-        # it and in the description, built ONCE for the identifier and the tags.
-        large = (
-            len(known_secret) + len(known_detail or "") + sum(len(item[0] or "") for item in also)
-            + len(flat) + len(tags_json or "")
-        ) > _LARGE
-        prepare = functools.partial(
-            _prepare_masks, known_secret, flat, prose=value_prose, detail=known_detail, also=also,
-        )
-        strict, named, masked, spans = await asyncio.to_thread(prepare) if large else prepare()
-        # The searchable name: the identifier masked, then capped. It carries
-        # the body header; the key never does.
-        name = reference_ops.cap_masked(masked, _MAX_IDENTIFIER, named) if not nameless else "credential"
-        # What this write knows of the entry's identity, held in meta (never
-        # indexed): who wrote it, every span the identifier's mask has replaced,
-        # this time and in each earlier rotation of the entry it updates, so a
-        # later write masks them all, and whether its value is prose.
-        recorded = [*(knowledge_crud._meta_fields(observed.meta)[2] or ()), *spans]
-        meta[knowledge_crud.IDENTITY_META] = {
-            "origin": knowledge_crud.UNTRUSTED if insert_only else knowledge_crud.TRUSTED,
-            "masked_spans": list(dict.fromkeys(span for span in recorded if span.strip())),
-            "value_is_prose": value_prose,
-        }
-        secret_meta = json.dumps(meta, sort_keys=True, ensure_ascii=False, default=str)
-        content = f"[{knowledge_crud.CREDENTIAL_DOMAIN}] {name}" + content[len(header):]
-        if secret_value is None and observed.value is not None and (
-            secret_detail is not None or secret_meta != observed.meta
-        ):
-            # A new description or new metadata with the value placeholder: the
-            # stored value beside them, together, as a new secret row.
-            secret_value = observed.value
-        if secret_value is None and observed.value is None:
-            # Nothing to keep and nothing given: an ordinary entry whose held
-            # value is empty, never a refusal.
-            secret_value = ""
-        if secret_value is not None and secret_detail is None:
-            # The stored description stays beside a new value, in the new row.
-            secret_detail = observed.detail if observed.detail is not None else ""
-        mask_tags = functools.partial(reference_ops.mask_value_tags, strict, tags_json, content)
-        tags_json, content = await asyncio.to_thread(mask_tags) if large else mask_tags()
+        plan = await build(await _name_entries(db, project, domain, name_read, insert_only=insert_only))
+        (
+            content, secret_value, secret_detail, secret_meta, observed, concept, name,
+            write_identity, tags_json,
+        ) = plan.fields()
         # The unit's own metadata is neutral: the caller's is in the secret row.
         known = isinstance(pipeline, str) and pipeline in _PIPELINES
         provenance = {"source_pipeline": pipeline if known else "knowledge_ingest"}
@@ -439,21 +367,13 @@ async def _ingest_once(
         name = None
         write_identity = None
     # A credential write that upsert would refuse (no value to hold, or no
-    # reference_secrets table) is refused HERE, before store.store puts a
-    # vector and a memory_fts row in place that no unit would name.
-    if credential and observed is None:
+    # reference_secrets table) is refused under the writer lock below, before
+    # store.store puts a vector and a memory_fts row in place that no unit
+    # would name.
+    if credential and observed is None and plan.same is None:
         observed = await knowledge_crud.observe_credential_key(
             db, project_type=project, domain=domain, concept=resolved_concept,
         )
-    held_by = await knowledge_crud.check_credential_write(
-        db, project_type=project, domain=domain, concept=resolved_concept,
-        secret_value=secret_value, insert_only=insert_only, observed=observed,
-        secret_detail=secret_detail, secret_meta=secret_meta,
-    )
-    if insert_only and held_by is not None:
-        # The key already holds this very value: nothing to write, and no
-        # vector to store beside the one the unit already names.
-        return _stored(held_by, resolved_concept, name, candidates)
 
     # Injection-pattern scan (detect-and-log, fail-open). This is the second
     # ingestion chokepoint — covering the knowledge_ingest MCP tool (allow-listed
@@ -486,6 +406,39 @@ async def _ingest_once(
     # no other publisher can dedup onto, or retire, a point between this write's
     # store, its reference commit and its cleanup.
     async with writer(db):
+        if credential:
+            # The plan above was built from the entries the name resolved to,
+            # and the key, as read before the lock. Another write of this name
+            # that committed since (the compare-and-swap below covers only this
+            # write's own key) has the plan built again HERE, under the lock,
+            # from a fresh read: never an error, so every writer in a race
+            # lands, masked against the others.
+            fresh = await _name_entries(db, project, domain, name_read, insert_only=insert_only)
+            if await plan.changed(db, fresh, project=project, domain=domain, keyed=keyed is not None):
+                plan = await build(fresh, prior=plan)
+                (
+                    content, secret_value, secret_detail, secret_meta, observed, concept, name,
+                    write_identity, tags_json,
+                ) = plan.fields()
+                resolved_concept = concept
+            if plan.same is not None:
+                # An untrusted write of the credential an untrusted entry
+                # already holds, decided under the lock.
+                return plan.same
+            # The entries a value-less carded write could have meant, from the
+            # read the plan stands on (it was stored as a new entry).
+            candidates = _ambiguous(list(plan.seen), name_read[1], carded=carded, insert_only=insert_only)
+        # Decided under the lock too, against the observation the
+        # compare-and-swap commits against.
+        held_by = await knowledge_crud.check_credential_write(
+            db, project_type=project, domain=domain, concept=resolved_concept,
+            secret_value=secret_value, insert_only=insert_only, observed=observed,
+            secret_detail=secret_detail, secret_meta=secret_meta,
+        )
+        if insert_only and held_by is not None:
+            # The key already holds this very value: nothing to write, and no
+            # vector to store beside the one the unit already names.
+            return _stored(held_by, resolved_concept, name, candidates)
         if observed is not None:
             # The observation is the predecessor the compare-and-swap commits
             # against, so its point is the one this write really displaces.
@@ -690,6 +643,193 @@ async def _resolve_by_name(
         return None, identity, entries
     target = next((e for e in trusted if e.name_hash), None) or next(iter(trusted), None)
     return target, identity, entries
+
+
+async def _name_entries(
+    db: aiosqlite.Connection, project: str, domain: str, name_read: tuple, *, insert_only: bool,
+) -> tuple:
+    """``_resolve_by_name`` with the ``name_read`` arguments (name, value,
+    carded, nameless): a write with no name resolves to no entry."""
+    from genesis.memory import reference_ops
+
+    name, value, carded, nameless = name_read
+    if nameless:
+        return None, reference_ops.name_hash(name), []
+    return await _resolve_by_name(db, project, domain, name, value, carded=carded, insert_only=insert_only)
+
+
+class _CredentialPlan(NamedTuple):
+    """What a credential write builds from its read of the entries its name
+    resolves to (``_credential_plan``)."""
+
+    #: The entry an untrusted write of the same credential is (nothing to write).
+    same: StoredId | None
+    #: The entries as read, and the key's observation: the plan stands while
+    #: both are unchanged.
+    seen: tuple
+    observed: knowledge_crud.KeyObservation | None = None
+    content: str = ""
+    secret_value: str | None = None
+    secret_detail: str | None = None
+    secret_meta: str | None = None
+    concept: str = ""
+    name: str | None = None
+    write_identity: tuple | None = None
+    tags_json: str | None = None
+    #: The stored headers this plan recognises as a read-back body's first
+    #: line, and the secrets it masks: a rebuild under the lock keeps both.
+    headers: tuple = ()
+    also: tuple = ()
+
+    def fields(self) -> tuple:
+        return (
+            self.content, self.secret_value, self.secret_detail, self.secret_meta,
+            self.observed, self.concept, self.name, self.write_identity, self.tags_json,
+        )
+
+    async def changed(
+        self, db: aiosqlite.Connection, fresh: tuple, *, project: str, domain: str, keyed: bool,
+    ) -> bool:
+        """Whether ``fresh`` (``_name_entries`` read again) or the key this plan
+        observed differ from what it was built from. A key given by the
+        caller is not observed again: a change to it is the compare-and-swap's."""
+        if tuple(fresh[2]) != self.seen:
+            return True
+        if keyed or self.same is not None:
+            return False
+        return await knowledge_crud.observe_credential_key(
+            db, project_type=project, domain=domain, concept=self.concept,
+        ) != self.observed
+
+
+async def _credential_plan(
+    db: aiosqlite.Connection, resolution: tuple, *, project: str, domain: str, given: str,
+    header: str, split, split_large: bool, held: tuple, flat: str, carded: bool,
+    insert_only: bool, keyed: knowledge_crud.KeyObservation | None, entry_key: str | None,
+    prose: bool, nameless: bool, meta: dict, tags_json: str | None,
+    prior: _CredentialPlan | None = None,
+) -> _CredentialPlan:
+    """The part of a credential write built from ``resolution`` (``_name_entries``:
+    the target, the name's hash, the entries the name resolves to), from the
+    caller's input as split (``held``: content, value, description) and its
+    ``meta`` and ``tags_json`` as given, never as a previous build left them,
+    so it can run again under the writer lock (``ingest_knowledge_unit``).
+    Run again, it is given the plan it replaces (``prior``): a header and a
+    secret that read recognised stay recognised (Devin 4682745904, 4682746508)."""
+    from genesis.memory import reference_ops
+
+    target, identity, entries = resolution
+    content, secret_value, secret_detail = held
+    meta = dict(meta)
+    first, sep, _ = given.partition("\n")
+    headers = tuple(dict.fromkeys([
+        *(prior.headers if prior else ()), *((entry.body or "").partition("\n")[0] for entry in entries),
+    ]))
+    if sep and first != header and first in headers:
+        # A body read back and saved again starts with the header STORED
+        # for the entry its name resolves to (its name masked): that line
+        # is the header, never description text (comment 4579950912). The
+        # value is the same either way, so the resolution stands.
+        header = first
+        split = functools.partial(split, header=header)
+        content, secret_value, secret_detail = await asyncio.to_thread(split) if split_large else split()
+    if insert_only:
+        # The value this write would store: an upload whose whole text is the
+        # placeholder holds an empty value (below), and is compared as that.
+        stored_value = secret_value if secret_value is not None else ""
+        for entry in entries:
+            # An untrusted write of the credential an untrusted entry already
+            # holds (a re-upload) is that entry: the one sameness rule.
+            if knowledge_crud.same_untrusted(entry, stored_value, secret_detail, json.dumps({"identifier": flat})):
+                return _CredentialPlan(_stored(entry.id, entry.concept), tuple(entries), headers=headers)
+    if keyed is not None:
+        concept, observed = entry_key, keyed
+    elif target is not None:
+        concept = target.concept
+        observed = await knowledge_crud.observe_credential_key(
+            db, project_type=project, domain=domain, concept=concept,
+        )
+        # An update keeps the full name the entry records (the same name,
+        # perhaps in another case or spacing), from its meta as observed:
+        # the one snapshot the compare-and-swap commits against.
+        recorded = reference_ops.recorded_name(target.concept, target.body, observed.meta)
+        if recorded:
+            flat = meta["identifier"] = recorded
+    else:
+        concept, observed = await _mint_key(db, project, domain)
+    write_identity = None if keyed is not None else (
+        identity,
+        reference_ops.UNTRUSTED if insert_only else reference_ops.UNNAMED if nameless
+        else reference_ops.CARDED if carded else reference_ops.TRUSTED,
+    )
+    if secret_value == "" and observed.value is not None:
+        # An empty value line on a key that holds one keeps it.
+        secret_value = None
+    known_secret = (secret_value if secret_value is not None else observed.value) or ""
+    known_detail = secret_detail if secret_detail is not None else observed.detail
+    # Whether the value the probes are built from was free prose: this
+    # write's, or the stored one it keeps.
+    value_prose = prose if secret_value is not None else knowledge_crud._meta_fields(observed.meta)[3]
+    # The secrets this write must not repeat beside its own: the value it
+    # replaces and every value and recorded masked span of the entries the
+    # name resolves to (any origin), never a description. Stated limit: a
+    # name that spells a secret of an entry under another name is not
+    # masked with it. The pure-Python work runs off the event loop when any
+    # value it reads is large.
+    also = _secrets_of(observed, entries, known_secret, value_prose)
+    if prior is not None:
+        # Every secret the plan this one replaces masked stays masked, even
+        # one this read no longer holds (rotated away in between).
+        also = tuple(dict.fromkeys([
+            *also, *(t for t in prior.also if t[0] != known_secret or bool(t[2]) != bool(value_prose)),
+        ]))
+    # Every probe of the value and of the secrets the capture rules find in
+    # it and in the description, built ONCE for the identifier and the tags.
+    large = (
+        len(known_secret) + len(known_detail or "") + sum(len(item[0] or "") for item in also)
+        + len(flat) + len(tags_json or "")
+    ) > _LARGE
+    prepare = functools.partial(
+        _prepare_masks, known_secret, flat, prose=value_prose, detail=known_detail, also=also,
+    )
+    strict, named, masked, spans = await asyncio.to_thread(prepare) if large else prepare()
+    # The searchable name: the identifier masked, then capped. It carries
+    # the body header; the key never does.
+    name = reference_ops.cap_masked(masked, _MAX_IDENTIFIER, named) if not nameless else "credential"
+    # What this write knows of the entry's identity, held in meta (never
+    # indexed): who wrote it, every span the identifier's mask has replaced,
+    # this time and in each earlier rotation of the entry it updates, so a
+    # later write masks them all, and whether its value is prose.
+    recorded = [*(knowledge_crud._meta_fields(observed.meta)[2] or ()), *spans]
+    meta[knowledge_crud.IDENTITY_META] = {
+        "origin": knowledge_crud.UNTRUSTED if insert_only else knowledge_crud.TRUSTED,
+        "masked_spans": list(dict.fromkeys(span for span in recorded if span.strip())),
+        "value_is_prose": value_prose,
+    }
+    secret_meta = json.dumps(meta, sort_keys=True, ensure_ascii=False, default=str)
+    content = f"[{knowledge_crud.CREDENTIAL_DOMAIN}] {name}" + content[len(header):]
+    if secret_value is None and observed.value is not None and (
+        secret_detail is not None or secret_meta != observed.meta
+    ):
+        # A new description or new metadata with the value placeholder: the
+        # stored value beside them, together, as a new secret row.
+        secret_value = observed.value
+    if secret_value is None and observed.value is None:
+        # Nothing to keep and nothing given: an ordinary entry whose held
+        # value is empty, never a refusal.
+        secret_value = ""
+    if secret_value is not None and secret_detail is None:
+        # The stored description stays beside a new value, in the new row.
+        secret_detail = observed.detail if observed.detail is not None else ""
+    mask_tags = functools.partial(reference_ops.mask_value_tags, strict, tags_json, content)
+    tags_json, content = await asyncio.to_thread(mask_tags) if large else mask_tags()
+    return _CredentialPlan(
+        None, tuple(entries), observed, content, secret_value, secret_detail, secret_meta,
+        concept, name, write_identity, tags_json, headers,
+        # The value masked as this write's own is a secret a rebuild masks
+        # too: it is dropped there again only if it is still the write's own.
+        tuple(dict.fromkeys([*also, *([(known_secret, known_detail, value_prose)] if known_secret else [])])),
+    )
 
 
 def _ambiguous(

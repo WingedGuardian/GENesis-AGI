@@ -76,7 +76,8 @@ async def test_checkpoint_occurs_after_disconnect_and_preserves_cost(tmp_path, m
             id TEXT PRIMARY KEY, cc_session_id TEXT, session_type TEXT, model TEXT,
             source_tag TEXT, status TEXT, cc_pid INTEGER, started_at TEXT,
             last_heartbeat TEXT, completed_at TEXT, checkpointed_at TEXT,
-            cost_usd REAL DEFAULT 0, pid INTEGER, last_activity_at TEXT)""")
+            cost_usd REAL DEFAULT 0, pid INTEGER, last_activity_at TEXT,
+            channel TEXT, effort TEXT)""")
         await db.commit()
     register_terminal_session_sync(str(dbpath), "actual", pid=99999)
     async with aiosqlite.connect(dbpath) as db:

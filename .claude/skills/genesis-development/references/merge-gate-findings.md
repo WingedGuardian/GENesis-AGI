@@ -12,13 +12,27 @@
    scored once, as Devin. CodeRabbit Minor and below stay SURFACE-ONLY by owner
    ruling — only Devin gained scoring.
 
-   **Clearing a finding:** a MAINTAINER's in-thread reply, as always — or, for
-   a DEVIN finding only, Devin itself replying in that finding's thread with a
-   first line starting `✅ **Resolved**` (Devin may withdraw its own finding; no
-   bot can clear another's, free prose such as "Fixed in …" clears nothing, and
-   Codex and CodeRabbit findings still need a maintainer reply). Devin's reviewer
-   and its builder post under ONE login, so a self-withdrawal is reply text, not
-   an identity: it still clears, but the gate always LISTS it as
+   **Clearing a finding below the floor:** a MAINTAINER's in-thread reply — or,
+   for a DEVIN finding only, Devin itself replying in that finding's thread with a
+   first line starting `✅ **Resolved**` (no bot can clear another's, and Codex and
+   CodeRabbit findings still need a maintainer reply).
+
+   **Clearing a FLOOR finding (#4933):** a reply with a line that starts with
+   `Fixed in <sha>` (or `at`/`by`), outside quotes and code and unhedged, whose commit
+   is one of the PR's own, single-parent, descending from the head the finding was
+   posted on, and touching its file or its renamed name; the fix must still be in the
+   head being merged (that head or its ancestor, with the file changed there since the
+   finding was posted, so a fully reverted fix does not clear, #5000; a revert hidden by
+   another change to the same file still clears); or the owner's
+   `# floor-accept=<id>[,<id>]`. Any other reply clears nothing, and neither does
+   `# review-override`. MEASURED over the 739 floor findings on the 862 PRs merged
+   2026-10-01 to 2026-11-20, two readers agreed that 73 replies did not fix a
+   leak, destructive or fail-open finding they had cleared. This rule blocks 72; the
+   73rd (#2878) turned out to be a real fix, cited in Devin's own reply.
+   Devin's reviewer and its builder post under ONE login, so its `Resolved` is
+   reply text, not an identity, and it never names a commit (MEASURED 0 of 23). On a
+   thread carrying that marker, a `Fixed in <sha>` from Devin's own login counts and
+   must pass the same test; the gate still LISTS the finding as
    `[Devin self-withdrawn]` so you can check the fix landed. A thread
    resolved in the GitHub UI does NOT clear a finding; reply instead. A finding
    Devin posted more than once counts once: each copy's diff and documentation
@@ -143,10 +157,10 @@
    prompt sit downstream of this guard and can still stop the command.
    Never any command text — the row is metadata only, because a trailing comment
    rides a Bash command that can carry a credential.
-   **Scope, stated so the log is not read as more complete than it is:** the six
+   **Scope, stated so the log is not read as more complete than it is:** the seven
    PR-merge sigils are covered (`# review-override`, `# ci-override`,
    `# stale-review-override`, `# scheduled-review-override`,
-   `# substitute-review`, `# rework-override`), from the point the
+   `# substitute-review`, `# rework-override`, `# floor-accept`), from the point the
    PR is resolved onward. A merge rejected BEFORE that point writes nothing —
    no `--admin`, an unresolvable repo/PR, a compound carrying two publish/merge
    operations, or a merge compounded with a local `git merge` into main are the
