@@ -2488,7 +2488,15 @@ Standard open-source workflow: PRs go directly to the public repo.
   banned, so a rebased pushed branch diverges from its remote with no way to
   publish the rewrite. A merge commit on a *branch* is fine — the squash erases
   it at PR merge; "squash only" above governs merging into main, not
-  reconciling a branch.
+  reconciling a branch. The same holds for a **stacked PR's base**: bring a
+  fixed base branch in with a merge (`--no-ff`), never `rebase --onto`. A
+  rebase also strands an open round's reflection: the commit gate credits it
+  only behind the reviewed head, which the rebase rewrites away, so every fix
+  commit is then refused.
+- **A gate that says "ask the owner" means ask.** Do it even when you caused
+  the block yourself and judge the block correct. Never rewrite history (reset,
+  re-merge, sigils) to get past the gate: that judgment is the one the message
+  reserves for the owner.
 - **In a reconciliation merge, the base wins on policy.** The merge commit may
   DELETE from your branch (a rule main superseded, a test that pinned your
   now-dead behavior); it may never re-litigate main. Scope, precisely: base
