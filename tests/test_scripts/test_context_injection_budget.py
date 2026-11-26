@@ -271,6 +271,24 @@ def test_huge_user_md_elides_conversation_to_pointer(monkeypatch, capsys, tmp_pa
     assert _ctx.utf16_len(out) <= _ctx._PART_BUDGET
 
 
+@pytest.mark.parametrize("replace", [False, True])
+def test_elided_conversation_pointer_names_the_files_in_force(monkeypatch, capsys, tmp_path, replace):
+    """The pointer sends the model to what is actually in force: the shipped file
+    and its local layer, or the layer alone when it replaces the shipped text."""
+    ident = tmp_path / "identity"
+    ident.mkdir()
+    (ident / "USER.md").write_text("U" * 8_000)
+    (ident / "CONVERSATION.md").write_text("C" * 3_000)
+    marker = "<!-- genesis: replace -->\n" if replace else ""
+    (ident / "CONVERSATION.local.md").write_text(marker + "L" * 3_000)
+    out = _direct_part(monkeypatch, capsys, ident, "identity-user")
+    assert "omitted for size" in out
+    assert "src/genesis/identity/CONVERSATION.local.md" in out
+    shipped = "`src/genesis/identity/CONVERSATION.md`"
+    assert (shipped in out) is (not replace), out[-800:]
+    assert _ctx.utf16_len(out) <= _ctx._PART_BUDGET
+
+
 def test_conversation_sized_to_the_real_room_is_not_elided(monkeypatch, capsys, tmp_path):
     """The audit-line headroom is reserved ONCE, by the writer.
 
@@ -896,3 +914,46 @@ def test_the_emitter_derivation_reaches_NESTED_scripts(tmp_path) -> None:
     assert "hooks/nested.py" in found, "a nested emitter is invisible to the lock"
     assert not any("hook_output" in f for f in found), "the writer excludes itself"
     assert "unrelated.py" not in found
+
+
+# ── the identity resolver (#2862) ────────────────────────────────────────
+
+
+def test_identity_core_reads_the_seed_and_the_steering_layer(monkeypatch, capsys, tmp_path):
+    ident = tmp_path / "identity"
+    ident.mkdir()
+    (ident / "SOUL.md.example").write_text("shipped soul")
+    (ident / "STEERING.md").write_text("# Steering\n\n---\n\nshipped rule")
+    (ident / "STEERING.local.md").write_text("local rule")
+    out = _direct_part(monkeypatch, capsys, ident, "identity-core")
+    assert "shipped soul" in out
+    assert "shipped rule\n\n---\n\nlocal rule" in out
+
+
+def test_truncation_notice_names_every_file_that_was_read(monkeypatch, capsys, tmp_path):
+    ident = tmp_path / "identity"
+    ident.mkdir()
+    (ident / "SOUL.md").write_text("soul")
+    (ident / "STEERING.md").write_text("# Steering")
+    (ident / "STEERING.local.md").write_text("R" * 12_000)
+    out = _direct_part(monkeypatch, capsys, ident, "identity-core")
+    assert (
+        "read src/genesis/identity/STEERING.md and "
+        "src/genesis/identity/STEERING.local.md directly." in out
+    )
+    assert _ctx.utf16_len(out) <= _ctx._PART_BUDGET
+
+
+def test_steering_notice_is_reserved_at_its_real_length(monkeypatch, capsys, tmp_path):
+    """An oversized SOUL truncates to make room for STEERING's notice, which names
+    STEERING.local.md too; reserving only the fixed tail cut the part hard."""
+    ident = tmp_path / "identity"
+    ident.mkdir()
+    (ident / "SOUL.md").write_text("S" * 12_000)
+    # Larger than any reserve, so STEERING itself degrades to its notice.
+    (ident / "STEERING.md").write_text("# Steering\n\n---\n\n" + "R" * 2_000)
+    (ident / "STEERING.local.md").write_text("local rule")
+    out = _direct_part(monkeypatch, capsys, ident, "identity-core")
+    assert "CUT" not in out
+    assert "src/genesis/identity/STEERING.local.md directly.]_" in out
+    assert _ctx.utf16_len(out) <= _ctx._PART_BUDGET
