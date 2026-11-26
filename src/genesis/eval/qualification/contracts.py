@@ -207,7 +207,7 @@ class RecordingRouter:
 
 async def relevance(case, router) -> dict:
     capture = RecordingRouter(router)
-    score, detail, _model = await J9EvalBatchExecutor(router=capture)._judge_relevance(
+    score, detail, _model, _served_model = await J9EvalBatchExecutor(router=capture)._judge_relevance(
         case["query"], case["memory_content"]
     )
     # Checked FIRST, as novelty() does: production swallows a transport that

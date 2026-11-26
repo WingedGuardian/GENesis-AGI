@@ -2792,6 +2792,13 @@ verified: 204c69c1f 2026-11-22
   would expire before the next window) wait for `snapshots.deletion_window`,
   default 05:00-07:00 in the user's timezone, because deleting a large btrfs
   subvolume can stall filesystem commits for minutes under quota accounting.
+  The window's zone is `snapshots.deletion_window_timezone`, else a configured
+  user timezone, else the host clock's zone (a host Guardian usually has no
+  genesis.yaml; a UTC host clock does not count), else UTC; `disk-status`
+  reports which (`config|user|system|fallback`). Guardian log stamps carry
+  their UTC offset. The gateway `set-timezone <zone>` verb sets the host
+  clock's zone, then the container's, with the installers' calls; host jobs
+  then follow local time, as on a fresh install.
   The healthy snapshot is still created on its cadence. Reserve relief and
   delete-first never wait; early relief waits only while the pool stays above
   its reserve until the window opens. `any` restores immediate scheduling.

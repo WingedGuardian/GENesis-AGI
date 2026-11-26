@@ -14,15 +14,35 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 from typing import TYPE_CHECKING, Any
 
 from genesis.eval.types import ScorerType
+from genesis.security.credential_shapes import (
+    KNOWN_KEY_PREFIX_PATTERN,
+    STRUCTURED_CREDENTIAL_PATTERN,
+)
 
 if TYPE_CHECKING:
     from genesis.eval.rubrics import Rubric
     from genesis.routing.router import Router
 
 logger = logging.getLogger(__name__)
+
+_MAX_SERVED_MODEL_LENGTH = 200
+_SERVED_MODEL_ID = re.compile(r"~?[A-Za-z0-9][A-Za-z0-9._-]*(?:[/@:][A-Za-z0-9][A-Za-z0-9._-]*)*")
+
+
+def judge_served_model(value: object) -> str | None:
+    """Accept a bounded model identifier from a judge response for persistence."""
+    if not isinstance(value, str) or len(value) > _MAX_SERVED_MODEL_LENGTH:
+        return None
+    if not _SERVED_MODEL_ID.fullmatch(value):
+        return None
+    if KNOWN_KEY_PREFIX_PATTERN.search(value) or STRUCTURED_CREDENTIAL_PATTERN.search(value):
+        return None
+    return value
+
 
 def render_rubric_prompt(rubric: Rubric, actual: str, expected: str, config: dict) -> str:
     """Render the judge question identically for scoring and reference preflight."""
@@ -281,8 +301,11 @@ class LLMJudgeScorer(Scorer):
     string with shape::
 
         {"rubric_name": str, "rubric_version": str,
-         "judge_model": str, "judge_score": float,
+         "judge_model": str, "judge_served_model": str | None, "judge_score": float,
          "rationale": str, "raw_response": str}
+
+    ``judge_model`` falls back to the configured ID or provider label when
+    ``judge_served_model`` has no provider-reported identity.
 
     On call failure, ``passed=False, score=0.0`` and ``detail`` carries
     a sentinel (``judge_parse_fail`` / ``judge_call_fail``) plus the
@@ -351,7 +374,11 @@ class LLMJudgeScorer(Scorer):
             return False, 0.0, detail
 
         raw = result.content or ""
-        judge_model = result.model_id or result.provider_used or "unknown"
+        served_model = judge_served_model(getattr(result, "served_model", None))
+        judge_identity = {
+            "judge_model": served_model or result.model_id or result.provider_used or "unknown",
+            "judge_served_model": served_model,
+        }
 
         # Parse JSON tolerantly — borrow the existing _extract_json
         # helper that handles markdown fences and prose-wrapped JSON.
@@ -373,7 +400,7 @@ class LLMJudgeScorer(Scorer):
             detail = json.dumps({
                 "rubric_name": rubric.name,
                 "rubric_version": rubric.version,
-                "judge_model": judge_model,
+                **judge_identity,
                 "error": _JUDGE_PARSE_FAIL,
                 "error_message": str(exc),
                 "raw_response": raw[:1000],
@@ -391,7 +418,7 @@ class LLMJudgeScorer(Scorer):
             detail = json.dumps({
                 "rubric_name": rubric.name,
                 "rubric_version": rubric.version,
-                "judge_model": judge_model,
+                **judge_identity,
                 "error": _JUDGE_PARSE_FAIL,
                 "error_message": f"non-finite score: {score_val!r}",
                 "raw_response": raw[:1000],
@@ -405,7 +432,7 @@ class LLMJudgeScorer(Scorer):
         detail = json.dumps({
             "rubric_name": rubric.name,
             "rubric_version": rubric.version,
-            "judge_model": judge_model,
+            **judge_identity,
             "judge_score": score_val,
             "rationale": rationale,
             "raw_response": raw[:1000],

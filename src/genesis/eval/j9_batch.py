@@ -18,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from genesis.db.crud import j9_eval
+from genesis.eval.scorers import judge_served_model
 from genesis.surplus.types import ExecutorResult, SurplusTask
 
 if TYPE_CHECKING:
@@ -172,7 +173,7 @@ class J9EvalBatchExecutor:
                 # chain_offset rotates the judge provider chain per item so
                 # concurrent calls spread across providers (same pattern as
                 # knowledge.distillation).
-                relevance, rationale, model_used = await self._judge_relevance(
+                relevance, rationale, model_used, served_model = await self._judge_relevance(
                     query, content, chain_offset=index,
                 )
                 if relevance is not None:
@@ -189,6 +190,7 @@ class J9EvalBatchExecutor:
                             "relevance": relevance,
                             "judge_rationale": rationale,
                             "judge_model": model_used,
+                            "judge_served_model": served_model,
                             "judge_prompt_version": _RELEVANCE_PROMPT_VERSION,
                         },
                     )
@@ -381,20 +383,23 @@ class J9EvalBatchExecutor:
 
     async def _judge_relevance(
         self, query: str, memory_content: str, *, chain_offset: int = 0,
-    ) -> tuple[float | None, str, str]:
+    ) -> tuple[float | None, str, str, str | None]:
         """Ask the judge model to score relevance via the router.
 
-        Returns (relevance_score, rationale_or_error, model_used).
+        Returns (relevance_score, rationale_or_error, model_label, served_model).
+        The label falls back to configured identity when served_model is absent.
         ``chain_offset`` rotates the provider chain so concurrent callers
         spread across the judge chain's providers.
         """
         if self._router is None:
-            return (None, "no router configured", "none")
+            return (None, "no router configured", "none", None)
 
         prompt = _RELEVANCE_PROMPT.format(
             query=query[:500],
             memory_content=memory_content[:1000],
         )
+        model_used = "router:judge"
+        served_model = None
         try:
             result = await self._router.route_call(
                 call_site_id="judge",
@@ -406,7 +411,9 @@ class J9EvalBatchExecutor:
             model_used = result.model_id or result.provider_used or "router:judge"
             if not result.success:
                 logger.debug("J9 relevance routing failed: %s", result.error)
-                return (None, result.error or "routing failed", model_used)
+                return (None, result.error or "routing failed", model_used, None)
+            served_model = judge_served_model(getattr(result, "served_model", None))
+            model_used = served_model or model_used
             text = result.content or ""
             # Parse JSON response
             parsed = json.loads(text.strip())
@@ -417,10 +424,10 @@ class J9EvalBatchExecutor:
                 raise ValueError("judge response missing required 'relevance' key")
             relevance = float(parsed["relevance"])
             rationale = parsed.get("rationale", "")
-            return (max(0.0, min(1.0, relevance)), rationale, model_used)
+            return (max(0.0, min(1.0, relevance)), rationale, model_used, served_model)
         except (json.JSONDecodeError, KeyError, ValueError) as exc:
-            logger.debug("J9 relevance parse error: %s", exc)
-            return (None, str(exc), "router:judge")
+            logger.debug("J9 relevance parse error (model observed=%s): %s", served_model is not None, exc)
+            return (None, str(exc), model_used, served_model)
         except Exception as exc:
-            logger.debug("J9 relevance LLM error: %s", exc)
-            return (None, str(exc), "router:judge")
+            logger.debug("J9 relevance LLM error (model observed=%s): %s", served_model is not None, exc)
+            return (None, str(exc), model_used, served_model)

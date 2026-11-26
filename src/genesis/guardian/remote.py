@@ -13,7 +13,7 @@ update, sync-gateway, redeploy, update-cc, update-node, test-approval, test-aler
 disk-status, host-profile, cc-tmp-apply, reharden-key, ping, provision-status,
 provision-grow-disk, provision-grow-memory, provision-vzdump,
 provision-vzdump-status, storage-expand, grow-root,
-set-container-limits, sent-log.
+set-container-limits, sent-log, set-timezone.
 """
 
 from __future__ import annotations
