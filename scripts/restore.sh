@@ -1533,7 +1533,26 @@ if [ -d "$BACKUP_DIR/user_config" ]; then
     if [ -L "$_UCFG_TARGET" ]; then
         warn "user config: $_UCFG_TARGET is a symlink; not restored through it"
     else
+        # Nothing is pruned (backup §6g), so a path that turned from a file into a
+        # directory, or back, leaves copies of both layouts. Restoring deepest first
+        # lets the directory layout land; the other side is then a layout conflict,
+        # skipped and counted as kept, and both copies stay in the backup. This
+        # favours the directory (the layout code creates: modules/,
+        # research-profiles/, reflection/); it does not know which side is newer.
+        _ucfg_by_depth() {
+            local f n d
+            while IFS= read -r -d '' f; do
+                n="${f##*/}"
+                d="${n//__/}"
+                printf '%06d\t%s\0' "$(( (${#n} - ${#d}) / 2 ))" "$f"
+            done < <(find "$BACKUP_DIR/user_config" -maxdepth 1 -type f -name '*.gpg' -print0 2>/dev/null)
+        }
+        # A dry run creates nothing, so the directories a real run would make are
+        # recorded here and treated as present: the preview reports the same
+        # conflicts the real run meets.
+        declare -A _ucfg_planned=()
         while IFS= read -r -d '' src; do
+            src="${src#*$'\t'}"
             name="${src##*/}"
             _stem="${name%.gpg}"
             rel="${_stem//__//}"
@@ -1559,14 +1578,25 @@ if [ -d "$BACKUP_DIR/user_config" ]; then
             fi
             dst="$_UCFG_TARGET/$rel"
             _ucfg_dir="$_UCFG_TARGET"
+            _ucfg_file_in_way=false
             for _seg in "${_ucfg_parts[@]:0:${#_ucfg_parts[@]}-1}"; do
                 _ucfg_dir="$_ucfg_dir/$_seg"
-                if [ -L "$_ucfg_dir" ] || { [ -e "$_ucfg_dir" ] && [ ! -d "$_ucfg_dir" ]; }; then
+                if [ -L "$_ucfg_dir" ]; then
                     _ucfg_bad=true
+                elif [ -e "$_ucfg_dir" ] && [ ! -d "$_ucfg_dir" ]; then
+                    _ucfg_file_in_way=true
                 fi
             done
+            # A symlink on the way could lead the write outside the directory.
             if $_ucfg_bad || [ -L "$dst" ]; then
-                warn "user config: $rel runs through a symlink or a file; skipped"
+                warn "user config: $rel runs through a symlink; skipped"
+                continue
+            fi
+            # The other layout of the same path is here: a layout conflict, not a
+            # failure. The copy stays in the backup.
+            if $_ucfg_file_in_way || [ -d "$dst" ] || [ -n "${_ucfg_planned[$rel]:-}" ]; then
+                log "User config: $rel conflicts with the file or directory already at its path; kept as it is (both layouts stay in the backup)"
+                _USER_CONFIG_KEPT=$(( _USER_CONFIG_KEPT + 1 ))
                 continue
             fi
             # Freshness cannot be read from mtimes (a downloaded or cloned copy carries
@@ -1592,12 +1622,17 @@ if [ -d "$BACKUP_DIR/user_config" ]; then
             if $DRY_RUN; then
                 log "User config: would restore $rel → $dst"
                 _USER_CONFIG_RESTORED=$(( _USER_CONFIG_RESTORED + 1 ))
+                _ucfg_p="$(dirname -- "$rel")"
+                while [ "$_ucfg_p" != "." ] && [ "$_ucfg_p" != "/" ]; do
+                    _ucfg_planned[$_ucfg_p]=1
+                    _ucfg_p="$(dirname -- "$_ucfg_p")"
+                done
                 continue
             fi
             mkdir -p "$(dirname "$dst")"
             decrypt_file "$src" "$dst" || { warn "user config decrypt failed: $rel"; continue; }
             _USER_CONFIG_RESTORED=$(( _USER_CONFIG_RESTORED + 1 ))
-        done < <(find "$BACKUP_DIR/user_config" -maxdepth 1 -type f -name '*.gpg' -print0 2>/dev/null)
+        done < <(_ucfg_by_depth | sort -z -t $'\t' -k1,1r -k2,2)
         log "User config: $_USER_CONFIG_RESTORED restored"
     fi
 else

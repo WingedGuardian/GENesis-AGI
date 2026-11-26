@@ -1976,6 +1976,47 @@ def test_user_config_only_backup_is_a_restorable_payload(backup_env, tmp_path):
     assert cfg.read_text() == "cadence: 2\n", r.stdout[-3000:]
 
 
+@pytest.mark.parametrize(("file_already_here", "dry_run"), [(False, False), (True, False), (False, True)])
+def test_user_config_both_layouts_of_a_path_restore_without_failing(
+    backup_env, tmp_path, file_already_here, dry_run
+):
+    """Nothing is pruned, so a path that turned from a file into a directory leaves
+    copies of both. A clean restore lands the directory layout (deepest first) and
+    skips the stale file; a box that already holds the file keeps it and skips
+    the copies under it. Either way it is a layout conflict, not a failure."""
+    src = tmp_path / "both-layouts"
+    (src / "user_config").mkdir(parents=True)
+    for name, data in (("modules.gpg", b"old file\n"), ("modules__tool.yaml.gpg", b"enabled: true\n")):
+        _gpg(backup_env["home"], "--symmetric", "-o", str(src / "user_config" / name), "-", data=data)
+    fresh = tmp_path / "fresh"
+    cfg = fresh / ".genesis" / "config"
+    cfg.mkdir(parents=True)
+    (fresh / "genesis").mkdir()
+    (fresh / "tmp").mkdir()
+    (fresh / ".gnupg").mkdir(mode=0o700)
+    if file_already_here:
+        (cfg / "modules").write_text("mine\n")
+    r = subprocess.run(
+        ["bash", str(_RESTORE), "--from", str(src), *(["--dry-run"] if dry_run else [])],
+        env=_fresh_restore_env(backup_env, fresh),
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    status = json.loads((fresh / ".genesis" / "restore_status.json").read_text())
+    assert not [f for f in status["failures"] if "user config" in f.lower()], status
+    # Already here: the stale copies under it conflict, and the file itself is kept.
+    assert status["user_config_kept"] == (2 if file_already_here else 1), status
+    if file_already_here:
+        assert (cfg / "modules").read_text() == "mine\n", r.stdout[-3000:]
+    elif dry_run:  # the preview meets the same conflict the real run does
+        assert status["user_config_restored"] == 1, status
+        assert not (cfg / "modules").exists()
+    else:
+        assert (cfg / "modules" / "tool.yaml").read_text() == "enabled: true\n", r.stdout[-3000:]
+    assert "conflicts with the file or directory already at its path" in r.stdout, r.stdout[-3000:]
+
+
 def test_user_config_extra_entry_is_covered_not_a_gap(backup_env, tmp_path):
     """An install that still lists ~/.genesis/config as an extra dir (from before
     section 6g) is told it is covered; it is not a skip, so no extras-gap alert."""
