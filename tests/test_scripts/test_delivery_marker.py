@@ -344,17 +344,16 @@ def test_compose_writes_the_comment_and_prints_a_new_comment_command(
     cmd = cap.out.strip().splitlines()[-1]
     assert shlex.split(cmd) == [
         "gh",
-        "pr",
-        "comment",
-        "7",
-        "--repo",
-        "Own/repo",
-        "--body-file",
-        str(out),
+        "api",
+        "repos/Own/repo/issues/7/comments",
+        "-F",
+        f"body=@{out}",
     ]
 
 
-def test_compose_patches_the_owners_latest_marker_comment(dm, monkeypatch, tmp_path, capsys):
+def test_compose_supersedes_the_owners_latest_marker_with_a_new_comment(
+    dm, monkeypatch, tmp_path, capsys
+):
     old = _good().replace(HEAD, OTHER)
     gh = FakeGh(
         comments=[
@@ -390,15 +389,17 @@ def test_compose_patches_the_owners_latest_marker_comment(dm, monkeypatch, tmp_p
     )
     rc, out, cap = _compose(dm, monkeypatch, tmp_path, capsys, gh, "--intended", "read")
     assert rc == 0
+    # A NEW comment (a REST POST), never a PATCH: the push guard denies an agent's
+    # comment edit on an open PR, and select() reads the newest owner marker. Not
+    # `gh pr comment --body-file`, whose opaque body the review-request gate asks on.
     assert shlex.split(cap.out.strip().splitlines()[-1]) == [
         "gh",
         "api",
-        "--method",
-        "PATCH",
-        "repos/Own/repo/issues/comments/12",
+        "repos/Own/repo/issues/7/comments",
         "-F",
         f"body=@{out}",
     ]
+    assert "supersedes your marker comment 12" in cap.out
 
 
 def test_compose_never_posts(dm, monkeypatch, tmp_path, capsys):
@@ -496,7 +497,7 @@ def test_read_says_when_there_is_no_marker(dm, monkeypatch, capsys):
 # ── review round (pre-PR architect findings) ─────────────────────────────────
 
 
-def test_compose_never_patches_a_comment_that_only_quotes_the_header(
+def test_compose_never_supersedes_a_comment_that_only_quotes_the_header(
     dm, monkeypatch, tmp_path, capsys
 ):
     old = _good().replace(HEAD, OTHER)
@@ -520,7 +521,7 @@ def test_compose_never_patches_a_comment_that_only_quotes_the_header(
     )
     rc, out, cap = _compose(dm, monkeypatch, tmp_path, capsys, gh, "--intended", "read")
     assert rc == 0
-    assert "repos/Own/repo/issues/comments/12" in cap.out.strip().splitlines()[-1]
+    assert "supersedes your marker comment 12;" in cap.out
 
 
 def test_compose_refuses_when_gh_is_not_the_owner(dm, monkeypatch, tmp_path, capsys):
@@ -1319,13 +1320,20 @@ def test_a_re_read_keeps_the_aside_line_it_replaces(dm, monkeypatch, tmp_path, c
     gh = FakeGh(comments=[_row(12, "(aside)\n" + _good(), "2026-01-05")])
     rc, out, cap = _compose(dm, monkeypatch, tmp_path, capsys, gh, "--intended", "read")
     assert rc == 0 and out.read_text().startswith("(aside)\n")
-    assert "comments/12" in cap.out
+    assert "marker comment 12;" in cap.out
 
 
 def test_compose_replaces_the_comment_select_would_pick_on_a_tie(dm, monkeypatch, tmp_path, capsys):
     gh = FakeGh(comments=[_row(12, _good(), "2026-01-05"), _row(15, _good(), "2026-01-05")])
     rc, _, cap = _compose(dm, monkeypatch, tmp_path, capsys, gh, "--intended", "read")
-    assert rc == 0 and "comments/15" in cap.out
+    assert rc == 0 and "marker comment 15;" in cap.out
+
+
+def test_a_re_read_posted_as_a_new_comment_governs(dm):
+    """compose posts a re-read as a new comment, so select must take the newest
+    owner marker at head over the older one it supersedes."""
+    rows = [_row(12, _at(HEAD), "2026-01-03"), _row(30, _at(HEAD), "2026-01-09")]
+    assert dm.select(rows, [], "own", HEAD)["governing"]["id"] == 30
 
 
 def test_select_skips_a_row_without_an_integer_id(dm):

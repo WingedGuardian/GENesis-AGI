@@ -549,7 +549,9 @@ comment and label moves it.
    --pr <N> --head <the head you read> --verdict <V> --scope <S> --checker
    other --body-file <prose>` (plus `--intended`, `--change`, `--coderabbit` as
    they apply; `--help` lists them), then run the one `gh` command it prints
-   (the script never posts). Answer the
+   (the script never posts). It always posts a NEW comment, which supersedes an
+   earlier marker (the newest governs); never edit the old one, since the push
+   guard denies an agent's comment edit on an open PR. Answer the
    author's open questions in the same comment, except one Devin's bot is waiting
    on: that answer goes in its own comment without `(aside)`. Record `--checker other`: you
    are not the builder. If this session built the PR, the read is done by a
@@ -590,8 +592,8 @@ comment and label moves it.
    `- CHANGED:` and `- UNVERIFIABLE:`; `Wrong fix named by the issue: "<...>":
    not taken (`path:line`) | taken | none named`; `Scope: <clean, or the
    unrequested part>`; and `Author questions: <each, answered here>`. A
-   DELIVERS needs at least one `- DONE:` line citing a file the PR changes. One owner
-   comment per PR, edited in place when the read is redone; a block by anyone
+   DELIVERS needs at least one `- DONE:` line citing a file the PR changes. A redone
+   read is a NEW owner comment (step 7), never an edit; the newest governs. A block by anyone
    else, or in a review body, does not count. The comment is public: technical
    content only.
 8. **Then act on the verdict.** DELIVERS: continue the loop. PARTIAL or
@@ -794,7 +796,11 @@ agent's merge is bound to the round-4 head, the 4th round by `opened_at`
 moved off it (a fix, a merge of main, a force-push) blocks at merge unless every
 commit after it is empty, and merging that head is the owner's bang-command merge
 (`! gh pr merge …`) or a send-back. A round-4 head that cannot be placed blocks
-too. A
+too. Past round 4 the push guard also denies an agent's push onto the PR's
+branch (any spelling), `gh pr update-branch`, and an `@codex` mention once the
+head is off the round-4 head; on any open PR it denies deleting or editing a
+comment. Each deny names the owner's bang command. A push to a fork PR's branch is
+not covered (a stated residual). A
 fifth round exists only by explicit user approval, re-asked every round, and
 each of those is terminal in the same way (this replaced "round 6 and later are
 strongly discouraged", which read round 5 as ordinary; the discouragement was never a

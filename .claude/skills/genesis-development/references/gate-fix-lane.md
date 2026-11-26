@@ -35,7 +35,10 @@ Applies to any PR whose diff touches the enforcement-hook surface (`scripts/revi
   `opened_at`), or at a head that adds only empty commits to it, and an unreadable
   budget blocks every agent merge (`git_push_guard.py` `_check_past_terminal`, the
   `terminal-head` row of `--check-pr`). Any other head is the owner's bang-command
-  merge or a send-back.
+  merge or a send-back. Past that limit the push guard also denies, foreground and
+  dispatched alike, a push onto the PR's branch, `gh pr update-branch`, and an
+  `@codex` mention off the terminal head (`_past_terminal_route_deny`,
+  `_past_terminal_push_deny`); an unreadable budget leaves these as they were.
 
   **Scope: any PR whose diff touches the enforcement-hook surface** —
   `HOOK_SURFACE_PREFIXES` + `HOOK_SURFACE_FILES` in `scripts/review_budget.py`.
