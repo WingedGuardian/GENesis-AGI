@@ -90,9 +90,10 @@ The shadow verdict requires the sampled daemon's held-memory threshold and
 two consecutive growth cycles on the same daemon. Each cycle expands
 beyond the earlier loaded-thread set, returns to that set, and retains new
 process groups seen during expansion. Genesis waits at least 60 seconds after
-that return and confirms the surviving groups in two observations. Held
-memory must still meet the threshold after unloading. This
-comparison detects persistent growth associated with observed release cycles.
+that return and confirms the surviving groups in two observations. The
+lowest held-memory reading from return through confirmation must meet the
+threshold. This comparison detects persistent growth associated with
+observed release cycles.
 An incomplete sample, an interrupted return, or a gap of more than two minutes
 breaks the streak. Groups already seen before expansion do not count as
 growth. A later baseline reading below the threshold takes precedence over

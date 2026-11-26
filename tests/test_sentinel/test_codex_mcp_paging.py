@@ -3,6 +3,8 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
+
 from genesis.sentinel import codex_mcp_inventory, codex_mcp_paging
 from genesis.sentinel.codex_mcp_paging import Eligibility, RetentionTracker
 
@@ -90,6 +92,24 @@ def test_latest_baseline_low_memory_invalidates_an_older_high_reading():
     tracker.observe(sample("a", (1, 2, 3), ram=2000), 540)
     tracker.observe(sample("ab", (1, 2, 3, 4), ram=5000), 600)
     assert tracker.eligibility(600, THRESHOLD) == Eligibility.INELIGIBLE
+
+
+@pytest.mark.parametrize(("low_at", "low_mib"), [(360, 2000), (390, 0), (420, 2000)])
+def test_confirmation_keeps_the_lowest_reading_from_the_release(low_at, low_mib):
+    tracker = RetentionTracker()
+    tracker.observe(sample("a", (1,)), 0)
+    perform_cycle(tracker, 60, (1, 2))
+    tracker.observe(sample("ab", (1, 2, 3)), 300)
+    for at in (360, 390, 420, 480):
+        tracker.observe(sample("a", (1, 2, 3), ram=low_mib if at == low_at else 5000), at)
+
+    assert tracker.excursions == 2
+    assert tracker.confirmed_held_kib == low_mib * 1024
+    assert tracker.eligibility(480, THRESHOLD) == Eligibility.INELIGIBLE
+
+    perform_cycle(tracker, 540, (1, 2, 3, 4), ram=THRESHOLD)
+    assert tracker.confirmed_held_kib == THRESHOLD * 1024
+    assert tracker.eligibility(720, THRESHOLD) == Eligibility.ELIGIBLE
 
 
 def test_partial_observation_and_daemon_replacement():

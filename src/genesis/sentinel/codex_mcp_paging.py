@@ -32,6 +32,7 @@ class RetentionTracker:
     excursions: int = 0
     expanded: bool = False
     returned_at: float | None = None
+    release_min_held_kib: int | None = None
     observed_at: float | None = None
     complete: bool = False
     baseline_held_kib: int = 0
@@ -41,6 +42,7 @@ class RetentionTracker:
     def _clear_excursion(self) -> None:
         self.expanded = False
         self.returned_at = None
+        self.release_min_held_kib = None
         self.expanded_groups = self.pending_groups = frozenset()
 
     def observe(self, sample: Inventory, now: float) -> None:
@@ -90,6 +92,10 @@ class RetentionTracker:
         self.confirmed_held_kib = min(self.confirmed_held_kib, sample.held_kib)
         if not self.expanded:
             return
+        self.release_min_held_kib = (
+            sample.held_kib if self.release_min_held_kib is None
+            else min(self.release_min_held_kib, sample.held_kib)
+        )
         if self.returned_at is None:
             self.returned_at = now
             return
@@ -105,7 +111,7 @@ class RetentionTracker:
             self.pending_groups = residual
             return
         self.confirmed_groups |= residual
-        self.confirmed_held_kib = sample.held_kib
+        self.confirmed_held_kib = self.release_min_held_kib
         self.excursions += 1
         self._clear_excursion()
 
