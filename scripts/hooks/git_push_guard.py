@@ -347,6 +347,7 @@ try:
     # Inside this block on purpose: a broken module degrades the guard closed
     # (degraded_exit below) instead of exiting 1, which the harness reads as allow.
     from gh_merge import (  # noqa: E402
+        _graphql_code,
         api_merge_reason,
         body_file_path,
         body_file_path_problem,
@@ -373,6 +374,7 @@ try:
         analyze_checked,
         commit_skips_hooks,
         gh_api_request,
+        gh_bool,
         gh_command,
         gh_option_values,
         gh_pr_subcommand,
@@ -6554,13 +6556,41 @@ def _check_past_terminal(
 _CODEX_MENTION_RE = re.compile(r"(?<![\w@])@codex\b", re.IGNORECASE)
 _API_PR_THREAD_RE = re.compile(r"/?repos/([^/\s]+/[^/\s]+)/(?:issues|pulls)/(\d+)/(?:comments|reviews)/?\Z")
 _API_COMMENT_RE = re.compile(r"/?repos/[^/\s]+/[^/\s]+/(?:issues|pulls)/comments/(\d+)/?\Z")
-# GraphQL mutations that delete, edit or hide a PR comment. A match is denied while
-# the repo has any open PR: resolving the target node to its PR would need the node
-# id out of the query or its variables, and this is the simpler of the two rules.
+# GraphQL mutations that delete, edit or hide a PR comment or a whole review (the
+# review names mirror builder_guard's list). A match is denied while the repo has any
+# open PR: resolving the target node to its PR would need the node id out of the
+# query or its variables, and this is the simpler of the two rules. Matched only in
+# a document that is a mutation, outside its strings and comments
+# (``gh_merge._graphql_code``).
 _GRAPHQL_COMMENT_REWRITE_RE = re.compile(
     r"\b(?:deleteIssueComment|updateIssueComment|minimizeComment"
-    r"|deletePullRequestReviewComment|updatePullRequestReviewComment)\b"
+    r"|deletePullRequestReviewComment|updatePullRequestReviewComment"
+    r"|updatePullRequestReview)\b"
 )
+_GRAPHQL_MUTATION_RE = re.compile(r"\bmutation\b")
+# A whole review (REST): deleting one removes it and its comments, and lowers the
+# round count, as deleting a comment does.
+_API_REVIEW_RE = re.compile(r"/?repos/([^/\s]+/[^/\s]+)/pulls/(\d+)/reviews/\d+/?\Z")
+
+
+def _graphql_rewrites_comment(query: str) -> bool:
+    code = _graphql_code(query)
+    return bool(_GRAPHQL_MUTATION_RE.search(code) and _GRAPHQL_COMMENT_REWRITE_RE.search(code))
+
+
+def _off_terminal_head(budget: dict) -> bool:
+    """For an ``@codex`` request: the PR head is not literally the terminal head.
+    Unlike the merge check there is no empty-commit allowance, because a review
+    at any other sha opens a round."""
+    current = str(budget.get("current_head") or "").lower()
+    return current != str(budget.get("terminal_head") or "").lower()
+
+
+def _owner_command(raw: str, cwd: str | None) -> str:
+    """The command the owner reruns. A deny aborts the whole Bash call, so a
+    ``cd`` earlier in it never ran: name the segment's resolved directory."""
+    raw = raw.strip()
+    return f"cd {shlex.quote(cwd)} && {raw}" if cwd else raw
 
 
 def _past_terminal(budget) -> bool:
@@ -6572,14 +6602,16 @@ def _past_terminal(budget) -> bool:
     )
 
 
-def _past_terminal_route_text(what: str, pr_num: str, budget: dict, raw: str) -> str:
+def _past_terminal_route_text(
+    what: str, pr_num: str, budget: dict, raw: str, cwd: str | None = None
+) -> str:
     terminal = str(budget.get("terminal_head") or "")[:12]
     return (
         f"BLOCKED: {what} on PR #{pr_num}, which is past its terminal review round "
         f"(terminal head {terminal}). Past terminal there are two choices: merge at the "
         "terminal head with the remaining issues filed, or send the PR back. Anything "
-        f"else is the owner's call: the owner can run `! {raw.strip()}` (a bang command "
-        "runs no hook)."
+        f"else is the owner's call: the owner can run `! {_owner_command(raw, cwd)}` (a "
+        "bang command runs no hook)."
     )
 
 
@@ -6611,7 +6643,10 @@ def _open_prs_for_branch(
     ``branch``, in the repo gh resolves at ``cwd``; empty on any failure. As in
     ``_open_pr_count_for_branch``, a PR counts only when every push URL names its
     repository (read from the PR's own URL, so it costs no second call): gh may
-    resolve a different repo than the one the push reaches. Seam
+    resolve a different repo than the one the push reaches. A response that fills
+    the ``--limit`` window is a truncated read: unknown, so empty (best effort).
+    Stated residual: a FORK PR (``isCrossRepository``) is never matched, so a push
+    to a fork's head branch keeps today's behaviour. Seam
     ``_TEST_GH_BRANCH_PRS``: a JSON object mapping a branch to ``gh pr list --json
     number,url,isCrossRepository`` rows."""
     raw = os.environ.get("_TEST_GH_BRANCH_PRS")
@@ -6627,8 +6662,10 @@ def _open_prs_for_branch(
             rows = json.loads(got.stdout) if got.returncode == 0 else []
     except Exception:  # noqa: BLE001 - friction: an unanswerable lookup matches nothing
         return []
+    if not isinstance(rows, list) or len(rows) >= _PR_LIST_WINDOW:
+        return []
     out = []
-    for row in rows if isinstance(rows, list) else []:
+    for row in rows:
         url = _PR_URL_RE.match(str(row.get("url") or "")) if isinstance(row, dict) else None
         if (
             url
@@ -6653,7 +6690,7 @@ def _past_terminal_push_deny(seg, cur: str | None, remote: str | None, cwd: str 
             budget = _terminal_budget(pr_num, repo)
             if _past_terminal(budget):
                 what = f"this push moves the head of '{branch}'"
-                return _past_terminal_route_text(what, pr_num, budget, seg.raw)
+                return _past_terminal_route_text(what, pr_num, budget, seg.raw, cwd)
     return None
 
 
@@ -6766,11 +6803,14 @@ def _past_terminal_route_deny(segs, cmd: str, payload: dict) -> str | None:
             target = _route_target(seg, "comment")
             if target is None:
                 continue  # an unresolvable identity is no match (best effort)
-            flags = {name for name, _ in gh_option_values(seg.argv, frozenset({"--delete-last", "--edit-last"}))}
+            flags = gh_bool(
+                gh_option_values(seg.argv, frozenset({"--delete-last", "--edit-last"})),
+                frozenset({"--delete-last", "--edit-last"}),
+            )
             if flags:
                 num, repo = target
                 if (num or cwd) and (repo or cwd) and _pr_is_open("pr", num or "", repo, cwd):
-                    return _comment_rewrite_text(seg.raw)
+                    return _comment_rewrite_text(seg.raw, cwd)
             elif (
                 verb == ("pr", "comment")
                 and target[0]
@@ -6782,29 +6822,43 @@ def _past_terminal_route_deny(segs, cmd: str, payload: dict) -> str | None:
             endpoint = api.endpoint.removeprefix("https://api.github.com/")
             literal = "{" not in endpoint and ":owner" not in endpoint
             if endpoint.lstrip("/") == "graphql":
-                query = " ".join(v for k, v in api.fields if k == "query")
+                queries = [v for k, v in api.fields if k == "query"]
                 if (
-                    _GRAPHQL_COMMENT_REWRITE_RE.search(query)
+                    any(_graphql_rewrites_comment(q) for q in queries)
                     and cwd
                     and _pr_is_open("repo", "", None, cwd)
                 ):
-                    return _comment_rewrite_text(seg.raw)
+                    return _comment_rewrite_text(seg.raw, cwd)
                 continue
             if api.method in ("DELETE", "PATCH") and _API_COMMENT_RE.match(endpoint):
                 if (literal or cwd) and _pr_is_open("comment", endpoint, None, cwd):
-                    return _comment_rewrite_text(seg.raw)
+                    return _comment_rewrite_text(seg.raw, cwd)
+                continue
+            review = _API_REVIEW_RE.match(endpoint)
+            # An edit only: GitHub deletes only a PENDING review, which counts no
+            # round, so denying a review delete would protect nothing.
+            if review and api.method in ("PUT", "PATCH"):
+                repo = review.group(1) if literal else None
+                if (repo or cwd) and _pr_is_open("pr", review.group(2), repo, cwd):
+                    return _comment_rewrite_text(seg.raw, cwd)
                 continue
             thread = _API_PR_THREAD_RE.match(endpoint)
             if not (thread and api.method == "POST"):
                 continue
             target = (thread.group(2), thread.group(1) if literal else None)
-            body = " ".join(v for k, v in api.fields if k == "body")
+            files = {v for _, v in gh_option_values(seg.argv, frozenset({"-F", "--field"})) if v}
+            body = " ".join(
+                v
+                for k, v in api.fields
+                if k == "body" and not (v.startswith("@") and f"{k}={v}" in files)
+            )
         elif verb in (("pr", "review"), ("pr", "update-branch")):
             target = _route_target(seg, inv.subcommand)
             if target is None:
                 continue
             if verb == ("pr", "review"):
-                body = _comment_body(["comment", *seg.argv[seg.argv.index("review") + 1:]])[0]
+                tail = ["comment", *seg.argv[seg.argv.index("review") + 1:]]
+                body = _comment_body(tail)[0]
         update = verb == ("pr", "update-branch")
         if not update and not (body and _CODEX_MENTION_RE.search(body)):
             continue
@@ -6819,19 +6873,21 @@ def _past_terminal_route_deny(segs, cmd: str, payload: dict) -> str | None:
         if not _past_terminal(budget):
             continue
         if update:
-            return _past_terminal_route_text("this update-branch moves the head", num, budget, seg.raw)
-        if _check_past_terminal(num, repo, str(budget.get("current_head") or ""), budget=budget)[0]:
-            return _past_terminal_route_text("this @codex mention opens a round", num, budget, seg.raw)
+            what = "this update-branch moves the head"
+            return _past_terminal_route_text(what, num, budget, seg.raw, cwd)
+        if _off_terminal_head(budget):
+            what = "this @codex mention opens a round"
+            return _past_terminal_route_text(what, num, budget, seg.raw, cwd)
     return None
 
 
-def _comment_rewrite_text(raw: str) -> str:
+def _comment_rewrite_text(raw: str, cwd: str | None = None) -> str:
     return (
         "BLOCKED: this command deletes or edits a comment on an open pull request. "
         "Deleting a reviewer's comment lowers the review round count, and a pinned "
         "head lives in a comment, so an agent does neither on an open PR. Post a new "
-        f"comment instead; the owner can run `! {raw.strip()}` (a bang command runs "
-        "no hook)."
+        f"comment instead; the owner can run `! {_owner_command(raw, cwd)}` (a bang "
+        "command runs no hook)."
     )
 
 
@@ -7157,14 +7213,10 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
         # Past terminal with the head moved off the terminal head, the ask past the
         # limit becomes a deny (owner ruling 3f6ad6fb), for a positive request only;
         # at the terminal head it stays the ask below (F-B3).
-        current = str(result.get("current_head") or "")
-        if (
-            body_signal is True
-            and _past_terminal(result)
-            and _check_past_terminal(pr_num, repo, current, budget=result)[0]
-        ):
+        if body_signal is True and _past_terminal(result) and _off_terminal_head(result):
             what = "this review request opens a round"
-            return "deny", _past_terminal_route_text(what, pr_num, result, seg.raw)
+            seg_cwd = effective_cwd if isinstance(effective_cwd, str) else None
+            return "deny", _past_terminal_route_text(what, pr_num, result, seg.raw, seg_cwd)
 
         if result.get("status") == "ok" and result.get("confirmation_exempt"):
             marker = _review_budget.confirmation_marker(

@@ -887,7 +887,9 @@ def compose(a: argparse.Namespace) -> int:
     # Always a NEW comment: the push guard denies an agent's edit of a comment on an
     # open PR (a deleted or rewritten comment can lower the round count), and
     # ``select`` reads the newest owner marker, so a new comment supersedes the old.
-    cmd = ["gh", "pr", "comment", str(a.pr), "--repo", repo, "--body-file", str(out)]
+    # A REST POST, not `gh pr comment --body-file`: the guard's review-request gate
+    # reads an opaque `gh pr comment` body as a possible `@codex review` and asks.
+    cmd = ["gh", "api", f"repos/{repo}/issues/{a.pr}/comments", "-F", f"body=@{out}"]
     if replaced:
         print(f"Wrote {out}. It supersedes your marker comment {replaced['id']}; post it with:")
     else:

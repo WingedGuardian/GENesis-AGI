@@ -344,13 +344,10 @@ def test_compose_writes_the_comment_and_prints_a_new_comment_command(
     cmd = cap.out.strip().splitlines()[-1]
     assert shlex.split(cmd) == [
         "gh",
-        "pr",
-        "comment",
-        "7",
-        "--repo",
-        "Own/repo",
-        "--body-file",
-        str(out),
+        "api",
+        "repos/Own/repo/issues/7/comments",
+        "-F",
+        f"body=@{out}",
     ]
 
 
@@ -392,17 +389,15 @@ def test_compose_supersedes_the_owners_latest_marker_with_a_new_comment(
     )
     rc, out, cap = _compose(dm, monkeypatch, tmp_path, capsys, gh, "--intended", "read")
     assert rc == 0
-    # A NEW comment, never a PATCH: the push guard denies an agent's comment edit on
-    # an open PR, and select() reads the newest owner marker.
+    # A NEW comment (a REST POST), never a PATCH: the push guard denies an agent's
+    # comment edit on an open PR, and select() reads the newest owner marker. Not
+    # `gh pr comment --body-file`, whose opaque body the review-request gate asks on.
     assert shlex.split(cap.out.strip().splitlines()[-1]) == [
         "gh",
-        "pr",
-        "comment",
-        "7",
-        "--repo",
-        "Own/repo",
-        "--body-file",
-        str(out),
+        "api",
+        "repos/Own/repo/issues/7/comments",
+        "-F",
+        f"body=@{out}",
     ]
     assert "supersedes your marker comment 12" in cap.out
 

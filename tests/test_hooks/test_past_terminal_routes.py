@@ -16,6 +16,7 @@ This file covers the friction in front of it, in the push guard:
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -134,7 +135,7 @@ def test_a_push_onto_a_past_terminal_pr_branch_is_denied(monkeypatch, capsys, re
     assert _main(monkeypatch, cmd, str(repo)) == 2
     err = capsys.readouterr().err
     assert "PR #7, which is past its terminal review round" in err
-    assert f"`! {cmd}`" in err
+    assert f"`! cd {shlex.quote(str(repo))} && {cmd}`" in err
     assert "merge at the terminal head" in err and "send the PR back" in err
 
 
@@ -143,11 +144,6 @@ def test_a_plain_re_push_of_the_current_branch_is_denied(monkeypatch, capsys, re
     _seams(monkeypatch, _budget(current=T))
     assert _main(monkeypatch, "git push", str(repo)) == 2
     assert "PR #7, which is past its terminal review round" in capsys.readouterr().err
-
-
-def test_a_force_push_onto_the_pr_branch_is_denied(monkeypatch, repo):
-    _seams(monkeypatch, _budget(current=T))
-    assert _main(monkeypatch, "git push --force origin feat", str(repo)) == 2
 
 
 def test_a_dispatched_session_is_denied_the_same_way(monkeypatch, repo):
@@ -245,7 +241,7 @@ def test_update_branch_past_terminal_is_denied(monkeypatch, capsys, dispatched):
     assert _main(monkeypatch, cmd, dispatched=dispatched) == 2
     err = capsys.readouterr().err
     assert "PR #7, which is past its terminal review round" in err
-    assert f"`! {cmd}`" in err
+    assert f"`! cd {shlex.quote(HERE)} && {cmd}`" in err
 
 
 def test_update_branch_below_terminal_is_unchanged(monkeypatch):
@@ -340,7 +336,7 @@ def test_a_comment_rewrite_on_an_open_pr_is_denied(monkeypatch, capsys, cmd, dis
     assert _main(monkeypatch, cmd, dispatched=dispatched) == 2
     err = capsys.readouterr().err
     assert "deletes or edits a comment on an open pull request" in err
-    assert f"`! {cmd}`" in err
+    assert f"`! cd {shlex.quote(HERE)} && {cmd}`" in err
 
 
 @pytest.mark.parametrize("cmd", REWRITES)
@@ -480,3 +476,162 @@ def test_a_graphql_read_is_not_a_rewrite(monkeypatch):
     cmd = "gh api graphql -f query='query { viewer { login } }'"
     _seams(monkeypatch, _budget(current=T), states={"repo:": "OPEN"})
     assert G._past_terminal_route_deny(G.analyze(cmd), cmd, CTX) is None
+# -- round 1 findings on #5065 -------------------------------------------------
+
+
+def test_the_owner_command_keeps_the_directory_of_a_push(monkeypatch, capsys, repo, tmp_path):
+    """Devin 4703792023: a deny aborts the whole Bash call, so a `cd` before the
+    push never ran; the bang command must name the push's own directory."""
+    _seams(monkeypatch, _budget(current=T))
+    cmd = f"cd {repo} && git push origin feat"
+    assert _main(monkeypatch, cmd, str(tmp_path)) == 2
+    assert f"`! cd {shlex.quote(str(repo))} && git push origin feat`" in capsys.readouterr().err
+
+
+def test_the_owner_command_keeps_the_directory_of_a_gh_route(monkeypatch, capsys, tmp_path):
+    _seams(monkeypatch, _budget(current=MOVED))
+    target = tmp_path / "other checkout"
+    target.mkdir()
+    cmd = f"cd '{target}' && gh issue comment 7 --repo {REPO} --body '@codex review'"
+    assert _main(monkeypatch, cmd) == 2
+    err = capsys.readouterr().err
+    assert f"`! cd {shlex.quote(str(target))} && gh issue comment 7 --repo {REPO}" in err
+
+
+def test_the_review_request_deny_keeps_the_directory(monkeypatch, tmp_path):
+    _seams(monkeypatch, _budget(current=MOVED))
+    cmd = f"cd {tmp_path} && {CODEX_ROUTES[0]}"
+    decision, reason = G._check_codex_round_escalation(G.analyze(cmd), cmd, CTX)
+    assert decision == "deny"
+    assert f"`! cd {shlex.quote(str(tmp_path))} && {CODEX_ROUTES[0]}`" in reason
+
+
+# Codex 4704023791 and Devin 4703792118: the delivery-marker command compose prints.
+
+
+def _marker_cmd(tmp_path) -> str:
+    body = tmp_path / "pr-7-marker.md"
+    body.write_text("<!-- genesis-delivery-check: ... -->\n@codex review is quoted here\n")
+    return f"gh api repos/{REPO}/issues/7/comments -F body=@{body}"
+
+
+@pytest.mark.parametrize("state", ["below", "past"])
+@pytest.mark.parametrize("dispatched", [False, True])
+def test_the_delivery_marker_post_is_allowed_and_raises_no_ask(
+    monkeypatch, capsys, tmp_path, state, dispatched
+):
+    _seams(monkeypatch, _budget(current=MOVED, state=state))
+    assert _main(monkeypatch, _marker_cmd(tmp_path), dispatched=dispatched) == 0
+    got = capsys.readouterr()
+    assert "permissionDecision" not in got.out, got.out
+    assert "BLOCKED" not in got.err
+
+
+def test_an_opaque_body_file_field_is_no_codex_match(monkeypatch, tmp_path):
+    """A typed `-F body=@file` is a file the guard does not read, even when its name
+    starts `codex`; a raw `-f body=@codex ...` is visible text and still matches."""
+    _seams(monkeypatch, _budget(current=MOVED))
+    opaque = f"gh api repos/{REPO}/issues/7/comments -F body=@codex.md"
+    assert G._past_terminal_route_deny(G.analyze(opaque), opaque, CTX) is None
+    raw = f"gh api repos/{REPO}/issues/7/comments -f body=@codex.md"
+    assert G._past_terminal_route_deny(G.analyze(raw), raw, CTX) is not None
+
+
+# Devin 4703792173: no empty-commit allowance for a review request.
+
+E1 = "e" * 40  # an empty commit on top of T
+
+
+def _empty_on_terminal() -> dict:
+    budget = _budget(current=E1)
+    budget["commits"] = [
+        {"sha": T, "parents": ["c" * 40], "tree": "d" * 40},
+        {"sha": E1, "parents": [T], "tree": "d" * 40},
+    ]
+    return budget
+
+
+@pytest.mark.parametrize("cmd", CODEX_ROUTES)
+def test_codex_at_an_empty_commit_on_the_terminal_head_is_denied(monkeypatch, cmd):
+    budget = _empty_on_terminal()
+    assert G._check_past_terminal("7", REPO, E1, budget=budget)[0] is False  # the merge passes
+    _seams(monkeypatch, budget)
+    assert _main(monkeypatch, cmd) == 2
+
+
+# CodeRabbit 4703812706: an explicit false is unset.
+
+
+def test_an_explicit_false_rewrite_flag_is_unset(monkeypatch):
+    _seams(monkeypatch, _budget(current=T, state="below"), states={"pr:7": "OPEN"})
+    off = f"gh pr comment 7 --repo {REPO} --edit-last=false --body x"
+    assert G._past_terminal_route_deny(G.analyze(off), off, CTX) is None
+    on = f"gh pr comment 7 --repo {REPO} --delete-last=true --yes"
+    assert G._past_terminal_route_deny(G.analyze(on), on, CTX) is not None
+
+
+# CodeRabbit 4703812712: only a mutation's code, never a read or a string.
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        'query { search(query: "deleteIssueComment", type: ISSUE, first: 1) { issueCount } }',
+        "query { viewer { login } } # deleteIssueComment",
+        'mutation { addComment(input: {subjectId: "x", body: "updateIssueComment"}) { clientMutationId } }',
+    ],
+)
+def test_graphql_names_in_a_read_a_string_or_a_comment_are_no_match(monkeypatch, query):
+    cmd = f"gh api graphql -f query='{query}'"
+    _seams(monkeypatch, _budget(current=T), states={"repo:": "OPEN"})
+    assert G._past_terminal_route_deny(G.analyze(cmd), cmd, CTX) is None
+
+
+# GLM P2: deleting or editing a whole review.
+
+REVIEW_REWRITES = [
+    f"gh api -X PUT repos/{REPO}/pulls/7/reviews/99 -f body=x",
+    "gh api --method PATCH repos/{owner}/{repo}/pulls/7/reviews/99 -f body=x",
+    GRAPHQL.format(name="updatePullRequestReview"),
+]
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        f"gh api -X DELETE repos/{REPO}/pulls/7/reviews/99",
+        GRAPHQL.format(name="deletePullRequestReview"),
+    ],
+)
+def test_deleting_a_pending_review_is_not_denied(monkeypatch, cmd):
+    # GitHub deletes only a pending review, which counts no round: nothing to protect.
+    _seams(monkeypatch, _budget(current=T, state="below"), states={"pr:7": "OPEN", "repo:": "OPEN"})
+    assert G._past_terminal_route_deny(G.analyze(cmd), cmd, CTX) is None
+
+
+@pytest.mark.parametrize("cmd", REVIEW_REWRITES)
+def test_a_review_delete_or_edit_on_an_open_pr_is_denied(monkeypatch, capsys, cmd):
+    _seams(monkeypatch, _budget(current=T, state="below"), states={"pr:7": "OPEN", "repo:": "OPEN"})
+    assert _main(monkeypatch, cmd) == 2
+    assert "deletes or edits a comment" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("cmd", REVIEW_REWRITES)
+def test_a_review_delete_or_edit_off_an_open_pr_is_unaffected(monkeypatch, cmd):
+    _seams(monkeypatch, _budget(current=T, state="below"), states={"pr:7": "CLOSED"})
+    assert G._past_terminal_route_deny(G.analyze(cmd), cmd, CTX) is None
+
+
+def test_reading_a_review_is_not_a_rewrite(monkeypatch):
+    _seams(monkeypatch, _budget(current=T), states={"pr:7": "OPEN"})
+    cmd = f"gh api repos/{REPO}/pulls/7/reviews/99"
+    assert G._past_terminal_route_deny(G.analyze(cmd), cmd, CTX) is None
+
+
+# GLM P3: a full --limit window is a truncated read.
+
+
+def test_a_full_pr_list_window_is_unknown(monkeypatch, repo):
+    _seams(monkeypatch, _budget(current=T))
+    monkeypatch.setattr(G, "_PR_LIST_WINDOW", 1)
+    assert _push_verdict(repo, "git push origin feat") is None

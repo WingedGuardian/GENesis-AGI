@@ -142,7 +142,7 @@ PUBLISHING_GUARD_FUNCTIONS = (
     "_seg_dash_C",
     "main",
 )
-PUBLISHING_GUARD_DIGEST = "942b1a7fa907f9ec11dfff25dde1714cda1258c77fa33c269794e2c64271c09e"
+PUBLISHING_GUARD_DIGEST = "bbac76962a87e901256e533470a1f80b190a35c888998655edafd7b3f336a460"
 
 
 def direct_publishing_allowance(request, guard):
