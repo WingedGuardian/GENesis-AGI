@@ -12,7 +12,9 @@ A PEP 578 audit hook on ``socket.connect`` judges every in-process connect:
 - **TCP to this machine** (loopback, ``0.0.0.0``/``::``, or one of its own
   addresses): refused when a socket is LISTENING NOW on that port at that
   destination (the same address, or a wildcard on either side) and at least one
-  such socket does not belong to this pytest process or one of its children.
+  such socket does not belong to this pytest run's process tree (this process
+  and its children, or, on an xdist worker, the controller and all its
+  children; see ``_run_root``).
   Decided at connect time from ``/proc/net/tcp*`` and the process tree's open
   sockets, so a test's own server (in a thread or a child) is reachable, a
   service that started after the run began is still fenced, and a test's own
@@ -340,6 +342,34 @@ def _hook(event: str, args: tuple) -> None:
     raise exc(code, f"live fence: refused a connection to {reason}")
 
 
+def _run_root(config) -> int:
+    """The pid whose process tree is this pytest run: the xdist controller on a
+    worker, this process otherwise.
+
+    A worker is a child of the controller (MEASURED, xdist 3.8: a worker's
+    ``getppid()`` is the controller's pid), and the controller listens on
+    loopback for its own plugins. pytest-rerunfailures' crash-recovery status
+    socket is one, which every worker connects to at startup (#5024). Rooted at
+    the worker alone, the fence read that listener as a live service and
+    refused it, ending the run before any test. Rooted at the controller, it
+    still refuses everything outside this run. If the parent cannot be shown to
+    be pytest, the root stays this process: the fence only ever gets narrower.
+    One consequence: a test's server (or a child it starts) on one worker is
+    reachable from tests on another worker, since both are inside the run; a
+    process that leaves the tree (a double-forked daemon) is still refused.
+    """
+    me = os.getpid()
+    if not hasattr(config, "workerinput"):
+        return me
+    parent = os.getppid()
+    try:
+        with open(f"/proc/{parent}/cmdline", "rb") as f:
+            argv = f.read().split(b"\0")
+    except OSError:
+        return me
+    return parent if any(b"pytest" in arg or b"xdist" in arg for arg in argv) else me
+
+
 def install(config) -> None:
     """Arm the outbound fence. Idempotent: an audit hook cannot be removed.
 
@@ -351,7 +381,7 @@ def install(config) -> None:
     # as the runtime's egress classifier does, not by a copy that drifts.
     from genesis.util.netclass import _LOCAL_NETS
 
-    _S.pid = os.getpid()
+    _S.pid = _run_root(config)
     _S.uid = os.getuid()
     _S.real_home = _live_fence._S.real_home
     _S.local_addrs = _local_addresses()
