@@ -787,7 +787,13 @@ Post the round ledger and get a fresh decision.
 
 **ROUND 4 IS TERMINAL** (owner ruling, 2026-09-25). There is no ordinary round
 5. At four rounds the decision is not "another round": it is to MERGE
-with the outstanding issues accepted and filed, or to SEND IT BACK for rework. A
+with the outstanding issues accepted and filed, or to SEND IT BACK for rework. An
+agent's merge is bound to the round-4 head, the 4th round by `opened_at`
+(`terminal_head`; owner rulings 3f6ad6fb and cc17ee20, 2026-11-25): a head that
+moved off it (a fix, a merge of main, a force-push) blocks at merge unless every
+commit after it is empty, and merging that head is the owner's bang-command merge
+(`! gh pr merge …`) or a send-back. A round-4 head that cannot be placed blocks
+too. A
 fifth round exists only by explicit user approval, re-asked every round, and
 each of those is terminal in the same way (this replaced "round 6 and later are
 strongly discouraged", which read round 5 as ordinary; the discouragement was never a
@@ -1696,14 +1702,15 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   `review_budget.evaluate_evidence`; read those, not this paragraph, for an edge case.
   Ordinary PRs carry standing authorization through four rounds. Starting with the
   fifth review request or the fix commit after four rounds, every action needs its
-  own native user approval. Round 4 is terminal (step 3).
+  own native user approval. Round 4 is terminal (step 3): past it an agent merges
+  only at the round-4 head.
 
   This approval is never a shell sigil and is never persisted. `# escalation-ack` and
   `# final-round-accept` are retired syntax and authorize no current gate. An earlier "okay" cannot authorize a later request or
   commit. Foreground sessions receive the native approval dialog at the action;
   autonomous/dispatched sessions are denied because nobody is present to answer it.
   Unreadable or ambiguous GitHub evidence takes the same ask/deny direction and never
-  becomes zero rounds. Multiple gated actions must be split so one approval cannot cover
+  becomes zero rounds; at merge it blocks every agent merge, at any count. Multiple gated actions must be split so one approval cannot cover
   several commits or review requests.
 
   The native approval enforcement in this section is implemented at Claude Code's
@@ -1809,7 +1816,10 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   review comment's abbreviated SHA is resolved against the PR's full commit list,
   and an ambiguous prefix makes the result unknown. `--check-pr` prints the count
   as an advisory `rounds` row, with findings per round and a RISING marker; it
-  never moves the verdict. Under it, and only when it applies, an advisory
+  never moves the verdict. The `terminal-head` row after it is BLOCKING, and the
+  merge arm runs the same check (`_check_past_terminal`): an unreadable budget
+  blocks an agent merge at any round count, and past terminal the merge must be
+  at the terminal head (below). Under it, and only when it applies, an advisory
   `NOTE: … the PR's own commits since that review changed no file` says a push
   after the last review (a message-only rewrite or an empty commit, possibly under
   a later merge of main) carries the reviewed tree unchanged. Read it before
