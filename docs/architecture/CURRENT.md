@@ -2984,7 +2984,9 @@ verified: 204c69c1f 2026-11-22
   waited out in the tick (the reply can come at the gate's deadline, and
   the post-approval reads take most of what the unit timeout leaves): the
   first tick after the backoff runs it through the same checks, without
-  asking again; a lock that then reads held, a spent budget, the end of
+  asking again. Meanwhile the wait's 2 h re-alert keeps its cadence (owner
+  ruling 953ca5ee) as a plain alert that asks nothing and says the approved
+  restart waits for the recovery cooldown and about when it runs (in the owner's timezone); a lock that then reads held, a spent budget, the end of
   the wait or 2 h kept drops it, and each is said. That stand-down and health check (signals
   read again after APPROVE, before anything runs) is one check shared with
   Gate 2's APPROVE and its deferred wait, on every install: a healthy

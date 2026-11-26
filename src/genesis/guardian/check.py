@@ -1941,10 +1941,11 @@ async def _wait_tick(
         )
         sm.clear_down_alert_sent()
         return True
-    if sm.state.frozen_approved_at is not None and await _kept_approval(
-        config, sm, dispatcher, recovery_engine, state
-    ):
-        return False
+    kept = ""
+    if sm.state.frozen_approved_at is not None:
+        done, kept = await _kept_approval(config, sm, dispatcher, recovery_engine, state)
+        if done:
+            return False
     # An unreadable lock's first gate in this wait is due at once, even when the
     # wait began held (owner ruling 91998f4f); after it, every 2 h, flips or not.
     if state == live_drop.UNREADABLE:
@@ -1957,6 +1958,14 @@ async def _wait_tick(
         return False
     hours = _waited(sm)
     hint = await live_drop.host_hint(cname, inode)
+    if state == live_drop.UNREADABLE and kept:  # 953ca5ee: re-alerted, never asked again
+        await live_drop.send_wait_alert(
+            sm, dispatcher, f"Genesis still down — update.lock unreadable for {hours}",
+            f"incus reports the container {status or 'in an unknown state'} (not stopped), and "
+            "update.lock cannot be read: the Guardian cannot tell whether a deploy is running. "
+            + (f"{hint} " if hint else "") + f"{kept} You hear again in 2 h.",
+        )
+        return False
     if state == live_drop.UNREADABLE:
         return await _frozen_gate(config, sm, dispatcher, recovery_engine, status, hours, hint)
     await live_drop.send_wait_alert(
@@ -1981,6 +1990,16 @@ _GATE_RETRY_S = 600.0
 #: post-approval path's own exec timeouts take most of what TimeoutStartSec
 #: leaves. Kept longer than this, it expires and the gate asks again.
 _KEPT_APPROVAL_MAX_S = live_drop.WAIT_REALERT_S
+
+
+def _owner_clock(when: datetime) -> str:
+    """``when`` as the owner reads it ("9:40 PM JST"), in the user timezone
+    the deletion window also resolves on the host (genesis.env.user_timezone(),
+    imported lazily; UTC, so labelled, where none can be resolved)."""
+    from genesis.guardian.deletion_window import _resolve_tz
+
+    tz, _name, _source = _resolve_tz(None)
+    return when.astimezone(tz).strftime("%I:%M %p %Z").lstrip("0")
 
 
 def _waited(sm: ConfirmationStateMachine) -> str:
@@ -2010,10 +2029,13 @@ async def _drop_kept(sm: ConfirmationStateMachine, dispatcher, why: str) -> None
         )
 
 
-async def _kept_approval(config, sm, dispatcher, recovery_engine, state: str) -> bool:
-    """The tick of a kept APPROVE (c4701689631): True when it is still held by
-    its backoff (quiet) or was acted on now; False once dropped (said), so the
-    wait's own cadence applies."""
+async def _kept_approval(
+    config, sm, dispatcher, recovery_engine, state: str
+) -> tuple[bool, str]:
+    """The tick of a kept APPROVE (c4701689631): (True, "") when it was acted
+    on now; else the wait's own cadence applies (owner ruling 953ca5ee: a kept
+    approval never pauses the 2 h re-alert), with the sentence its re-alert
+    adds while the backoff still holds it, or "" once it was dropped (said)."""
     from genesis.guardian.diagnosis import RecoveryAction
 
     channel = _find_telegram_channel(dispatcher)
@@ -2029,12 +2051,18 @@ async def _kept_approval(config, sm, dispatcher, recovery_engine, state: str) ->
         why = "no Telegram channel is left to report on it"
     else:
         if wait_s > 0:
-            return True
+            at = _owner_clock(datetime.now(UTC) + timedelta(seconds=wait_s))
+            return False, (
+                "Your approved container restart is waiting for the recovery cooldown "
+                f"and runs at about {at} (in about "
+                f"{max(1, round(wait_s / 60))} min), unless Genesis is back, the Guardian "
+                "stands down, or update.lock no longer reads unreadable."
+            )
         since = sm.take_approval()
         await _frozen_restart(config, sm, recovery_engine, channel, _waited(sm), since)
-        return True
+        return True, ""
     await _drop_kept(sm, dispatcher, why)
-    return False
+    return False, ""
 
 
 def _stood_down(config: GuardianConfig, snapshot) -> bool:

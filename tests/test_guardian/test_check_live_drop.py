@@ -1737,3 +1737,53 @@ async def test_a_held_alert_just_sent_leaves_the_first_frozen_gate_due_at_once()
     channel = _frozen_channel("DENY")
     await _tick(config, sm, LockContainer(lock=(1,)), channel=channel)
     assert _gates(channel) == 1
+
+
+# ── owner ruling 953ca5ee: a kept approval never pauses the re-alerts ───────
+
+
+def _kept_in_backoff(config, backoff_left_s: float = 90.0) -> ConfirmationStateMachine:
+    """A wait whose gate went out 2.5 h ago, its APPROVE kept, the backoff on."""
+    sm = _waiting_sm(config, 2.5)
+    sm.state.frozen_gate_sent = True
+    sm.keep_approval(_ago(60))
+    sm.state.recovery_attempts = 1
+    sm.state.last_recovery_at = _ago(100 - backoff_left_s)  # the first backoff is 100 s
+    return sm
+
+
+async def test_a_kept_approval_does_not_pause_the_2_h_re_alert():
+    """953ca5ee: the unreadable wait's 2 h re-alert goes out on its cadence
+    while an approval waits for its backoff; it asks nothing (the yes stands),
+    and the approval stays kept."""
+    config = _armed()
+    sm = _kept_in_backoff(config)
+    box = LockContainer(lock=(1,))
+    channel = _frozen_channel()
+    dispatcher, _, _ = await _tick(config, sm, box, channel=channel)
+    alerts = [c.args[0] for c in dispatcher.send.await_args_list]
+    assert len(alerts) == 1 and alerts[0].severity == AlertSeverity.EMERGENCY
+    assert "Reply APPROVE" not in alerts[0].body and _gates(channel) == 0
+    assert not box.sent("incus restart") and sm.state.frozen_approved_at
+    assert datetime.fromisoformat(sm.state.last_alert_at) > datetime.now(UTC) - timedelta(minutes=1)
+    dispatcher, _, _ = await _tick(config, sm, box, channel=channel)  # the next tick
+    dispatcher.send.assert_not_awaited()  # its normal cadence: the next in 2 h
+
+
+@pytest.mark.parametrize("zone", ["Asia/Tokyo", "UTC"])
+async def test_the_re_alert_says_when_the_kept_restart_runs(zone):
+    """The time is in the owner's timezone (genesis.env.user_timezone()), with
+    its abbreviation, as in "9:40 PM JST"."""
+    from zoneinfo import ZoneInfo
+
+    config = _armed()
+    sm = _kept_in_backoff(config, backoff_left_s=90)
+    with patch("genesis.env.user_timezone", return_value=zone):
+        dispatcher, _, _ = await _tick(
+            config, sm, LockContainer(lock=(1,)), channel=_frozen_channel()
+        )
+    body = dispatcher.send.await_args_list[0].args[0].body
+    assert "approved container restart is waiting for the recovery cooldown" in body, body
+    when = [datetime.now(UTC) + timedelta(seconds=s) for s in (85, 91)]
+    shown = [t.astimezone(ZoneInfo(zone)).strftime("%I:%M %p %Z").lstrip("0") for t in when]
+    assert any(f"at about {t} (" in body for t in shown), (shown, body)
