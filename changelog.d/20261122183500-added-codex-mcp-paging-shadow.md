@@ -1,1 +1,1 @@
-Record shadow evidence for a possible Codex-only Sentinel activation rule based on repeated post-unload growth.
+- Record shadow evidence for a possible Codex-only Sentinel activation rule based on repeated post-unload growth.
