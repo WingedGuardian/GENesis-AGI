@@ -170,11 +170,44 @@ _CONFIRMATION_RE = re.compile(
 )
 #: An owner's "merge at head X" ruling, posted as a PR comment (owner ruling
 #: 3f6ad6fb, F-B2). It only restricts which head an agent may merge.
-_PIN_RE = re.compile(r"<!--\s*genesis-pin\s+head=([0-9a-fA-F]{40})\s*-->", re.IGNORECASE)
+_PIN_RE = re.compile(r"\s*genesis-pin\s+head=([0-9a-fA-F]{40})\s*", re.IGNORECASE)
+#: Any HTML comment mentioning ``genesis-pin``. One the strict form does not fully
+#: match is a malformed pin: the ruling was meant, so it blocks rather than binding nothing.
+_PIN_LOOSE_RE = re.compile(r"<!--((?:(?!-->).)*?\bgenesis-pin\b(?:(?!-->).)*)-->", re.I | re.S)
+_INLINE_CODE_RE = re.compile(r"(`+)[^\n]*?\1")  # one line: never crosses a paragraph
 #: The GitHub ``authorAssociation`` values whose pin comments count: the repo's maintainers.
 _PIN_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 
 Runner = Callable[..., tuple[int, str, str]]
+
+
+def _pin_markers(body: str) -> tuple[set[str], bool]:
+    """``(heads, malformed)``: the pins in a comment body, read only from its prose.
+
+    Fenced code, ``>`` quote lines and inline code are dropped first: the agent
+    posts from the maintainer's account, so an example it quotes must never bind.
+    An unclosed fence runs to the end of the body, as GitHub renders it."""
+    kept: list[str] = []
+    fence = ""
+    for line in body.splitlines():
+        stripped = line.lstrip()
+        if fence:
+            fence = "" if stripped.startswith(fence) else fence
+            continue
+        if stripped[:3] in ("```", "~~~"):
+            fence = stripped[:3]
+            continue
+        if not stripped.startswith(">"):
+            kept.append(line)
+    heads: set[str] = set()
+    malformed = False
+    for comment in _PIN_LOOSE_RE.finditer(_INLINE_CODE_RE.sub("", "\n".join(kept))):
+        strict = _PIN_RE.fullmatch(comment.group(1))
+        if strict is None:
+            malformed = True
+        else:
+            heads.add(strict.group(1).lower())
+    return heads, malformed
 
 
 def _parse_external_identity_scalar(raw: str) -> object:
@@ -817,6 +850,7 @@ def evaluate_evidence(
     confirmation_times: dict[str, datetime] = {}
     confirmation_untimed: set[str] = set()
     pin_heads: set[str] = set()
+    pin_malformed = False
     for item in issue_comments:
         if not isinstance(item, Mapping):
             return _unknown("malformed_comment_record", current_head=head)
@@ -852,7 +886,9 @@ def evaluate_evidence(
         # stranger's stale or disagreeing pin would block every agent merge until the
         # owner removed it. Anyone else's pin-shaped text, or a deleted author's, is ignored.
         if login is not None and item.get("author_association") in _PIN_ASSOCIATIONS:
-            pin_heads.update(pin.group(1).lower() for pin in _PIN_RE.finditer(body))
+            marked_pins, malformed_pin = _pin_markers(body)
+            pin_heads |= marked_pins
+            pin_malformed = pin_malformed or malformed_pin
         for index, pattern in enumerate(identities):
             for match in pattern.finditer(body):
                 resolved, error = _resolve_sha(match.group(1), commits)
@@ -1098,7 +1134,9 @@ def evaluate_evidence(
 
     # Every live pin must hold (F-B2): the newest does not win, so two heads disagree.
     pin_error = None
-    if any(sha not in order for sha in pin_heads):
+    if pin_malformed:
+        pin_error = "malformed_pin"
+    elif any(sha not in order for sha in pin_heads):
         pin_error = "pin_not_in_pr"
     elif len(pin_heads) > 1:
         pin_error = "pins_disagree"

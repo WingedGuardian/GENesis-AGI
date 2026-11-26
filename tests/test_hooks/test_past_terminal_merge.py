@@ -556,6 +556,92 @@ def test_unknown_evidence_carries_a_blocking_pin_error():
     assert got["pin_heads"] == [] and got["pin_error"] == "evidence_unknown"
 
 
+def _says(body: str, *, assoc: str | None = "OWNER", when=None, edited=None) -> dict:
+    """A comment with exactly ``body``, from a maintainer unless ``assoc`` says otherwise."""
+    when = when or _at(9)
+    return {
+        "login": "owner" if assoc else "stranger",
+        "type": "User",
+        "author_association": assoc or "NONE",
+        "body": body,
+        "created_at": when,
+        "updated_at": edited or when,
+    }
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        pytest.param(f"<!-- genesis-pin head={H3[:7]} -->", id="short-sha"),
+        pytest.param(f'<!-- genesis-pin head="{H3}" -->', id="quoted-sha"),
+        pytest.param(f"<!-- genesis-pin head={H3} by=owner -->", id="extra-attribute"),
+        pytest.param(f"<!-- genesis-pin {H3} -->", id="no-head-key"),
+        pytest.param("<!--\ngenesis-pin head=<sha>\n-->", id="placeholder-multiline"),
+    ],
+)
+def test_a_maintainers_malformed_pin_blocks_never_binds_nothing(marker):
+    got = _ev(head=H5, comments=(_says(f"Ruling: merge here.\n{marker}"),))
+    assert got["pin_error"] == "malformed_pin", got["pin_heads"]
+    blocked, msg = G._check_past_terminal("7", "o/r", H5, budget=got)
+    assert blocked is True
+    assert "malformed_pin" in msg and "<!-- genesis-pin head=<full 40-hex sha> -->" in msg
+
+
+def test_a_strangers_malformed_pin_is_ignored():
+    got = _ev(head=H5, comments=(_says(f"<!-- genesis-pin head={H3[:7]} -->", assoc=None),))
+    assert got["pin_heads"] == [] and got["pin_error"] is None
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(f"> <!-- genesis-pin head={H3} -->", id="quote-line"),
+        pytest.param(f"Example:\n  >> <!-- genesis-pin head={H2} -->", id="nested-quote"),
+        pytest.param(f"```\n<!-- genesis-pin head={H3} -->\n```", id="backtick-fence"),
+        pytest.param(f"~~~md\n<!-- genesis-pin head={H2} -->\n~~~", id="tilde-fence"),
+        pytest.param(f"To pin, post `<!-- genesis-pin head={H3} -->`.", id="inline-code"),
+        pytest.param("To pin, post `<!-- genesis-pin head=<sha> -->`.", id="inline-placeholder"),
+        pytest.param(f"```\n<!-- genesis-pin head={H3[:7]} -->\n```", id="malformed-in-fence"),
+        pytest.param(f"> <!-- genesis-pin head={H3[:7]} -->", id="malformed-in-quote"),
+    ],
+)
+def test_a_quoted_or_code_pin_is_ignored(body):
+    # The agent posts from the maintainer account: an example it quotes must not bind.
+    got = _ev(head=H5, comments=(_says(body),))
+    assert got["pin_heads"] == [] and got["pin_error"] is None
+
+
+def test_a_pin_after_a_closed_fence_still_counts():
+    body = f"```\nexample\n```\n<!-- genesis-pin head={H3} -->"
+    got = _ev(head=H5, comments=(_says(body),))
+    assert got["pin_heads"] == [H3] and got["pin_error"] is None
+
+
+def test_a_stray_backtick_never_swallows_a_pin_in_another_paragraph():
+    body = f"it`s ruled.\n\n<!-- genesis-pin head={H3} -->\n\nsee `x`"
+    got = _ev(head=H5, comments=(_says(body),))
+    assert got["pin_heads"] == [H3] and got["pin_error"] is None
+
+
+def test_a_pin_added_by_editing_a_comment_counts():
+    got = _ev(
+        head=H5, comments=(_says(f"<!-- genesis-pin head={H3} -->", when=_at(1), edited=_at(9)),)
+    )
+    assert got["pin_heads"] == [H3] and got["pin_error"] is None
+
+
+def test_two_identical_markers_in_one_comment_are_one_pin():
+    marker = f"<!-- genesis-pin head={H3} -->"
+    got = _ev(head=H5, comments=(_says(f"{marker}\n{marker}"),))
+    assert got["pin_heads"] == [H3] and got["pin_error"] is None
+
+
+def test_two_different_markers_in_one_comment_disagree():
+    body = f"<!-- genesis-pin head={H2} -->\n<!-- genesis-pin head={H3} -->"
+    got = _ev(head=H5, comments=(_says(body),))
+    assert got["pin_error"] == "pins_disagree"
+
+
 def test_a_pin_landing_between_the_two_reads_is_unknown(monkeypatch):
     """The double read compares the pin fields too: a pin posted mid-evaluation
     is a policy change, never silently dropped."""

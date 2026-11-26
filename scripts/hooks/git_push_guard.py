@@ -6520,9 +6520,15 @@ def _check_past_terminal(
     pin_error = budget.get("pin_error") or (None if isinstance(pins, list) else "malformed_pins")
     if pin_error:
         named = ", ".join(str(p) for p in pins) if isinstance(pins, list) else "unreadable"
+        why = {
+            "malformed_pin": "a maintainer's `genesis-pin` comment is not exactly "
+            "`<!-- genesis-pin head=<full 40-hex sha> -->`",
+            "pin_not_in_pr": "a pin names a commit that is not in the PR",
+            "pins_disagree": "two pins name different heads",
+        }.get(str(pin_error), "the pins could not be read")
         return True, (
-            f"the PR's `genesis-pin` comments cannot be honoured ({pin_error}; pinned: "
-            f"{named or 'none'}). Only the owner moves or removes a pin — {owner_route}."
+            f"the PR's `genesis-pin` comments cannot be honoured ({pin_error}: {why}; "
+            f"pinned: {named or 'none'}). Only the owner moves or removes a pin — {owner_route}."
         )
     pins = [str(p).lower() for p in pins]
     if any(merging != pin for pin in pins):

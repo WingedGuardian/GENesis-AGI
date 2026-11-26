@@ -37,7 +37,8 @@ Applies to any PR whose diff touches the enforcement-hook surface (`scripts/revi
   `terminal-head` row of `--check-pr`). Any other head is the owner's bang-command
   merge or a send-back. An owner's "merge at head X" is pinned with a PR comment
   carrying `<!-- genesis-pin head=<full sha> -->` from a maintainer's account (any
-  other author's pin is ignored); the merge must then be at X as well, and only
+  other author's pin, and one in code or a quote, is ignored; a malformed one
+  blocks); the merge must then be at X as well, and only
   the owner removes a pin (a deletion leaves no trace on GitHub,
   so that limit is best effort).
 
