@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import re
 
 import aiosqlite
@@ -300,3 +301,265 @@ async def test_a_placeholder_re_ingest_whose_identifier_carries_the_stored_value
     assert ro.display_name(await kc.get(db, moved)) == "router [held]"
     assert await kc.get_reference_secret(db, moved) == "password: Kept!Fake5"
     assert len(await db.execute_fetchall("SELECT 1 FROM knowledge_units")) == 1
+
+
+# ─── 3. same-name writes racing (round-2 class audit B) ──────────────────────
+#
+# A write builds its masks, its target and its sameness from the entries its
+# name resolves to, read before it holds the writer lock; the compare-and-swap
+# covers only its own key. Under the lock it reads them again, and a change
+# has it build the write again there, never an error: every writer lands,
+# masked against the others.
+
+
+def _pause_at(monkeypatch, at: str):
+    """A gate that pauses the first write to reach ``at`` ("lock": the writer
+    lock's entry; "resolve": just after its read of the name's entries) until
+    ``gate.resume`` is set; ``gate.entered`` is set when it pauses."""
+    from types import SimpleNamespace
+
+    gate = SimpleNamespace(armed=True, entered=asyncio.Event(), resume=asyncio.Event())
+
+    async def _hold():
+        if gate.armed and not gate.entered.is_set():
+            gate.entered.set()
+            await gate.resume.wait()
+
+    if at == "lock":
+        real_writer = ki.writer
+
+        @contextlib.asynccontextmanager
+        async def _writer(*args, **kwargs):
+            await _hold()
+            async with real_writer(*args, **kwargs):
+                yield
+
+        monkeypatch.setattr(ki, "writer", _writer)
+    else:
+        real_resolve = ki._resolve_by_name
+
+        async def _resolve(*args, **kwargs):
+            out = await real_resolve(*args, **kwargs)
+            await _hold()
+            return out
+
+        monkeypatch.setattr(ki, "_resolve_by_name", _resolve)
+    return gate
+
+
+async def _race(gate, first, second):
+    """``first()`` paused at its gate while ``second()`` runs to completion,
+    then resumed: (first's result, second's result)."""
+    task = asyncio.create_task(first())
+    await asyncio.wait_for(gate.entered.wait(), 10)
+    gate.armed = False
+    other = await second()
+    gate.resume.set()
+    return await asyncio.wait_for(task, 10), other
+
+
+async def _all_indexed(db, store) -> list[str]:
+    from tests.test_memory.test_reference_opaque_identity import _indexed
+
+    return await _indexed(db, store)
+
+
+_RACE_NAME = "Example portal Fake9pwx"
+_RACE_TAGS = json.dumps(["reference", "credentials", "tag Fake9pwx"])
+
+
+@pytest.mark.parametrize("at", ["lock", "resolve"])
+async def test_b1_an_upload_racing_a_trusted_save_of_its_name_is_masked(db, monkeypatch, at):
+    """The upload read the name's entries before the trusted save committed:
+    its name and tags must still mask the saved value."""
+    from tests.test_memory.test_reference_opaque_identity import _held_save, _untrusted
+
+    store = _PointStore()
+    gate = _pause_at(monkeypatch, at)
+    upload, saved = await _race(
+        gate,
+        lambda: _untrusted(db, store, _RACE_NAME, "uploaded notes: Up9load!Fake1", tags_json=_RACE_TAGS),
+        lambda: _held_save(db, store, _RACE_NAME, "Fake9pwx"),
+    )
+    assert upload != saved and "Fake9pwx" not in (upload.name or "")
+    for text in await _all_indexed(db, store):
+        assert "Fake9pwx" not in text, text
+
+
+@pytest.mark.parametrize("at", ["lock", "resolve"])
+async def test_b10_a_trusted_save_racing_an_upload_of_its_name_is_masked(db, monkeypatch, at):
+    """The reverse order: the trusted save read the name's entries before an
+    upload whose value its name and tags spell committed."""
+    from tests.test_memory.test_reference_opaque_identity import _held_save, _untrusted
+
+    store = _PointStore()
+    gate = _pause_at(monkeypatch, at)
+    saved, upload = await _race(
+        gate,
+        lambda: _held_save(db, store, _RACE_NAME, "Tr1st!Fake2", tags_json=_RACE_TAGS),
+        lambda: _untrusted(db, store, _RACE_NAME, "Fake9pwx"),
+    )
+    assert upload != saved and "Fake9pwx" not in (saved.name or "")
+    for text in await _all_indexed(db, store):
+        assert "Fake9pwx" not in text, text
+
+
+@pytest.mark.parametrize("at", ["lock", "resolve"])
+async def test_b5_two_identical_concurrent_uploads_are_one_entry(db, monkeypatch, at):
+    from tests.test_memory.test_reference_opaque_identity import _untrusted
+
+    store = _PointStore()
+    gate = _pause_at(monkeypatch, at)
+    first, second = await _race(
+        gate,
+        lambda: _untrusted(db, store, "Example doc", "same Fake9pwx content"),
+        lambda: _untrusted(db, store, "Example doc", "same Fake9pwx content"),
+    )
+    assert first == second
+    assert len(await db.execute_fetchall("SELECT 1 FROM knowledge_units")) == 1
+    await _assert_one_named_point(db, store)
+
+
+async def test_b3_a_rotation_between_the_read_and_the_lock_rereads_one_snapshot(db, monkeypatch):
+    """The target rotated after the write read the name's entries: the write
+    builds again under the lock from a fresh read (one snapshot feeds the
+    target, the masks and the recorded spans) and lands as the last write,
+    masking the rotated value."""
+    from tests.test_memory.test_reference_opaque_identity import _held_save
+
+    name = "Example portal Rot2!Fake4"
+    store = _PointStore()
+    unit = await _held_save(db, store, name, "Old1!Fake0")
+    attempts = []
+    real_once = ki._ingest_once
+
+    async def _counted(**kwargs):
+        attempts.append(1)
+        return await real_once(**kwargs)
+
+    monkeypatch.setattr(ki, "_ingest_once", _counted)
+    # Paused at the lock: after the plan was built from its read, so only the
+    # rebuild under the lock sees the rotation (paused earlier, the base code
+    # observes the rotated key and passes without one).
+    gate = _pause_at(monkeypatch, "lock")
+    first, second = await _race(
+        gate,
+        lambda: _held_save(db, store, name, "Rot1!Fake3"),
+        lambda: _held_save(db, store, name, "Rot2!Fake4"),
+    )
+    assert first == second == unit
+    assert await kc.get_reference_secret(db, unit) == "Rot1!Fake3"
+    # The paused write and the save in its window: the paused write builds
+    # again under the writer lock, never from a fresh ingest attempt.
+    assert len(attempts) == 2
+    ref = (await kc.get(db, unit))["secret_ref"]
+    rows = await db.execute_fetchall("SELECT meta FROM reference_secrets WHERE id = ?", (ref,))
+    meta = json.loads(rows[0][0])
+    assert "Rot2!Fake4" in meta[kc.IDENTITY_META]["masked_spans"]
+    for text in await _all_indexed(db, store):
+        assert "Rot2!Fake4" not in text, text
+    await _assert_one_named_point(db, store)
+
+
+@pytest.mark.parametrize("trusted_first", [True, False])
+async def test_h1_twenty_four_concurrent_uploads_of_one_name_all_land(db, trusted_first):
+    """Round-2 fix audit H1: distinct uploads of one name, all at once. Each
+    commit changes the entries every other write resolved, and each is built
+    again under the lock rather than retried, so none errors, every one lands,
+    and no indexed text carries a held value: the trusted save's or another
+    upload's. A regression guard for the whole flow: it also passes on the code
+    before the in-lock rebuild (b1, b10, b5 and b3 are the tests that fail
+    there)."""
+    from tests.test_memory.test_reference_opaque_identity import _held_save, _untrusted
+
+    store = _PointStore()
+    if trusted_first:
+        await _held_save(db, store, _RACE_NAME, "Fake9pwx")
+    count = 24
+
+    async def _one(i):
+        tags = json.dumps(["reference", "credentials", "tag Fake9pwx", f"tag Up{i}Fake"])
+        return await _untrusted(db, store, _RACE_NAME, f"upload body {i} Up{i}Fake", tags_json=tags)
+
+    results = await asyncio.gather(*(_one(i) for i in range(count)), return_exceptions=True)
+    assert not [r for r in results if isinstance(r, BaseException)], results
+    assert len(set(results)) == count
+    units = await db.execute_fetchall("SELECT 1 FROM knowledge_units")
+    assert len(units) == count + trusted_first
+    held = [f"Up{i}Fake" for i in range(count)] + (["Fake9pwx"] if trusted_first else [])
+    for text in await _all_indexed(db, store):
+        for value in held:
+            if value != "Fake9pwx" or trusted_first:
+                assert not re.search(rf"(?<![0-9]){value}", text), (value, text)
+
+
+async def test_b11_a_resaved_body_racing_a_rotation_keeps_the_rotated_description(db, monkeypatch):
+    """Devin 4682745904: a body read back and saved again, with a rotation in
+    its window that masks a word of the stored header. The rebuild under the
+    lock still treats the read-back first line as the header the first read
+    recognised, so the description stays and is never header text."""
+    from tests.test_memory.test_reference_opaque_identity import _held_save
+
+    name = "Example portal Old1!Fake0 Next!Fake2"
+    store = _PointStore()
+    unit = await _held_save(db, store, name, "Old1!Fake0")
+    stored = (await kc.get(db, unit))["body"]
+    # The stored header masks the old value, so it is not the caller's name.
+    assert stored.startswith("[reference.credentials] Example portal [held] Next!Fake2\n")
+    gate = _pause_at(monkeypatch, "lock")
+    first, second = await _race(
+        gate,
+        lambda: _ingest(db, store, stored, concept=name),
+        lambda: _ingest(
+            db, store, _body(name, "Next!Fake2"), concept=name,
+            held_value="Next!Fake2", held_detail="rotated note",
+        ),
+    )
+    assert first == second == unit
+    assert await ro.reveal_reference(db, await kc.get(db, unit)) == ("Next!Fake2", "rotated note")
+    for text in await _all_indexed(db, store):
+        assert "Next!Fake2" not in text and "Old1!Fake0" not in text, text
+
+
+async def test_b12_an_upload_racing_a_rotation_keeps_the_old_value_masked(db, monkeypatch):
+    """Devin 4682746508: an upload read the name's entries while they held a
+    value that a trusted save then rotated away. The rebuild under the lock
+    still masks every secret the first read masked, so the old value never
+    reaches the upload's tags or name."""
+    from tests.test_memory.test_reference_opaque_identity import _held_save, _untrusted
+
+    name = "Example portal login"
+    store = _PointStore()
+    await _held_save(db, store, name, "Old1!Fake0")
+    tags = json.dumps(["reference", "credentials", "tag Old1!Fake0"])
+    gate = _pause_at(monkeypatch, "lock")
+    await _race(
+        gate,
+        lambda: _untrusted(db, store, name, "upload body Up1!Fake5", tags_json=tags),
+        lambda: _held_save(db, store, name, "New2!Fake3"),
+    )
+    for text in await _all_indexed(db, store):
+        assert "Old1!Fake0" not in text, text
+        assert "New2!Fake3" not in text, text
+
+
+async def test_b13_a_value_less_save_racing_a_rotation_keeps_the_old_value_masked(db, monkeypatch):
+    """Security review of the b11/b12 fix: a save with no value of its own (a
+    placeholder value line) masks the stored value as its own; a rotation in
+    its window must not leave that value visible in its tags."""
+    from tests.test_memory.test_reference_opaque_identity import _held_save
+
+    name = "Example portal login"
+    store = _PointStore()
+    unit = await _held_save(db, store, name, "Old1!Fake0")
+    tags = json.dumps(["reference", "credentials", "tag Old1!Fake0"])
+    gate = _pause_at(monkeypatch, "lock")
+    first, second = await _race(
+        gate,
+        lambda: _ingest(db, store, _body(name, ro.SECRET_PLACEHOLDER), concept=name, tags_json=tags),
+        lambda: _held_save(db, store, name, "New2!Fake3"),
+    )
+    assert first == second == unit
+    for text in await _all_indexed(db, store):
+        assert "Old1!Fake0" not in text, text
+        assert "New2!Fake3" not in text, text

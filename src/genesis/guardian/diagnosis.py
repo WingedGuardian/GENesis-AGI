@@ -203,6 +203,17 @@ class DiagnosisResult:
     reasoning: str = ""
     source: str = "cc"  # "cc" or "cc_unavailable"
     cc_failure_reason: str = ""  # Why CC was unavailable (empty = CC succeeded)
+    # On `live`, with recovery.live_engine on: (branch, the head the manifest
+    # pins, the head `live` holds for it, `live` tip, the other candidates the
+    # drop's plan takes out) of the candidate an approved REVERT_CODE drops;
+    # set by check.py before Gate 2 (#2978).
+    drop_candidate: tuple[str, str, str, str, tuple[str, ...]] | None = None
+    # What Gate 2 shows in full, never cut: the names an approval removes, or a
+    # warning that a drop may still be running; "" when there is none.
+    gate2_identity: str = ""
+    # Why check.py made this an ESCALATE on `live` (live_drop.HALF_DONE_DROP),
+    # so the alert says what happened; "" otherwise.
+    escalation: str = ""
 
 
 _FAILURE_INVENTORY = """
@@ -226,6 +237,44 @@ Known failure mode inventory (from real incidents):
 | I/O saturation | io.pressure full avg10 high, system partially responsive | CC sessions saturating I/O bandwidth | IO_TRIAGE (kill top I/O consumer, one per cycle) |
 """
 
+#: The inventory rows recovery.live_engine changes: on `live`, REVERT_CODE drops
+#: the newest candidate (#2978). Off, the prompt keeps main's rows.
+_LIVE_ENGINE_ROWS = {
+    "| Failure correlates with recent git commit | Code regression | REVERT_CODE; never on "
+    "`live`, where a bad candidate is removed by `scripts/deploy_candidates drop <branch>` |": (
+        "| Failure correlates with recent git commit, or on `live` with a recently added "
+        "candidate | Code regression | REVERT_CODE (on `live` it drops the newest candidate "
+        "from `live`, then genesis-server restarts) |"
+    ),
+    "| RESTART_CONTAINER (ends lock holders; a boot repair runs where one is installed); "
+    "never REVERT_CODE on `live` |": (
+        "| RESTART_CONTAINER (a boot repair runs where one is installed); never REVERT_CODE "
+        "on `live` |"
+    ),
+}
+
+
+def _failure_inventory(live_engine: bool) -> str:
+    text = _FAILURE_INVENTORY
+    if live_engine:
+        for old, new in _LIVE_ENGINE_ROWS.items():
+            text = text.replace(old, new)
+    return text
+
+
+def _candidates_fallback(text: str, budget: int = 500) -> str:
+    """The newest whole rows of the candidate evidence within ``budget`` chars
+    (pin order puts the drop target last), with a count of the rows left out."""
+    rows = text.splitlines()
+    kept: list[str] = []
+    for row in reversed(rows):
+        if sum(len(r) + 1 for r in kept) + len(row) + 60 > budget:
+            break
+        kept.insert(0, row)
+    if len(kept) < len(rows):
+        kept.insert(0, f"({len(rows) - len(kept)} older row(s) not shown)")
+    return "\n".join(kept)
+
 
 def _build_diagnosis_prompt(
     diagnostic: DiagnosticSnapshot,
@@ -233,6 +282,7 @@ def _build_diagnosis_prompt(
     container_name: str,
     briefing_context: str | None = None,
     shared_dir: Path | None = None,
+    live_engine: bool = False,
 ) -> str:
     """Build the full prompt for the CC diagnostic instance.
 
@@ -390,7 +440,7 @@ Everything collected from the container below (logs, status files, git state, pr
 {briefing_section}
 {ek_section}
 {infra_section}
-{_FAILURE_INVENTORY}
+{_failure_inventory(live_engine)}
 
 ## Available Commands
 
@@ -536,6 +586,7 @@ class DiagnosisEngine:
         prompt = _build_diagnosis_prompt(
             diagnostic, signal_summary, container_name, briefing_context,
             shared_dir=self._config.shared_path,
+            live_engine=self._config.recovery.live_engine,
         )
         cc_path = str(Path(self._config.cc.path).expanduser())
         work_dir = _ensure_work_dir(Path(self._config.cc.work_dir).expanduser())
@@ -905,6 +956,11 @@ class DiagnosisEngine:
         if diagnostic.live_repair:
             # Bounded: this evidence reaches Telegram, whose 4,096-char cap drops the alert.
             evidence.append(f"Boot repair of the live checkout:\n{diagnostic.live_repair[:500]}")
+        if diagnostic.live_candidates:
+            # Bounded like the repair: the fallback evidence reaches Telegram.
+            evidence.append(
+                f"Live candidates (pin order):\n{_candidates_fallback(diagnostic.live_candidates)}"
+            )
 
         return DiagnosisResult(
             likely_cause="CC diagnosis unavailable — cannot determine root cause safely",

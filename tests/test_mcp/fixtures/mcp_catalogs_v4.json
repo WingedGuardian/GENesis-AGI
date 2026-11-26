@@ -3688,7 +3688,7 @@
     {
       "name": "memory_expand",
       "title": "Memory Expand",
-      "description": "Fetch full content + graph neighbors for specific memory IDs.\n\nUse after a compact memory_recall to selectively expand interesting results.\nAccepts full UUIDs or the proactive hook's short handles (``id:xxxxxxxx``\nor bare 8-char hex prefixes). Returns full RetrievalResult data with graph\nenrichment for each ID found; unresolved or ambiguous handles are reported\nin a trailing ``{\"not_found\": [...], \"ambiguous\": [...]}`` entry instead\nof being silently dropped.",
+      "description": "Fetch full content + graph neighbors for specific memory IDs.\n\nUse after a compact memory_recall to selectively expand interesting results.\nAccepts full UUIDs or the proactive hook's short handles (``id:xxxxxxxx``\nor bare 8-char hex prefixes). Returns full RetrievalResult data with graph\nenrichment for each ID found; unresolved or ambiguous handles are reported\nin a trailing ``{\"not_found\": [...], \"ambiguous\": [...]}`` entry instead\nof being silently dropped. Each neighbour has a plain ``relation`` and, when\nits text may be shown, a short ``label``.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,

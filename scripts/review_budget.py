@@ -93,7 +93,9 @@ ORDINARY_TERMINAL_RULE = (
 #: The rule plus the clause for a gate whose approval authorizes a further ROUND.
 ORDINARY_TERMINAL_NOTICE = (
     f"{ORDINARY_TERMINAL_RULE} Approve only to authorize one further round anyway, "
-    "and only if that is genuinely the least costly option."
+    "and only if that is genuinely the least costly option. An agent merge stays "
+    f"bound to the round-{STANDING_REVIEWED_HEAD_LIMIT} head: a later head is "
+    "merged by the owner or sent back."
 )
 
 CONFIRMATION_MARKER_TEMPLATE = "<!-- genesis-review-request head={head} kind=confirmation -->"
@@ -268,6 +270,10 @@ def _unknown(*errors: str, current_head: str = "") -> dict[str, Any]:
         "approval_required": True,
         "commit_approval_required": True,
         "strongly_discouraged": True,
+        "terminal_state": "unknown",
+        "terminal_head": None,
+        "terminal_error": "evidence_unknown",
+        "confirmation_heads": [],
         "open_keys": [],
         "reflection_keys": "unknown",
         "body": None,
@@ -389,8 +395,9 @@ def _mark_off_diff(events: Sequence[dict[str, Any]], changed: set[str]) -> None:
     hold for an issue-comment key: the merge gate does not score a Codex
     findings issue comment at all (its badge form matches none of the verdict
     channel's patterns). And off the diff is the ONE merge-gate exclusion
-    stated here: a maintainer reply and a documentation path also keep a
-    finding out of the merge gate's score, and neither is in the budget."""
+    stated here: a documentation path, a maintainer reply to a below-floor
+    finding and a verified fix reply to a floor finding also keep a finding out of
+    the merge gate's score, and none of them is in the budget."""
     for event in events:
         flags = event["source"].get("blocking")
         if not isinstance(flags, list):
@@ -454,6 +461,47 @@ def _round_source(
         "finding_keys": keys,
         "blocking": blocking,
     }
+
+
+def _nth_round_head(rounds: Sequence[Mapping[str, Any]], n: int) -> tuple[str | None, str | None]:
+    """``(head, error)``: the head of the ``n``-th round by ``opened_at``.
+
+    Never by list position: ``rounds`` is in commit-date order, which a rebase
+    or a cherry-pick breaks. A round with no ``opened_at`` cannot be placed, so
+    it may be one of the first ``n``: an error. So is a tie anywhere among the
+    first ``n + 1``, since it leaves either the order or the ``n``-th unproven."""
+    timed: list[tuple[datetime, str]] = []
+    for row in rounds:
+        ok, when = _parse_time(row.get("opened_at"))
+        if not ok or when is None:
+            return None, "round_opened_at_missing"
+        timed.append((when, str(row.get("head"))))
+    if len(timed) < n:
+        return None, "fewer_rounds_than_terminal"
+    timed.sort()
+    first = [when for when, _ in timed[: n + 1]]
+    if len(set(first)) != len(first):
+        return None, "round_opened_at_tied"
+    return timed[n - 1][1], None
+
+
+def _earliest_marker_head(
+    times: Mapping[str, datetime], untimed: set[str], order: Mapping[str, int]
+) -> tuple[str | None, str | None]:
+    """``(head, error)``: the earliest confirmation marker naming a PR commit.
+
+    ``(None, None)`` when no marker names one, so the caller falls back to the
+    round rule. A marker with no time, or two tied at the earliest, is an error:
+    which one came first is then unknown."""
+    live = {sha for sha in (*times, *untimed) if sha in order}
+    if not live:
+        return None, None
+    if live & untimed:
+        return None, "confirmation_marker_untimed"
+    stamps = sorted((times[sha], sha) for sha in live)
+    if len(stamps) > 1 and stamps[0][0] == stamps[1][0]:
+        return None, "confirmation_marker_tied"
+    return stamps[0][1], None
 
 
 def evaluate_evidence(
@@ -591,10 +639,28 @@ def evaluate_evidence(
     legacy_times: dict[str, tuple[datetime, object]] = {}
     legacy_untimed: set[str] = set()
     confirmed: set[str] = set()  # heads the primary (or the identity) reviewed
+    # The latest TIMED confirmation of each head, so the gate lane's terminal head
+    # needs a review that came after its confirmation marker, not one before it.
+    confirmed_last: dict[str, datetime] = {}
     found: dict[str, dict[str, Any]] = {}  # round head -> what landed there
 
-    def confirm(sha: str, before: bool, when: datetime | None = None, raw: object = None) -> None:
+    def confirm(
+        sha: str,
+        before: bool,
+        when: datetime | None = None,
+        raw: object = None,
+        *,
+        answers: bool = True,
+    ) -> None:
+        """``answers`` False: the record counts as before, but is no review that
+        could answer a confirmation request (a thread-reply wrapper)."""
         confirmed.add(sha)
+        if (
+            answers
+            and when is not None
+            and (sha not in confirmed_last or when > confirmed_last[sha])
+        ):
+            confirmed_last[sha] = when
         if before:
             legacy.add(sha)
             if when is None:
@@ -672,28 +738,30 @@ def evaluate_evidence(
         if sha is None:
             return _unknown("malformed_review_head", current_head=head)
         before = when is None or when < cut
+        raw_tops, raw_body = item.get("top_level"), item.get("body")
+        # A review record with no body and no top-level comment is the
+        # wrapper GitHub makes for a reply inside a thread: nobody reviewed
+        # the head it names, so it marks nothing.
+        # A row with no comment list at all reads the same way: marking less
+        # can only make the count larger. Only a COMMENTED review (or one
+        # whose state is missing or unknown) can be a wrapper: an approval,
+        # a change request or a dismissed review with no text is still a
+        # review of the head.
+        reply_only = (
+            item.get("state") not in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
+            and (raw_tops is None or (isinstance(raw_tops, list) and not raw_tops))
+            and (raw_body is None or (isinstance(raw_body, str) and not raw_body.strip()))
+        )
         if primary:
-            confirm(sha, before, when, item.get("submitted_at"))
+            # A reply wrapper keeps its old effect on the counts, but never
+            # answers a confirmation marker: it is no review of the head.
+            confirm(sha, before, when, item.get("submitted_at"), answers=not reply_only)
         elif when is None:
             # Only a test seam omits the time; a non-primary review cannot be
             # placed on either side of the cutover, and dropping it undercounts.
             return _unknown("review_time_missing", current_head=head)
         if item.get("state") != "PENDING":
             report(sha, login)
-            raw_tops, raw_body = item.get("top_level"), item.get("body")
-            # A review record with no body and no top-level comment is the
-            # wrapper GitHub makes for a reply inside a thread: nobody reviewed
-            # the head it names, so it marks nothing.
-            # A row with no comment list at all reads the same way: marking less
-            # can only make the count larger. Only a COMMENTED review (or one
-            # whose state is missing or unknown) can be a wrapper: an approval,
-            # a change request or a dismissed review with no text is still a
-            # review of the head.
-            reply_only = (
-                item.get("state") not in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
-                and (raw_tops is None or (isinstance(raw_tops, list) and not raw_tops))
-                and (raw_body is None or (isinstance(raw_body, str) and not raw_body.strip()))
-            )
             if not reply_only:
                 mark(sha, when, item.get("submitted_at"))
         if before:
@@ -737,6 +805,10 @@ def evaluate_evidence(
             return _unknown("review_findings_deleted", current_head=head)
 
     confirmation_heads: set[str] = set()
+    # When each marker head was first requested, for the gate lane's terminal
+    # head. A marker with no time cannot be placed among the others.
+    confirmation_times: dict[str, datetime] = {}
+    confirmation_untimed: set[str] = set()
     for item in issue_comments:
         if not isinstance(item, Mapping):
             return _unknown("malformed_comment_record", current_head=head)
@@ -759,7 +831,15 @@ def evaluate_evidence(
         # The confirmation marker and the identity template are matched on TEXT,
         # not on who wrote it, so a deleted author's comment still counts for both.
         for marker in _CONFIRMATION_RE.finditer(body):
-            confirmation_heads.add(marker.group(1).lower())
+            marker_head = marker.group(1).lower()
+            confirmation_heads.add(marker_head)
+            # Timed by the comment's LAST EDIT (``marked``), not its creation: an
+            # old comment edited to carry a marker must not date the marker before
+            # the review that would then seem to answer it.
+            if marked is None:
+                confirmation_untimed.add(marker_head)
+            elif marker_head not in confirmation_times or marked < confirmation_times[marker_head]:
+                confirmation_times[marker_head] = marked
         for index, pattern in enumerate(identities):
             for match in pattern.finditer(body):
                 resolved, error = _resolve_sha(match.group(1), commits)
@@ -804,7 +884,7 @@ def evaluate_evidence(
         if is_findings and not before:
             if sha is None:
                 return _unknown("codex_findings_comment_unbound", current_head=head)
-            confirm(sha, False)
+            confirm(sha, False, when)
             comment_id = item.get("id")
             events.append(
                 {
@@ -970,6 +1050,39 @@ def evaluate_evidence(
         discouraged = count >= STRONGLY_DISCOURAGED_REVIEWED_HEADS
         reason = "ordinary_limit" if request_approval else "within_ordinary_limit"
 
+    # The TERMINAL HEAD (owner ruling 3f6ad6fb, 2026-11-25): past terminal, the
+    # one head an agent may merge at. Past terminal is ``commit_approval`` in both
+    # lanes. Ordinary lane: the head of the STANDING_REVIEWED_HEAD_LIMIT-th round
+    # by ``opened_at``, never by list position (the list is in commit-date order,
+    # see below). Gate lane: the head of the earliest confirmation marker that is
+    # still a PR commit and was reviewed after the marker, else the
+    # GATE_DISCOVERY_ROUND_LIMIT-th round. A round or marker that cannot be placed (no time, or a tie) is ``unknown``: the merge
+    # gate blocks on it and never guesses.
+    terminal_state, terminal_head, terminal_error = "below", None, None
+    if commit_approval:
+        terminal_state = "past"
+        if gate_surface:
+            # Only a marker whose head the primary (or the identity) reviewed
+            # AFTER the marker: a marker is matched on text from any author, so
+            # a marker-only comment must not move the terminal head, and a
+            # review from before the marker answers no confirmation request.
+            # Any other marker falls back to the round rule.
+            terminal_head, terminal_error = _earliest_marker_head(
+                {
+                    s: t
+                    for s, t in confirmation_times.items()
+                    if s in confirmed_last and confirmed_last[s] > t
+                },
+                {s for s in confirmation_untimed if s in confirmed},
+                order,
+            )
+            if terminal_head is None and terminal_error is None:
+                terminal_head, terminal_error = _nth_round_head(rounds, GATE_DISCOVERY_ROUND_LIMIT)
+        else:
+            terminal_head, terminal_error = _nth_round_head(rounds, STANDING_REVIEWED_HEAD_LIMIT)
+        if terminal_error is not None:
+            terminal_state, terminal_head = "unknown", None
+
     # Live rounds only: a head a force-push removed has no position, so its place
     # in this order (and so in the trend) would be a guess.
     scored = [r["findings"] for r in rounds if r["findings"] is not None and r["head"] in order]
@@ -1085,6 +1198,20 @@ def evaluate_evidence(
         "approval_required": request_approval,
         "commit_approval_required": commit_approval,
         "strongly_discouraged": discouraged,
+        "terminal_state": terminal_state,
+        "terminal_head": terminal_head,
+        "terminal_error": terminal_error,
+        "confirmation_heads": [
+            {
+                "head": sha,
+                "created_at": (
+                    None
+                    if sha in confirmation_untimed or sha not in confirmation_times
+                    else confirmation_times[sha].isoformat()
+                ),
+            }
+            for sha in sorted(confirmation_heads)
+        ],
         "rounds": rounds,
         "round_state": round_state,
         "trend": trend,

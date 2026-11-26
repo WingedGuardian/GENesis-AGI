@@ -426,6 +426,8 @@ async def test_a_credential_with_no_value_to_hold_stores_its_vector_with_its_row
         concept="brand new",
     )
     assert (await kc.get(db, unit))["qdrant_id"] == "qid-1"
+    # The vector the row names survives the write (no cleanup deleted it).
+    assert all("qid-1" not in map(str, call.args + tuple(call.kwargs.values())) for call in store.delete.call_args_list)
 
 
 def test_the_project_is_case_folded_like_the_domain():

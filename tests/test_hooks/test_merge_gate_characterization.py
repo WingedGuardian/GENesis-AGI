@@ -711,17 +711,16 @@ _CASES: list[tuple[str, object, int, str]] = [
         2,
         "bound to the Codex-verified head",
     ),
-    # (follow-up 535648be) `# review-override` also waives the INLINE P1 scan directly
-    # (not just transitively via the shared force_override).
+    # #4933: `# review-override` no longer waives a floor finding the scan can see.
     (
-        "inline_override_waives_P1_allows",
+        "inline_override_leaves_P1_blocking",
         lambda mp: _run(
             mp,
             _merge_cmd(trailer="# review-override"),
             router=_router(inline_lines=_INLINE_P1_LINE),
         ),
-        0,
-        "",
+        2,
+        "always-fix floor",
     ),
     # (follow-up 535648be) numberless merge + explicit --repo → fail CLOSED (can't
     # resolve the PR; a cwd-branch number gated against a named repo = the wrong-PR class).
@@ -1445,7 +1444,7 @@ def _report_env(monkeypatch, *, scheduled: str, head: str = HEAD):
         _mod, "_check_pr_review_findings", lambda n, repo=None, force=False: (False, "")
     )
     monkeypatch.setattr(
-        _mod, "_check_inline_review_findings", lambda n, repo=None, force=False, uncounted_out=None: (False, "")
+        _mod, "_check_inline_review_findings", lambda n, repo=None, force=False, uncounted_out=None, head=None: (False, "")
     )
 
 
@@ -1522,17 +1521,23 @@ def test_check_pr_report_names_an_outside_contribution_exemption(monkeypatch, ca
     ],
 )
 def test_the_rounds_row_is_advisory_and_never_moves_the_verdict(monkeypatch, capsys, result, shown):
-    """Past-terminal and unreadable rounds still leave an otherwise green report
-    green: the round budget is enforced where it acts (the review-request ask and
-    the commit gate), never a second time here."""
+    """The ``rounds`` row itself only displays. Since owner rulings 3f6ad6fb and
+    cc17ee20 (2026-11-25) the budget's BLOCKING half is the ``terminal-head`` row:
+    an unreadable budget, or a past-terminal one with no placeable terminal head,
+    blocks there, and that is the report's only failure."""
     _report_env(monkeypatch, scheduled=_scheduled_marker(HEAD))
     monkeypatch.delenv("_TEST_ROUNDS_ROW", raising=False)
     monkeypatch.setattr(_mod._review_budget, "evaluate_pr", lambda *a, **k: result)
+    monkeypatch.setenv("_TEST_TERMINAL_BUDGET", json.dumps(result))
     rc = _mod.check_pr_report("100", repo=REPO)
     out = capsys.readouterr().out
     row = next(ln for ln in out.splitlines() if ln.startswith("rounds"))
     assert shown in row
-    assert rc == 0, out
+    assert "BLOCK" not in row
+    term = next(ln for ln in out.splitlines() if ln.startswith("terminal-head"))
+    assert term.startswith("terminal-head  : BLOCK"), out
+    assert "1 gate(s) would block" in out
+    assert rc == 1, out
 
 
 @pytest.mark.parametrize("note_behaviour", ["fires", "silent", "raises"])
@@ -1542,12 +1547,15 @@ def test_the_no_change_note_is_wired_and_never_moves_the_verdict(
     """The report hands the rounds row's budget to ``_no_change_note`` and prints
     what it returns. Firing, silent or raising, the verdict stays green."""
     _report_env(monkeypatch, scheduled=_scheduled_marker(HEAD))
-    budget = {"status": "ok", "current_head": HEAD}
+    # `terminal_state` because the terminal-head row reads this budget too, and an
+    # ok budget that does not place the PR against its terminal round blocks there.
+    budget = {"status": "ok", "current_head": HEAD, "terminal_state": "below"}
     seen = {}
 
-    def fake_rounds(pr_num, repo=None, budget_out=None):
-        if budget_out is not None:
-            budget_out.append(budget)
+    def fake_rounds(pr_num, repo=None, budget_out=None, read_out=None):
+        for out in (budget_out, read_out):
+            if out is not None:
+                out.append(budget)
         return "x"
 
     def fake_note(pr_num, repo, got):

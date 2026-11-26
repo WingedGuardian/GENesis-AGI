@@ -58,11 +58,14 @@ Commands:
         first write or its "unchanged" result; an on-`live` drop writes the
         manifest right after that check, and a manifest-only drop re-checks
         the branch, HEAD and `live` before writing it.
-  drop <branch> --expect-branch live --expect-head T --expect-candidate H [--restart-server]
+  drop <branch> --expect-branch live --expect-head T --expect-candidate H
+       [--expect-leaving JSON] [--restart-server]
         The Guardian's drop (#4911), run with the entry's --wait 0, so all of
         it happens in ONE update.lock hold. It refuses, nothing changed,
         unless the manifest still pins <branch> at H (a re-pin since refuses),
-        the checkout is on `live` at T, and no move refusal applies. After the
+        the checkout is on `live` at T, no move refusal applies, and (with
+        --expect-leaving, a JSON list) the other candidates its plan takes out
+        of `live` are exactly that list (the set the owner approved). After the
         drop it confirms from its own view: <branch> neither listed nor held
         by `live`, the checkout on `live` at the commit the move left, no move
         refusal. Only then, with --restart-server, it QUEUES the restart
@@ -80,8 +83,9 @@ Commands:
                restarts); or, from the entry, a live deploy "holds the deploy
                marker" (that phrase: a wait, nothing changed; "cannot write
                the deploy marker" is a fault)
-          2    usage: --restart-server needs --expect-candidate, which needs
-               --expect-branch live and --expect-head, never --no-rebuild
+          2    usage: --restart-server and --expect-leaving need
+               --expect-candidate, which needs --expect-branch live and
+               --expect-head, never --no-rebuild
           4    dropped and confirmed, but the restart was not queued (the
                state read failed, or the enqueue failed with an answer; the
                text names the systemctl error)
@@ -95,8 +99,11 @@ Commands:
   list [--json [--move-refusals]]
         The manifest as written (checked to be this repository's). No network.
         --json: what the manifest lists and what `live` holds (deploy health).
-        --move-refusals adds the checkout's branch and HEAD and every reason a
-        drop or rebuild would refuse to move it now (the Guardian's drop).
+        --move-refusals adds the checkout's branch and HEAD, every reason a
+        drop or rebuild would refuse to move it now, and drop_preview: the
+        newest candidate `live` holds and every other candidate its drop's
+        plan takes out ({"branch", "leaving"}), or null when that cannot be
+        planned (the Guardian's drop). Writes only unreachable objects.
   status
         READINESS, and per candidate: whether it is in `live` now, what the next
         rebuild would do with it (included, excluded and why, retired, or
@@ -232,6 +239,7 @@ import datetime  # noqa: E402
 import fcntl  # noqa: E402
 import json  # noqa: E402
 import subprocess  # noqa: E402
+import time  # noqa: E402
 from collections.abc import Callable, Mapping  # noqa: E402
 from pathlib import Path  # noqa: E402
 
@@ -282,7 +290,7 @@ def _replace_json(path: Path, data: dict, durable: bool) -> None:
 
 
 def _err(msg: str) -> None:
-    print(msg, file=sys.stderr, flush=True)
+    core.say(sys.stderr, msg)
 
 
 def _restart_advice(moved: plan.Move) -> None:
@@ -364,6 +372,8 @@ class Engine(Repo):
 
     def _move_preflight(self, need_manifest: bool, source: plan.Source) -> dict | None:
         """Every refusal before a checkout move, in order. Returns the manifest.
+        The harmless update record is retired later, by the move's before_write
+        (#5007): the checkout lock and the re-check under it still refuse.
         ``source`` is the command's one baseline (#3492), read once at its start:
         the branch, worktree and tracked-change refusals judge THAT read, so what
         was judged safe is exactly what every later re-check compares to, and
@@ -387,7 +397,6 @@ class Engine(Repo):
         if reasons:
             raise Refusal(reasons[0])
         plan.refuse_moved_source(self, source, "nothing changed")
-        self._retire_harmless_update_state()
         return data
 
     def _expected_source(self, expect: tuple[str, str] | None) -> plan.Source:
@@ -493,26 +502,30 @@ class Engine(Repo):
                 f"written to {path}: {exc}"
             )
 
-    def _retire_harmless_update_state(self) -> None:
+    def _retire_harmless_update_state(self) -> bool:
         """Remove an update_state.json that guards nothing, before a move.
 
-        Called under update.lock once every refusal has passed, so the file is a
+        Called under update.lock as the move's before_write (under the checkout
+        lock, after its re-check; drop's just before the manifest write), once every
+        refusal that says nothing changed has passed, so the file is a
         leftover the shared rule calls safe (it sits at its rollback tag). The move
         is about to take HEAD off that tag, after which the same file would read as
         guarding merged code it never merged: keeping it would turn a harmless
         leftover into a false restart guard. A file the rule cannot clear again
-        here is left alone; a file it clears but this cannot remove refuses."""
+        here is left alone; a file it clears but this cannot remove refuses.
+        True when it removed one."""
         path = str(self.update_state)
         if (
             not os.path.lexists(path)
             or self._own_update_state()
             or self._update_state_refusal() is not None
         ):
-            return
+            return False
         try:
             os.unlink(path)
+            return True
         except FileNotFoundError:
-            return
+            return False
         except OSError as exc:
             raise Refusal(
                 f"{path} guards nothing but could not be removed before the move ({exc}); "
@@ -631,6 +644,7 @@ class Engine(Repo):
             seen = self.observe()
             if move_refusals:
                 seen.update(self.observe_moves())
+                seen["drop_preview"] = self._drop_preview(seen)
             out(json.dumps(seen, sort_keys=True))
             return 0
         data = self.store.load()
@@ -700,16 +714,77 @@ class Engine(Repo):
     def observe_moves(self) -> dict:
         """`list --json --move-refusals`, for the Guardian's drop (#2978): the
         checkout drop would judge and every reason it would refuse to move it,
-        from the one function drop refuses with. Lockless and read-only, like
-        observe(). A read that fails is a reason, never an empty list."""
+        from the one function drop refuses with. Lockless, like observe(). A
+        read that fails is a reason, never an empty list. drop also
+        refuses a `live` holding foreign commits (refuse_foreign, against the
+        local origin/main it walks from), so that is a reason here too, as in
+        status."""
         try:
             source = plan.read_source(self)
+            refusals = self._move_refusals(source)
+            base = self.resolve(BASE_REF)
+            if not base:
+                refusals.append(f"{BASE_REF} does not resolve.")
+            else:
+                foreign = self.foreign_commits(base)
+                if foreign:
+                    refusals.append(
+                        "`live` holds commits that are neither a rebuild merge nor a candidate's: "
+                        + ", ".join(c[:12] for c in foreign)
+                    )
             return {
                 "checkout": {"branch_ref": source.branch_ref, "head": source.head},
-                "move_refusals": self._move_refusals(source),
+                "move_refusals": refusals,
             }
         except (Refusal, Unknown) as exc:
             return {"checkout": None, "move_refusals": [f"could not judge: {exc}"]}
+
+    def _drop_preview(self, seen: dict) -> dict | None:
+        """What a drop of the newest candidate `live` holds would take out of
+        `live`, from that drop's own plan, so an approval can name every one:
+        {"branch", "leaving"} (sorted), or None when it cannot be planned. The
+        newest is the last held candidate the manifest lists, as the Guardian
+        picks it. Lockless, like status: it writes only unreachable objects."""
+        listed = {r["branch"] for r in seen["listed"]}
+        held = [h["branch"] for h in seen["live"]["holds"] or () if h["branch"] in listed]
+        try:
+            data = self.store.load()
+            if not held or data is None:
+                return None
+            _, p = self._drop_plan(held[-1], data)
+        except (Refusal, Unknown, OSError):
+            return None
+        return {"branch": held[-1], "leaving": sorted(b for b in p.excluded if b != held[-1])}
+
+    def _drop_plan(self, branch: str, data: dict) -> tuple[str, core.Plan]:
+        """(the base `live` is on, the plan of `live` without ``branch``): what
+        an on-`live` drop moves to, and what the list's drop_preview reports."""
+        walk_base = self.resolve(BASE_REF)
+        if not walk_base:
+            raise Refusal(f"{BASE_REF} does not resolve.")
+        self.refuse_foreign(walk_base)
+        live_base, live_now = self.live_set(walk_base, data)
+        if live_base is None:
+            raise Refusal("`live` does not exist; nothing to rebuild.")
+        # Subtract-only by construction: a candidate still live that shares the
+        # dropped one's unmerged commits would carry them straight back, so it
+        # goes out with it, by name. A rebuild never leaves such a pair live, but
+        # live_set also counts a listed candidate whose code an earlier one
+        # carries (a hand-edited manifest), and drop must not trust how `live`
+        # was built.
+        remaining = [(b, h) for b, h in live_now if b != branch]
+        dropped_head = dict(live_now).get(branch)
+        sticky: dict[str, str] = {}
+        if dropped_head:
+            for b in plan.shared_with(
+                self, live_base, {branch: dropped_head, **dict(remaining)}
+            ).get(branch, []):
+                sticky[b] = f"shares dropped {branch}'s unmerged commits; drop it too"
+        rebuild_id = core.now().strftime("%Y%m%dT%H%M%SZ")
+        # Planned like a rebuild: every hook the remaining candidates change
+        # needs its one approved owner among them (the dropped one's approval is gone).
+        kept = {**data, "candidates": [c for c in data["candidates"] if c["branch"] != branch]}
+        return live_base, self._attributed_plan(live_base, remaining, rebuild_id, sticky, kept)
 
     def cmd_add(
         self, branch: str, owner: str, pr: int | None, approve_hooks: str | None = None
@@ -874,10 +949,11 @@ class Engine(Repo):
         expect: tuple[str, str] | None = None,
         candidate: str | None = None,
         restart: bool = False,
+        leaving: list[str] | None = None,
     ) -> int:
-        """``candidate`` (--expect-candidate) and ``restart`` (--restart-server):
-        the Guardian's drop (#4911); main() lets them through only on `live`
-        with ``expect`` set."""
+        """``candidate`` (--expect-candidate), ``restart`` (--restart-server)
+        and ``leaving`` (--expect-leaving): the Guardian's drop (#4911); main()
+        lets them through only on `live` with ``expect`` set."""
         self.require_update_lock()
         source = self._expected_source(expect)
         # No manifest: nothing to drop, and the manifest is not created.
@@ -931,40 +1007,26 @@ class Engine(Repo):
         # On `live`: subtract-only, offline. Every refusal comes before the manifest
         # changes, so a drop that cannot take the code out never reports it gone.
         self._move_preflight(need_manifest=True, source=source)
-        walk_base = self.resolve(BASE_REF)
-        if not walk_base:
-            raise Refusal(f"{BASE_REF} does not resolve.")
-        self.refuse_foreign(walk_base)
-        live_base, live_now = self.live_set(walk_base, data)
-        if live_base is None:
-            raise Refusal("`live` does not exist; nothing to rebuild.")
-        # Subtract-only by construction: a candidate still live that shares the
-        # dropped one's unmerged commits would carry them straight back, so it
-        # goes out with it, by name. A rebuild never leaves such a pair live, but
-        # live_set also counts a listed candidate whose code an earlier one
-        # carries (a hand-edited manifest), and drop must not trust how `live`
-        # was built.
-        remaining = [(b, h) for b, h in live_now if b != branch]
-        dropped_head = dict(live_now).get(branch)
-        sticky: dict[str, str] = {}
-        if dropped_head:
-            for b in plan.shared_with(
-                self, live_base, {branch: dropped_head, **dict(remaining)}
-            ).get(branch, []):
-                sticky[b] = f"shares dropped {branch}'s unmerged commits; drop it too"
-        rebuild_id = core.now().strftime("%Y%m%dT%H%M%SZ")
-        # Planned like a rebuild: every hook the remaining candidates change
-        # needs its one approved owner among them (the dropped one's approval is gone).
-        kept = {**data, "candidates": [c for c in data["candidates"] if c["branch"] != branch]}
-        p = self._attributed_plan(live_base, remaining, rebuild_id, sticky, kept)
+        live_base, p = self._drop_plan(branch, data)
         out(
             f"deploy_candidates drop {branch} (on the base `live` is on, {live_base[:12]}; nothing fetched)"
         )
         self._print_plan(p)
+        gone = sorted(b for b in p.excluded if b != branch)
+        if leaving is not None and gone != sorted(set(leaving)):
+            raise Refusal(
+                f"this drop would also take out of `live`: {', '.join(gone) or 'nothing else'}, "
+                f"not {', '.join(sorted(set(leaving))) or 'nothing else'} as approved "
+                "(--expect-leaving); nothing changed."
+            )
         self._refuse_blockers(p.tip, "the manifest still lists " + branch)
         saved: list[dict | None] = []
+        retired: list[bool] = []
 
         def save() -> None:  # under the checkout lock, after the move's last re-check
+            # Before the manifest write (#5007): a removal that refuses leaves the
+            # manifest as it was, never a half-drop.
+            retired.append(self._retire_harmless_update_state())
             saved.append(self.store.update(remove))
             out(f"  {branch} dropped from {self.store.path}.")
 
@@ -972,8 +1034,14 @@ class Engine(Repo):
             moved = plan.move_checkout(self, p, source, save)
         except Refusal as exc:
             if not saved:
+                removed = (
+                    "; a harmless update_state.json leftover was removed"
+                    if any(retired)
+                    else ""
+                )
                 raise Refusal(
-                    f"{exc}\nThe manifest is unchanged: this drop wrote nothing and `live` did not move."
+                    f"{exc}\nThe manifest is unchanged: this drop wrote nothing to it and `live` "
+                    f"did not move{removed}."
                 ) from exc
             raise Refusal(
                 f"{exc}\nThe manifest change WAS saved ({branch} is no longer a candidate), but `live` still "
@@ -991,7 +1059,6 @@ class Engine(Repo):
             "checking which candidates share its commits",
             lambda: self._warn_shared(branch, data, after),
         )
-        gone = [b for b in p.excluded if b != branch]
         if gone:
             out(
                 "  NOTE: "
@@ -1002,6 +1069,12 @@ class Engine(Repo):
         if pinned is None:
             _restart_advice(moved)
             return 0
+        if restart:
+            # serving_commit.py cannot name the boot commit of a start in the
+            # second HEAD moved, and a down server starts with no stop phase.
+            # Before the confirmation: nothing locks out a session switching the
+            # checkout, so the confirmation stays the last look before the queue.
+            time.sleep(1.01 - time.time() % 1)
         try:
             seen, still_in = self._unconfirmed_drop(branch, moved)
         except (Refusal, Unknown) as exc:  # past the save: never "nothing changed"
@@ -1243,7 +1316,8 @@ class Engine(Repo):
         p = self._attributed_plan(base, cands, rebuild_id, sticky, data)
         self._print_plan(p, sorted(gone))
         self._refuse_blockers(p.tip, "nothing was retired")
-        moved = plan.move_checkout(self, p, source)
+        # Retired under the checkout lock, past its refusals (#5007).
+        moved = plan.move_checkout(self, p, source, self._retire_harmless_update_state)
         state = f"`live` is at {moved.at[:12]}"
         if moved.files:
             self._sync_moved_hooks(state, moved.before, moved.at)
@@ -1533,6 +1607,7 @@ def _parser() -> argparse.ArgumentParser:
     # The Guardian's drop (#4911): the head it approved, and the restart.
     d.add_argument("--expect-candidate", metavar="COMMIT")
     d.add_argument("--restart-server", action="store_true")
+    d.add_argument("--expect-leaving", metavar="JSON")  # the others it takes out, as approved
     ls = sub.add_parser("list")
     # Machine-readable, for deploy health (observe()); the text form is unchanged.
     ls.add_argument("--json", action="store_true")
@@ -1581,6 +1656,17 @@ def main(
     if getattr(args, "restart_server", False) and candidate is None:
         _err("deploy_candidates: --restart-server goes with --expect-candidate")
         return 2
+    leaving = getattr(args, "expect_leaving", None)
+    if leaving is not None:
+        try:
+            leaving = json.loads(leaving)
+        except (ValueError, RecursionError):  # RecursionError: deeply nested input
+            leaving = None
+        if candidate is None or not (
+            isinstance(leaving, list) and all(isinstance(b, str) for b in leaving)
+        ):
+            _err("deploy_candidates: --expect-leaving is a JSON list, with --expect-candidate")
+            return 2
     if candidate is not None and (
         not candidate or args.no_rebuild or expect is None or expect[0] != LIVE_BRANCH
     ):
@@ -1608,7 +1694,7 @@ def main(
             return engine.cmd_add(args.branch, args.owner, args.pr, args.approve_hooks)
         if args.cmd == "drop":
             return engine.cmd_drop(
-                args.branch, args.no_rebuild, expect, candidate, args.restart_server
+                args.branch, args.no_rebuild, expect, candidate, args.restart_server, leaving
             )
         if args.cmd == "rebuild":
             return engine.cmd_rebuild(expect)

@@ -654,13 +654,14 @@ def _backup_health(
     #     extras_detail names the partial ones (signed-in viewers only, #4304).
     if _extras_incomplete(lb, resolved_backend):
         reason = (
-            "Some configured extra directories were not fully backed up "
-            "in the last run; the backup log names them."
+            "Some configured extra directories or identity files were not "
+            "fully backed up in the last run; the backup log names them."
         )
         if extras_detail:
             reason = (
-                "Some configured extra directories were not fully backed up "
-                f"in the last run. Partial: {extras_detail}. The backup log has the rest."
+                "Some configured extra directories or identity files were not "
+                f"fully backed up in the last run. Partial: {extras_detail}. "
+                "The backup log has the rest."
             )
         return {"state": "warn", "code": "extra_dirs_incomplete", "reason": reason}
 

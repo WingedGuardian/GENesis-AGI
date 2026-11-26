@@ -642,3 +642,35 @@ async def test_rollback_retry_follows_listing_order_not_names(config, sm, dispat
     ok, _ = await engine._snapshot_rollback()
     assert ok is True
     snapshots.delete.assert_called_once_with(newer_by_time)
+
+
+# ── #5007: a cancelled subprocess leaves no child behind ─────────────────────
+
+
+async def test_a_cancelled_subprocess_kills_and_reaps_its_child(tmp_path):
+    """A SIGTERM'd tick cancels the call: the child must not outlive it."""
+    import asyncio
+    import contextlib
+    import os
+    import signal
+
+    from genesis.guardian._subprocess import run_subprocess
+
+    pidfile = tmp_path / "pid"
+    task = asyncio.create_task(
+        run_subprocess("sh", "-c", f"echo $$ > {pidfile}; exec sleep 60", timeout=120.0)
+    )
+    for _ in range(500):
+        if pidfile.exists() and pidfile.read_text().strip():
+            break
+        await asyncio.sleep(0.01)
+    pid = int(pidfile.read_text())
+    task.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)  # killed and reaped: no such process, not even a zombie
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)

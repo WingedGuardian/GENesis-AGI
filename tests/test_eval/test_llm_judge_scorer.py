@@ -30,6 +30,7 @@ class StubRouter:
     success: bool = True
     error: str | None = None
     model_id: str = "deepseek/deepseek-v4-pro"
+    served_model: str | None = None
     provider_used: str = "openrouter-deepseek-v4"
     last_call_site_id: str = ""
     last_messages: list[dict] | None = None
@@ -46,6 +47,7 @@ class StubRouter:
             model_id=self.model_id if self.success else None,
             provider_used=self.provider_used if self.success else None,
             error=self.error,
+            served_model=self.served_model,
         )
 
 
@@ -140,11 +142,44 @@ async def test_score_async_pass(simple_rubric):
     assert detail["judge_score"] == 0.85
     assert detail["rationale"] == "good"
     assert detail["judge_model"] == "deepseek/deepseek-v4-pro"
+    assert detail["judge_served_model"] is None
     # And the call site was correct
     assert router.last_call_site_id == "judge"
     # Prompt got the substitutions
     assert "actual=actual_text" in router.last_messages[0]["content"]
     assert "expected=expected_text" in router.last_messages[0]["content"]
+
+
+@pytest.mark.parametrize("response", ['{"score": 0.85}', '{}', '{"score": "NaN"}'])
+async def test_judge_records_observed_model_even_when_grade_is_invalid(simple_rubric, response):
+    router = StubRouter(response_content=response, served_model="deepseek/deepseek-v4-pro-20260423")
+    _, _, detail = await LLMJudgeScorer(router=router).score_async(
+        "actual", "expected", {"rubric_name": simple_rubric.name}
+    )
+    evidence = json.loads(detail)
+    assert evidence["judge_model"] == router.served_model
+    assert evidence["judge_served_model"] == router.served_model
+
+
+@pytest.mark.parametrize("served_model, expected", [
+    ("models/gemini-3.8-flash", "models/gemini-3.8-flash"),
+    ("~anthropic/claude-sonnet-latest", "~anthropic/claude-sonnet-latest"),
+    ("anthropic.claude-sonnet-5-v1:0", "anthropic.claude-sonnet-5-v1:0"),
+    ("vendors/model@2026-11-21", "vendors/model@2026-11-21"),
+    ("model with spaces", None),
+    ("vendor/model\nforged", None),
+    ("vendor/" + "m" * 200, None),
+    ("vendor/sk-" + "x" * 24, None),
+    ("123456789:" + "a" * 32, None),
+])
+async def test_judge_observed_identity_is_bounded(simple_rubric, served_model, expected):
+    router = StubRouter(served_model=served_model)
+    _, _, detail = await LLMJudgeScorer(router=router).score_async(
+        "actual", "expected", {"rubric_name": simple_rubric.name}
+    )
+    evidence = json.loads(detail)
+    assert evidence["judge_model"] == (expected or router.model_id)
+    assert evidence["judge_served_model"] == expected
 
 
 async def test_integer_float_conversion_overflow_is_a_parse_failure(simple_rubric):

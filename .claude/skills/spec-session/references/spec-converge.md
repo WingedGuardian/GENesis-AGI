@@ -8,8 +8,9 @@ it stops.
 
 Where it runs: `build-session`, "Verify BEFORE the PR", for any build that has
 a spec. It is the builder's pass. At review time, the architect's Step 0.5
-compares the diff with the plan; that step stays informational and does not
-replace this one, and this one does not replace it.
+compares the diff with the spec and the plan; its scope lines stay
+informational, its `Spec check:` line is for the PR-open gate, and it does
+not replace this pass, nor this pass it.
 
 ## Inputs
 
@@ -30,9 +31,14 @@ rules in `spec-analyze.md`, Step 1, on the spec as it is now. Reuse the ids of
 the spec's `spec-analyze` report only when its Index line still matches the
 spec word for word; otherwise match earlier items by their first words, since
 an inserted requirement renumbers everything after it (`spec-analyze.md`,
-Step 4). Add each plan decision that
+Step 4). Once the spec has a `<spec stem>.approved.analysis.md`, take the ids
+from it instead (a builder that has only the issue takes them from the
+approval report's verbatim copy posted there, which carries the same Index
+line), and apply each `## Amendments` entry to the item it names:
+that item is judged by the amendment's new text. Add each plan decision that
 obliges the build to something, and each ticket. Record the line each comes
-from.
+from. `V-n` items (the spec's `Definition of Verified`) are checked after
+merge, by the validator: list them, and do not judge them in this pass.
 
 **A checked box is not evidence.** A ticket marked done, a task list ticked
 off, a ledger row closed or a plan bullet that says "done" is a claim, and
@@ -93,7 +99,9 @@ One item per gap, CRITICAL and HIGH first, each traced to the line of the spec
 earlier sections, or an earlier convergence section, and it never renumbers,
 reorders or deletes an item. It writes no code; doing the items is the build's
 next step. A build with no plan file puts the same section in its session
-output instead, since a spec is not the builder's to edit.
+output instead, since a spec is not the builder's to edit; the one exception is
+a spec's `## Amendments` section, where a builder relays the owner's decision
+in the owner's words (build-session, "Building from a spec").
 
 **A gap already listed in an earlier convergence section is never appended
 again.** If it is still open, the report counts it as open. A gap leaves the

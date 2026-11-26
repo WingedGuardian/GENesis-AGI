@@ -65,6 +65,17 @@ class TestAutonomyInit:
         assert rt.protected_paths is not None
         assert rt.action_classifier is not None
         assert rt.task_verifier is not None
+        assert rt.router is None
+        assert rt.autonomous_dispatcher is None
+        assert rt.autonomous_cli_approval_gate is not None
+        request_id = await rt._approval_manager.request_approval(
+            action_type="sentinel_dispatch",
+            action_class="costly_reversible",
+            description="routerless recovery fixture",
+        )
+        gate = rt.autonomous_cli_approval_gate
+        assert await gate.resolve_request(request_id, decision="cancelled", resolved_by="alarm_cleared")
+        assert (await gate.get_request(request_id))["status"] == "cancelled"
 
         # Verify state was seeded (load_or_create_defaults called)
         cursor = await conn.execute("SELECT COUNT(*) FROM autonomy_state")

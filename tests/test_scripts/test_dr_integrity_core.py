@@ -32,6 +32,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_scripts.test_backup_dated_snapshots import _isolated_src
+
 _SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 _BACKUP = _SCRIPTS / "backup.sh"
 _RESTORE = _SCRIPTS / "restore.sh"
@@ -103,7 +105,7 @@ def sandbox(tmp_path):
     (home / "tmp").mkdir()
     (gd / ".venv" / "bin").mkdir(parents=True)
     (gd / ".venv" / "bin" / "python").symlink_to(Path(sys.executable))
-    (gd / "src").symlink_to(_SCRIPTS.parent / "src", target_is_directory=True)
+    _isolated_src(gd)  # never the real identity files
     subprocess.run(
         ["sqlite3", str(gd / "data" / "genesis.db"), "CREATE TABLE t(x); INSERT INTO t VALUES(1);"],
         check=True,
