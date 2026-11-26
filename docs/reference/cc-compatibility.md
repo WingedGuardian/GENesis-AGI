@@ -1314,8 +1314,13 @@ auto-discovery but forces `ANTHROPIC_API_KEY`-only auth, which this install
 does not use. CLAUDE.md itself has a 4 MiB ceiling and is dropped whole above
 it (no truncation); the docs recommend under 200 lines for adherence.
 
-Consequence: the SessionStart injection ships as **four hook entries**
-(`--part charter | identity-core | identity-user | knowledge`), each held under
+Consequence: the SessionStart injection ships as **five hook entries**
+(`--part charter`, `--part identity-core --only soul`, `--part identity-core --only
+steering`, `--part identity-user`, `--part knowledge`). Bare `--part identity-core`,
+the earlier SOUL + STEERING part, is still accepted for sessions wired before the
+split, and a script from before the split ignores `--only`, so wiring newer than
+the script duplicates SOUL and STEERING within budget rather than losing them.
+Re-probe a five-entry run near budget after a CC bump. Each part is held under
 `_PART_BUDGET = 9_800` — enforced at a single chokepoint (`BoundedStdout` in
 `scripts/hooks/hook_output.py`) so a block that forgets to check its budget
 cannot overrun. The DEGRADE decisions live there too: a caller says what the

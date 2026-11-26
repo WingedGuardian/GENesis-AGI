@@ -72,6 +72,7 @@
           content: "",
           loadedName: "",
           syntax: "markdown",
+          version: null,
           editable: true,
           deletable: false,
           dirty: false,
@@ -3781,6 +3782,9 @@
             if (resp?.ok) {
               const data = await resp.json();
               this.configModal.content = data.content || "(empty file)";
+              // A layered identity file (CONVERSATION/STEERING) carries a version
+              // that a save sends back, so a stale save is refused, not merged.
+              this.configModal.version = data.version || null;
               this.configModal.loadedName = file.name;
               this.configModal.syntax = data.syntax || "markdown";
               this.finishModalFetch("configModal");
@@ -3821,12 +3825,22 @@
           try {
             const resp = await fetchApi(
               `/api/genesis/config-files/${this.configModal.name.split('/').map(encodeURIComponent).join('/')}`,
-              { method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify({content}) }
+              { method: "PUT", headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({content, version: this.configModal.version}) }
             );
             if (resp?.ok) {
+              const saved = await resp.json().catch(() => ({}));
+              this.configModal.version = saved.version || null;
+              // A layered file comes back as it now resolves (the resolver may add
+              // a `---` before the added text); show that, not what was typed.
+              if (typeof saved.content === "string" && saved.content !== content) {
+                this._configEditor.setValue(saved.content, -1);
+              }
               this.configModal.dirty = false;
-              this.configModal.content = content;
-              this.configModal.saveMessage = "Saved";
+              this.configModal.content = typeof saved.content === "string" ? saved.content : content;
+              this.configModal.saveMessage = saved.replaced
+                ? "Saved to this install's local file (it now replaces the shipped text)"
+                : "Saved";
             } else {
               const data = await resp.json().catch(() => ({}));
               this.configModal.saveError = data.error || "Save failed";

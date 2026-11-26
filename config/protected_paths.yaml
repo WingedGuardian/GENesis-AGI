@@ -111,6 +111,8 @@ sensitive:
     reason: "Identity files shape how Genesis thinks"
   - pattern: "src/genesis/identity/loader.py"
     reason: "Identity loading — changes affect all LLM prompts"
+  - pattern: "src/genesis/identity/paths.py"
+    reason: "Identity resolution — decides which identity text every prompt gets"
 
   # Model routing — affects cost and quality
   - pattern: "config/model_routing.yaml"

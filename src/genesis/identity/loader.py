@@ -4,15 +4,24 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
+
+from genesis.identity.paths import local_path, locked, read_identity, read_regular, write_atomic
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_DIR = Path(__file__).parent
 _STEERING_SEPARATOR = "---"
-_STEERING_MAX_RULES = 20
+# A captured rule longer than this is refused, never cut: the directive filter
+# counts words, and one "word" can be any length (a path, or text joined by a
+# non-space blank).
+_MAX_RULE_CHARS = 600
+# A rule line that could pass for file structure: a heading, an HTML comment
+# (the replace marker is one), or a `_[` note like the resolver's own.
+_STRUCTURE_LINE = re.compile(r"^\s*(#|_\[)|<!--")
 
 # USER.md auto-synthesis — line cap keeps context injection under ~1500 tokens.
 _MAX_USER_MD_LINES = 50
@@ -123,12 +132,9 @@ class IdentityLoader:
     def __init__(
         self,
         identity_dir: Path = _DEFAULT_DIR,
-        *,
-        steering_max_rules: int = _STEERING_MAX_RULES,
     ) -> None:
         self._dir = identity_dir
         self._cache: dict[str, str] = {}
-        self._steering_max_rules = steering_max_rules
 
     def soul(self) -> str:
         return self._load("SOUL.md")
@@ -151,7 +157,11 @@ class IdentityLoader:
         (The 2026-06-30 incident flattened the file because the old parser
         split per line and dropped every ``#`` header and ``---`` separator.)
         """
-        text = self.steering()
+        return self._parse_rules(self.steering())
+
+    @staticmethod
+    def _parse_rules(text: str) -> list[str]:
+        """Split STEERING text into its rule blocks (the preamble excluded)."""
         if not text:
             return []
         blocks: list[str] = []
@@ -413,24 +423,55 @@ class IdentityLoader:
                 return label
         return None
 
-    def add_steering_rule(self, rule: str) -> None:
-        """Append a steering rule to STEERING.md with FIFO eviction.
+    def add_steering_rule(self, rule: str) -> bool:
+        """Append a steering rule to STEERING.local.md, the per-install layer.
 
-        If the rule count exceeds the cap, the oldest rule is dropped.
-        Clears the STEERING.md cache so the next read picks up the change.
-        Any line inside the rule that is exactly the block separator (``---``)
-        is neutralized to an em-dash, so a rule body can never be silently split
-        into two blocks on the next read→write round-trip.
+        The shipped STEERING.md is never written, and no stored rule is ever
+        evicted or cut. The rule becomes its own ``---``-delimited block after
+        the local file's existing ones (inside a replace layer, after its
+        body), so the resolver reads it after every rule already in force. A
+        rule already in force (compared with whitespace normalized) is not
+        added twice. A line that is exactly the separator is neutralized to an
+        em-dash, so a body is never split.
+
+        Refused with a warning, returning False: a rule over _MAX_RULE_CHARS,
+        or one with a line matching _STRUCTURE_LINE. A STEERING.local.md that
+        is a symlink or not a regular file raises.
+
+        The read-modify-write holds a lock on the identity directory (held for
+        milliseconds; the server is the only writer today) and swaps in a
+        fresh 0600 file, fsynced, created under a random name. Returns whether
+        a rule was written; each write is logged with the full rule.
         """
-        path = self._dir / "STEERING.md"
-        rules = self.steering_rules()
-        safe_rule = re.sub(r"(?m)^\s*---\s*$", "—", rule.strip())
-        rules.append(safe_rule)
-        # FIFO eviction — drop oldest if over cap
-        while len(rules) > self._steering_max_rules:
-            rules.pop(0)
-        self._write_steering(path, rules)
-        self._cache.pop("STEERING.md", None)
+        safe_rule = re.sub(r"(?m)^\s*---\s*$", "—", "\n".join(rule.strip().splitlines()))
+        if not safe_rule:
+            return False
+        if len(safe_rule) > _MAX_RULE_CHARS or any(
+            _STRUCTURE_LINE.search(line) for line in safe_rule.splitlines()
+        ):
+            logger.warning(
+                "Steering rule refused: %d chars (at most %d) or a heading, comment "
+                "or note line: %r",
+                len(safe_rule), _MAX_RULE_CHARS, safe_rule[:200],
+            )
+            return False
+        path = local_path("STEERING.md", self._dir)
+        try:
+            with locked(self._dir):
+                # First, so the resolver read below never opens a symlink or a FIFO.
+                text = read_regular(path) or ""
+                in_force = self._parse_rules(read_identity("STEERING.md", self._dir) or "")
+                if _rule_key(safe_rule) in {_rule_key(r) for r in in_force}:
+                    return False
+                # Every rule follows a separator, the first one too: the resolver
+                # and _parse_rules read a file's first block as a preamble, never a
+                # rule, and a rule can then never become the replace marker line.
+                new = text.rstrip() + ("\n\n" if text.strip() else "") + "---\n\n" + safe_rule + "\n"
+                write_atomic(path, new)
+        finally:
+            self._cache.pop("STEERING.md", None)
+        logger.info("Steering rule written to %s (%d chars): %s", path, len(safe_rule), safe_rule)
+        return True
 
     def reload(self) -> None:
         self._cache.clear()
@@ -438,36 +479,16 @@ class IdentityLoader:
     def _load(self, filename: str) -> str:
         if filename in self._cache:
             return self._cache[filename]
-        path = self._dir / filename
-        if not path.exists():
-            logger.debug("Identity file not found: %s", path)
+        text = read_identity(filename, self._dir)
+        if text is None:
+            logger.debug("Identity file not found: %s", self._dir / filename)
             self._cache[filename] = ""
             return ""
-        text = path.read_text(encoding="utf-8").strip()
+        text = text.strip()
         self._cache[filename] = text
         return text
 
-    @staticmethod
-    def _write_steering(path: Path, rules: list[str]) -> None:
-        """Write STEERING.md as preamble + ``---``-delimited rule blocks.
 
-        Each rule is emitted as its own block preceded by a ``---`` separator,
-        so a rule's ``## header`` and multi-line body survive read→append→write
-        round-trips. Counterpart to :meth:`steering_rules` (which splits on the
-        same separator). FIFO eviction in :meth:`add_steering_rule` now drops
-        whole oldest blocks, not partial lines.
-        """
-        preamble = "\n".join([
-            "# Steering Rules",
-            "",
-            "Rules below are hard constraints on Genesis behavior, set by the user.",
-            "Genesis MUST NOT violate these rules under any circumstances.",
-            "",
-            "When the user gives strong negative feedback (\"never do X\", \"stop doing Y\"),",
-            "a new rule is appended here. Oldest rules are evicted when the cap is reached.",
-        ])
-        parts = [preamble]
-        for rule in rules:
-            parts.append(_STEERING_SEPARATOR)
-            parts.append(rule.strip())
-        path.write_text("\n\n".join(parts) + "\n", encoding="utf-8")
+def _rule_key(rule: str) -> str:
+    """A rule compared for duplicates: NFKC, whitespace runs collapsed."""
+    return " ".join(unicodedata.normalize("NFKC", rule).split())

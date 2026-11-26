@@ -89,11 +89,6 @@ rate_limit_patterns:
     - "try again"
     - "quota exceeded"
 
-# STEERING.md configuration
-steering:
-  max_rules: 20           # FIFO eviction at this count
-  file_path: "src/genesis/identity/STEERING.md"
-
 # Calibration feedback injection
 calibration:
   min_sample_count: 10    # Minimum predictions per domain before injecting feedback
