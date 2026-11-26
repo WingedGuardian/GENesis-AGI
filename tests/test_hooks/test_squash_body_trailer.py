@@ -286,7 +286,7 @@ def _drive(monkeypatch, command, *, body=BODY, commits=None):
     monkeypatch.setattr(
         _mod,
         "_check_inline_review_findings",
-        lambda n, force=False, repo=None, uncounted_out=None: (False, ""),
+        lambda n, force=False, repo=None, uncounted_out=None, head=None: (False, ""),
     )
     monkeypatch.setattr(
         _mod,
@@ -418,7 +418,7 @@ def _report_env(monkeypatch):
     monkeypatch.setattr(
         _mod,
         "_check_inline_review_findings",
-        lambda n, repo=None, force=False, uncounted_out=None: (False, ""),
+        lambda n, repo=None, force=False, uncounted_out=None, head=None: (False, ""),
     )
 
 

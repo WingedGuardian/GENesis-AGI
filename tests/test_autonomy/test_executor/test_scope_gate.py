@@ -477,8 +477,12 @@ class TestBaseWiring:
             seen.append({"base": base})
             return worktree_base / f"task-{task_id[:8]}"
 
+        async def fresh_task(task_id, repo_root, worktree_base):
+            return worktree_mgr.task_locator(task_id, worktree_base)
+
         monkeypatch.setattr(worktree_mgr, "resolve_base", AsyncMock(return_value=base))
         monkeypatch.setattr(worktree_mgr, "create_worktree", fake_create)
+        monkeypatch.setattr(worktree_mgr, "assert_fresh_task", fresh_task)
         return seen
 
     async def _outputs(self, db) -> dict:

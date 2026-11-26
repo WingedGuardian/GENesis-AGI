@@ -184,6 +184,9 @@ the domain's `needs_restart` flag is the stated contract.
   save copies a repo-sibling overlay into the user dir, which then shadows it.
   `outreach` and `confidence_gates` have no validator, so their values are written
   unchecked (#2446).
+- **Backup:** `scripts/backup.sh` §6g encrypts every file in `~/.genesis/config/`
+  (except `genesis.yaml`, which §8 covers) and `scripts/restore.sh` §4e puts them
+  back; the repo-sibling `config/*.local.yaml` overlays are §6 / restore §6.
 - **Registry:** 48 domains in `_DOMAIN_REGISTRY`. `readonly` domains refuse writes;
   `recon_*` route to the `recon_config` tool; disabling
   `autonomous_cli_policy.manual_approval_required` needs `confirm_disable_approval_gate`.

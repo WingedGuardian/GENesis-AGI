@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from genesis.db.crud import j9_eval
 from genesis.eval.j9_batch import J9EvalBatchExecutor
 
@@ -84,6 +86,29 @@ async def test_judges_all_memories_happy_path(db):
     assert await _relevance_pairs(db) == {(eid, "m1"), (eid, "m2"), (eid, "m3")}
 
 
+@pytest.mark.parametrize("has_served_model", [False, True])
+async def test_relevance_events_distinguish_observed_and_fallback_models(db, has_served_model):
+    router = _FakeRouter()
+    original = router.route_call
+
+    async def route(*args, **kwargs):
+        response = await original(*args, **kwargs)
+        if has_served_model:
+            response.served_model = "fake-observed-model"
+        return response
+
+    router.route_call = route
+    await _seed_recall(db, query="q", memory_ids=["m1"])
+    await J9EvalBatchExecutor(db=db, router=router).execute(_task())
+    event, = await j9_eval.get_events(db, dimension="memory", event_type="recall_relevance")
+    assert event["metrics"]["judge_model"] == (
+        "fake-observed-model" if has_served_model else "fake-judge"
+    )
+    assert event["metrics"]["judge_served_model"] == (
+        "fake-observed-model" if has_served_model else None
+    )
+
+
 async def test_missing_relevance_key_not_stored_as_zero(db):
     """A judge response that is valid JSON but LACKS the 'relevance' key must be
     treated as an ERROR (not stored), NOT recorded as a fake relevance=0.0
@@ -94,7 +119,7 @@ async def test_missing_relevance_key_not_stored_as_zero(db):
             return SimpleNamespace(
                 success=True, provider_used="fake", model_id="fake-judge",
                 content=json.dumps({"rationale": "forgot the relevance field"}),
-                error=None,
+                error=None, served_model="fake-observed-model",
             )
 
     await _seed_recall(db, query="q", memory_ids=["m1"])
@@ -103,8 +128,31 @@ async def test_missing_relevance_key_not_stored_as_zero(db):
     result = await ex.execute(_task())
 
     assert result.success
+    grade, _, model, observed = await ex._judge_relevance("q", "content")
+    assert grade is None
+    assert model == observed == "fake-observed-model"
     # Missing key → judge error → the pair is NOT stored (no fake 0.0 event).
     assert await _relevance_pairs(db) == set()
+
+
+async def test_malformed_grade_does_not_log_unusable_model_identity(caplog):
+    marker = "sk-" + "x" * 24
+
+    class _InvalidResponseRouter:
+        async def route_call(self, **kwargs):
+            return SimpleNamespace(
+                success=True, provider_used="fake", model_id="fake-judge",
+                served_model=marker, content="{}",
+            )
+
+    with caplog.at_level("DEBUG", logger="genesis.eval.j9_batch"):
+        grade, _, model, observed = await J9EvalBatchExecutor(
+            router=_InvalidResponseRouter()
+        )._judge_relevance("q", "content")
+    assert marker not in caplog.text
+    assert grade is None
+    assert model == "fake-judge"
+    assert observed is None
 
 
 async def test_checkpoint_skips_already_judged(db):

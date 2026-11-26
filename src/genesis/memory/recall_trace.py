@@ -187,6 +187,9 @@ def build_record(trace: dict[str, Any]) -> dict[str, Any]:
         "window": len(candidates),
         "omitted": max(0, len(fused) - sum(1 for c in candidates if c["id"] in fused)),
         "delivered": delivered,
+        # Full ids of the breadcrumb hints shown with this recall, so an expand
+        # of one in the same session counts as a followed link (MW-11).
+        "hints": list(trace.get("hints") or []),
         "candidates": candidates,
     }
 

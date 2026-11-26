@@ -4,7 +4,7 @@
 A delivery read answers one question about a PR: does it deliver what its basis (the
 issue, ledger row, follow-up, spec or plan it points at, or its own claim) asks for?
 The session doing the read records the verdict as ONE owner-authored PR comment,
-edited in place when the read is redone. The comment opens with a closed header:
+posted anew when the read is redone (the newest one governs). The comment opens with a closed header:
 
     <!-- genesis-delivery-check: head=<40 hex> basis=<B> verdict=<V> scope=<S>
          [intended=<I>] [change=<C>] [coderabbit=<R>] [checker=<K>] [outcome=<O>] -->
@@ -24,8 +24,8 @@ Usage:
 line (the acceptance gate's parser) or, with none, from the one issue GitHub links to
 the PR (``--basis``, when given, must agree), refuses a
 DELIVERS whose DONE lines cite no ``path:line`` or cite a file the PR does not change,
-writes the comment to a file, and PRINTS the one ``gh`` command that posts it: a PATCH
-of the owner's existing marker comment, or a new comment. It never posts.
+writes the comment to a file, and PRINTS the one ``gh`` command that posts it as a new
+comment, which supersedes any earlier owner marker. It never posts.
 
 ``read`` lists every marker block on the PR's comments and reviews with how a reader
 treats it. ``parse(text)`` is the one parser; the gate row imports it.
@@ -437,7 +437,7 @@ def select(comments: list[dict], reviews: list[dict], owner: str, head: str) -> 
     Only an owner's PR comment counts (a review body cannot be edited in place, and a
     marker from anyone else is ignored). Among the usable ones, the latest-edited block
     at ``head`` governs; with none at ``head``, the latest-edited block. This matches the
-    writer, which re-edits the owner's latest marker comment, and needs no commit list.
+    writer, which posts each re-read as a new comment, and needs no commit list.
     An owner block that is unusable never governs, but one edited after the governing
     block is returned in ``later_unusable``: it may be a newer verdict with a typo, so a
     reader must not print the older one as settled.
@@ -884,20 +884,15 @@ def compose(a: argparse.Namespace) -> int:
         out.write_text(render(fields, prose, aside=aside), encoding="utf-8")
     except OSError as exc:
         raise Refused(f"cannot write {out}: {exc}") from exc
-    if mine:
-        latest = replaced
-        cmd = [
-            "gh",
-            "api",
-            "--method",
-            "PATCH",
-            f"repos/{repo}/issues/comments/{latest['id']}",
-            "-F",
-            f"body=@{out}",
-        ]
-        print(f"Wrote {out}. It replaces your marker comment {latest['id']}; post it with:")
+    # Always a NEW comment: the push guard denies an agent's edit of a comment on an
+    # open PR (a deleted or rewritten comment can lower the round count), and
+    # ``select`` reads the newest owner marker, so a new comment supersedes the old.
+    # A REST POST, not `gh pr comment --body-file`: the guard's review-request gate
+    # reads an opaque `gh pr comment` body as a possible `@codex review` and asks.
+    cmd = ["gh", "api", f"repos/{repo}/issues/{a.pr}/comments", "-F", f"body=@{out}"]
+    if replaced:
+        print(f"Wrote {out}. It supersedes your marker comment {replaced['id']}; post it with:")
     else:
-        cmd = ["gh", "pr", "comment", str(a.pr), "--repo", repo, "--body-file", str(out)]
         print(f"Wrote {out}. Post it with:")
     print(shlex.join(cmd))
     if a.second_reader:

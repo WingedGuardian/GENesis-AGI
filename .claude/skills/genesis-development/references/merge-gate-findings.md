@@ -6,7 +6,9 @@
    warning), and 🔍 is informational, surfaced and never scored. The marker agrees
    with the metadata `kind` on every comment measured. A
    marker outside that closed set is FORMAT DRIFT: surfaced, never scored. A
-   finding Devin posted twice counts once (dedup on its metadata `id`). It is
+   finding Devin posted twice counts once (dedup on its metadata `id`), unless
+   someone else edited a copy: the edited copies and the untouched ones then
+   count apart (#5001). It is
    parsed only for the `devin-ai-integration[bot]` Bot account, and its branch
    runs before the Codex badge match, so a Devin body QUOTING `![P1 Badge]` is
    scored once, as Devin. CodeRabbit Minor and below stay SURFACE-ONLY by owner
@@ -20,9 +22,14 @@
    **Clearing a FLOOR finding (#4933):** a reply with a line that starts with
    `Fixed in <sha>` (or `at`/`by`), outside quotes and code and unhedged, whose commit
    is one of the PR's own, single-parent, descending from the head the finding was
-   posted on, and touching its file or its renamed name; or the owner's
+   posted on, and touching its file or its renamed name; the fix must still be in the
+   head being merged (that head or its ancestor, with the file changed there since the
+   finding was posted, so a fully reverted fix does not clear, #5000; a revert hidden by
+   another change to the same file still clears); or the owner's
    `# floor-accept=<id>[,<id>]`. Any other reply clears nothing, and neither does
-   `# review-override`. MEASURED over the 739 floor findings on the 862 PRs merged
+   `# review-override`. A reviewer's finding comment edited by anyone but that reviewer is a
+   floor finding whatever it now says (off-diff and doc exclusions still apply),
+   cleared only by that sigil (#5001). MEASURED over the 739 floor findings on the 862 PRs merged
    2026-10-01 to 2026-11-20, two readers agreed that 73 replies did not fix a
    leak, destructive or fail-open finding they had cleared. This rule blocks 72; the
    73rd (#2878) turned out to be a real fix, cited in Devin's own reply.

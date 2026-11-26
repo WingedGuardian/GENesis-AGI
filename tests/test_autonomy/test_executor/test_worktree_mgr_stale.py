@@ -1,10 +1,10 @@
-"""Re-creating a task worktree never deletes work (#2926 PR 4).
+"""Task worktree creation refuses every retained or occupied locator.
 
 Real git, scratch repositories. Before this change a stale task worktree that
 ``git worktree remove`` refused (uncommitted changes) was ``rmtree``d, and the
 re-create then failed anyway because the branch and registration survived
-(MEASURED). Now a registered worktree is left for the reaper with a clear
-error, and an orphan directory git does not know goes to the trash.
+(MEASURED). Creation now refuses retained branches and occupied paths without
+changing either one.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ from pathlib import Path
 import pytest
 
 from genesis.autonomy.executor import worktree_mgr
-from genesis.trash import ITEM, list_entries
 
 
 @pytest.fixture()
@@ -49,11 +48,10 @@ async def test_a_dirty_registered_worktree_is_left_in_place(repo):
     (wt / "work.txt").write_text("uncommitted task work")
     subprocess.run(["git", "-C", str(wt), "add", "work.txt"], check=True)
 
-    with pytest.raises(worktree_mgr.StaleWorktreeError, match="worktree reaper"):
+    with pytest.raises(worktree_mgr.StaleWorktreeError, match="retained task branch"):
         await worktree_mgr.create_worktree(TASK, repo, base)
 
     assert (wt / "work.txt").read_text() == "uncommitted task work"
-    assert list_entries() == []  # nothing trashed, nothing deleted
 
 
 @pytest.mark.asyncio
@@ -68,10 +66,9 @@ async def test_a_newline_in_the_repo_path_does_not_hide_a_registered_worktree(tm
 
     records = await worktree_mgr._worktree_records(odd)
     assert worktree_mgr._record_for(records, wt) is not None
-    with pytest.raises(worktree_mgr.StaleWorktreeError, match="uncommitted work"):
+    with pytest.raises(worktree_mgr.StaleWorktreeError, match="retained task branch"):
         await worktree_mgr.create_worktree(TASK, odd, base)
     assert (wt / "work.txt").read_text() == "uncommitted"
-    assert list_entries() == []
 
 
 @pytest.mark.asyncio
@@ -80,24 +77,34 @@ async def test_a_locked_worktree_says_nothing_will_reap_it(repo):
     wt = await worktree_mgr.create_worktree(TASK, repo, base)
     subprocess.run(["git", "-C", str(repo), "worktree", "lock", str(wt)], check=True)
 
-    with pytest.raises(worktree_mgr.StaleWorktreeError, match="is locked; nothing reaps"):
+    with pytest.raises(worktree_mgr.StaleWorktreeError, match="retained task branch"):
         await worktree_mgr.create_worktree(TASK, repo, base)
-    assert wt.is_dir() and list_entries() == []
+    assert wt.is_dir()
 
 
 @pytest.mark.asyncio
-async def test_an_orphan_directory_goes_to_the_trash_and_creation_proceeds(repo):
+@pytest.mark.parametrize("kind", ["directory", "file", "dangling_symlink"])
+async def test_an_occupied_task_path_is_refused_without_changing_it(repo, kind):
     base = repo / ".claude" / "worktrees"
     orphan = base / f"task-{TASK[:8]}"
-    orphan.mkdir(parents=True)
-    (orphan / "leftover.txt").write_text("from a crashed run")
+    orphan.parent.mkdir(parents=True)
+    if kind == "directory":
+        orphan.mkdir()
+        (orphan / "leftover.txt").write_text("from a crashed run")
+    elif kind == "file":
+        orphan.write_text("not a worktree")
+    else:
+        orphan.symlink_to(orphan.parent / "missing")
 
-    wt = await worktree_mgr.create_worktree(TASK, repo, base)
+    with pytest.raises(worktree_mgr.StaleWorktreeError, match="target path is already occupied"):
+        await worktree_mgr.create_worktree(TASK, repo, base)
 
-    assert wt == orphan and await worktree_mgr.is_registered_worktree(wt, repo)
-    [entry] = list_entries()
-    assert entry.tombstone.caller == "worktree_mgr.create_worktree"
-    assert (entry.path / ITEM / "leftover.txt").read_text() == "from a crashed run"
+    assert orphan.exists() is (kind != "dangling_symlink")
+    assert orphan.is_symlink() is (kind == "dangling_symlink")
+    if kind == "directory":
+        assert (orphan / "leftover.txt").read_text() == "from a crashed run"
+    elif kind == "file":
+        assert orphan.read_text() == "not a worktree"
 
 
 @pytest.mark.asyncio
@@ -117,7 +124,6 @@ async def test_an_unreadable_worktree_list_deletes_nothing(repo, monkeypatch):
     with pytest.raises(worktree_mgr.StaleWorktreeError, match="could not be read"):
         await worktree_mgr.create_worktree(TASK, repo, base)
     assert (orphan / "leftover.txt").read_text() == "keep"
-    assert list_entries() == []
 
 
 @pytest.mark.asyncio
@@ -145,8 +151,7 @@ async def test_an_orphan_directory_is_not_a_registered_worktree(repo):
 
 @pytest.mark.asyncio
 async def test_ambient_git_location_variables_are_ignored_throughout(tmp_path, repo, monkeypatch):
-    # Set BEFORE the worktree exists: the add, the listing and the reset must
-    # all act on repo_root, or a live worktree reads as an orphan and is trashed.
+    # Set before the worktree exists: every manager Git read must still use repo.
     other = tmp_path / "other"
     subprocess.run(["git", "init", "-q", "-b", "main", str(other)], check=True)
     monkeypatch.setenv("GIT_DIR", str(other / ".git"))
@@ -160,10 +165,9 @@ async def test_ambient_git_location_variables_are_ignored_throughout(tmp_path, r
         check=True,
         env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
     )
-    with pytest.raises(worktree_mgr.StaleWorktreeError, match="uncommitted work"):
+    with pytest.raises(worktree_mgr.StaleWorktreeError, match="retained task branch"):
         await worktree_mgr.create_worktree(TASK, repo, base)
     assert (wt / "work.txt").read_text() == "uncommitted"
-    assert list_entries() == []
 
 
 @pytest.mark.asyncio
@@ -217,16 +221,19 @@ async def test_a_prunable_record_does_not_make_an_orphan_registered(repo):
 
 
 @pytest.mark.asyncio
-async def test_a_prunable_orphan_is_trashed_and_the_worktree_recreated(repo):
+async def test_a_prunable_orphan_and_retained_branch_are_left_unchanged(repo):
     base = repo / ".claude" / "worktrees"
     wt = await worktree_mgr.create_worktree(TASK, repo, base)
     _delete_and_recreate(wt)
+    before = _porcelain(repo)
+    tip = await worktree_mgr.branch_tip(f"task/{TASK[:8]}", repo)
 
-    again = await worktree_mgr.create_worktree(TASK, repo, base)
+    with pytest.raises(worktree_mgr.StaleWorktreeError, match="retained task branch"):
+        await worktree_mgr.create_worktree(TASK, repo, base)
 
-    assert again == wt and await worktree_mgr.is_registered_worktree(wt, repo)
-    [entry] = list_entries()
-    assert (entry.path / ITEM / "leftover.txt").read_text() == "orphan"
+    assert (wt / "leftover.txt").read_text() == "orphan"
+    assert _porcelain(repo) == before
+    assert await worktree_mgr.branch_tip(f"task/{TASK[:8]}", repo) == tip
 
 
 @pytest.mark.asyncio
@@ -239,10 +246,10 @@ async def test_a_locked_record_does_not_make_an_orphan_registered(repo):
     _delete_and_recreate(wt)
     assert "prunable" not in _porcelain(repo)
     assert await worktree_mgr.is_registered_worktree(wt, repo) is False
-    # Re-creating refuses (locked) and deletes nothing.
-    with pytest.raises(worktree_mgr.StaleWorktreeError, match="is locked"):
+    # A retained branch refuses before the occupied locked path is changed.
+    with pytest.raises(worktree_mgr.StaleWorktreeError, match="retained task branch"):
         await worktree_mgr.create_worktree(TASK, repo, base)
-    assert (wt / "leftover.txt").read_text() == "orphan" and list_entries() == []
+    assert (wt / "leftover.txt").read_text() == "orphan"
 
 
 @pytest.mark.asyncio
@@ -315,7 +322,7 @@ async def test_a_task_path_linked_to_another_worktree_is_not_registered(repo):
     shutil.rmtree(b)
     b.symlink_to(a)
     assert await worktree_mgr.is_registered_worktree(b, repo) is False
-    with pytest.raises(worktree_mgr.StaleWorktreeError, match="is a symlink"):
+    with pytest.raises(worktree_mgr.StaleWorktreeError, match="retained task branch"):
         await worktree_mgr.create_worktree(TASK, repo, base)
     assert a.is_dir() and b.is_symlink()
 
