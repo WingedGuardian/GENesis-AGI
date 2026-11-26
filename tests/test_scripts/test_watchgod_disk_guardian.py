@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -216,6 +217,302 @@ def test_green_ends_the_episode_so_the_next_one_pages_again(box):
     _handle(box, "green", free=90_000)
     _handle(box, "orange")
     assert len(first + [p for p in _pages(box) if p["severity"] == "warning"]) == 2
+
+
+@pytest.fixture
+def deleted_holder(box):
+    """A real process holding a DELETED 3 MB file under the sandbox HOME: the
+    shape SQLite's spill files take, which du cannot see."""
+    d = box["home"] / ".genesis" / "cc-tmp"
+    d.mkdir(parents=True, exist_ok=True)
+    code = (
+        "import os, sys, time\n"
+        f"p = os.path.join({str(d)!r}, 'etilqs_test')\n"
+        "f = open(p, 'wb'); f.write(os.urandom(3 * 1024 * 1024)); f.flush(); os.fsync(f.fileno())\n"
+        "os.unlink(p); print('ready', flush=True); time.sleep(60)\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-I", "-c", code], stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout.readline().strip() == "ready"
+        # Guard the guard: the fixture really holds a deleted file.
+        held = [os.readlink(f"/proc/{proc.pid}/fd/{fd}") for fd in os.listdir(f"/proc/{proc.pid}/fd")]
+        assert any(t.endswith("etilqs_test (deleted)") for t in held), held
+        yield proc
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_a_page_names_who_holds_deleted_files(box, deleted_holder):
+    """Space held by deleted-but-open files is invisible to du. The page names
+    the holding process and how much it holds, so the culprit is known at the
+    event, not reconstructed afterwards."""
+    _handle(box, "red")
+    (page,) = [p for p in _pages(box) if p["severity"] == "emergency"]
+    body = page["body"]
+    assert "Deleted but still open" in body, body
+    assert f"pid {deleted_holder.pid} " in body, body
+    assert ": 3 MB in 1 file(s), invisible to du" in body, body
+    assert ": 3 MB in 1 file(s)\n" in body + "\n", body
+
+
+def test_attribution_log_names_who_holds_deleted_files(box, deleted_holder):
+    _handle(box, "yellow")
+    log = _log(box)
+    assert "Deleted but still open" in log and f"pid {deleted_holder.pid} " in log, log
+
+
+def test_holder_names_are_read_now_not_from_an_earlier_scan(box, deleted_holder):
+    """The runaway scan's identity cache can be a poll old; a holder may have
+    exec'd or renamed itself since. The page reads the holder's identity now."""
+    pid = deleted_holder.pid
+    _run(
+        box,
+        f"_RW_IDENT[{pid}]=$'1\\tS\\tstale-name\\t1\\tinit'; ALL_WRITERS=''; "
+        f"handle_fs '{box['home']}' '{_home_dev(box)}' red 1000 100000 - '' btrfs",
+    )
+    (page,) = [p for p in _pages(box) if p["severity"] == "emergency"]
+    assert f"pid {pid} " in page["body"], page["body"]
+    assert "stale-name" not in page["body"], page["body"]
+
+
+def test_an_incomplete_deleted_file_scan_is_reported_even_when_it_found_little(box):
+    """A walk that timed out may have found nothing; silence would read as
+    'nothing held'. The page says the scan did not complete."""
+    real_find = shutil.which("find")
+    _stub(
+        box["bin"] / "find",
+        f'#!/usr/bin/env bash\ncase " $* " in *" -links "*) exit 124;; esac\nexec {real_find} "$@"\n',
+    )
+    _handle(box, "red")
+    (page,) = [p for p in _pages(box) if p["severity"] == "emergency"]
+    assert "Deleted-file scan under" in page["body"] and "did not complete (status 124)" in page["body"], page[
+        "body"
+    ]
+
+
+def test_no_deleted_block_when_nothing_is_held(box):
+    _handle(box, "red")
+    (page,) = [p for p in _pages(box) if p["severity"] == "emergency"]
+    assert "Deleted but still open" not in page["body"], page["body"]
+
+
+def test_deleted_files_on_another_path_are_not_listed(box, deleted_holder, tmp_path):
+    """Only files under the paged path count: a page for one tree must not
+    blame a holder whose file lives elsewhere on the same disk."""
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    dev = _home_dev(box)
+    # Guard the guard: only the path filter can exclude the holder, never the device.
+    assert str(os.stat(other).st_dev) == dev
+    _run(box, f"ALL_WRITERS=''; handle_fs '{other}' '{dev}q100000' red 1000 100000 - '' btrfs")
+    (page,) = [p for p in _pages(box) if p["severity"] == "emergency"]
+    assert f"pid {deleted_holder.pid} " not in page["body"], page["body"]
+
+
+def test_a_whole_filesystem_domain_is_not_narrowed_by_path(box, deleted_holder, tmp_path):
+    """A mount key covers the whole filesystem; its path is only the first
+    watched path on it, so a holder under another tree must still be named."""
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    dev = _home_dev(box)
+    assert str(os.stat(other).st_dev) == dev
+    _run(box, f"ALL_WRITERS=''; handle_fs '{other}' '{dev}m12345' red 1000 100000 - '' btrfs")
+    (page,) = [p for p in _pages(box) if p["severity"] == "emergency"]
+    assert f"pid {deleted_holder.pid} " in page["body"], page["body"]
+
+
+def test_a_file_held_twice_is_counted_once(box, deleted_holder):
+    """A deleted file held through two descriptors occupies its space once."""
+    d = box["home"] / ".genesis" / "cc-tmp"
+    code = (
+        "import os, time\n"
+        f"p = os.path.join({str(d)!r}, 'etilqs_dup')\n"
+        "f = open(p, 'wb'); f.write(os.urandom(2 * 1024 * 1024)); f.flush(); os.fsync(f.fileno())\n"
+        "g = os.dup(f.fileno()); os.unlink(p); print('ready', flush=True); time.sleep(60)\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-I", "-c", code], stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout.readline().strip() == "ready"
+        _handle(box, "red")
+    finally:
+        proc.kill()
+        proc.wait()
+    (page,) = [p for p in _pages(box) if p["severity"] == "emergency"]
+    # 3 MB + 2 MB, two files, though the 2 MB one is held through two descriptors.
+    assert ": 5 MB in 2 file(s), invisible to du" in page["body"], page["body"]
+
+
+def test_a_read_only_holder_is_named(box):
+    """A deleted file held only for READING still occupies its space; the page
+    names that holder instead of printing '?' for it."""
+    d = box["home"] / ".genesis" / "cc-tmp"
+    d.mkdir(parents=True, exist_ok=True)
+    code = (
+        "import os, time\n"
+        f"p = os.path.join({str(d)!r}, 'etilqs_ro')\n"
+        "w = open(p, 'wb'); w.write(os.urandom(3 * 1024 * 1024)); w.flush(); os.fsync(w.fileno()); w.close()\n"
+        "f = open(p, 'rb'); os.unlink(p); print('ready', flush=True); time.sleep(60)\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-I", "-c", code], stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout.readline().strip() == "ready"
+        comm = Path(f"/proc/{proc.pid}/comm").read_text().strip()
+        _handle(box, "red")
+    finally:
+        proc.kill()
+        proc.wait()
+    (page,) = [p for p in _pages(box) if p["severity"] == "emergency"]
+    assert f"pid {proc.pid} {comm} (parent " in page["body"], page["body"]
+
+
+def test_red_relieves_before_it_scans_and_scans_once(box):
+    """The deleted-file scan can take seconds on a busy /proc. On a first RED
+    poll the reserve release and the pressure units run before it, and the
+    attribution log and the page share one scan."""
+    trace = box["tmp"] / "order"
+    _run(
+        box,
+        f"wg_deleted_holders() {{ echo scan >> '{trace}'; echo '  held-list-marker'; }}\n"
+        f"reserve_release() {{ echo release >> '{trace}'; echo released; }}\n"
+        f"start_pressure_unit() {{ echo \"pressure $1\" >> '{trace}'; }}\n"
+        f"ALL_WRITERS=''; handle_fs '{box['home']}' '{_home_dev(box)}' red 1000 100000 - '' btrfs",
+    )
+    order = trace.read_text().split("\n")[:-1]
+    assert order == ["pressure standard", "release", "pressure last-resort", "scan"], order
+    (page,) = [p for p in _pages(box) if p["severity"] == "emergency"]
+    assert "held-list-marker" in page["body"], page["body"]
+    assert "held-list-marker" in _log(box), _log(box)
+
+
+def _clears(box) -> list[dict]:
+    return [p for p in _pages(box) if ":clear-" in p["dedupe_key"]]
+
+
+@pytest.mark.parametrize("tier,word", [("red", "RED"), ("orange", "ORANGE")])
+def test_green_after_a_page_sends_one_all_clear(box, tier, word):
+    """A page with no all-clear leaves the owner unable to tell "recovered a
+    minute later" from "still filling". The first GREEN after a page sends one
+    INFO message saying the filesystem recovered and how far the episode got."""
+    _handle(box, tier)
+    assert not _clears(box)
+    _handle(box, "green", free=90_000)
+    clears = _clears(box)
+    assert len(clears) == 1, _pages(box)
+    assert clears[0]["severity"] == "info"
+    assert clears[0]["title"].startswith("Disk recovered:")
+    assert word in clears[0]["body"] and "90000 MB free" in clears[0]["body"]
+    for q in box["queue"].glob("*.json"):  # delivered: the queue's dedupe cannot hide a repeat
+        q.unlink()
+    _handle(box, "green", free=90_000)
+    assert _clears(box) == [], "one all-clear per episode, not one per green poll"
+
+
+def test_red_after_orange_clears_once_naming_red(box):
+    _handle(box, "orange")
+    _handle(box, "red")
+    _handle(box, "green", free=90_000)
+    clears = _clears(box)
+    assert len(clears) == 1 and "RED" in clears[0]["body"], clears
+
+
+def test_no_all_clear_when_no_page_was_sent(box):
+    """YELLOW pages nobody, so its recovery says nothing either."""
+    _handle(box, "yellow")
+    _handle(box, "green", free=90_000)
+    assert _pages(box) == []
+
+
+def test_no_all_clear_for_a_page_that_never_queued(box):
+    """A page that could not be queued was never seen; clearing it would be the
+    first the owner heard of the episode."""
+    box["queue"].mkdir()
+    box["queue"].chmod(0o555)
+    try:
+        _handle(box, "red")
+    finally:
+        box["queue"].chmod(0o755)
+    _handle(box, "green", free=90_000)
+    assert _clears(box) == []
+
+
+def test_an_all_clear_that_cannot_queue_still_ends_the_episode(box):
+    """Losing an all-clear is logged; it must not hold the episode open, or the
+    next real emergency would be deduplicated against this one and never page."""
+    _handle(box, "red")
+    box["queue"].chmod(0o555)
+    try:
+        _handle(box, "green", free=90_000)
+    finally:
+        box["queue"].chmod(0o755)
+    assert "could not queue the all-clear" in _log(box)
+    for q in box["queue"].glob("*.json"):  # delivered; an undelivered copy collapses
+        q.unlink()
+    _handle(box, "red")
+    assert len([p for p in _pages(box) if p["severity"] == "emergency"]) == 1, "the next episode pages again"
+
+
+@pytest.mark.parametrize("tier", ["red", "orange"])
+def test_the_clear_names_the_page_it_answers_and_the_episode_start(box, tier):
+    """Queued is not delivered. The clear names its page's key and when the
+    episode began, and the drainer sends it only if that page was DELIVERED
+    since then (runtime/init/alert_drain.py), so the owner never receives an
+    all-clear for a page they did not get."""
+    import os
+
+    _handle(box, tier)
+    page_key = next(p["dedupe_key"] for p in _pages(box) if p["dedupe_key"].endswith(f":{tier}"))
+    yellow = box["state"] / f"episode_{_home_dev(box)}_yellow"
+    os.utime(yellow, (1_700_000_000, 1_700_000_000))  # the episode's first marker
+    _handle(box, "green", free=90_000)
+    (clear,) = _clears(box)
+    assert clear["meta"] == {"answers_pages": [page_key], "episode_start": 1_700_000_000}
+    assert clear["dedupe_key"] == page_key.replace(f":{tier}", f":clear-{tier}:1700000000")
+
+
+def test_a_clear_after_red_and_orange_answers_both_pages(box):
+    _handle(box, "orange")
+    _handle(box, "red")
+    _handle(box, "green", free=90_000)
+    (clear,) = _clears(box)
+    assert sorted(clear["meta"]["answers_pages"]) == sorted(
+        p["dedupe_key"] for p in _pages(box) if p["severity"] in ("warning", "emergency")
+    )
+
+
+def test_each_episode_gets_its_own_clear_key(box):
+    """A clear keyed only by tier would be deduplicated for a day against the
+    previous episode's clear, even when this episode's page was delivered."""
+    import os
+
+    keys = []
+    for stamp in (1_700_000_000, 1_700_090_000):
+        _handle(box, "red")
+        os.utime(box["state"] / f"episode_{_home_dev(box)}_yellow", (stamp, stamp))
+        _handle(box, "green", free=90_000)
+        keys += [c["dedupe_key"] for c in _clears(box)]
+        for q in box["queue"].glob("*.json"):  # delivered
+            q.unlink()
+    assert len(keys) == 2 and keys[0] != keys[1], keys
+
+
+@pytest.mark.parametrize("green_act", [0, 1])
+def test_an_observe_page_gets_an_observe_clear_in_either_mode(box, green_act):
+    """The clear follows the page that was sent, not the mode at GREEN."""
+    _handle(box, "red", act=0)
+    _handle(box, "green", free=90_000, act=green_act)
+    (clear,) = _clears(box)
+    assert clear["title"].startswith("[observe mode] Disk recovered:"), clear
+    assert ":clear-red:observe:" in clear["dedupe_key"], clear
+    assert clear["meta"]["answers_pages"][0].endswith(":red:observe"), clear
+
+
+def test_an_act_page_gets_an_act_clear_after_a_switch_to_observe(box):
+    _handle(box, "red", act=1)
+    _handle(box, "green", free=90_000, act=0)
+    (clear,) = _clears(box)
+    assert clear["title"].startswith("Disk recovered:"), clear
+    assert ":clear-red:" in clear["dedupe_key"] and ":observe" not in clear["dedupe_key"], clear
 
 
 def test_attribution_is_logged_once_per_episode(box):

@@ -31,19 +31,45 @@ All tests run from the genesis project root using pytest:
 source ~/genesis/.venv/bin/activate
 cd genesis
 
-# Full suite
-pytest -v
+# Full suite: run the hosted CI test job, not a local full-suite invocation.
 
-# Specific subsystem
-pytest -v tests/test_memory/
-pytest -v tests/test_resilience/
+# Local checks: name the relevant test files.
+pytest -v tests/test_pytest_storage.py tests/test_pytest_retention_policy.py
 
 # Linting (run before committing)
 ruff check .
 
-# Both (standard pre-commit check)
-ruff check . && pytest -v
 ```
+
+## Persistent test caches
+
+Default pytest cache data lives in `.pytest_cache/pytest` within the selected
+checkout. Pytest creates a fresh cache through a temporary sibling directory;
+the nested placement keeps that bootstrap inside `.pytest_cache` too.
+The root test conftest defaults Hypothesis storage to the same checkout's
+`.pytest_cache/hypothesis` before child conftests load. Constants and local
+example databases remain persistent between runs. Hypothesis profiles are
+unchanged, including the installed library's CI profile and its disabled
+default example database.
+
+These defaults start cold: existing `.hypothesis` and legacy `.pytest_cache/v`
+contents are neither migrated nor deleted. `--cache-clear` clears pytest's
+cache data while leaving the Hypothesis sibling in place.
+
+An explicit `HYPOTHESIS_STORAGE_DIRECTORY` wins, including relative or empty
+values; an empty value retains Hypothesis's native `.hypothesis` fallback.
+CI can supply its run-owned storage through that same variable. Pytest's
+`-o cache_dir=<path>` override and `-p no:cacheprovider` retain their usual
+behavior. Explicit paths outside test-owned storage remain subject to the
+write audit; these settings do not widen its exemptions. The libraries retain
+their own permission-error handling. A plugin that resolves Hypothesis storage
+before the root conftest loads must supply the environment variable before
+starting pytest; the conftest does not reset previously resolved global state.
+
+`tests/test_pytest_storage.py` exercises real fresh/repeated runs, early
+child-conftest resolution, serial and two-worker execution, persistence,
+overrides, `--lf`, and cache clearing. Its deliberate outside-cache write
+checks that the observer remains effective.
 
 ## Test Suite Overview
 
@@ -122,6 +148,44 @@ Two ceilings bound the suite, and they are different things:
 The per-test cost of individual tests had never been measured; CI now prints
 `--durations=25` so the slowest are visible in every run's log. Read them
 before changing either ceiling.
+
+**Retries (#5024).** CI retries a failed test once (`--force-reruns=1`,
+pytest-rerunfailures, pinned beside xdist). The forced count outranks any
+`@pytest.mark.flaky(reruns=N)` marker, so no test can buy a second retry. A test
+that fails and then passes does not fail the run, but it is never silent:
+
+- A change's own test files get no retry at all. The `test` job's "List the
+  change's test files" step lists every `.py` file the change touches (from
+  the base `collected-floor` uses, failing closed where it does), and the run
+  passes each to `--rerun-exclude-path`. A change's own flaky test fails its
+  own run.
+- `tests/_rerun_ledger.py`, armed by `GENESIS_RERUN_LEDGER` and inert
+  everywhere else, writes a ledger of every retried test and its final
+  outcome. It also fails the run when a collected test reached no outcome at
+  all, judged by node id against what the workers collected. One probe run
+  under `--max-worker-restart=0` with retries ended green with a crashed test
+  missing (seen once in 16 runs, cause not established); this check keeps such
+  a run red.
+- The "Account for retried tests" step lists every retried test, and every
+  test with no outcome, in the run summary.
+- On a main push, the `flaky-report` job files each retried test as a `flaky`
+  issue titled `Flaky test: <node id>`, or comments on the open one. A
+  dispatch runs it as a dry run. Set the repository variable
+  `FLAKY_AUTOFILE` to `off` to stop the filing without a code change.
+
+A test that fails both attempts fails the run, as before. A hang still ends
+its worker (the per-test timeout above), so a retry never hides one.
+
+Known limits:
+- A change to non-test code (or a `tests/_*.py` helper) that makes an
+  EXISTING test flaky is still retried on that change's own run. Exclusion is
+  by test file and by changed `conftest.py` directory; a changed module has no
+  test path to match. The flake surfaces once it reaches main, as a `flaky`
+  issue. The same holds for a change to test data files or to pytest settings
+  (`pyproject.toml`, `pytest.ini`): only changed `.py` files and the
+  directories of changed `conftest.py` files are excluded.
+- A module that fails to import contributes no test ids, so it is not counted
+  as "no outcome". The run still fails on the collection error itself.
 
 ## Test Directory Structure
 
@@ -370,8 +434,10 @@ it because nothing listens there. A PEP 578 audit hook judges every in-process
 - **TCP to this machine** (loopback, `0.0.0.0`/`::`, or one of its own
   addresses): refused when a socket is listening NOW on that port at that
   destination (the same address, or a wildcard on either side) and at least one
-  of those sockets does not belong to the pytest process or one of its
-  children. Decided at connect time, so a test's own server (in a thread or a
+  of those sockets does not belong to the pytest run's process tree: the pytest
+  process and its children, or, on an xdist worker, the controller and all its
+  children (pytest-rerunfailures' workers connect to a status socket the
+  controller listens on). Decided at connect time, so a test's own server (in a thread or a
   child) is reachable, a service that started mid-run is still fenced, a test's
   own listener on one address does not vouch for someone else's on another, and
   a port nobody listens on fails on its own.
@@ -431,29 +497,74 @@ It also reports reads of the real credential files (the deployed `secrets.env`,
   box lock file, `/dev`, and `__pycache__` / `.pytest_cache` directories.
 - Each write is classed by where it lands (the deployed checkout, this checkout,
   `~/.genesis`, `~/.claude`, elsewhere in the home) and attributed to the test.
-- The run summary counts tests per class under "writes outside the test's temp
-  dirs"; `GENESIS_LIVE_WRITES_REPORT=<file>` writes one tab-separated line per
+- The run summary counts tests per class under "audit observations";
+  `GENESIS_LIVE_WRITES_REPORT=<file>` writes one escaped tab-separated line per
   (test, class, operation, path), on every run.
-- A hit is a write that happens: an attempt the kernel refuses or that changes
-  nothing (`mkdir(exist_ok=True)` on an existing directory, `unlink` of a missing
-  file, reopening an existing file without writing) is not recorded. A relative
-  `os.open` is judged against the cwd and labelled so (its audit event carries no
-  `dir_fd`). Writes during collection count as "outside any test".
+- An observation records a pre-operation event, not successful completion.
+  Established no-effect cases (`mkdir(exist_ok=True)` on an existing directory,
+  `unlink` of a missing file, reopening an existing file without writing) are
+  filtered; other refused operations can still be reported, and some aliases can
+  be missed (tracked in #4193). Relative `os.open`
+  events omit `dir_fd`. On Linux/CPython, `tests/_live_writes_fd.py` corrects a
+  supported successful call using its returned descriptor, one observed native
+  event and matching unchanged parent/target metadata. This applies to exact
+  string/bytes leaf names, explicit nonnegative integer directory descriptors
+  and write flags with `O_NOFOLLOW` or `O_CREAT|O_EXCL`, excluding `O_PATH`.
+  Failed, unsupported, saved-native-alias and ambiguous calls retain the primary
+  observer's explicitly labelled cwd guess. Existing credential observations
+  and every fault count remain; published evidence is never subtracted.
+  Writes during collection count as "outside any test".
+- The test-process wrapper changes `os.open` identity and builtin status;
+  signatures, pickling and directory-FD feature membership are preserved. It
+  restores only its own callable/member at unconfigure. Fork children bypass
+  refinement. This does not extend the child-process coverage below.
+- Report capture temporarily disables new refinement while sealing pending
+  calls and copying both observations and status. A pending call makes the
+  census incomplete even if it later succeeds. Calls entering during capture
+  use primary observation; later independent calls can refine again. Ordinary
+  writes after the snapshot retain the existing documented coverage limit.
+- An `observer fault` row identifies the test and the audit event/stage/fixed
+  builtin error category. Its path field is the literal `<not captured>`;
+  exception messages, filenames, custom type names and tracebacks are not
+  included. Failed test attribution uses `<attribution unavailable>`.
+  Identical diagnostic rows deduplicate, while the fault count includes every
+  judging failure. If diagnostic capture itself fails, the count still makes
+  the census incomplete. Older count-only reports cannot recover fault causes.
 - Not covered: writes made by child processes, writes without an audit event,
   metadata changes (`chmod`, `utime`, `setxattr`, `touch` of an existing file),
   `mkfifo`/`mknod`, SQLite writes through an already-open connection, and
   `file://localhost` or percent-encoded SQLite URIs. The OS-level sandbox is the
   boundary there.
 
-The list it produces is the to-do list for moving each such test under its own
-`tmp_path`; once it is empty, the audit can refuse instead of report.
+The observations identify tests to investigate and move under their own
+`tmp_path`. Enforcement requires a successful complete census on corrected
+main, with an empty report, zero faults, an installed observer and no missing
+or disarmed workers. An empty TSV alone does not establish this: CI also checks
+the fresh run identity, test outcome, report digest/count and worker coverage.
+Both reliable write detection and credential-read coverage are prerequisites.
+The audit remains report-only while ambiguous observations and unknown faults
+remain unresolved; correcting successful destinations does not exempt denied
+reads or qualify enforcement by itself.
+
+Generated session MCP configs are isolated by the function-scoped autouse fixture
+in `tests/_session_config.py`, registered by the root conftest. It redirects only
+the builder's generated-output directory to each test's `tmp_path`: generation,
+profile filtering, template reads, repository-root substitution and cache reuse
+remain real. Its independent monkeypatch survives a test undoing its own patches.
+Each test starts with a cold output directory, including on separate xdist workers.
+This fixture does not cover generation during collection, broader-scoped fixture
+setup or child processes; those callers must explicitly own their output paths.
+The bounded-output hook tests that exercise recall use a real temporary SQLite
+database and migration marker, rather than pointing SQLite at a test source file.
+These fixture fixes do not enable write-audit enforcement or establish that the
+full-suite census is empty.
 
 ## Shared MCP qualification environments
 
 Ordinary CI keeps its existing runtime dependency ranges. The shared-only
-protocol suites require the exact versions admitted by
+protocol and shared CLI suites require the exact versions admitted by
 `genesis.mcp.shared_http._settings.require_qualified_stack`; an unsupported
-ordinary environment explicitly skips those three modules before SDK imports.
+ordinary environment explicitly skips those four modules before SDK imports.
 Pure configuration and missing/later-version refusal tests remain ordinary
 tests in `tests/test_mcp/test_shared_http_settings.py`.
 
@@ -464,9 +575,15 @@ read-only permissions. `GENESIS_REQUIRE_SHARED_MCP_QUALIFICATION=1` is test-only
 qualification refusal becomes a collection error in this job. No production
 version, feature, credential or rollout gate changes.
 
-The protocol step names the admission, policy and actual HTTP modules explicitly.
+The protocol step names the admission, policy, actual HTTP and shared CLI modules
+explicitly. The CLI checks start all four real factories with disposable local
+dependencies, exercise catalog/authentication/read calls over TCP, and observe
+SDK shutdown and registered-owner drainage before resource closure on SIGTERM.
+They also exercise path/abstract readiness datagrams after bind and cleanup on
+failed notification, bind failure and shutdown requested during startup. The
+memory notification-failure case checks its actual provider/cache closers.
 Its fresh JUnit report must pass `scripts/check_skip_ceiling.py` with zero skips
-and a floor of 91 cases. Installation, collection, test or report-check failure
+and a floor of 104 cases. Installation, collection, test or report-check failure
 fails the job; missing or filtered workflow runs do not qualify a PR. Closing
 checks its actual head/base result. Ordinary skip-budget changes require observed
 skip identities; this workflow does not raise that budget automatically.
@@ -474,6 +591,16 @@ skip identities; this workflow does not raise that budget automatically.
 For a local run, use an already qualified isolated interpreter and the same
 strict test flag, then run the workflow's report check. Changing installed
 packages or enabling shared services is not part of that test command.
+
+`test_shared_notify.py` exercises owned local datagrams and error propagation
+without SDK qualification. `test_shared_mcp_templates.py` reuses both actual
+renderer loops and executes their activation sections with nondelegating command
+shims, checking literal paths, stamps and keep/take behavior without starting a
+unit. Successful per-test payload/event files require both an explicit scratch
+`--basetemp` and `-o tmp_path_retention_policy=all`; the normal policy removes
+successful test directories. Read-only `systemd-analyze verify` can validate
+rendered syntax with generators disabled; it does not execute or qualify a live
+service.
 
 ## Integration Tests
 
@@ -514,3 +641,13 @@ database lease. `tests/test_memory/test_tag_index_ownership.py` covers independe
 background admission, physical scan drain, refusal/creation failure, prestart
 cancellation, retriever propagation and the body-completed/done-callback gap.
 `tests/test_memory/test_tag_index_swr.py` retains legacy stale-query behavior.
+
+Owned shared bootstrap coverage lives in `tests/test_mcp/test_shared_service_settings.py`,
+`test_shared_resource_factories.py`, `test_shared_launch_selection.py` and
+`test_shared_runner.py`, plus `tests/test_memory/test_embedding_resource_lifecycle.py`.
+Factory argument tests use real canonical SQLite/facades with captured initializer
+arguments and provider doubles; they are not real-provider or native-client E2E.
+`test_shared_runner_lifecycle.py` runs disposable child processes with real Uvicorn
+and inert ASGI/resource dependencies to verify signal replay, cancelled startup,
+bind errors, failed lifespan and cancelled/forced shutdown ordering. These tests
+do not send signals to another session or start a deployed service.

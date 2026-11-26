@@ -1,6 +1,6 @@
 [project]
 name = "genesis-v3"
-version = "3.0.0b19"
+version = "3.0.0b20"
 requires-python = ">=3.12,<3.15"  # upper bound: every current litellm release caps Python <3.15
 dependencies = [
     "aiosqlite",
@@ -55,6 +55,7 @@ dependencies = [
                                   # bound is the best instrument available here, not a complete one.
     "pydantic>=2.12,<3",  # strict validation for the decision registry (already pulled in by fastapi, litellm and mcp)
     "pyyaml",
+    "python-dotenv>=1.2.0,<2",  # external MCP adapter uses inherited-first interpolation and the disable predicate
     "a2a-sdk==1.2.2",
     "claude-agent-sdk==0.2.172",  # live_agent: drives a persistent Claude Code session (query/steer/interrupt/
                                   # can_use_tool). Pinned exactly: the wire contract it speaks to the CLI moves
@@ -75,10 +76,12 @@ dependencies = [
     "mcp>=2.3.0,<3",  # Direct SDK floor; FastMCP v4 requires the v2 protocol implementation.
     "detect-secrets>=1.4",  # Phase 6 contribution sanitizer — REQUIRED floor. sanitize.py fails closed if missing.
     "pymupdf>=1.27",  # PDF text extraction for knowledge ingestion pipeline
-    "scrapling>=0.4.7",  # Web fetching with TLS fingerprint impersonation
+    "scrapling==0.5.1",  # Fetcher dependencies are installed with the browser extra below.
     "tldextract>=5",  # Public Suffix List (bundled snapshot): the cookie tools refuse to clear a public suffix
-    "curl_cffi>=0.15.0",  # curl_cffi backend for Scrapling's AsyncFetcher
-    "yt-dlp[default]>=2026.08.19",  # YouTube metadata + transcripts (knowledge/processors/youtube.py,
+    "curl_cffi==0.17.0",  # Qualified with yt-dlp 2026.10.26; includes patched bundled Brotli.
+    "brotli>=1.2.1",  # GHSA-9v8h-qqgm-4m35: the Python decoder is separate from curl_cffi's bundle.
+    "brotlicffi>=1.2.1.0",  # yt-dlp prefers this decoder when present; cover both choices.
+    "yt-dlp[default]==2026.10.26",  # YouTube metadata + transcripts (knowledge/processors/youtube.py,
                                     # behind the web_fetch MCP tool). The `default` extra brings the
                                     # JavaScript challenge solver (yt-dlp-ejs) at the exact version this
                                     # yt-dlp release pins, installed locally: never fetched at run time.
@@ -116,20 +119,23 @@ transcript-analytics = ["duckdb==1.5.6", "pyarrow==24.0.0"]
 # the list is INSTALL_EXTRAS in scripts/lib/venv_matches_pyproject.py): an install
 # runs its own test suite, and the card vault needs the payments packages.
 test = [
+    # Offline artifact tests invoke the declared build backend directly.
+    "setuptools>=64",
+    "wheel",
     "pytest>=8.0",
     "pytest-asyncio",
     "pytest-timeout",
-    # Parallel runs (`-n`). CI's `test` job is still serial; the parallel-CI
-    # work lands the fixes that make a parallel run report what a serial one
-    # does before any job passes `-n`.
+    # Parallel runs (`-n`); CI's `test` job runs on four workers.
     "pytest-xdist",
+    # CI retries a failed test once (`--force-reruns=1`, #5024); inert without the flag.
+    "pytest-rerunfailures",
     # Property tests exercise hook-output budget invariants across Unicode edges.
-    "hypothesis>=6.0",
+    "hypothesis>=6.152.0",
     "aioresponses>=0.7.7",
     # tests/test_hooks/test_edit_verify_advisory.py executes the real hook,
     # which shells out to the venv's ruff — CI's test job installs only this
     # extra, so ruff must be here (the lint job installs its own copy).
-    "ruff>=0.5",
+    "ruff==0.17.5",  # Keep the required CI lint job on this same qualified version.
     # tests/test_dashboard/test_dashboard_css_isolation.py parses the shipped
     # stylesheets. A hand-rolled CSS parser inside that guard failed OPEN twice —
     # once on a brace inside a `url()`, once on a rule nested in `@media` — so
@@ -147,6 +153,7 @@ test = [
 # camoufox < 0.5 engine the browser step has not replaced yet (measured:
 # "Protocol error (Browser.setDefaultViewport)").
 browser = [
+    "scrapling[fetchers]==0.5.1",  # AsyncFetcher imports Patchright/browserforge, even for HTTP.
     "camoufox>=0.5.7,<0.5.9",  # engine pinned by the package's browser-pin.json (Firefox 156).
                              # <0.5.9: 0.5.9 removed camoufox.addons.maybe_download_addons,
                              # which provision.py's addon step calls, and moves the engine to
@@ -241,6 +248,9 @@ quote-style = "double"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Pytest bootstraps a fresh cache beside cache_dir. Nest it so those transient
+# files also stay inside the existing test-owned .pytest_cache directory.
+cache_dir = ".pytest_cache/pytest"
 asyncio_mode = "auto"
 # Explicit, so pytest-asyncio stops warning that it is unset (pytest 9.2 prints
 # that warning ahead of everything, including tests/conftest.py's own first

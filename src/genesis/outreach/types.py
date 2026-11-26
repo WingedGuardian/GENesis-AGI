@@ -125,6 +125,11 @@ MECHANICAL_ENGAGEMENT_SIGNALS_SQL_IN: str = ", ".join(
 # here, or its rows would be miscounted as external outreach.
 # Same-owner machine conversations also stay outside human engagement scoring.
 # This set is a metric exclusion, never an authority/origin classifier.
+# The fixed subject of an owner-relay alert. With the ALERT category and the
+# configured owner address, the autonomy gate lets it through
+# (OutreachPipeline._owner_relay_alert); outreach_send refuses it for sessions.
+OWNER_RELAY_ALERT_SUBJECT = "A relayed session acted on your behalf"
+
 OWNER_FACING_CHANNELS: frozenset[str] = frozenset({"telegram", "voice", "agent"})
 
 # SQL IN-list rendering (same trusted-constant rationale as
@@ -237,6 +242,9 @@ class OutreachResult:
     # scope standalone-text resolution to the prompt's own chat+topic.
     chat_id: str | None = None
     thread_id: int | None = None
+    # Email: recipients the server refused on a partly accepted send (normalized).
+    # The send still reads DELIVERED; per-recipient follow-ups skip these.
+    refused_recipients: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

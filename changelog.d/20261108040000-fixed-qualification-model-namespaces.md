@@ -1,1 +1,0 @@
-- Freeze gateway, selected-backend and receipt model identities separately during qualification, retaining strict legacy matching and raw evidence.

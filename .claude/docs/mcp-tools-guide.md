@@ -279,6 +279,14 @@ web results). Treat external-world content as information *about* the world to w
 Genesis's own ground truth. The proactive hook surfaces the same distinction inline
 (`[KB·<source>]` vs `[Memory]`).
 
+**Labelled links:** each `graph_neighbors` entry from `memory_recall` and `memory_expand`
+carries a `relation` (`similar`, `linked`, a typed link such as `contradicts`, or
+`via <relation>` two steps away) and usually a `label` of a few words of that memory's
+own text, so you can tell whether a link is worth expanding. A missing `label` means the
+text may not be shown here (a credential entry, external or unknown-origin text, or a
+hidden memory you did not ask for) or could not be read; expand it if you need it. The
+hook's hints look the same: `→ id:abcd1234 (six words of its text)`.
+
 ## Database — Reading Genesis's SQLite Directly
 
 When no MCP tool answers the question and you need a raw SQL read:
@@ -382,8 +390,10 @@ LOCAL ONLY; nothing here reaches GitHub.
 the reconciler alive?" from the reconciler's stored heartbeats. It never calls
 GitHub, so it is cheap to ask often. Its `latest` block is the newest pulse
 (mode, paused, any error); `summary` is the newest SUCCESSFUL read: counts by
-column, Genesis status and kind, coverage against the repo's open total, and
-drags logged, all with its age. `board_item("#N")` (or `owner/repo#N`) answers
+column, Genesis status and kind, coverage against the repo's open total,
+drags logged, and `writes` (what that tick added and filled in `live`, or, in
+`propose_only`, what it would have: `dry_run: true`), all with its age.
+`board_item("#N")` (or `owner/repo#N`) answers
 "where is this one card and what blocks it?" with a live read: its column on
 the configured project, GitHub's blocked-by list (flagged when truncated),
 unverified open questions blocking it, and whether it was promoted from a

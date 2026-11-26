@@ -18,8 +18,9 @@
 #
 # WHAT IT DOES, by tier (per filesystem; free space AND time-to-full, see
 # dg_tier). It never deletes working files and never kills a process:
-#   YELLOW  log attribution once per episode: who is writing, and where the
-#           space went.
+#   YELLOW  log attribution once per episode: who is writing, where the space
+#           went, and who holds DELETED files there (space du cannot see;
+#           wg_deleted_holders). The ORANGE and RED pages carry that list too.
 #   ORANGE  reclaim: on the $HOME filesystem start genesis-disk-hygiene-
 #           pressure@standard (caches, ~/tmp older than 4 days, live writers
 #           spared); on cc-tmp's, run the retention sweep at 2 days. Page a
@@ -32,6 +33,10 @@
 #           there (that RED was measured before the emptying freed the space).
 # Reclaim levers only run for the filesystem they can actually relieve; the
 # others page with attribution.
+#   GREEN   after an episode that queued an ORANGE or RED page, queue one
+#           INFO all-clear naming how far it got (_wg_all_clear), then end
+#           the episode. The alert drainer sends it only if one of those
+#           pages was delivered during the episode.
 #
 # RUNAWAY FILES, at every tier (scripts/lib/watchgod_runaway.sh): a file held
 # open for writing that alone is a large share of its filesystem, or that grew
@@ -291,16 +296,23 @@ attribution_paths() {
 }
 
 log_attribution() {
-    # $1 path, $2 device, $3 tier, $4 top-writers text. The writer list is
-    # computed by the caller (cheap); the du is backgrounded, niced and bounded,
-    # because du across a large tree inside the poll loop would stop the very
-    # measurements that matter while the disk fills.
-    local path="$1" dev="$2" tier="$3" writers="$4"
+    # $1 path, $2 device, $3 tier, $4 top-writers text, $5 deleted-holder list
+    # (handle_fs scans once per poll, after the relief actions, and shares it
+    # with the page). The writer list is computed by the caller (cheap); the du
+    # is backgrounded, niced and bounded, because du across a large tree inside
+    # the poll loop would stop the very measurements that matter while the disk
+    # fills.
+    local path="$1" dev="$2" tier="$3" writers="$4" held="${5:-}"
     log WARN "disk ${tier^^} [${path}] top writers by bytes written since the last poll (own uid only; blind to tmpfs):"
     if [[ -n "$writers" ]]; then
         while IFS= read -r line; do log WARN "  writer: $line"; done <<< "$writers"
     else
         log WARN "  writer: (none measurable)"
+    fi
+    # Deleted-but-open files: the space du (below) cannot see.
+    local line
+    if [[ -n "$held" ]]; then
+        while IFS= read -r line; do log WARN "  $line"; done <<< "$held"
     fi
     # Detached from the daemon's stdio: it logs through log() only, and must
     # never hold a pipe a caller is waiting on.
@@ -375,6 +387,56 @@ _wg_page() {
     fi
     log WARN "could not queue the page '${2}' (alert queue unwritable?) — retrying next poll"
     return 1
+}
+
+_wg_all_clear() {
+    # $1 path $2 domain key $3 free $4 total $5 fstype. Called on the first
+    # GREEN poll after an episode, before its markers are cleared. Queues one
+    # INFO message when the episode queued a page (an orange/red marker is
+    # written only once its page was queued), so a page never stands alone:
+    # without it the owner cannot tell "recovered a minute later" from "still
+    # filling and muted". Either mode's marker counts, so an episode paged in
+    # observe mode and ended after a switch to act still gets its all-clear.
+    # A failed enqueue is logged and does NOT hold the episode open: an open
+    # episode would deduplicate the next emergency against this one.
+    # Queued is not delivered: delivery can drop a page, or deduplicate it
+    # against an earlier episode's page for a day (#3276). So the clear names
+    # the pages it answers and when the episode began (its first marker:
+    # YELLOW is marked before any page), and the drainer
+    # (runtime/init/alert_drain.py) sends it only if one of those pages was
+    # DELIVERED since then. Its key carries that start, so one episode's clear
+    # never deduplicates the next episode's.
+    local path="$1" dev="$2" free="$3" total="$4" fstype="$5" worst="" sfx="" t title
+    local pages="" start="" f m
+    for t in red orange; do
+        if episode_seen "$dev" "$t"; then worst="$t"; break; fi
+        if episode_seen "$dev" "${t}_observe"; then worst="$t"; sfx=":observe"; break; fi
+    done
+    [[ -n "$worst" ]] || return 0
+    if [[ ! "$dev" =~ ^[0-9A-Za-z]+$ ]]; then
+        log WARN "all-clear for ${path} not queued: domain key '${dev}' cannot be named in it"
+        return 0
+    fi
+    for t in red red_observe orange orange_observe; do
+        episode_seen "$dev" "$t" || continue
+        pages+="${pages:+,}\"watchgod:disk:${dev}:${t/_observe/:observe}\""
+    done
+    for f in "$DG_STATE_DIR/episode_${dev}_"*; do
+        m="$(stat -c %Y "$f" 2>/dev/null)" || continue
+        if [[ -z "$start" ]] || (( m < start )); then start="$m"; fi
+    done
+    [[ -n "$start" ]] || start="$(date +%s)"
+    title="Disk recovered: ${path} is GREEN"
+    [[ -z "$sfx" ]] || title="[observe mode] ${title}"
+    if queue_alert_try info "watchgod:disk" "$title" \
+            "${path}: ${free} MB free of ${total} MB (${fstype}). This episode reached ${worst^^}; the page sent then needs no action now." \
+            "watchgod:disk:${dev}:clear-${worst}${sfx}:${start}" \
+            "{\"answers_pages\":[${pages}],\"episode_start\":${start}}"; then
+        log INFO "all-clear: ${path} back to GREEN after ${worst} (${free} MB free)"
+    else
+        log WARN "could not queue the all-clear for ${path} (alert queue unwritable?); the episode ends anyway"
+    fi
+    return 0
 }
 
 # ── Reclaim (the one deleter lives in disk_hygiene.sh) ───────
@@ -612,6 +674,13 @@ _WG_WRITERS_LABEL="Top writers among this user's processes this poll (block-devi
 # premise check); the du list in the log shows what holds the space.
 _WG_WRITERS_TMPFS="Writer attribution unavailable: tmpfs writes are not counted per process. The watchgod log lists what is using the space (du)."
 
+_wg_held_block() {
+    # $1 the deleted-holder list handle_fs read this poll. The block for a page,
+    # led by a blank line, or nothing.
+    [[ -n "$1" ]] && printf '\n\n%s' "$1"
+    return 0
+}
+
 # ── Per-filesystem tier handling ─────────────────────────────
 handle_fs() {
     # $1 path $2 limit-domain key (see check_disks) $3 tier $4 free $5 total
@@ -640,6 +709,7 @@ handle_fs() {
         if ls "$DG_STATE_DIR/episode_${dev}_"* >/dev/null 2>&1; then
             (( is_home )) && _wg_unstamp pressure_standard pressure_last-resort
             (( is_cc )) && _wg_unstamp cc_sweep_pressure
+            _wg_all_clear "$path" "$dev" "$free" "$total" "$fstype"
         fi
         episode_clear "$dev"
         (( is_home )) && reserve_ensure "$free" "$total"
@@ -649,26 +719,19 @@ handle_fs() {
 
     local summary="${path}: ${free} MB free of ${total} MB (${fstype}); time to full: ${eta} min"
 
+    # Relief first, attribution second: the deleted-file scan below can take
+    # up to DG_RUNAWAY_SCAN_TIMEOUT_S, and the reserve release and pressure
+    # units must not wait on it while the disk fills (review finding).
+    local first=0
     if ! episode_seen "$dev" yellow; then
         episode_mark "$dev" yellow
-        log_attribution "$path" "$dev" "$tier" "$writers"
+        first=1
     fi
 
     if [[ "$tier" == orange || "$tier" == red ]]; then
         _WG_LEVER_START=""; _WG_LEVER_SWEEP=""
         (( is_home )) && start_pressure_unit standard
         (( is_cc )) && maybe_sweep_cc_tmp pressure
-        if [[ "$tier" == orange ]] && ! episode_seen "$dev" "orange$pg"; then
-            lever="none on this filesystem"
-            if [[ -n "$_WG_LEVER_START" && -n "$_WG_LEVER_SWEEP" ]]; then
-                lever="${_WG_LEVER_START}; ${_WG_LEVER_SWEEP}"
-            elif [[ -n "${_WG_LEVER_START}${_WG_LEVER_SWEEP}" ]]; then
-                lever="${_WG_LEVER_START}${_WG_LEVER_SWEEP}"
-            fi
-            body="${summary}. Reclaim: ${lever}. ${writers_block}"
-            _wg_page warning "Disk filling: ${path} ORANGE" "$body" "watchgod:disk:${dev}:orange" "WARNING — ${summary}" \
-                && episode_mark "$dev" "orange$pg"
-        fi
     fi
 
     if [[ "$tier" == red ]]; then
@@ -688,11 +751,33 @@ handle_fs() {
                 rel="cc-tmp reserve $(cc_reserve_release)" || true
             fi
         fi
-        if ! episode_seen "$dev" "red$pg"; then
-            body="${summary}. Reserve: ${rel}."$'\n'"${writers_block}"
-            _wg_page emergency "Disk nearly full: ${path} RED" "$body" "watchgod:disk:${dev}:red" "EMERGENCY — ${summary}" \
-                && episode_mark "$dev" "red$pg"
+    fi
+
+    # One deleted-file scan per poll, and only when its list is about to be
+    # used: the first-episode log, or a page not yet delivered.
+    local page_orange=0 page_red=0 held=""
+    [[ "$tier" == orange ]] && ! episode_seen "$dev" "orange$pg" && page_orange=1
+    [[ "$tier" == red ]] && ! episode_seen "$dev" "red$pg" && page_red=1
+    if (( first || page_orange || page_red )); then
+        held="$(wg_deleted_holders "$dev" "$path")" || held=""
+    fi
+    (( first )) && log_attribution "$path" "$dev" "$tier" "$writers" "$held"
+
+    if (( page_orange )); then
+        lever="none on this filesystem"
+        if [[ -n "$_WG_LEVER_START" && -n "$_WG_LEVER_SWEEP" ]]; then
+            lever="${_WG_LEVER_START}; ${_WG_LEVER_SWEEP}"
+        elif [[ -n "${_WG_LEVER_START}${_WG_LEVER_SWEEP}" ]]; then
+            lever="${_WG_LEVER_START}${_WG_LEVER_SWEEP}"
         fi
+        body="${summary}. Reclaim: ${lever}. ${writers_block}$(_wg_held_block "$held")"
+        _wg_page warning "Disk filling: ${path} ORANGE" "$body" "watchgod:disk:${dev}:orange" "WARNING — ${summary}" \
+            && episode_mark "$dev" "orange$pg"
+    fi
+    if (( page_red )); then
+        body="${summary}. Reserve: ${rel}."$'\n'"${writers_block}$(_wg_held_block "$held")"
+        _wg_page emergency "Disk nearly full: ${path} RED" "$body" "watchgod:disk:${dev}:red" "EMERGENCY — ${summary}" \
+            && episode_mark "$dev" "red$pg"
     fi
     return 0
 }

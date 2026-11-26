@@ -75,7 +75,7 @@ fi
 # restore. The skip deliberately does NOT touch backup_status.json: writing
 # success:false would page a false CRITICAL (health `backup:last_failed`)
 # during a legitimate restore, so the prior run's status stays put and the
-# existing `backup:overdue` staleness alert (>8h) detects a wedged holder
+# existing `backup:overdue` staleness alert (>9h) detects a wedged holder
 # honestly. That is why this block sits BEFORE the EXIT trap below — a skip
 # must write nothing (log() isn't defined yet either; the echo is inline).
 # The lock fd is held for the script's lifetime and released at exit; the
@@ -224,7 +224,7 @@ print(json.dumps(out, ensure_ascii=True, separators=(",", ":")))
     fi
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_dirs_partial":${_EXTRA_PARTIAL:-0},"extra_dirs_partial_detail":$_partial_detail,"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"payment_vault":"${_PV_STATUS:-skipped}","payment_vault_copies":${_PV_COPIES:-null},"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"identity_files":${_IDENTITY_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_dirs_partial":${_EXTRA_PARTIAL:-0},"extra_dirs_partial_detail":$_partial_detail,"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"payment_vault":"${_PV_STATUS:-skipped}","payment_vault_copies":${_PV_COPIES:-null},"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
 STATUSEOF
 }
 
@@ -264,7 +264,7 @@ _on_exit() {
     # N2: the SQL section's temps (the dump's count file and the encrypted
     # candidate) must not outlive the script if it died mid-section.
     rm -f "${_SQL_COUNT:-}" "${_SQL_ARTIFACT_TMP:-}" 2>/dev/null || true
-    rm -f "${_EXTRA_TAR_TMP:-}" "${_EXTRA_TAR_ERR:-}" 2>/dev/null || true  # §6f plaintext tar + its file-name diagnostics
+    rm -f "${_EXTRA_GPG_TMP:-}" "${_EXTRA_TAR_ERR:-}" 2>/dev/null || true  # §6f encrypted archive in flight + its diagnostics
     rm -f "${_ENCRYPT_PARTIAL:-}" "${_ENCRYPT_ERR_TMP:-}" 2>/dev/null || true  # encrypt_file's in-flight partial + gpg stderr
     if [ -n "${_VERIFY_DB:-}" ]; then
         rm -f "$_VERIFY_DB" "$_VERIFY_DB-journal" "$_VERIFY_DB-wal" "$_VERIFY_DB-shm" 2>/dev/null || true
@@ -343,97 +343,25 @@ log "big-temp dir: $GENESIS_BIG_TMP"
 # write-a-plaintext-dump-and-a-DB-then-free-them every 6h was MEASURED to
 # coincide with 18-58 s filesystem commit stalls.
 _VERIFY_MODE=""  # memory | disk, set by _pick_verify_mode
-_CGROUP_FS="${GENESIS_BACKUP_CGROUP_FS:-/sys/fs/cgroup}"   # overridable for tests
-_PROC_CGROUP="${GENESIS_BACKUP_PROC_CGROUP:-/proc/self/cgroup}"
+# _num, _cgroup_headroom_kb and the fits-in-memory predicate are shared with
+# the backup unit's ExecStartPre (scripts/backup_wait_for_ram.sh), which waits
+# for this same predicate before backup.sh starts.
+# shellcheck source=scripts/lib/backup_verify_memory.sh
+source "$_SCRIPT_DIR/lib/backup_verify_memory.sh"
 
-# _num <value> <default> — a decimal integer of at most 6 digits, else the
-# default. 10# stops "08" aborting the run as a bad octal under set -e, and the
-# length cap keeps the arithmetic below from overflowing.
-_num() {
-    case "$1" in ''|*[!0-9]*) echo "$2" ;; *) [ "${#1}" -le 6 ] && echo $((10#$1)) || echo "$2" ;; esac
-}
-
-# _cgroup_headroom_kb — the smallest (limit - usage + inactive_file) over this
-# process's cgroup and its ancestors, in KB; empty when no level is capped.
-# Usage includes page cache, which fills toward the cap on any long-running
-# box, so the cold part of it (inactive_file) counts as available, the way
-# MemAvailable counts it. /proc/meminfo reports the host's memory under a capped
-# Docker/systemd cgroup without lxcfs, so it alone could approve memory a cap
-# does not have. A v1 memory-controller line wins over "0::": a hybrid host has
-# both, and its cap lives on the v1 side. Each level is read on its own (its own
-# limit against its own usage), so a cap on an ancestor counts everything under
-# it. A level with a cap but unreadable usage counts as no headroom.
-_cgroup_headroom_kb() {
-    local _p _d _root _m _c _i _h _best="" _v1=false
-    _p=$(awk -F: '$2 ~ /(^|,)memory(,|$)/ {print $3; exit}' "$_PROC_CGROUP" 2>/dev/null) || _p=""
-    if [ -n "$_p" ]; then
-        _v1=true
-        _root="$_CGROUP_FS/memory"
-    else
-        _p=$(awk -F: '$1 == "0" {print $3; exit}' "$_PROC_CGROUP" 2>/dev/null) || _p=""
-        [ -n "$_p" ] || return 0
-        _root="$_CGROUP_FS"
-    fi
-    _d="$_root${_p%/}"
-    while :; do
-        if $_v1; then
-            _m=$(cat "$_d/memory.limit_in_bytes" 2>/dev/null) || _m=""
-            _c=$(cat "$_d/memory.usage_in_bytes" 2>/dev/null) || _c=""
-            _i=$(awk '$1 == "total_inactive_file" {print $2}' "$_d/memory.stat" 2>/dev/null) || _i=""
-        else
-            _m=$(cat "$_d/memory.max" 2>/dev/null) || _m=""
-            _c=$(cat "$_d/memory.current" 2>/dev/null) || _c=""
-            _i=$(awk '$1 == "inactive_file" {print $2}' "$_d/memory.stat" 2>/dev/null) || _i=""
-        fi
-        case "$_i" in ''|*[!0-9]*) _i=0 ;; esac
-        # A cap is a decimal below 2^60: v2 writes "max" for none, and v1 a
-        # value near 2^63 (19 digits), which is also kept out of the arithmetic.
-        case "$_m" in ''|*[!0-9]*) _m="" ;; esac
-        if [ -n "$_m" ] && [ "${#_m}" -le 18 ] && [ "$_m" -lt 1152921504606846976 ]; then
-            case "$_c" in
-                ''|*[!0-9]*) _h=0 ;;
-                *) [ "${#_c}" -le 18 ] && _h=$(( (_m - _c + _i) / 1024 )) || _h=0 ;;
-            esac
-            [ "$_h" -ge 0 ] || _h=0
-            if [ -z "$_best" ] || [ "$_h" -lt "$_best" ]; then _best=$_h; fi
-        fi
-        [ "$_d" = "$_root" ] && break
-        _d="${_d%/*}"
-        case "$_d" in "$_root"*) ;; *) break ;; esac
-    done
-    echo "$_best"
-}
-
-# _pick_verify_mode — set _VERIFY_MODE. Memory needs available memory of
-# VERIFY_RAM_FACTOR x the live DB size (the rebuilt DB plus sqlite's working
-# set) PLUS a floor of VERIFY_RAM_FLOOR_PCT of MemTotal. Available is the lower
-# of MemAvailable and the cgroup headroom. The floor is there because
-# systemd-oomd kills sessions on sustained reclaim pressure: the check only
-# takes memory when it would stay well clear of that afterwards. It is a
-# start-time snapshot; a check that then fails in memory is re-run on disk.
+# _pick_verify_mode — set _VERIFY_MODE: memory when _verify_memory_check
+# (scripts/lib/backup_verify_memory.sh) says the rebuilt DB fits with the floor
+# to spare, disk otherwise. It is a snapshot taken here, minutes after the unit
+# started; a check that then fails in memory is re-run on disk.
 # GENESIS_BACKUP_VERIFY_MEMORY=off forces disk.
 _pick_verify_mode() {
-    local _factor _floor_pct _db_bytes _wal_bytes _need_kb _avail_kb _total_kb _floor_kb _cg
+    local _need_kb _avail_kb _total_kb _floor_kb
     _VERIFY_MODE=disk
     if [ "${GENESIS_BACKUP_VERIFY_MEMORY:-on}" = off ]; then
         log "SQLite: round-trip verify on disk: GENESIS_BACKUP_VERIFY_MEMORY=off"
         return 0
     fi
-    _factor=$(_num "${GENESIS_BACKUP_VERIFY_RAM_FACTOR:-}" 2)
-    [ "$_factor" -ge 2 ] || _factor=2  # the rebuilt DB plus its index sorts
-    _floor_pct=$(_num "${GENESIS_BACKUP_VERIFY_RAM_FLOOR_PCT:-}" 20)
-    _db_bytes=$(stat -c %s "$DB_FILE" 2>/dev/null) || _db_bytes=0
-    # Committed data still in the WAL is part of the dump, and so of the
-    # rebuilt DB, but not of the main file's size.
-    _wal_bytes=$(stat -c %s "$DB_FILE-wal" 2>/dev/null) || _wal_bytes=0
-    _db_bytes=$(( _db_bytes + _wal_bytes ))
-    _need_kb=$(( (_db_bytes / 1024 + 1) * _factor ))
-    _avail_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null) || _avail_kb=0
-    _total_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null) || _total_kb=0
-    _cg=$(_cgroup_headroom_kb) || _cg=""
-    if [ -n "$_cg" ] && [ "$_cg" -lt "${_avail_kb:-0}" ]; then _avail_kb=$_cg; fi
-    _floor_kb=$(( ${_total_kb:-0} * _floor_pct / 100 ))
-    if [ "${_avail_kb:-0}" -lt $(( _need_kb + _floor_kb )) ]; then
+    if ! _verify_memory_check "$DB_FILE"; then
         log "SQLite: round-trip verify on disk: memory short (need ${_need_kb} KB + floor ${_floor_kb} KB, available ${_avail_kb:-0} KB)"
         return 0
     fi
@@ -1115,6 +1043,111 @@ if [ -d "$_EVAL_DIR" ]; then
     fi
 fi
 
+# --- 6e. Per-install identity files (encrypted — USER.md is the owner's profile) ---
+# The files in src/genesis/identity/ that each install writes for itself: USER.md,
+# the SOUL.md/VOICE.md copies seeded from their .example, and the <stem>.local.md
+# layers. A name counts only when it is a .local.md or its .example sibling ships
+# beside it, so a file the repo still ships as tracked (no .example yet) is left to
+# the repo, and the runtime-regenerated files are outside the pattern.
+_IDENTITY_SRC="$GENESIS_DIR/src/genesis/identity"
+_IDENTITY_COUNT=0
+# A file this run could not capture is reported like an extra directory left out:
+# in the snapshot's COMPLETE marker, the status file and the incomplete-extras alert.
+# (Collected here, folded into the extras counters once §6f has set them up.)
+_IDENTITY_GAPS=()
+_identity_gap() {
+    # "*" (the whole directory) and "(listing)" are labels; anything else is a file
+    # name, quoted so a control byte cannot break the alert or the manifest line.
+    local _n="$1"
+    case "$_n" in
+        '*'|'(listing)') ;;
+        *) _n="$(LC_ALL=C printf '%q' "$_n" | cut -c1-120)" ;;
+    esac
+    _IDENTITY_GAPS+=("identity/$_n ($2)")
+}
+_identity_copy_matches() {
+    # Whether the kept copy $1 decrypts to exactly the file $2. Unreadable reads as
+    # "differs", so the copy is re-encrypted rather than trusted.
+    gpg --batch --quiet --no-symkey-cache --passphrase-fd 3 --decrypt -- "$1" \
+        3< <(printf '%s' "$_BACKUP_PASSPHRASE") 2>/dev/null | cmp -s - "$2"
+}
+mkdir -p identity
+find identity -type f ! -name '*.gpg' -delete 2>/dev/null || true
+if [ -L "$_IDENTITY_SRC" ]; then
+    # find does not descend a symlinked start point, so nothing would be captured:
+    # the kept copies stay as they are and the run reports the gap.
+    log "WARNING: $_IDENTITY_SRC is a symlink — identity copies left as they are"
+    _identity_gap "*" "identity directory is a symlink"
+elif [ -d "$_IDENTITY_SRC" ]; then
+    log "Backing up per-install identity files..."
+    if ! $_ENCRYPT_READY; then
+        log "WARNING: GENESIS_BACKUP_PASSPHRASE not set — skipping identity files (refusing plaintext)"
+    else
+        # The listing goes through a file so a failed find is SEEN and reported. No
+        # copy is ever deleted: as for memory, eval and the repo config overlays, a
+        # file deleted here comes back on a disaster-recovery restore, which is
+        # recoverable by deleting it again, where a wrong prune would lose data.
+        _identity_list_ok=true
+        _identity_list="$(mktemp -p "$GENESIS_BIG_TMP" identity-list.XXXXXX)" || _identity_list_ok=false
+        if $_identity_list_ok; then
+            # Regular files and symlinks both: a symlink is never followed (like every
+            # other section), but its kept copy stays, with a warning, below.
+            find "$_IDENTITY_SRC" -maxdepth 1 \( -type f -o -type l \) -name '*.md' -print0 >"$_identity_list" \
+                || _identity_list_ok=false
+        fi
+        if ! $_identity_list_ok; then
+            log "WARNING: could not list $_IDENTITY_SRC — identity copies left as they are"
+            _identity_gap "*" "listing failed"
+        else
+            _identity_listed=$(tr -cd '\0' <"$_identity_list" | wc -c)
+            _identity_read=0
+            while IFS= read -r -d '' src; do
+                _identity_read=$((_identity_read + 1))
+                name="${src##*/}"
+                case "$name" in
+                    *.local.md) ;;
+                    USER.md|SOUL.md|VOICE.md) [ -f "$src.example" ] || continue ;;
+                    *) continue ;;
+                esac
+                # The off-site restore reads back only names matching restore.sh's
+                # payload rule; a name outside it would be uploaded and never come back.
+                if [[ ! "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]]; then
+                    log "WARNING: identity/$name has characters restore cannot read back; not backed up (rename it)"
+                    _identity_gap "$name" "name restore cannot read"
+                    continue
+                fi
+                dst="identity/$name.gpg"
+                if [ -L "$src" ]; then
+                    log "WARNING: identity/$name is a symlink — not followed; its last copy is kept"
+                    _identity_gap "$name" "symlink, last copy kept"
+                    continue
+                fi
+                # A file byte-identical to its .example is a fresh seed (a rebuilt box
+                # before its restore): it never replaces a copy already kept.
+                if [ -f "$dst" ] && [ -f "$src.example" ] && cmp -s -- "$src" "$src.example"; then
+                    continue
+                fi
+                # Compared by content, never by mtime: a freshly cloned backups repo
+                # gives every copy its checkout time, which says nothing about the file.
+                if [ -f "$dst" ] && _identity_copy_matches "$dst" "$src"; then
+                    continue
+                fi
+                if ! encrypt_file "$src" "$dst" stamp; then
+                    log "WARNING: failed to encrypt identity/$name — this snapshot lacks its current copy"
+                    _identity_gap "$name" "not captured"
+                fi
+            done <"$_identity_list"
+            if [ "$_identity_read" -ne "$_identity_listed" ]; then
+                log "WARNING: read $_identity_read of $_identity_listed identity names — the rest keep their last copies"
+                _identity_gap "(listing)" "read stopped early"
+            fi
+        fi
+        [ -n "${_identity_list:-}" ] && rm -f -- "$_identity_list"
+        _IDENTITY_COUNT=$(find identity -maxdepth 1 -type f -name '*.gpg' 2>/dev/null | wc -l)
+        log "Identity files: $_IDENTITY_COUNT files (encrypted)"
+    fi
+fi
+
 # --- 6f. Opt-in extra directories (encrypted, Tier 2 / off-site only) ---
 # GENESIS_BACKUP_EXTRA_DIRS lists ':'-separated directories UNDER $HOME (a leading
 # `~/` is expanded) that this install wants kept — install-local data no other
@@ -1135,7 +1168,7 @@ fi
 # older snapshots keep it until retention drops them. It never fails the backup.
 _EXTRA_COUNT=0
 _EXTRA_SKIPPED=0       # listed directories NOT archived this run, for any reason
-_EXTRA_TAR_TMP=""
+_EXTRA_GPG_TMP=""     # the encrypted archive being written (absolute), for the exit handler
 _EXTRA_TAR_ERR=""
 _EXTRA_UPLOAD_FAILED=0
 _EXTRA_UPLOADED=()     # names that reached the off-site snapshot (recorded in COMPLETE)
@@ -1144,6 +1177,9 @@ _EXTRA_SKIP_LABELS=()  # listed entries not archived this run (recorded in COMPL
 _EXTRA_PARTIAL=0       # archived, but a restore will refuse some of their members
 _EXTRA_PARTIAL_LABELS=()
 _EXTRA_PARTIAL_DETAIL=()
+# Identity files §6e could not capture count as entries left out of this snapshot.
+_EXTRA_SKIP_LABELS+=("${_IDENTITY_GAPS[@]+"${_IDENTITY_GAPS[@]}"}")
+_EXTRA_SKIPPED=${#_IDENTITY_GAPS[@]}
 _extra_prev=0
 if mkdir -p extra 2>/dev/null; then
     _extra_prev="$(find extra -maxdepth 1 -type f -name '*.tar.gpg' 2>/dev/null | wc -l || true)"
@@ -1295,19 +1331,13 @@ else
         _name="$(printf '%s' "$_rel" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80)-$(printf '%s' "$_rel" | sha1sum | cut -c1-8).tar.gpg"
         # Temp creation can fail (a full or inode-exhausted temp filesystem): skip this
         # directory, never abort the whole backup over an optional payload.
-        if ! _tar_tmp="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.tar 2>/dev/null)"; then
-            _extra_skip "cannot create a temp file in $GENESIS_BIG_TMP" "$_d"
-            continue
-        fi
-        _EXTRA_TAR_TMP="$_tar_tmp"
         if ! _tar_err="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.err 2>/dev/null)"; then
-            rm -f "$_tar_tmp"
-            _EXTRA_TAR_TMP=""
             _extra_skip "cannot create a temp file in $GENESIS_BIG_TMP" "$_d"
             continue
         fi
         _EXTRA_TAR_ERR="$_tar_err"
         _gpg_tmp="extra/.${_name}.partial.$$"
+        _EXTRA_GPG_TMP="$PWD/$_gpg_tmp"
         # A Python virtualenv under the directory, whatever it is named (the default
         # excludes catch only `.venv` and `venv`): any directory holding pyvenv.cfg.
         # Its interpreter links in bin/ are absolute, so a restore refuses them and the
@@ -1335,22 +1365,44 @@ else
             done < <(find "$_venv/bin" -maxdepth 1 -type l -lname '/*' -print0 2>/dev/null)
         done < <(find "$_abs" -mindepth 1 -type d \( "${_venv_prune[@]}" -false \) -prune \
             -o -type f -name pyvenv.cfg -printf '%h\0' 2>/dev/null)
-        _tar_rc=0
+        # The archive streams straight into encryption, and the check below reads it
+        # back by decrypting what was encrypted: no plaintext copy of the directory
+        # is ever written. The plaintext tar this replaced doubled the stage's disk
+        # writes (several GB per run for a large directory), and on a busy disk
+        # that burst stalled the whole filesystem.
         # --hard-dereference: a hard link is stored as file content, so restore never
         # meets a hard-link member. Symlinks are kept as links; restore accepts the
         # ones that stay inside the restored directory.
-        tar -C "$_home_real" --hard-dereference "${_extra_ex_args[@]}" \
+        if tar -C "$_home_real" --hard-dereference "${_extra_ex_args[@]}" \
             --anchored "${_venv_ex[@]+"${_venv_ex[@]}"}" --no-anchored \
-            -cf "$_tar_tmp" -- "$_rel" 2>"$_tar_err" || _tar_rc=$?
+            -cf - -- "$_rel" 2>"$_tar_err" | encrypt_stream "$_gpg_tmp"; then
+            _xst=("${PIPESTATUS[@]}")
+        else
+            _xst=("${PIPESTATUS[@]}")
+        fi
+        _tar_rc="${_xst[0]}" _enc_rc="${_xst[1]}"
         # GNU tar exit 1 = some files changed while being read: the archive is written,
-        # but a file that was changing may be torn. 2+ = fatal.
+        # but a file that was changing may be torn. 2+ = fatal; 128+ is a signal,
+        # usually SIGPIPE after encryption stopped reading.
         _tar_head="$(head -3 "$_tar_err" | tr '\n' ' ')"
         rm -f "$_tar_err"
         _EXTRA_TAR_ERR=""
-        if [ "$_tar_rc" -ge 2 ]; then
-            rm -f "$_tar_tmp"
-            _EXTRA_TAR_TMP=""
+        if [ "$_tar_rc" -ge 2 ] && [ "$_tar_rc" -lt 128 ]; then
+            rm -f "$_gpg_tmp"
+            _EXTRA_GPG_TMP=""
             _extra_skip "tar failed rc=$_tar_rc: $_tar_head" "$_d"
+            continue
+        fi
+        if [ "$_enc_rc" -eq 0 ] && [ "$_tar_rc" -ge 2 ]; then
+            rm -f "$_gpg_tmp"
+            _EXTRA_GPG_TMP=""
+            _extra_skip "tar was stopped by signal $((_tar_rc - 128))" "$_d"
+            continue
+        fi
+        if [ "$_enc_rc" -ne 0 ]; then
+            rm -f "$_gpg_tmp"
+            _EXTRA_GPG_TMP=""
+            _extra_skip "encryption failed (encrypt exit $_enc_rc, tar exit $_tar_rc)" "$_d"
             continue
         fi
         [ "$_tar_rc" -eq 1 ] && log "NOTE: ~/$_rel changed while archiving; a file that was changing may be torn: $_tar_head"
@@ -1358,20 +1410,47 @@ else
         # and yield an archive without it, with rc 0. Check with the reader and the
         # member filter restore uses (never by parsing `tar -t`, which escapes
         # backslashes and, under a C locale, non-ASCII names), so backup keeps exactly
-        # what restore will accept.
-        _tar_root="" _tar_root_why="" _tar_summary="" _tar_verify_rc=0
+        # what restore will accept. The archive checked is the encrypted one that
+        # ships, decrypted into the checker as the SQL round-trip does it; the
+        # decrypted bytes count only once the decrypt tool exits 0 (GPG has then
+        # authenticated the whole message). Its stderr is fixed text naming the
+        # cause (authentication failed, or the checker closed the pipe), so it is
+        # kept with the checker's.
+        _tar_root="" _tar_root_why="" _tar_summary="" _tar_verify_rc=0 _dec_rc=""
         if _tar_root_err="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.err 2>/dev/null)"; then
             _EXTRA_TAR_ERR="$_tar_root_err"
-            _tar_root="$(python3 "$_SCRIPT_DIR/lib/extra_restore.py" verify "$_tar_tmp" "$GENESIS_BIG_TMP" 2>"$_tar_root_err")" || _tar_verify_rc=$?
+            _tar_root="$( {
+                {
+                    printf '%s' "$_BACKUP_PASSPHRASE" | python3 \
+                        "$_SCRIPT_DIR/../src/genesis/guardian/cred_integrity.py" decrypt-backup-stream "$_gpg_tmp"
+                    exit "${PIPESTATUS[1]}"
+                } | python3 "$_SCRIPT_DIR/lib/extra_restore.py" verify-stream "$GENESIS_BIG_TMP"
+                _vst="${PIPESTATUS[0]} ${PIPESTATUS[1]}"  # before any other command resets it
+                echo "VERIFY-STATUS $_vst" >&2
+            } 2>"$_tar_root_err" )" || true
+            _vst="$(sed -n 's/^VERIFY-STATUS //p' "$_tar_root_err" | tail -n 1)" || _vst=""
+            _dec_rc="${_vst%% *}"
+            _tar_verify_rc="${_vst##* }"
+            case "$_dec_rc$_tar_verify_rc" in '' | *[!0-9]*) _dec_rc="?" _tar_verify_rc=5 ;; esac
             # verify's last line counts the refusals by class (exit 4 only): kept for
             # the status file, and left out of the WARNING, which stays prose.
             _tar_summary="$(grep -m1 '^REFUSED-SUMMARY ' "$_tar_root_err" | cut -d' ' -f2-)" || _tar_summary=""
-            _tar_root_why="$(grep -v '^REFUSED-SUMMARY ' "$_tar_root_err")" || true
+            _tar_root_why="$(grep -v -e '^REFUSED-SUMMARY ' -e '^VERIFY-STATUS ' "$_tar_root_err")" || true
             rm -f "$_tar_root_err"
             _EXTRA_TAR_ERR=""
         else
             _tar_verify_rc=5
             _tar_root_why="cannot create a temp file in $GENESIS_BIG_TMP"
+        fi
+        # A check that failed by itself (exit 5) closes the pipe, which makes the
+        # decrypt fail too: the check's branch below reports that case. Only a check
+        # that read the whole archive (0 or 4) pins a failure on the archive itself.
+        if [ -n "$_dec_rc" ] && [ "$_dec_rc" != 0 ] \
+            && { [ "$_tar_verify_rc" = 0 ] || [ "$_tar_verify_rc" = 4 ]; }; then
+            rm -f "$_gpg_tmp"
+            _EXTRA_GPG_TMP=""
+            _extra_skip "the encrypted archive did not read back (decrypt exit $_dec_rc, check exit $_tar_verify_rc)" "$_d"
+            continue
         fi
         _tar_partial=false
         if [ "$_tar_verify_rc" -eq 4 ] && [ "$_tar_root" = "$_rel" ]; then
@@ -1379,17 +1458,17 @@ else
             # partial, so the off-site copy is not reported complete and the alert fires.
             _tar_partial=true
         elif [ "$_tar_verify_rc" -eq 0 ] && [ -n "$_tar_root" ] && [ "$_tar_root" != "$_rel" ]; then
-            rm -f "$_tar_tmp"
-            _EXTRA_TAR_TMP=""
+            rm -f "$_gpg_tmp"
+            _EXTRA_GPG_TMP=""
             _extra_skip "the archive holds ${_tar_root} instead; does an exclude pattern match the directory itself?" "$_d"
             continue
         elif [ "$_tar_verify_rc" -ne 0 ] || [ "$_tar_root" != "$_rel" ]; then
-            rm -f "$_tar_tmp"
-            _EXTRA_TAR_TMP=""
+            rm -f "$_gpg_tmp"
+            _EXTRA_GPG_TMP=""
             _extra_skip "restore could not use the archive (rc=$_tar_verify_rc: ${_tar_root_why:-no directory member}); does an exclude pattern match the directory itself?" "$_d"
             continue
         fi
-        if encrypt_file "$_tar_tmp" "$_gpg_tmp" && mv -f "$_gpg_tmp" "extra/$_name"; then
+        if mv -f -T "$_gpg_tmp" "extra/$_name"; then
             _EXTRA_COUNT=$((_EXTRA_COUNT + 1))
             _EXTRA_BUILT+=("$_name")
             if $_tar_partial; then
@@ -1400,10 +1479,9 @@ else
             fi
         else
             rm -f "$_gpg_tmp"
-            _extra_skip "encryption failed" "$_d"
+            _extra_skip "could not move the encrypted archive into place" "$_d"
         fi
-        rm -f "$_tar_tmp"
-        _EXTRA_TAR_TMP=""
+        _EXTRA_GPG_TMP=""
     done
     if [ "$_extra_listed" -eq 0 ]; then
         _extra_skip "the list has no entries" "GENESIS_BACKUP_EXTRA_DIRS=$GENESIS_BACKUP_EXTRA_DIRS"
@@ -1783,6 +1861,27 @@ else
         done < <(find eval -type f -name '*.gpg' -print0 2>/dev/null)
     fi
 
+    # Upload the per-install identity files (§6e) into the COMPLETE snapshot so a
+    # no-git fresh-box DR rehydrates them. Flat by construction (maxdepth 1).
+    if [ -d identity ]; then
+        backend_mkdir "${_T2_DIR}/identity"
+        while IFS= read -r -d '' f; do
+            if [ "$f" = "//find-failed" ]; then
+                log "WARNING: could not list identity/ for the off-site upload"
+                _T2_OK=false
+                continue
+            fi
+            fname=$(basename "$f")
+            if backend_put "$f" "${_T2_DIR}/identity/$fname"; then
+                log "  off-site: uploaded identity/$fname"
+            else
+                log "WARNING: off-site upload failed for identity/$fname"
+                _T2_OK=false
+            fi
+        done < <(find identity -maxdepth 1 -type f -name '*.gpg' -print0 2>/dev/null \
+            || printf '%s\0' //find-failed)
+    fi
+
     # Upload opt-in extra-dir archives (§6f). Flat by construction — one file
     # per directory — so restore's single-level off-site pull reads them back.
     # Only the archives THIS run built (never whatever else sits in extra/), so a
@@ -1953,7 +2052,7 @@ fi
 backend_cleanup
 
 # --- Ensure .gitignore excludes Tier 2 files ---
-# Tier 1 (git): memory/, config_overrides/, secrets/, infrastructure/, audit/
+# Tier 1 (git): memory/, identity/, config_overrides/, secrets/, infrastructure/, audit/
 # Tier 2 (off-site): data/, transcripts/, extra/
 if ! grep -q '^data/$' .gitignore 2>/dev/null; then
     cat >> .gitignore << 'GITIGNORE'
@@ -2009,7 +2108,7 @@ while IFS= read -r -d '' _partial; do
     [ "$_ppid" = "$$" ] && continue
     kill -0 "$_ppid" 2>/dev/null && continue
     rm -f -- "$_partial" && log "Removed an encryption partial left by an interrupted run: $_partial"
-done < <(find transcripts memory eval data secrets creds -type f \( -name '.genesis-partial.*' \
+done < <(find transcripts memory eval identity data secrets creds -type f \( -name '.genesis-partial.*' \
     ! -name '*.gpg' -o -path 'data/.genesis.sql.gpg.partial.*' \) -print0 2>/dev/null)
 
 # --- Commit and push (Tier 1 only) ---
@@ -2125,10 +2224,11 @@ print(core, gap or '-')
         # target is fine — the escrowed passphrase is stale), so name the real
         # cause + fix instead of pointing at the off-site target.
         if [ "$_alert_kind" = extras ]; then
-            _send_telegram "⚠️ *Off-site copy incomplete — extra directories*
+            _send_telegram "⚠️ *Off-site copy incomplete — extra directories or identity files*
 
 The core backup reached the off-site snapshot and is restorable, but the
-extra directories are incomplete: ${_EXTRA_SKIPPED:-0} not archived this run,
+extra directories or identity files are incomplete (an identity/ entry keeps
+its last good copy): ${_EXTRA_SKIPPED:-0} not captured this run,
 ${_EXTRA_UPLOAD_FAILED:-0} not uploaded, ${_EXTRA_PARTIAL:-0} archived without members a
 restore would refuse. Missing or partial in this snapshot:
 $(printf '%s\n' "${_EXTRA_SKIP_LABELS[@]+"${_EXTRA_SKIP_LABELS[@]}"}" "${_EXTRA_PARTIAL_LABELS[@]+"${_EXTRA_PARTIAL_LABELS[@]/%/ (partial)}"}" | head -5)

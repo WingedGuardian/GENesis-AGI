@@ -12,9 +12,9 @@ Usage:
     # HTTP (for external clients):
     python genesis_mcp_server.py --server health --transport streamable-http --port 8100
 
-Architecture note: mcp.run(transport=...) owns the event loop (via anyio).
-Bootstrappers must be synchronous — async DB connections are opened inside
-the MCP server's event loop via FastMCP's _lifespan hook.
+Legacy mcp.run(transport=...) owns the event loop (via anyio); its synchronous
+bootstrappers open async DB connections in FastMCP's lifespan. Explicit
+--shared-service startup instead owns resources around the Uvicorn lifecycle.
 """
 
 from __future__ import annotations
@@ -69,7 +69,7 @@ _SERVER_DECLARED_PREFIXES: dict[str, tuple[str, ...]] = {
 _STANDALONE_ROUTER_SERVERS = frozenset({"health", "memory", "outreach", "recon"})
 
 
-def _standalone_routing_env_names(server: str) -> frozenset[str]:
+def _standalone_routing_env_names(server: str, *, required: bool = False) -> frozenset[str]:
     if server not in _STANDALONE_ROUTER_SERVERS:
         return frozenset()
 
@@ -82,13 +82,44 @@ def _standalone_routing_env_names(server: str) -> frozenset[str]:
             repo_root() / "config" / "model_routing.yaml",
             check_api_keys=False,
         )
+        types = {provider.provider_type for provider in config.providers.values()}
+        if required:
+            # A selected secrets file can enable one of these configured
+            # providers after discovery. Freeze its keys before that load too.
+            types.update(config.disabled_providers.values())
         return frozenset(
             name
-            for provider in config.providers.values()
-            for name in api_key_env_names(provider.provider_type)
+            for provider_type in types
+            for name in api_key_env_names(provider_type)
         )
     except Exception:
+        if required:
+            raise ValueError("external dependency keys unavailable") from None
         return frozenset()
+
+
+def _external_file_keys(server: str) -> frozenset[str]:
+    """File-import population for the retained external health/memory readers."""
+    common = frozenset({
+        "GENESIS_DB_PATH", "GENESIS_DB_BUSY_TIMEOUT_MS", "GENESIS_MCP_HTTP_TOKEN",
+        "GENESIS_MCP_ENV_RECORDER",
+    })
+    if server == "health":
+        return common
+    if server != "memory":
+        raise ValueError("unsupported external server")
+    return common | _standalone_routing_env_names(server, required=True) | {
+        "QDRANT_URL", "OLLAMA_URL", "API_KEY_DEEPINFRA", "API_KEY_QWEN", "API_KEY_VOYAGE",
+        "GENESIS_ENABLE_OLLAMA", "OLLAMA_EMBEDDING_MODEL", "GENESIS_EMBED_LOCAL_FIRST",
+        "GENESIS_EMBED_PRIORITY_TIER", "GENESIS_RECALL_READ_POOL_OFF",
+        "GENESIS_SESSION_READ_POOL_SIZE", "GENESIS_RECALL_READ_POOL_SIZE",
+        "GENESIS_GRAPH_TELEMETRY_DISABLED", "GENESIS_MEMORY_WRITEBACKS_OFF",
+        "GENESIS_MEMORY_RERANK_OFF", "GENESIS_FALKORDB_STORE_DISABLED",
+        "GENESIS_ENABLE_LM_STUDIO", "LM_STUDIO_URL", "LM_STUDIO_HEALTH_URL",
+        "GENESIS_DAILY_BUDGET_DISABLED",
+        # Admitted knowledge_recall uses corrective web augmentation internally.
+        "API_KEY_TINYFISH", "API_KEY_BRAVE", "SEARXNG_URL", "BRAVE_API_URL",
+    }
 
 
 _DEFAULT_FLAG = Path.home() / ".genesis" / "cc_context_enabled"
@@ -123,11 +154,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         nargs="?", const="external", choices=["external", "validator"],
         help="Enforce an external tool profile and disable Claude bookmark processing",
     )
-    parser.add_argument(
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument(
         "--server",
-        required=True,
         choices=sorted(_VALID_SERVERS),
         help="Which MCP server to run",
+    )
+    selection.add_argument(
+        "--shared-service",
+        choices=sorted(_STANDALONE_ROUTER_SERVERS),
+        help="Explicit owned shared HTTP service (requires configured limits and P3 credentials)",
     )
     parser.add_argument(
         "--transport",
@@ -137,7 +173,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--host",
-        default="127.0.0.1",
+        default=None,
         help="HTTP bind address (default: 127.0.0.1)",
     )
     parser.add_argument(
@@ -152,6 +188,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Bearer token for HTTP auth (default: GENESIS_MCP_HTTP_TOKEN env var)",
     )
     args = parser.parse_args(argv)
+    if args.shared_service is not None:
+        if (args.transport != "streamable-http" or args.host is not None or args.port is not None
+                or args.auth_token is not None or args.external_client is not None):
+            parser.error("Shared service requires streamable-http and configured bind/auth/profile authority")
+        args.server = args.shared_service
+    elif args.host is None:
+        args.host = "127.0.0.1"
     if args.external_client and args.server not in {"health", "memory"}:
         parser.error("External client profiles support only health and memory servers")
     return args
@@ -661,6 +704,12 @@ def _bearer_auth_middleware(expected_token: str):
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    shared_root = None
+    if args.shared_service is not None:
+        from genesis.mcp.shared_runner import require_source_checkout
+
+        # Bind imports before loading any checkout-dependent secrets/config.
+        shared_root = require_source_checkout(Path(__file__).resolve().parents[1])
 
     logging.basicConfig(
         level=logging.WARNING,
@@ -723,7 +772,13 @@ def main(argv: list[str] | None = None) -> None:
     from genesis.env import secrets_path
 
     secrets = secrets_path()
-    if secrets.exists():
+    external_file_names = frozenset()
+    if args.external_client:
+        from genesis.routing.standalone import configure_external_secrets, load_external_secrets
+
+        configure_external_secrets(_external_file_keys(args.server))
+        external_file_names = load_external_secrets(secrets)
+    elif secrets.exists():
         from dotenv import dotenv_values
 
         for key, value in dotenv_values(secrets).items():
@@ -749,7 +804,9 @@ def main(argv: list[str] | None = None) -> None:
         from genesis.env import genesis_home
         from genesis.observability.mcp_env_reads import install
 
-        secret_keys = frozenset(dotenv_values(secrets)) if secrets.is_file() else frozenset()
+        secret_keys = external_file_names if args.external_client else (
+            frozenset(dotenv_values(secrets)) if secrets.is_file() else frozenset()
+        )
         declared = (
             frozenset(_MCP_VARS)
             | _SERVER_DECLARED_VARS[args.server]
@@ -764,6 +821,19 @@ def main(argv: list[str] | None = None) -> None:
         )
     except Exception:
         logger.warning("Could not install MCP environment read recorder", exc_info=True)
+
+    if args.shared_service is not None:
+        from genesis.env import genesis_home
+        from genesis.mcp.shared_runner import run_shared
+
+        home = genesis_home()
+        run_shared(args.shared_service, source_root=shared_root,
+            db_path=_default_db_path(), status_path=home / "status.json",
+            cache_dir=home / "embedding_cache",
+            enabled=lambda: is_genesis_enabled(flag_path=home / "cc_context_enabled"),
+            setup_routing=_init_standalone_health_router,
+            setup_health_actions=_init_standalone_health_actions)
+        return
 
     transport_kwargs = _build_transport_kwargs(args)
 

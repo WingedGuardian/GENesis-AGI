@@ -31,7 +31,11 @@ readers only ever see the refusal the workflow's token gets (it has no
 behind them; ``_derive_repo_from_cwd`` runs only without ``--repo``; and the
 ``main-reverts`` readers (``_commit_touched_files``, ``_path_in_base_history``),
 ``_rework_is_issue`` and review_budget's renamed-file read need states no fixture
-here builds.
+here builds. The ``delivery`` row's reads live in ``delivery_marker``, reached through
+the guard's ``dm.`` calls (``DELIVERY_MARKER_GH``); its issue-basis GraphQL read selects
+an issue no fixture records, so only the claim-basis read is answered, and only at
+the PR's head: a marker CARRIED from an older head is not replayed (its base and
+compare reads, and the changes read for that head, have no record).
 
 Synthetic values throughout: the repository, PR number, logins and shas are made up.
 """
@@ -62,6 +66,7 @@ from tests.test_hooks.fake_gh_replay import (
 _ROOT = Path(__file__).resolve().parents[2]
 _GUARD = _ROOT / "scripts" / "hooks" / "git_push_guard.py"
 _REVIEW_BUDGET = _ROOT / "scripts" / "review_budget.py"
+_DELIVERY_MARKER = _ROOT / "scripts" / "delivery_marker.py"
 #: Resolved from this file, so a mutation sweep's copy runs its own copy of the fake.
 _FAKE_GH = Path(__file__).resolve().with_name("fake_gh_replay.py")
 
@@ -99,10 +104,13 @@ GH_CALLERS = {
     "_pr_changed_files_uncached": "api pulls/N/files --paginate",
     "_pr_commit_rows": "api pulls/N/commits",
     "_commit_at_prefix": "api commits/<sha>",
+    "_commit_info": "api commits/<sha> (the no-change note)",
     "_commit_touched_files": "api commits/<sha> --paginate",
     "_classify_post_review_delta": "api compare/<a>...<b>",
     "_pr_contribution": "api compare/<a>...<b>",
     "_sha_is_ancestor": "api compare/<a>...<b>",
+    "_compare_rows": "api compare/<finding head>...<head> (a floor fix is still there)",
+    "_blob_oids": "api graphql, object(expression) blob oids (a capped or renamed floor fix)",
     "_base_commits_to_path": "api commits?sha=&path=&since=",
     "_path_in_base_history": "api commits -X GET path= sha=",
     "_pin_file_at_ref": "api contents/<pin file>?ref=",
@@ -115,6 +123,14 @@ GH_CALLERS = {
 REVIEW_BUDGET_GH = {
     "snapshot": "api graphql, stored documents review_budget(_reread)",
     "_evaluate_pr_inner": "api pulls/N/files --paginate (a renamed file only)",
+}
+
+#: Outside the guard: the ``delivery`` row's reads, each through ``delivery_marker._gh``.
+DELIVERY_MARKER_GH = {
+    "_comments": "api issues/N/comments | pulls/N/reviews --paginate",
+    "_pr": "api pulls/N (head and body, from the pr view record)",
+    "linked_issues": "pr view --json closingIssuesReferences (a body with no pointer)",
+    "changes_since": "api graphql, stored document delivery_changes",
 }
 
 
@@ -431,7 +447,74 @@ def test_all_green_reports_mergeable_and_exits_zero(tmp_path):
     assert rows["review-body"] == "ok"
     assert rows["inline-findings"].startswith("ok"), rows["inline-findings"]
     assert rows["rework"].startswith("n/a"), rows["rework"]
+    assert rows["delivery"].startswith("advisory — no delivery check recorded"), rows["delivery"]
     assert f"--match-head-commit {HEAD}" in rows["merge-with"]
+
+
+def _delivery_state(body_edited_at: str | None) -> dict:
+    """The green PR with an owner's delivery read at head, against the PR's own claim."""
+    state = _green_state()
+    marker = {
+        "id": 8002,
+        "user": _user(OWNER_LOGIN),
+        "author_association": "OWNER",
+        "body": (
+            f"<!-- genesis-delivery-check: head={HEAD} basis=claim verdict=DELIVERS"
+            " scope=CLEAN checker=other -->\n- DONE: the example `src/example/module.py:1`\n"
+        ),
+        "created_at": "2026-01-02T05:00:00Z",
+        "updated_at": "2026-01-02T05:00:00Z",
+    }
+    state["api"][f"issues/{PR}/comments"].append(marker)
+    # No pointer line in the body, so the basis is re-derived through GitHub's links.
+    state["pr_view"]["closingIssuesReferences"] = []
+    state["graphql"]["delivery_changes"] = {
+        "data": {
+            "repository": {
+                "object": {"committedDate": "2026-01-02T03:00:00Z"},
+                "pullRequest": {
+                    "lastEditedAt": body_edited_at,
+                    "timelineItems": {"filteredCount": 0, "nodes": []},
+                },
+            }
+        }
+    }
+    return state
+
+
+# A body edit between the head commit (03:00Z) and the marker (05:00Z) is one the
+# read saw: a claim is judged by the marker's time, not the commit's.
+@pytest.mark.parametrize("body_edited_at", [None, "2026-01-02T04:00:00Z"])
+def test_a_delivery_read_at_head_reads_ok_and_moves_no_verdict(tmp_path, body_edited_at):
+    proc, rows, _ = _report(tmp_path, _delivery_state(body_edited_at))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert rows["delivery"] == (
+        "ok (DELIVERS at head, basis claim; basis is the PR's own claim, not an issue,"
+        " spec or plan: a weaker check)"
+    ), rows["delivery"]
+    assert rows["verdict"] == "MERGEABLE (all gates pass)"
+
+
+def test_a_builders_own_read_on_code_owes_a_closing_read(tmp_path):
+    """``checker=author-review`` on a code file: the row reads the PR's files (R1) and
+    asks for a closing read, still without moving the verdict."""
+    state = _delivery_state(None)
+    marker = state["api"][f"issues/{PR}/comments"][-1]
+    marker["body"] = marker["body"].replace("checker=other", "checker=author-review")
+    proc, rows, _ = _report(tmp_path, state)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert rows["delivery"].startswith(
+        "advisory — the builder's own read: a closing read (checker=other) is owed;"
+    ), rows["delivery"]
+    assert rows["verdict"] == "MERGEABLE (all gates pass)"
+
+
+def test_a_claim_edited_after_the_read_is_advisory_and_moves_no_verdict(tmp_path):
+    proc, rows, _ = _report(tmp_path, _delivery_state("2026-01-02T06:00:00Z"))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert rows["delivery"].startswith("advisory — DELIVERS at head"), rows["delivery"]
+    assert "the PR body (its claim) was edited since the check" in rows["delivery"]
+    assert rows["verdict"] == "MERGEABLE (all gates pass)"
 
 
 def test_a_codex_p1_inline_finding_blocks(tmp_path):
@@ -449,11 +532,41 @@ def test_a_codex_p1_inline_finding_blocks(tmp_path):
     assert "merge-with" not in rows
 
 
-def test_a_maintainer_answered_p1_passes(tmp_path):
-    """The control for the test above: the same P1, answered by the owner in its own
-    review. The inline comments reach the guard's jq filter non-empty and must come
-    out readable, with the reply's ``in_reply_to_id`` read as the P1 it answers."""
+FINDING_HEAD = "a" * 40
+
+
+def _answered_p1_state() -> dict:
+    """A P1 posted at FINDING_HEAD and answered by the owner with the HEAD commit that
+    fixed it, every read the fix test makes recorded."""
     state = _green_state()
+    finding_head = FINDING_HEAD
+    state["api"][f"pulls/{PR}/commits"] = [
+        {
+            **state["api"][f"pulls/{PR}/commits"][0],
+            "sha": finding_head,
+            "commit": {
+                "message": "feat: add an example",
+                "committer": {"date": "2026-01-02T03:00:00Z"},
+            },
+        },
+        {
+            **state["api"][f"pulls/{PR}/commits"][0],
+            "parents": [{"sha": finding_head}],
+            "commit": {
+                "message": "fix: keep the last row",
+                "committer": {"date": "2026-01-02T04:00:00Z"},
+            },
+        },
+    ]
+    state["api"][f"commits/{HEAD}"] = {
+        "sha": HEAD,
+        "files": [{"filename": "src/example/module.py", "status": "modified", "changes": 2}],
+    }
+    # #5000: the fix is still in the head being merged.
+    state["api"][f"compare/{finding_head}...{HEAD}"] = {
+        "status": "ahead",
+        "files": [{"filename": "src/example/module.py", "status": "modified", "changes": 2}],
+    }
     reply = {
         "id": 9102,
         "in_reply_to_id": 9101,
@@ -462,7 +575,7 @@ def test_a_maintainer_answered_p1_passes(tmp_path):
         "author_association": "OWNER",
         "path": "src/example/module.py",
         "line": 12,
-        "body": "Fixed.",
+        "body": f"Fixed in {HEAD[:9]}.",
         "created_at": "2026-01-02T05:00:00Z",
         "updated_at": "2026-01-02T05:00:00Z",
     }
@@ -472,12 +585,48 @@ def test_a_maintainer_answered_p1_passes(tmp_path):
         "author_association": "OWNER",
         "submitted_at": "2026-01-02T05:00:00Z",
     }
-    state["api"][f"pulls/{PR}/comments"] = [_codex_inline("P1"), reply]
+    finding = {**_codex_inline("P1"), "original_commit_id": finding_head}
+    state["api"][f"pulls/{PR}/comments"] = [finding, reply]
     state["api"][f"pulls/{PR}/reviews"].append(owner_review)
-    proc, rows, _ = _report(tmp_path, state)
+    return state
+
+
+def test_a_maintainer_answered_p1_passes(tmp_path):
+    """The control for the test above: the same P1, answered by the owner in its own
+    review with the commit that fixed it. The inline comments reach the guard's jq
+    filter non-empty and must come out readable, with the reply's ``in_reply_to_id``
+    read as the P1 it answers, and the fix read through the real commit endpoints."""
+    proc, rows, _ = _report(tmp_path, _answered_p1_state())
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert rows["inline-findings"].startswith("ok"), rows["inline-findings"]
     assert rows["verdict"] == "MERGEABLE (all gates pass)"
+
+
+@pytest.mark.parametrize(("at_head", "clears"), [("d" * 40, True), ("c" * 40, False)])
+def test_a_capped_compare_is_decided_by_the_blob_read(tmp_path, at_head, clears):
+    """#5000: past the compare's 300-file cap the finding's file has no row, so the
+    real GraphQL blob read decides: changed since the finding clears, the same blob
+    (a reverted fix) blocks."""
+    state = _answered_p1_state()
+    state["api"][f"compare/{FINDING_HEAD}...{HEAD}"] = {
+        "status": "ahead",
+        "files": [
+            {"filename": f"src/x{i}.py", "status": "modified", "changes": 1} for i in range(300)
+        ],
+    }
+    state["blobs"] = {
+        f"{FINDING_HEAD}:src/example/module.py": {"__typename": "Blob", "oid": "c" * 40},
+        f"{HEAD}:src/example/module.py": {"__typename": "Blob", "oid": at_head},
+    }
+    proc, rows, calls = _report(tmp_path, state)
+    assert any(f"a={FINDING_HEAD}:src/example/module.py" in c["argv"] for c in calls), (
+        "the blob read never ran"
+    )
+    if clears:
+        assert rows["inline-findings"].startswith("ok"), rows["inline-findings"]
+    else:
+        assert rows["inline-findings"].startswith("BLOCK"), rows["inline-findings"]
+        assert "unchanged since the finding was posted" in proc.stdout, proc.stdout
 
 
 def test_two_codex_p2s_block_a_critical_change(tmp_path):
@@ -699,6 +848,80 @@ def test_every_reachable_gh_caller_is_known():
     source = _GUARD.read_text(encoding="utf-8")
     assert "_review_budget.evaluate_pr(" in source, "the rounds row's evaluator moved"
     assert _gh_callers(_REVIEW_BUDGET, "evaluate_pr") == set(REVIEW_BUDGET_GH)
+    assert _delivery_marker_gh_callers() == set(DELIVERY_MARKER_GH)
+
+
+def _delivery_marker_gh_callers() -> set[str]:
+    """``delivery_marker`` functions reachable from the guard's ``dm.<name>`` uses
+    that run ``gh``: through its runner ``_gh``, or with a ``["gh", ...]`` argv of
+    their own."""
+    imports = [
+        node
+        for node in ast.walk(ast.parse(_GUARD.read_text(encoding="utf-8")))
+        if (isinstance(node, ast.ImportFrom) and node.module == "delivery_marker")
+        or (isinstance(node, ast.Import) and any(a.name == "delivery_marker" for a in node.names))
+    ]
+    # The walk follows ``dm.<name>`` only, so any other way in must fail here.
+    assert all(
+        isinstance(n, ast.Import)
+        and [(a.name, a.asname) for a in n.names] == [("delivery_marker", "dm")]
+        for n in imports
+    ), "the guard imports delivery_marker other than as `import delivery_marker as dm`"
+    used = {
+        node.attr
+        for node in ast.walk(ast.parse(_GUARD.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "dm"
+    }
+    tree = ast.parse(_DELIVERY_MARKER.read_text(encoding="utf-8"))
+    funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    callers, seen, stack = set(), set(), sorted(used & set(funcs))
+    while stack:
+        name = stack.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        for node in ast.walk(funcs[name]):
+            if isinstance(node, ast.Name) and node.id in funcs:
+                if node.id == "_gh" and name != "_gh":
+                    callers.add(name)
+                stack.append(node.id)
+            if (
+                name != "_gh"
+                and isinstance(node, (ast.List, ast.Tuple))
+                and node.elts
+                and isinstance(node.elts[0], ast.Constant)
+                and node.elts[0].value == "gh"
+            ):
+                callers.add(name)
+    return callers
+
+
+#: The repo modules the delivery row reaches past ``delivery_marker``: its one sibling
+#: import, and the file that one loads by path for the readable-body rule.
+_DELIVERY_ROW_MODULES = {
+    "acceptance_declaration": _ROOT / "scripts" / "acceptance_declaration.py",
+    "check_cc_pin_receipts": _ROOT / "scripts" / "check_cc_pin_receipts.py",
+}
+
+
+def test_the_delivery_row_runs_gh_only_in_delivery_marker():
+    """The sibling test above reads the guard's own imports only; the row reaches two
+    modules further, so a ``gh`` read added there would escape it."""
+    tree = ast.parse(_DELIVERY_MARKER.read_text(encoding="utf-8"))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            imported.add(node.module)
+        elif isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+    siblings = {n for n in imported if (_ROOT / "scripts" / f"{n}.py").is_file()}
+    assert siblings == {"acceptance_declaration"}, siblings
+    loaded = (_ROOT / "scripts" / "acceptance_declaration.py").read_text(encoding="utf-8")
+    assert "check_cc_pin_receipts.py" in loaded, "the readable-body loader moved"
+    for name, path in _DELIVERY_ROW_MODULES.items():
+        assert not _gh_holders(path), f"{name} now runs gh: give its read a route here"
 
 
 def test_no_other_sibling_module_the_guard_imports_runs_gh():
@@ -719,7 +942,7 @@ def test_no_other_sibling_module_the_guard_imports_runs_gh():
                 text = path.read_text(encoding="utf-8")
                 if "import subprocess" in text and _gh_holders(path):
                     runs_gh.add(name)
-    assert runs_gh == {"review_budget"}
+    assert runs_gh == {"review_budget", "delivery_marker"}
 
 
 def _gh_holders(path: Path) -> bool:
@@ -919,7 +1142,9 @@ def _live_graphql_documents() -> dict[str, str]:
     live = {
         "base_ref": base_ref[0],
         "codex_signal": guard["_CODEX_SIGNAL_QUERY"],
+        "blob_oids": guard["_BLOB_OIDS_QUERY"],
         "outside_pr": guard["_OUTSIDE_PR_QUERY"],
+        "delivery_changes": _module_strings(_DELIVERY_MARKER)[0]["_CHANGES_Q"],
     }
     for name, connections in _live_review_budget_reads(budget_tree).items():
         live[name] = namespace["_graphql_query"](list(connections))

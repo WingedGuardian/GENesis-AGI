@@ -1110,7 +1110,7 @@ class TestMainLevelIntegration:
             _mod, "_check_pr_review_findings", lambda n, force=False, repo=None: (False, "")
         )
         monkeypatch.setattr(
-            _mod, "_check_inline_review_findings", lambda n, force=False, repo=None, uncounted_out=None: (False, "")
+            _mod, "_check_inline_review_findings", lambda n, force=False, repo=None, uncounted_out=None, head=None: (False, "")
         )
         monkeypatch.setattr(
             _mod,
@@ -1272,7 +1272,7 @@ class TestStaleSigilDoesNotWaiveScanners:
             lambda n, force=False, repo=None: (not force, "" if force else "P1 unresolved"),
         )
         monkeypatch.setattr(
-            _mod, "_check_inline_review_findings", lambda n, force=False, repo=None, uncounted_out=None: (False, "")
+            _mod, "_check_inline_review_findings", lambda n, force=False, repo=None, uncounted_out=None, head=None: (False, "")
         )
         monkeypatch.setattr(
             _mod,
@@ -1340,7 +1340,7 @@ class TestCheckPrReportFreshnessLabel:
             _mod, "_check_pr_review_findings", lambda n, repo=None, force=False: (False, "")
         )
         monkeypatch.setattr(
-            _mod, "_check_inline_review_findings", lambda n, repo=None, force=False, uncounted_out=None: (False, "")
+            _mod, "_check_inline_review_findings", lambda n, repo=None, force=False, uncounted_out=None, head=None: (False, "")
         )
         _mod.check_pr_report("5")
         return capsys.readouterr().out
@@ -1447,7 +1447,7 @@ class TestReportFreshnessUnreadable:
             _mod, "_check_pr_review_findings", lambda n, repo=None, force=False: (False, "")
         )
         monkeypatch.setattr(
-            _mod, "_check_inline_review_findings", lambda n, repo=None, force=False, uncounted_out=None: (False, "")
+            _mod, "_check_inline_review_findings", lambda n, repo=None, force=False, uncounted_out=None, head=None: (False, "")
         )
         # freshness gate passes (allowed), but the relabel re-reads fail (None)
         monkeypatch.setattr(
@@ -1475,7 +1475,7 @@ class TestReportFreshnessHeadMovement:
         monkeypatch.setattr(
             _mod,
             "_check_inline_review_findings",
-            lambda n, repo=None, force=False, uncounted_out=None: (False, ""),
+            lambda n, repo=None, force=False, uncounted_out=None, head=None: (False, ""),
         )
 
         def pass_head(n, repo=None):
@@ -1640,7 +1640,7 @@ class TestCleanCommentFreshness:
             _mod, "_check_pr_review_findings", lambda n, repo=None, force=False: (False, "")
         )
         monkeypatch.setattr(
-            _mod, "_check_inline_review_findings", lambda n, repo=None, force=False, uncounted_out=None: (False, "")
+            _mod, "_check_inline_review_findings", lambda n, repo=None, force=False, uncounted_out=None, head=None: (False, "")
         )
         monkeypatch.setattr(
             _mod, "_substitute_reviewers_at_head", lambda n, h, repo=None: ([], [])
@@ -3505,7 +3505,7 @@ class TestCleanSignalAtHead:
         monkeypatch.setattr(
             _mod,
             "_check_inline_review_findings",
-            lambda n, repo=None, force=False, uncounted_out=None: (False, ""),
+            lambda n, repo=None, force=False, uncounted_out=None, head=None: (False, ""),
         )
         _mod.check_pr_report("1")
         out = capsys.readouterr().out
@@ -3586,7 +3586,7 @@ class TestCleanSignalAtHead:
         monkeypatch.setattr(
             _mod,
             "_check_inline_review_findings",
-            lambda n, repo=None, force=False, uncounted_out=None: (False, ""),
+            lambda n, repo=None, force=False, uncounted_out=None, head=None: (False, ""),
         )
         _mod.check_pr_report("1")
         out = capsys.readouterr().out

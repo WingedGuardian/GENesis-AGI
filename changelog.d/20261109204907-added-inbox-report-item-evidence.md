@@ -1,1 +1,0 @@
-- The inbox coverage report includes whole text/logical items, legacy input membership and explicit baseline/response evidence without promoting unknown history to verified evaluation.

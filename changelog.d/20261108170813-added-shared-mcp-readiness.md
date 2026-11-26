@@ -1,0 +1,1 @@
+- Add optional shared MCP service units that report readiness after binding. Rendering their templates does not enable them; shared routing still requires rollout qualification.

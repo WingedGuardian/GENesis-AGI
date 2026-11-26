@@ -50,12 +50,14 @@ async def query_recent(
     thread_id: int | None = None,
     limit: int = 20,
     before: str | None = None,
+    exclude_senders: tuple[str, ...] = (),
 ) -> list[dict]:
     """Return recent messages for a chat, newest first then reversed for readability.
 
     ``before`` (ISO timestamp, exclusive) pages further back — the scroll-up
     cursor: pass the oldest timestamp from the previous page to get the next
-    older window.
+    older window. ``exclude_senders`` leaves those senders' rows out (the
+    limit then counts the rest).
     """
     clauses = ["chat_id = ?"]
     params: list[object] = [chat_id]
@@ -65,6 +67,9 @@ async def query_recent(
     if before:
         clauses.append("timestamp < ?")
         params.append(before)
+    if exclude_senders:
+        clauses.append(f"sender NOT IN ({', '.join('?' * len(exclude_senders))})")
+        params.extend(exclude_senders)
     params.append(limit)
     cursor = await db.execute(
         f"""SELECT * FROM telegram_messages

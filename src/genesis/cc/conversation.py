@@ -290,6 +290,12 @@ _BG_RESEARCH_ROUTING = (
     "That background session runs to completion and delivers the finished outcome — "
     "success or failure — back to this exact conversation. Keep quick answers and short "
     "tool use inline as usual."
+    "\n\n## Answer first\n"
+    "The user is often waiting on the answer. When they ask for a specific fact (what "
+    "was said, what a value is, what happened when), read the obvious source and write "
+    "the direct answer before any further tool call. Then stop, or say what you are "
+    "still checking and continue briefly; anything long goes to the background lane "
+    "above. Do not hold the answer back to search wider or to polish it first."
 )
 
 
@@ -578,9 +584,7 @@ class ConversationLoop:
         model = intent.model_override or (
             CCModel(session["model"]) if session and session.get("model") else self._default_model
         )
-        effort = intent.effort_override or (
-            EffortLevel(session["effort"]) if session and session.get("effort") else self._default_effort
-        )
+        effort = self._resolve_effort(intent, model, session, channel)
 
         # Get or create session, persist any model/effort changes
         session = await self._session_mgr.get_or_create_foreground(
@@ -600,7 +604,10 @@ class ConversationLoop:
         chat_ref = str(chat_id) if chat_id else user_id.replace("tg-", "")
 
         async with self._get_lock(session["id"]):
-            await self._persist_overrides(session, model, effort)
+            session, model, effort = await self._resolve_under_lock(session, intent, channel)
+            effort = await self._persist_overrides(
+                session, model, effort, effort_explicit=bool(intent.effort_override),
+            )
 
             # First message: full system prompt, no resume
             # Subsequent: resume with cc_session_id, no system prompt
@@ -902,9 +909,7 @@ class ConversationLoop:
         model = intent.model_override or (
             CCModel(session["model"]) if session and session.get("model") else self._default_model
         )
-        effort = intent.effort_override or (
-            EffortLevel(session["effort"]) if session and session.get("effort") else self._default_effort
-        )
+        effort = self._resolve_effort(intent, model, session, channel)
 
         session = await self._session_mgr.get_or_create_foreground(
             user_id=user_id, channel=channel, model=model, effort=effort,
@@ -920,10 +925,13 @@ class ConversationLoop:
         chat_ref = str(chat_id) if chat_id else user_id.replace("tg-", "")
 
         async with self._get_lock(session["id"]):
+            session, model, effort = await self._resolve_under_lock(session, intent, channel)
             # Capture old values before persisting overrides (for change feedback)
             old_model = session.get("model")
             old_effort = session.get("effort")
-            await self._persist_overrides(session, model, effort)
+            effort = await self._persist_overrides(
+                session, model, effort, effort_explicit=bool(intent.effort_override),
+            )
 
             # Emit immediate feedback on model/effort changes
             if on_event:
@@ -2022,20 +2030,82 @@ class ConversationLoop:
         )
         return new_session
 
+    def _resolve_effort(self, intent, model: CCModel, session, channel) -> EffortLevel:
+        """Explicit effort > the channel's per-model default on a model switch (#4854)
+        > the session's stored effort > the config default."""
+        if intent.effort_override:
+            return intent.effort_override
+        switching = intent.model_override and (
+            not session or session.get("model") != str(model)
+        )
+        if switching:
+            try:
+                from genesis.channels.config import default_effort_for_model
+
+                per_model = default_effort_for_model(str(channel), str(model))
+            except Exception:
+                logger.warning("Per-model effort lookup failed", exc_info=True)
+                per_model = None
+            if per_model:
+                return per_model
+        if session and session.get("effort"):
+            return EffortLevel(session["effort"])
+        return self._default_effort
+
+    async def _resolve_under_lock(
+        self, session: dict, intent, channel,
+    ) -> tuple[dict, CCModel, EffortLevel]:
+        """Re-read the session row once the session lock is held, and resolve the
+        turn's model and effort from that one read.
+
+        ``session`` was read before the lock, and ``/model``, ``/effort`` and
+        ``session_config`` write the row without it, so the snapshot may be stale.
+        Resolving both fields from the same fresh row keeps the turn's model and
+        effort a matching pair. A failed read keeps the snapshot."""
+        try:
+            fresh = await cc_sessions.get_by_id(self._db, session["id"]) or session
+        except Exception:
+            logger.warning("Session re-read under the lock failed", exc_info=True)
+            fresh = session
+        model = intent.model_override or (
+            CCModel(fresh["model"]) if fresh.get("model") else self._default_model
+        )
+        return fresh, model, self._resolve_effort(intent, model, fresh, channel)
+
     async def _persist_overrides(
-        self, session: dict, model: CCModel, effort: EffortLevel,
-    ) -> None:
-        """If model or effort changed from what the session stores, update DB."""
+        self, session: dict, model: CCModel, effort: EffortLevel, *, effort_explicit: bool,
+    ) -> EffortLevel:
+        """If model or effort changed from what the session stores, update DB.
+
+        Returns the effort the turn should run with. An explicit effort is always
+        written with a model change, so one that equals the stored effort is not
+        replaced by the per-model default (#4854). An inferred effort is never
+        written over a model change: ``session`` is a snapshot taken before the
+        session lock, so its effort may be stale, and the atomic model-only update
+        decides the effort from the row as it is. The turn then runs with the
+        effort that update stored, returned by the write itself. ``session`` is
+        the row read under the lock (``_resolve_under_lock``), so with nothing to
+        write the resolved effort is already the row's own. When the channel
+        configures a default for the new model, a real switch takes that default
+        even over an effort set while the switch waited: that effort was chosen
+        for the old model.
+        """
         new_model = str(model) if str(model) != session.get("model") else None
-        new_effort = str(effort) if str(effort) != session.get("effort") else None
-        if new_model or new_effort:
-            await cc_sessions.update_model_effort(
-                self._db, session["id"], model=new_model, effort=new_effort,
-            )
-            logger.info(
-                "Session %s updated: model=%s effort=%s",
-                session["id"][:8], model, effort,
-            )
+        if effort_explicit:
+            new_effort = str(effort) if new_model or str(effort) != session.get("effort") else None
+        else:
+            new_effort = None  # an inferred effort is never written; the row keeps its own
+        if not (new_model or new_effort):
+            return effort
+        stored = await cc_sessions.apply_model_effort(
+            self._db, session["id"], model=new_model, effort=new_effort,
+        )
+        applied = EffortLevel(stored) if stored else effort
+        logger.info(
+            "Session %s updated: model=%s effort=%s",
+            session["id"][:8], model, applied,
+        )
+        return applied
 
     async def _build_topic_context(self, thread_id: str) -> str | None:
         """Build topic-specific context for the conversation system prompt.
@@ -2295,6 +2365,9 @@ class ConversationLoop:
                 chat_id,
                 thread_id=int(thread_id) if thread_id else None,
                 limit=self.RECOVERY_CONTEXT_MESSAGES,
+                # Interim progress rows are narration around the turn, not its
+                # answer; leaving them out keeps the budget on the turns (#4849).
+                exclude_senders=("genesis-progress",),
             )
             if not messages:
                 return ""

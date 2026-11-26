@@ -29,6 +29,7 @@ from genesis.cc.types import model_name_supports_effort
 from genesis.guardian.briefing import read_guardian_briefing
 from genesis.guardian.collector import DiagnosticSnapshot
 from genesis.guardian.config import GuardianConfig
+from genesis.util.atomic import atomic_write_text
 from genesis.util.proc_kill import kill_process_group, reap_bounded
 
 logger = logging.getLogger(__name__)
@@ -125,6 +126,54 @@ def _ensure_work_dir(configured: Path, fallback: Path | None = None) -> Path:
     return fallback
 
 
+_NO_MCP_JSON = '{"mcpServers": {}}'
+
+
+def _ensure_no_mcp_config(work_dir: Path) -> str:
+    """The ``--mcp-config`` value for a ``claude -p`` run in ``work_dir``.
+
+    The recovery brain needs only built-in tools. An install whose work dir never
+    got this file let CC load every configured MCP server (seen on a live host),
+    so it is written when missing. When it cannot be written, the same empty
+    config is returned inline: ``--mcp-config`` takes a JSON string as well as a
+    file (MEASURED, Claude Code 2.1.299), so ``--strict-mcp-config`` always
+    applies.
+    """
+    path = work_dir / "config" / "no_mcp.json"
+    if not path.exists():
+        try:
+            atomic_write_text(path, _NO_MCP_JSON + "\n")
+        except OSError as exc:
+            logger.warning("could not write %s, passing it inline: %s", path, exc)
+            return _NO_MCP_JSON
+    return str(path)
+
+
+def _cc_error_reason(stdout_text: str, stderr_text: str) -> str:
+    """Why a ``claude -p --output-format json`` run failed, from its own report.
+
+    Claude Code reports a failed run on STDOUT, in its JSON envelope
+    (``is_error``, ``result``, ``api_error_status``), and may leave stderr empty
+    (MEASURED 2026-11-18: an auth failure exits 1 with ``result`` "Failed to
+    authenticate. API Error: 401 ..." on stdout). Prefer that; fall back to
+    stderr. Bounded, so a page stays readable.
+    """
+    try:
+        env = json.loads(stdout_text)
+    except (json.JSONDecodeError, ValueError):
+        env = None
+    if isinstance(env, dict) and (env.get("is_error") or env.get("api_error_status")):
+        parts = [str(env.get("result") or "").strip()]
+        if env.get("api_error_status"):
+            parts.append(f"(api_error_status {env['api_error_status']})")
+        if env.get("terminal_reason"):
+            parts.append(f"[{env['terminal_reason']}]")
+        reason = " ".join(p for p in parts if p)
+        if reason:
+            return reason[:300]
+    return stderr_text.strip()[:300] or "no error reported on stdout or stderr"
+
+
 class CCDiagnosisError(Exception):
     """CC diagnosis failed with a specific, capturable reason."""
 
@@ -154,6 +203,17 @@ class DiagnosisResult:
     reasoning: str = ""
     source: str = "cc"  # "cc" or "cc_unavailable"
     cc_failure_reason: str = ""  # Why CC was unavailable (empty = CC succeeded)
+    # On `live`, with recovery.live_engine on: (branch, the head the manifest
+    # pins, the head `live` holds for it, `live` tip, the other candidates the
+    # drop's plan takes out) of the candidate an approved REVERT_CODE drops;
+    # set by check.py before Gate 2 (#2978).
+    drop_candidate: tuple[str, str, str, str, tuple[str, ...]] | None = None
+    # What Gate 2 shows in full, never cut: the names an approval removes, or a
+    # warning that a drop may still be running; "" when there is none.
+    gate2_identity: str = ""
+    # Why check.py made this an ESCALATE on `live` (live_drop.HALF_DONE_DROP),
+    # so the alert says what happened; "" otherwise.
+    escalation: str = ""
 
 
 _FAILURE_INVENTORY = """
@@ -177,6 +237,44 @@ Known failure mode inventory (from real incidents):
 | I/O saturation | io.pressure full avg10 high, system partially responsive | CC sessions saturating I/O bandwidth | IO_TRIAGE (kill top I/O consumer, one per cycle) |
 """
 
+#: The inventory rows recovery.live_engine changes: on `live`, REVERT_CODE drops
+#: the newest candidate (#2978). Off, the prompt keeps main's rows.
+_LIVE_ENGINE_ROWS = {
+    "| Failure correlates with recent git commit | Code regression | REVERT_CODE; never on "
+    "`live`, where a bad candidate is removed by `scripts/deploy_candidates drop <branch>` |": (
+        "| Failure correlates with recent git commit, or on `live` with a recently added "
+        "candidate | Code regression | REVERT_CODE (on `live` it drops the newest candidate "
+        "from `live`, then genesis-server restarts) |"
+    ),
+    "| RESTART_CONTAINER (ends lock holders; a boot repair runs where one is installed); "
+    "never REVERT_CODE on `live` |": (
+        "| RESTART_CONTAINER (a boot repair runs where one is installed); never REVERT_CODE "
+        "on `live` |"
+    ),
+}
+
+
+def _failure_inventory(live_engine: bool) -> str:
+    text = _FAILURE_INVENTORY
+    if live_engine:
+        for old, new in _LIVE_ENGINE_ROWS.items():
+            text = text.replace(old, new)
+    return text
+
+
+def _candidates_fallback(text: str, budget: int = 500) -> str:
+    """The newest whole rows of the candidate evidence within ``budget`` chars
+    (pin order puts the drop target last), with a count of the rows left out."""
+    rows = text.splitlines()
+    kept: list[str] = []
+    for row in reversed(rows):
+        if sum(len(r) + 1 for r in kept) + len(row) + 60 > budget:
+            break
+        kept.insert(0, row)
+    if len(kept) < len(rows):
+        kept.insert(0, f"({len(rows) - len(kept)} older row(s) not shown)")
+    return "\n".join(kept)
+
 
 def _build_diagnosis_prompt(
     diagnostic: DiagnosticSnapshot,
@@ -184,6 +282,7 @@ def _build_diagnosis_prompt(
     container_name: str,
     briefing_context: str | None = None,
     shared_dir: Path | None = None,
+    live_engine: bool = False,
 ) -> str:
     """Build the full prompt for the CC diagnostic instance.
 
@@ -341,7 +440,7 @@ Everything collected from the container below (logs, status files, git state, pr
 {briefing_section}
 {ek_section}
 {infra_section}
-{_FAILURE_INVENTORY}
+{_failure_inventory(live_engine)}
 
 ## Available Commands
 
@@ -487,6 +586,7 @@ class DiagnosisEngine:
         prompt = _build_diagnosis_prompt(
             diagnostic, signal_summary, container_name, briefing_context,
             shared_dir=self._config.shared_path,
+            live_engine=self._config.recovery.live_engine,
         )
         cc_path = str(Path(self._config.cc.path).expanduser())
         work_dir = _ensure_work_dir(Path(self._config.cc.work_dir).expanduser())
@@ -542,7 +642,7 @@ class DiagnosisEngine:
         # --strict-mcp-config ensures no global/project MCP configs are loaded,
         # preventing unnecessary memory consumption from heavy MCP server
         # processes (codebase-memory-mcp, serena, gitnexus, etc.).
-        no_mcp_config = work_dir / "config" / "no_mcp.json"
+        no_mcp_config = _ensure_no_mcp_config(work_dir)
         # Emit --effort unless the model doesn't use one (Haiku). Unknown model
         # strings fall through to including it (best-effort; guardian defaults to
         # opus, which supports the full range).
@@ -555,13 +655,7 @@ class DiagnosisEngine:
             "--max-turns", str(self._config.cc.max_turns),
             "--dangerously-skip-permissions",
         ]
-        if no_mcp_config.exists():
-            cmd.extend(["--mcp-config", str(no_mcp_config), "--strict-mcp-config"])
-        else:
-            logger.warning(
-                "config/no_mcp.json not found at %s — CC may load MCP servers",
-                no_mcp_config,
-            )
+        cmd.extend(["--mcp-config", no_mcp_config, "--strict-mcp-config"])
 
         logger.info(
             "Starting CC diagnosis: model=%s, max_turns=%d, timeout=%ds, "
@@ -607,17 +701,26 @@ class DiagnosisEngine:
             await reap_bounded(proc)
             raise
 
+        stdout_text = stdout.decode("utf-8", errors="replace")
         if proc.returncode != 0:
-            stderr_text = stderr.decode("utf-8", errors="replace")[:300]
+            reason = _cc_error_reason(
+                stdout_text, stderr.decode("utf-8", errors="replace"),
+            )
             logger.error(
-                "CC diagnosis exited with code %d: %s",
-                proc.returncode, stderr_text,
+                "CC diagnosis exited with code %d: %s", proc.returncode, reason,
             )
-            raise CCDiagnosisError(
-                f"CC exited with code {proc.returncode}: {stderr_text}"
-            )
+            raise CCDiagnosisError(f"CC exited with code {proc.returncode}: {reason}")
+        try:
+            envelope = json.loads(stdout_text)
+        except (json.JSONDecodeError, ValueError):
+            envelope = None
+        if isinstance(envelope, dict) and envelope.get("is_error"):
+            # A failed run can exit 0 and still report the error in its envelope.
+            reason = _cc_error_reason(stdout_text, "")
+            logger.error("CC diagnosis reported an error: %s", reason)
+            raise CCDiagnosisError(f"CC reported an error: {reason}")
 
-        result = self._parse_cc_response(stdout.decode("utf-8", errors="replace"))
+        result = self._parse_cc_response(stdout_text)
         if result is None:
             raise CCDiagnosisError(
                 "No valid JSON diagnosis found in CC response"
@@ -627,32 +730,26 @@ class DiagnosisEngine:
     async def _resolve_cc_env(self, cc_path: str) -> dict[str, str] | None:
         """Resolve the environment for the CC recovery-brain subprocess.
 
-        FALLBACK-ONLY setup-token injection. Returns ``None`` (inherit
-        ``os.environ`` — the ``create_subprocess_exec`` default, identical to
-        today's behavior) UNLESS a pre-flight ``claude auth status`` confirms the
-        host's own ``claude login`` is DEAD, in which case it injects the synced
-        ``CLAUDE_CODE_OAUTH_TOKEN`` so the brain can still authenticate.
+        Returns ``None`` (inherit ``os.environ``, the host's own ``claude
+        login``) only when a pre-flight ``claude auth status --json`` CONFIRMS
+        that login works (``loggedIn: true``). In every other case (logged
+        out, unknown, unparseable, timed out, or the probe failed) it injects
+        the synced ``CLAUDE_CODE_OAUTH_TOKEN`` when one exists.
 
-        The pre-flight runs with the SAME inherited env the real brain gets in
-        the no-token case, so ``loggedIn: true`` faithfully predicts the real
-        invocation. ``{**os.environ, ...}`` preserves every inherited key (the
-        brain relies on inherited provider keys — no env scrub), adding only the
-        token.
+        Why the default leans to the token (owner ruling 2026-11-18): the old
+        rule injected only on an explicit ``loggedIn: false`` and inherited on
+        any ambiguity. On a live host with no working login, a diagnosis run
+        right after a reboot did not inject and the brain failed to
+        authenticate, so the Guardian could only page "recovery failed". A
+        token that has gone stale is caught by the daily auth canary instead
+        of being discovered during an outage.
 
-        ⚠ Honest boundary: ``CLAUDE_CODE_OAUTH_TOKEN`` *overrides* a stored
-        login, so "never degrade a working login" rests on the pre-flight
-        reporting ``loggedIn`` correctly. On a FALSE ``loggedIn: false`` (login
-        actually fine) coinciding with a STALE synced token, we would inject and
-        the brain would fail onto the bad token — but that lands as the existing
-        ``CCDiagnosisError`` → ``cc_unavailable`` escalation (a clean fail-safe,
-        NOT silent brain death), only in that rare double-coincidence. We never
-        inject on ambiguity (unparseable / timeout / ``loggedIn`` unknown) nor
-        when no token exists. Never raises; never logs the token value.
-
-        Cost: one ~1-3s ``auth status`` call per diagnosis. Diagnosis fires only
-        when Genesis is DOWN (rare), so it is deliberately NOT cached — caching
-        would reintroduce the auth-staleness class this whole feature kills.
+        ``CLAUDE_CODE_OAUTH_TOKEN`` overrides a stored login, so a working
+        login is never overridden only because the probe confirmed it.
+        ``{**os.environ, ...}`` preserves every inherited key. Never raises;
+        never logs the token value.
         """
+        logged_in: bool | None = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 cc_path, "auth", "status", "--json",
@@ -671,38 +768,46 @@ class DiagnosisEngine:
             except TimeoutError:
                 kill_process_group(proc)
                 await reap_bounded(proc)
-                return None  # ambiguous → inherit; fail-safe covers a real outage
+                stdout = b""
             except asyncio.CancelledError:
                 kill_process_group(proc)
                 await reap_bounded(proc)
                 raise
             try:
-                logged_in = json.loads(
-                    stdout.decode("utf-8", errors="replace"),
-                ).get("loggedIn")
-            except (json.JSONDecodeError, ValueError, AttributeError, TypeError):
-                # Unparseable, or valid-but-non-object JSON (null/true/[] → no
-                # .get) → treat as ambiguity, never inject.
-                return None
-            if logged_in is not False:
-                # True (login works) or None (unknown) → inherit, never inject.
-                return None
-            # Host login is dead → inject the synced fallback token if present.
+                parsed = json.loads(stdout.decode("utf-8", errors="replace"))
+            except (json.JSONDecodeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict) and isinstance(parsed.get("loggedIn"), bool):
+                logged_in = parsed["loggedIn"]
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("CC auth pre-flight failed; treating login as unconfirmed", exc_info=True)
+
+        if logged_in is True:
+            return None  # confirmed working login: never override it
+        try:
             from genesis.guardian.credential_bridge import load_cc_oauth_token
 
             token = load_cc_oauth_token(self._config.state_dir).get(
                 "CLAUDE_CODE_OAUTH_TOKEN",
             )
-            if not token:
-                return None  # no fallback → inherit; cc_unavailable fail-safe fires
-            logger.warning(
-                "Host `claude login` reports logged-out — injecting the synced "
-                "setup-token as this diagnosis's fallback (token value not logged).",
-            )
-            return {**os.environ, "CLAUDE_CODE_OAUTH_TOKEN": token}
         except Exception:
-            logger.debug("CC auth pre-flight failed; inheriting env", exc_info=True)
+            logger.warning("could not read the synced setup-token", exc_info=True)
+            token = None
+        if not token:
+            logger.warning(
+                "Host `claude login` is %s and no synced setup-token exists; the "
+                "diagnosis runs with the inherited environment.",
+                "logged out" if logged_in is False else "unconfirmed",
+            )
             return None
+        logger.warning(
+            "Host `claude login` is %s — injecting the synced setup-token for this "
+            "diagnosis (token value not logged).",
+            "logged out" if logged_in is False else "unconfirmed",
+        )
+        return {**os.environ, "CLAUDE_CODE_OAUTH_TOKEN": token}
 
     def _parse_cc_response(self, raw: str) -> DiagnosisResult | None:
         """Parse the CC response into a DiagnosisResult.
@@ -851,6 +956,11 @@ class DiagnosisEngine:
         if diagnostic.live_repair:
             # Bounded: this evidence reaches Telegram, whose 4,096-char cap drops the alert.
             evidence.append(f"Boot repair of the live checkout:\n{diagnostic.live_repair[:500]}")
+        if diagnostic.live_candidates:
+            # Bounded like the repair: the fallback evidence reaches Telegram.
+            evidence.append(
+                f"Live candidates (pin order):\n{_candidates_fallback(diagnostic.live_candidates)}"
+            )
 
         return DiagnosisResult(
             likely_cause="CC diagnosis unavailable — cannot determine root cause safely",

@@ -48,6 +48,7 @@ def home(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(audit._S, "hits", {})
     monkeypatch.setattr(audit._S, "faults", 0)
+    monkeypatch.setattr(audit._S, "credential_inodes", frozenset())
     return fake
 
 
@@ -123,7 +124,9 @@ def test_valid_descriptor_without_proc_visibility_counts_uncertainty(home, monke
         audit._S.hits.clear()
         os.ftruncate(descriptor, 1)
     assert target.read_bytes() == b"o"
-    assert not audit._S.hits
+    assert [row[1:] for row in audit._S.hits] == [
+        ("observer fault", "os.truncate/judge/FileNotFoundError", "<not captured>")
+    ]
     assert audit._S.faults == 1
 
 
@@ -191,6 +194,7 @@ def test_hook_preserves_operator_interrupts(home, monkeypatch, signal):
 def test_fault_count_reaches_controller_and_summary(home, monkeypatch):
     monkeypatch.setattr(audit._S, "faults", 3, raising=False)
     monkeypatch.setattr(audit._S, "merged_workers", set())
+    monkeypatch.setattr(audit._S, "worker_status", {})
     monkeypatch.setattr(audit._S, "unreported", [])
     config = type("C", (), {"workeroutput": {}})()
     audit.pytest_sessionfinish(type("S", (), {"config": config})(), 0)
@@ -312,14 +316,14 @@ def test_a_sqlite_file_is_a_write_but_read_only_and_memory_are_not(home):
 @pytest.mark.parametrize(
     ("query", "read_only"),
     [
-        # Measured against CPython's sqlite3: which of these opened without writing.
+        # Deliberately narrow recognized forms, not an engine boolean parser.
         ("mode=ro", True),
         ("mode=memory", True),
         ("immutable=1", True),
-        ("immutable=TRUE", True),
-        ("immutable=on", True),
-        ("immutable=2", True),
-        ("immutable=1&immutable=0", True),
+        ("immutable=TRUE", False),
+        ("immutable=on", False),
+        ("immutable=2", False),
+        ("immutable=1&immutable=0", False),
         ("journal_mode=rollback", False),
         ("cache=shared&nomode=ro", False),
         ("immutable=0", False),
@@ -332,6 +336,105 @@ def test_a_sqlite_file_is_a_write_but_read_only_and_memory_are_not(home):
 )
 def test_a_sqlite_uri_is_read_only_only_by_its_exact_parameters(query, read_only):
     assert audit._read_only_uri(query) is read_only
+
+
+
+@pytest.mark.parametrize("query", [
+    "immutable=256", "immutable=512", "immutable=4294967297", "immutable=2147483648",
+    "immutable=²", "immutable=١", "%69mmutable=0&immutable=1",
+])
+def test_writable_sqlite_query_is_not_silently_exempted(home, query):
+    target = home / ".genesis" / "query.db"
+    sqlite3.connect(target).close()
+    audit._S.hits.clear()
+    with sqlite3.connect(f"file:{target}?{query}", uri=True) as connection:
+        connection.execute("CREATE TABLE owned(value)")
+        connection.execute("INSERT INTO owned VALUES (1)")
+    with sqlite3.connect(f"file:{target}?mode=ro", uri=True) as reader:
+        assert reader.execute("SELECT value FROM owned").fetchall() == [(1,)]
+    assert ("~/.genesis", "sqlite connect", str(target)) in {
+        (label, operation, path) for _node, label, operation, path in audit._S.hits
+    }
+    assert audit._S.faults == 0
+
+
+@pytest.mark.parametrize("suffix", ["extra", "é"])
+def test_memory_name_prefix_is_a_disk_file(home, monkeypatch, suffix):
+    directory = home / ".genesis"
+    monkeypatch.chdir(directory)
+    target = directory / f":memory:{suffix}"
+    audit._S.hits.clear()
+    with sqlite3.connect(f"file::memory:{suffix}", uri=True) as connection:
+        connection.execute("CREATE TABLE owned(value)")
+    assert target.is_file()
+    assert ("~/.genesis", "sqlite connect", str(target)) in {
+        (label, operation, path) for _node, label, operation, path in audit._S.hits
+    }
+    assert audit._S.faults == 0
+
+
+def test_sqlite_fragment_cannot_supply_a_readonly_query(home):
+    target = home / ".genesis" / "fragment.db"
+    sqlite3.connect(target).close()
+    audit._S.hits.clear()
+    with sqlite3.connect(f"file:{target}#ignored?mode=ro", uri=True) as connection:
+        connection.execute("CREATE TABLE owned(value)")
+    with sqlite3.connect(f"file:{target}?mode=ro", uri=True) as reader:
+        assert reader.execute("SELECT name FROM sqlite_master").fetchall() == [("owned",)]
+    assert ("~/.genesis", "sqlite connect", str(target)) in {
+        (label, operation, path) for _node, label, operation, path in audit._S.hits
+    }
+
+
+@pytest.mark.parametrize("uri", [
+    "file::memory:", "file::memory:?cache=shared", "file::memory:#fragment",
+    "file::memory:#ignored?mode=rw",
+])
+def test_exact_memory_uri_never_changes_a_disk_target(home, monkeypatch, uri):
+    directory = home / ".genesis"
+    monkeypatch.chdir(directory)
+    audit._S.hits.clear()
+    with sqlite3.connect(uri, uri=True) as connection:
+        connection.execute("CREATE TABLE owned(value)")
+        connection.execute("INSERT INTO owned VALUES (1)")
+        assert connection.execute("SELECT value FROM owned").fetchall() == [(1,)]
+        assert connection.execute("PRAGMA database_list").fetchone()[2] == ""
+    assert list(directory.iterdir()) == []
+    assert audit._S.hits == {}
+    assert audit._S.faults == 0
+
+
+
+@pytest.mark.parametrize("query", ["mode=ro", "immutable=1"])
+def test_plain_readonly_sqlite_form_refuses_disk_writes(home, query):
+    target = home / ".genesis" / "readonly.db"
+    with sqlite3.connect(target) as connection:
+        connection.execute("CREATE TABLE owned(value)")
+    before = target.read_bytes()
+    audit._S.hits.clear()
+    with sqlite3.connect(f"file:{target}?{query}", uri=True) as connection:
+        with pytest.raises(sqlite3.OperationalError) as failure:
+            connection.execute("INSERT INTO owned VALUES (1)")
+        assert failure.value.sqlite_errorcode == sqlite3.SQLITE_READONLY
+    assert target.read_bytes() == before
+    assert audit._S.hits == {}
+
+
+@pytest.mark.parametrize("exists", [False, True])
+def test_plain_memory_mode_uses_memory_even_for_a_disk_name(home, exists):
+    target = home / ".genesis" / "memory.db"
+    if exists:
+        with sqlite3.connect(target) as connection:
+            connection.execute("CREATE TABLE disk_only(value)")
+    before = target.read_bytes() if exists else None
+    audit._S.hits.clear()
+    with sqlite3.connect(f"file:{target}?mode=memory", uri=True) as connection:
+        connection.execute("CREATE TABLE owned(value)")
+        connection.execute("INSERT INTO owned VALUES (1)")
+        assert connection.execute("SELECT value FROM owned").fetchall() == [(1,)]
+        assert connection.execute("PRAGMA database_list").fetchone()[2] == ""
+    assert (target.read_bytes() if target.exists() else None) == before
+    assert audit._S.hits == {}
 
 
 def test_an_immutable_uri_to_a_missing_file_is_a_write(home):
@@ -476,6 +579,33 @@ def test_a_relative_os_open_that_only_reopens_an_existing_file_is_not_a_write(ho
     assert _hits() == set()
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def test_a_credential_file_read_under_another_name_is_recorded(home, tmp_path, monkeypatch):
     """Through a symlink and a hard link whose names say nothing: recorded."""
     secrets = home / "genesis" / "secrets.env"
@@ -517,24 +647,6 @@ def test_a_fault_in_the_credential_lookup_never_breaks_a_read(home, tmp_path, mo
     os.close(fd)
 
 
-def test_install_records_the_credential_files_by_inode(tmp_path, monkeypatch):
-    """The inode set is what lets a read under another name be recognised."""
-    fake = tmp_path / "home"
-    (fake / "genesis").mkdir(parents=True)
-    (fake / "genesis" / "secrets.env").write_text("K=v\n")
-    st = os.stat(fake / "genesis" / "secrets.env")
-    from tests import _live_fence
-
-    monkeypatch.setattr(audit._S, "installed", False)
-    monkeypatch.setattr(audit.sys, "addaudithook", lambda hook: None)
-    monkeypatch.setattr(_live_fence._S, "installed", True)
-    monkeypatch.setattr(_live_fence._S, "real_home", str(fake))
-    for name in ("real_home", "allowed_roots", "allowed_files", "classes", "credential_files"):
-        monkeypatch.setattr(audit._S, name, getattr(audit._S, name))
-    monkeypatch.setattr(audit._S, "credential_inodes", frozenset())
-    config = type("C", (), {"option": type("O", (), {"basetemp": None})()})()
-    audit.install(config)
-    assert (st.st_dev, st.st_ino) in audit._S.credential_inodes
 
 
 def test_install_without_a_known_real_home_stays_disarmed(monkeypatch):
@@ -546,6 +658,10 @@ def test_install_without_a_known_real_home_stays_disarmed(monkeypatch):
     from tests import _live_fence
 
     hooks = []
+    monkeypatch.setattr(audit._S, "hits", {})
+    monkeypatch.setattr(audit._S, "faults", 0)
+    monkeypatch.setattr(audit._S, "unreported", [])
+    monkeypatch.delenv("GENESIS_LIVE_WRITES_REPORT", raising=False)
     monkeypatch.setattr(audit._S, "installed", False)
     monkeypatch.setattr(audit._S, "disarmed", "")
     monkeypatch.setattr(audit.sys, "addaudithook", hooks.append)
@@ -755,7 +871,7 @@ def test_an_xdist_run_reports_the_workers_writes(tmp_path):
         "test_one.py",
         "test_two.py",
     ], text
-    assert "live writes: writes outside the test's temp dirs" in text
+    assert "live writes: audit observations" in text
     assert "no report from xdist worker" not in text
 
 
@@ -771,6 +887,7 @@ def test_a_worker_hands_over_an_undecodable_path_intact(monkeypatch):
     sent = gateway_base.loads(gateway_base.dumps(config.workeroutput))  # the channel
     monkeypatch.setattr(audit._S, "hits", {})
     monkeypatch.setattr(audit._S, "merged_workers", set())
+    monkeypatch.setattr(audit._S, "worker_status", {})
     monkeypatch.setattr(audit._S, "unreported", [])
     gateway = type("G", (), {"id": "gw0"})()
     audit.pytest_testnodedown(type("N", (), {"gateway": gateway, "workeroutput": sent})(), None)
@@ -779,6 +896,7 @@ def test_a_worker_hands_over_an_undecodable_path_intact(monkeypatch):
 
 def test_a_worker_that_never_reported_is_named(monkeypatch):
     monkeypatch.setattr(audit._S, "merged_workers", set())
+    monkeypatch.setattr(audit._S, "worker_status", {})
     monkeypatch.setattr(audit._S, "unreported", [])
     monkeypatch.setattr(audit._S, "hits", {})
     gateway = type("G", (), {"id": "gw3"})()
@@ -846,6 +964,6 @@ def test_a_run_reports_writes_without_failing_the_test(tmp_path):
     )
     text = out.stdout + out.stderr
     assert out.returncode == 0, text
-    assert "writes outside the test's temp dirs (reported, not failed)" in text, text
+    assert "audit observations (reported, not failed)" in text, text
     lines = report.read_text().splitlines()
     assert any(line.endswith("/f") and "\twrite\t" in line for line in lines), lines

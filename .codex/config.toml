@@ -43,6 +43,8 @@ timeout = 10
 # unattended (genesis.util.codex_cli sets GENESIS_CC_SESSION=1) keeps the
 # external 13-tool health/memory floor and gets no outreach or recon server;
 # `env_vars` forwards that marker, since Codex passes an MCP child nothing else.
+# Codex resolves cwd relative to the invocation directory. Resolve the linked
+# checkout root before opening the launcher so nested directories work too.
 #
 # Approvals (owner ruling 2026-11-08): reads run without a prompt; anything that
 # writes, sends, spends or spawns asks first. The server default is `prompt` and
@@ -60,8 +62,8 @@ timeout = 10
 # tool runs without asking, and under approval_policy="never" it is refused.
 
 [mcp_servers.genesis-health]
-command = "python3"
-args = ["scripts/codex_owner_mcp.py", "--server", "health"]
+command = "sh"
+args = ["-c", 'root=$(git rev-parse --show-toplevel) && exec python3 "$root/scripts/codex_owner_mcp.py" "$@"', "genesis-mcp", "--server", "health"]
 cwd = "."
 startup_timeout_sec = 30
 env_vars = ["GENESIS_CC_SESSION", "GENESIS_SESSION_ORIGIN"]
@@ -108,8 +110,8 @@ tools.update_history_recent.approval_mode = "approve"
 tools.zero_drop_status.approval_mode = "approve"
 
 [mcp_servers.genesis-memory]
-command = "python3"
-args = ["scripts/codex_owner_mcp.py", "--server", "memory"]
+command = "sh"
+args = ["-c", 'root=$(git rev-parse --show-toplevel) && exec python3 "$root/scripts/codex_owner_mcp.py" "$@"', "genesis-mcp", "--server", "memory"]
 cwd = "."
 startup_timeout_sec = 30
 env_vars = ["GENESIS_CC_SESSION", "GENESIS_SESSION_ORIGIN"]
@@ -130,8 +132,8 @@ tools.reference_export.approval_mode = "approve"
 tools.reference_lookup.approval_mode = "approve"
 
 [mcp_servers.genesis-outreach]
-command = "python3"
-args = ["scripts/codex_owner_mcp.py", "--server", "outreach"]
+command = "sh"
+args = ["-c", 'root=$(git rev-parse --show-toplevel) && exec python3 "$root/scripts/codex_owner_mcp.py" "$@"', "genesis-mcp", "--server", "outreach"]
 cwd = "."
 startup_timeout_sec = 30
 env_vars = ["GENESIS_CC_SESSION", "GENESIS_SESSION_ORIGIN"]
@@ -142,8 +144,8 @@ tools.outreach_pending.approval_mode = "approve"
 tools.outreach_queue.approval_mode = "approve"
 
 [mcp_servers.genesis-recon]
-command = "python3"
-args = ["scripts/codex_owner_mcp.py", "--server", "recon"]
+command = "sh"
+args = ["-c", 'root=$(git rev-parse --show-toplevel) && exec python3 "$root/scripts/codex_owner_mcp.py" "$@"', "genesis-mcp", "--server", "recon"]
 cwd = "."
 startup_timeout_sec = 30
 env_vars = ["GENESIS_CC_SESSION", "GENESIS_SESSION_ORIGIN"]

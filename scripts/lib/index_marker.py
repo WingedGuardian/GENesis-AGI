@@ -324,17 +324,33 @@ def _connect(wait_s: float = LOCK_WAIT_S, *, allow_convert: bool = False) -> sql
     # reports it as an observation error until its next write initializes it.
     if not existed and not allow_convert and _update_in_progress():
         raise QueueConversionDeferred("index queue creation deferred during an update")
-    db = sqlite3.connect(path, timeout=wait_s, isolation_level=None)
-    db.row_factory = sqlite3.Row
+    db = _configured_connection(path, wait_s)
     try:
-        db.execute(f"PRAGMA busy_timeout={max(1, int(wait_s * 1000))}")
-        db.execute("PRAGMA synchronous=FULL")
-        db.execute("PRAGMA foreign_keys=ON")
         _initialize(db, allow_convert=allow_convert)
         return db
     except BaseException:
         db.close()
         raise
+
+
+def _configured_connection(path, wait_s, *, uri=False):
+    db = sqlite3.connect(path, timeout=wait_s, isolation_level=None, uri=uri)
+    db.row_factory = sqlite3.Row
+    try:
+        db.execute(f"PRAGMA busy_timeout={max(1, int(wait_s * 1000))}")
+        db.execute("PRAGMA synchronous=FULL")
+        db.execute("PRAGMA foreign_keys=ON")
+        return db
+    except BaseException:
+        db.close()
+        raise
+
+
+def _connect_existing():
+    path = database_path()
+    if not _legacy.rollback_queue_present(path):
+        raise QueueConversionDeferred("existing rollback-journal schema5 queue required")
+    return _configured_connection(path.as_uri() + "?mode=rw", OUTCOME_LOCK_WAIT_S, uri=True)
 
 
 @contextmanager
@@ -344,7 +360,7 @@ def _transaction(db):
             db.execute("BEGIN IMMEDIATE")
         except sqlite3.OperationalError as exc:
             if _is_busy(exc):
-                raise TimeoutError("index-request queue busy; request not changed") from exc
+                raise _legacy.QueueBusy("index-request queue busy; request not changed") from exc
             raise
         yield db
         db.commit()
@@ -396,7 +412,11 @@ def _queue_gate(*, native=False, admission=None):
 
 
 @contextmanager
-def _decision_gate(*, native=False, admission=None):
+def _decision_gate(*, native=False, admission=None, existing=False):
+    if existing:
+        with _recovery.decision_gate(None, globals(), native=native, admission=admission) as decision:
+            yield decision
+        return
     with closing(_connect(OUTCOME_LOCK_WAIT_S)) as db, _recovery.decision_gate(
         db, globals(), native=native, admission=admission
     ) as decision:
@@ -717,8 +737,7 @@ def reconcile_native() -> list[str]:
 def reserve_launch(context: dict, data: dict) -> str:
     context = _native.context(context, _legs, marker_hash)
     data = _native.reservation(data, context)
-    with _queue_gate(native=True, admission=(context["hash"], context["provider"])) as db:
-        state = _native.reserve(db, context, data, _legs, fresh_cleanup=_fresh_gate(db))
+    state = _retry.launch_transition(globals(), context, data, _native.reserve)
     if state in ("conflict", "held"):
         raise RuntimeError("native reservation refused: " + state)
     return state
@@ -732,8 +751,7 @@ def cancel_launch(context: dict) -> str:
 
 def _native_gate(context, data, operation):
     context = _native.context(context, _legs, marker_hash)
-    with _queue_gate(native=True, admission=(context["hash"], context["provider"])) as db:
-        state = operation(db, context, data, _legs, _proof, fresh_cleanup=_fresh_gate(db))
+    state = _retry.launch_transition(globals(), context, data, operation)
     if state in ("conflict", "resource", "held"):
         raise RuntimeError("native launch refused: " + state)
     return state

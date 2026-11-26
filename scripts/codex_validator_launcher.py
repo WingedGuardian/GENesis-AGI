@@ -45,6 +45,7 @@ EXTRA_SOURCES = (
     "scripts/genesis_mcp_server.py",
     ".claude/mcp/run-mcp-server",
     "src/genesis/__init__.py",
+    "src/genesis/caller_context.py",
     "src/genesis/mcp/__init__.py",
     "src/genesis/mcp/external_profiles.py",
     "src/genesis/eval/__init__.py",

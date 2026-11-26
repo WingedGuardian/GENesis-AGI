@@ -198,7 +198,7 @@ _INVALID_MEMORY_SQL = f"""
 """  # noqa: S608 — interpolates a literal predicate constant, never a value
 
 
-async def invalid_memory_ids(db: aiosqlite.Connection) -> set[str]:
+async def invalid_memory_ids(db: aiosqlite.Connection, *, as_of: str | None = None) -> set[str]:
     """Memories normal recall hides — bitemporally expired, or deprecated.
 
     A memory with NO ``memory_metadata`` row is NOT included: that is the
@@ -206,7 +206,7 @@ async def invalid_memory_ids(db: aiosqlite.Connection) -> set[str]:
     ``graph_expansion`` already drops at hydration time and which this
     predicate deliberately leaves alone.
     """
-    now = datetime.now(UTC).isoformat()
+    now = as_of if as_of is not None else datetime.now(UTC).isoformat()
     cursor = await db.execute(_INVALID_MEMORY_SQL, (now,))
     return {row[0] for row in await cursor.fetchall()}
 

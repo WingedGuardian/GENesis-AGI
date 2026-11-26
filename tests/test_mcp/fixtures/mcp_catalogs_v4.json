@@ -100,7 +100,7 @@
     {
       "name": "board_status",
       "title": "Board Status",
-      "description": "The work board as the reconciler last read it: counts by column, by\nGenesis status and by kind, coverage (open repo issues and PRs on the board\nagainst the repo's open total), drags logged, and whether the reconciler is\nalive. Reads stored heartbeats only, never GitHub, so it is cheap and safe.\n\n``latest`` is the newest pulse (mode, paused, any error); ``summary`` is the\nnewest SUCCESSFUL read and its age. A board that is off or not set up has a\npulse but no summary, and says so.",
+      "description": "The work board as the reconciler last read it: counts by column, by\nGenesis status and by kind, coverage (open repo issues and PRs on the board\nagainst the repo's open total), drags logged, what the last tick wrote (or\nwould have written, outside ``live``), and whether the reconciler is alive.\nReads stored heartbeats only, never GitHub, so it is cheap and safe.\n\n``latest`` is the newest pulse (mode, paused, any error); ``summary`` is the\nnewest SUCCESSFUL read and its age. A board that is off or not set up has a\npulse but no summary, and says so.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -3688,7 +3688,7 @@
     {
       "name": "memory_expand",
       "title": "Memory Expand",
-      "description": "Fetch full content + graph neighbors for specific memory IDs.\n\nUse after a compact memory_recall to selectively expand interesting results.\nAccepts full UUIDs or the proactive hook's short handles (``id:xxxxxxxx``\nor bare 8-char hex prefixes). Returns full RetrievalResult data with graph\nenrichment for each ID found; unresolved or ambiguous handles are reported\nin a trailing ``{\"not_found\": [...], \"ambiguous\": [...]}`` entry instead\nof being silently dropped.",
+      "description": "Fetch full content + graph neighbors for specific memory IDs.\n\nUse after a compact memory_recall to selectively expand interesting results.\nAccepts full UUIDs or the proactive hook's short handles (``id:xxxxxxxx``\nor bare 8-char hex prefixes). Returns full RetrievalResult data with graph\nenrichment for each ID found; unresolved or ambiguous handles are reported\nin a trailing ``{\"not_found\": [...], \"ambiguous\": [...]}`` entry instead\nof being silently dropped. Each neighbour has a plain ``relation`` and, when\nits text may be shown, a short ``label``.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -3985,7 +3985,7 @@
     {
       "name": "memory_store",
       "title": "Memory Store",
-      "description": "Store memory with source metadata and type tag. Returns memory_id.",
+      "description": "Store memory; return an id, or a supersession report when requested.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -4076,7 +4076,7 @@
               }
             ],
             "default": null,
-            "description": "Memory ID that this new memory replaces. The old memory\nwill be marked as deprecated with a ``succeeded_by`` link to the\nnew one. Use when correcting stale facts."
+            "description": "Memory ID that this new memory replaces. The old memory\nis deprecated and linked to the correction. Returns memory_id,\nsuperseded, and full old_id/new_id; incomplete supersession includes\nthe exact memory_supersede repair call. Blank input is no request."
           }
         },
         "required": [
@@ -4087,7 +4087,15 @@
       "outputSchema": {
         "properties": {
           "result": {
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            ]
           }
         },
         "required": [
@@ -4100,7 +4108,7 @@
     {
       "name": "memory_supersede",
       "title": "Memory Supersede",
-      "description": "Deprecate a memory, recording another memory as its correction.\n\nThe supersede on its own, when the correction is ALREADY stored. Use it\nwhen you are linking two memories that both already exist, or whenever you\nknow both ids up front — it is the direct way to say \"this one replaces\nthat one\".\n\nIt does NOT say \"use this when ``memory_store(supersedes=...)`` told you the\ndeprecation failed\", because that tool cannot tell you: ``store()`` catches\na failed deprecation and still returns only the new memory's id, so no such\nreport reaches this boundary. Saying otherwise described a recovery the\ncaller can never be prompted to make.\n\nBoth arguments accept the same short ``id:<8-char>`` handles the proactive\nhook prints and ``memory_expand`` accepts; an ambiguous handle is never\nguessed.\n\nNothing is written unless every check passes, so a REJECTION costs\nnothing and is safe to retry once you have corrected the ids. It raises\nrather than returning a verdict, because there is no stored content whose\nfate you would have to interpret alongside the error — that asymmetry is\nexactly why this exists as its own tool.\n\nRejected, with nothing changed:\n  * either id naming no memory, or a prefix naming several\n  * ``old_id == new_id`` — a memory cannot replace itself\n  * a ``new_id`` that is itself deprecated OR already temporally invalid\n    (past ``invalid_at``) — normal recall filters both out, so the\n    correction would be unreachable while the target went away\n\nOne failure is NOT a rejection: ``SupersedeIncomplete`` means the SQLite\ndeprecation committed but a mirror (the Qdrant payload or the\n``succeeded_by`` link) did not. Retry with the FULL ids the error carries\n(a short handle may re-resolve elsewhere): every step is idempotent, and\nthe retry finishes the vector/graph half. It is not \"nothing happened\":\nthe old memory is already deprecated for keyword recall.",
+      "description": "Deprecate a memory, recording another memory as its correction.\n\nThe supersede on its own, when the correction is ALREADY stored. Use it\nwhen you are linking two memories that both already exist, or whenever you\nknow both ids up front — it is the direct way to say \"this one replaces\nthat one\".\n\nAlso use the full ids reported when ``memory_store(supersedes=...)`` saves\nthe correction but reports superseded=False. This repairs the remaining\nsupersession work without storing another memory.\n\nBoth arguments accept the same short ``id:<8-char>`` handles the proactive\nhook prints and ``memory_expand`` accepts; an ambiguous handle is never\nguessed.\n\nNothing is written unless every check passes, so a REJECTION costs\nnothing and is safe to retry once you have corrected the ids. It raises\nrather than returning a verdict, because there is no stored content whose\nfate you would have to interpret alongside the error — that asymmetry is\nexactly why this exists as its own tool.\n\nRejected, with nothing changed:\n  * either id naming no memory, or a prefix naming several\n  * ``old_id == new_id`` — a memory cannot replace itself\n  * a ``new_id`` that is itself deprecated OR already temporally invalid\n    (past ``invalid_at``) — normal recall filters both out, so the\n    correction would be unreachable while the target went away\n\nOne failure is NOT a rejection: ``SupersedeIncomplete`` means the SQLite\ndeprecation committed but a mirror (the Qdrant payload or the\n``succeeded_by`` link) did not. Retry with the FULL ids the error carries\n(a short handle may re-resolve elsewhere): every step is idempotent, and\nthe retry finishes the vector/graph half. It is not \"nothing happened\":\nthe old memory is already deprecated for keyword recall.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -4562,7 +4570,7 @@
     {
       "name": "reference_lookup",
       "title": "Reference Lookup",
-      "description": "Search stored references (credentials, URLs, IPs, identifiers) with audit logging.\n\nFor the reference store only — use memory_recall for general memories,\nknowledge_recall for ingested documents. Credential-kind entries get\naudit-logged when accessed.\n\nCombines two paths, same pattern as ``knowledge_recall``:\n1. Vector search via ``HybridRetriever.recall(source=\"episodic\")`` over\n   the ``episodic_memory`` Qdrant collection — catches semantic matches\n   (\"that community hobby forum\" → \"ExampleForum login\")\n   that keyword search misses. References live in episodic_memory\n   alongside other personal data.\n2. FTS5 keyword search over ``knowledge_fts`` — catches exact token\n   matches and structured identifiers.\n\nResults are merged and deduped by unit_id, filtered to entries with\n``project_type='reference'`` and the optional kind.\n\n``kind`` (optional): filter results to a single domain, e.g.\n``\"credentials\"``, ``\"url\"``, ``\"network\"``. If omitted, searches all\nreference entries.\n\n``limit`` (default 5): max results returned after dedup + filter.\n\n``accessor_context`` (optional): free-text marker of who/what is asking.\nRecorded in ``credential_access_log`` for any credentials-kind entry\nthat matches, so we keep an audit trail of sensitive lookups.\n\nReturns a list of dicts: ``{unit_id, concept, body, domain, tags,\nconfidence, source_doc, ingested_at, origin}`` where ``origin`` is\n``\"vector\"``, ``\"fts\"``, or ``\"both\"``. When a credentials-kind entry\nsurfaces, an audit row is written to ``credential_access_log``.",
+      "description": "Search stored references (credentials, URLs, IPs, identifiers) with audit logging.\n\nFor the reference store only — use memory_recall for general memories,\nknowledge_recall for ingested documents. Credential-kind entries get\naudit-logged when accessed.\n\nCombines two paths, same pattern as ``knowledge_recall``:\n1. Vector search via ``HybridRetriever.recall(source=\"episodic\")`` over\n   the ``episodic_memory`` Qdrant collection — catches semantic matches\n   (\"that community hobby forum\" → \"ExampleForum login\")\n   that keyword search misses. References live in episodic_memory\n   alongside other personal data.\n2. FTS5 keyword search over ``knowledge_fts`` — catches exact token\n   matches and structured identifiers.\n\nResults are merged and deduped by unit_id, filtered to entries with\n``project_type='reference'`` and the optional kind.\n\n``kind`` (optional): filter results to a single domain, e.g.\n``\"credentials\"``, ``\"url\"``, ``\"network\"``. If omitted, searches all\nreference entries.\n\n``limit`` (default 5): max results returned after dedup + filter.\n\n``accessor_context`` (optional): free-text marker of who/what is asking.\nRecorded in ``credential_access_log`` for any credentials-kind entry\nthat matches, so we keep an audit trail of sensitive lookups.\n\nReturns a list of dicts: ``{unit_id, concept, name, body, domain, tags,\nconfidence, source_doc, ingested_at, origin}`` where ``origin`` is\n``\"vector\"``, ``\"fts\"``, or ``\"both\"``. ``name`` is the entry's searchable\nname; a credential's ``concept`` is its opaque key, which\n``reference_store(entry_key=...)`` takes. When a credentials-kind entry\nsurfaces, an audit row is written to ``credential_access_log``.",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -4621,7 +4629,7 @@
     {
       "name": "reference_store",
       "title": "Reference Store",
-      "description": "Store a persistent reference entry (credential, URL, IP, persona pointer, etc).\n\nPersistent reference data that must be findable from future sessions\nwithout the user having to remind Genesis it exists. Dedup/upsert on\n``(kind, identifier)`` — re-storing the same logical entry updates in\nplace, preserving the stable unit ID.\n\n``kind`` must be one of: credentials, url, network, persona_pointer,\naccount, fact.\n\n``identifier`` is the human-readable name (e.g. \"ExampleForum\nlogin\"). It becomes the unique key ``concept`` field — use the same\nidentifier across re-stores to get upsert semantics.\n\n``value`` is the raw value (password, URL string, IP address, file path,\netc.). Stored plaintext (a credential's value and description outside the search index, so a credential is found by its identifier and tags, which must not contain the value), so an entry holding\na payment card number in any field is refused (the planned card vault\nis tracked in #3172).\n\n``description`` is REQUIRED. An IP without \"what is this\" or a credential\nwithout \"what service\" is useless 10 sessions later. Describes the\ncontext, purpose, or relationship — not just the value itself.\n\n``tags`` are optional extra tags for retrieval (e.g. ``[\"forum\",\n\"persona:example\"]``). The ``reference`` tag and the ``kind`` tag are\nadded automatically.\n\n``source`` is optional provenance (``session_id``, ``captured_via``,\n``captured_at``). Surfaced in the body for audit trails.\n\nReturns the unit_id of the stored row.",
+      "description": "Store a persistent reference entry (credential, URL, IP, persona pointer, etc).\n\nPersistent reference data that must be findable from future sessions\nwithout the user having to remind Genesis it exists. Dedup/upsert on\n``(kind, identifier)`` — re-storing the same logical entry updates in\nplace, preserving the stable unit ID.\n\n``kind`` must be one of: credentials, url, network, persona_pointer,\naccount, fact.\n\n``identifier`` is the human-readable name (e.g. \"ExampleForum\nlogin\"). It becomes the unique key ``concept`` field — use the same\nidentifier across re-stores to get upsert semantics. A credential is\nstored under an opaque key (``cred-...``) instead and found again by its\nfull name, compared without regard to case or spacing.\n\n``entry_key`` (credentials only): the key ``reference_lookup`` returned\nfor an entry. The write updates that entry and keeps the name it records\n(``identifier`` is not used); a key no entry holds is refused. Text that\nmerely looks like a key, passed as ``identifier``, is a name.\n\n``value`` is the raw value (password, URL string, IP address, file path,\netc.). Stored plaintext (a credential's value and description are held\noutside the search index: it is found by its identifier and tags, where\nits value is masked), so an entry holding a payment card\nnumber in any field is refused (card vault: #3172).\n\n``description`` is REQUIRED. An IP without \"what is this\" or a credential\nwithout \"what service\" is useless 10 sessions later. Describes the\ncontext, purpose, or relationship — not just the value itself.\n\n``tags`` are optional extra tags for retrieval (e.g. ``[\"forum\",\n\"persona:example\"]``). The ``reference`` tag and the ``kind`` tag are\nadded automatically.\n\n``source`` is optional provenance (``session_id``, ``captured_via``,\n``captured_at``). Shown in the body; held for credentials.\n\nReturns the stored row's unit_id, followed by\n`` (stored as: <name>)`` when a credential's searchable name differs from\nthe identifier given (it carried its value and was masked, or was capped).",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -4657,6 +4665,17 @@
               {
                 "additionalProperties": true,
                 "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "entry_key": {
+            "anyOf": [
+              {
+                "type": "string"
               },
               {
                 "type": "null"

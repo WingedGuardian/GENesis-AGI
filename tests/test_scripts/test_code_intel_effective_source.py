@@ -8,13 +8,14 @@ from types import SimpleNamespace
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
+WORKER = SimpleNamespace(**runpy.run_path(str(ROOT / "scripts/lib/code_intel_cbm_worker.py")))
 
 
 def identity(**changes):
     values = dict(
         snapshot=SimpleNamespace(commit="a" * 40, files={"scripts/start.py": "b" * 64}),
-        worker=SimpleNamespace(BUILD="c" * 64),
-        config=dict(main="/fixture/repository", cache="/fixture/cache", runtime="/fixture/runtime"),
+        worker=WORKER,
+        config=dict(main="/fixture/repository", cache="/fixture/cache", runtime="/fixture/runtime", build=WORKER.BUILD),
         args=SimpleNamespace(repo_path="/fixture/repository", mode="full", persistence="true"),
         cap=8 * 1024**3,
         settings=b'{"version":2}',
@@ -50,7 +51,7 @@ def test_each_effective_axis_changes_configuration_identity(field):
     if field == "settings":
         changes["settings"] = b'{ "version":2}'
     elif field in ("main", "cache", "runtime"):
-        config = dict(main="/fixture/repository", cache="/fixture/cache", runtime="/fixture/runtime")
+        config = dict(main="/fixture/repository", cache="/fixture/cache", runtime="/fixture/runtime", build=WORKER.BUILD)
         config[field] += "-other"
         changes["config"] = config
     elif field in ("mode", "persistence", "repository"):

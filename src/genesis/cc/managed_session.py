@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import html
 import json
 import logging
 import shutil
@@ -14,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from genesis.db.crud import cc_sessions
+from genesis.outreach.types import OWNER_RELAY_ALERT_SUBJECT
 from genesis.util.atomic import atomic_write_text
 from genesis.util.execution_privacy import private_execution
 
@@ -22,6 +24,85 @@ logger = logging.getLogger(__name__)
 # Terminal native states, written only by _finalize, mapped to the row status
 # its complete()/fail() call would have set.
 _COMMITTED_STATUS = {"succeeded": "completed", "failed": "failed", "cancelled": "failed"}
+
+
+async def _notify_owner_relay(
+    db, sid: str, tool_names=None, *, uncertain=False, ended=None, reason=None
+) -> bool:
+    """Queue one owner alert for a relayed peer session that acted or may have.
+
+    ``tool_names`` is the full, uncapped tool record when the caller has it; the
+    stored ``tools_summary`` is capped, so it is only the fallback. ``uncertain``
+    marks a record that may be missing calls (a partial stream, a restart): the
+    owner is then told the session may have acted even if no acting tool is seen.
+    ``ended`` and ``reason`` are the outcome about to be committed; callers queue
+    the alert BEFORE committing the terminal status, so a restart between the two
+    cannot lose it (``reconcile_orphans`` reads only active sessions). Without
+    them the row's committed outcome is used.
+    Idempotent per session: a retried finalization finds the alert already queued.
+    """
+    from genesis.db.crud import pending_outreach
+    from genesis.peers import relay
+
+    row = await cc_sessions.get_by_id(db, sid)
+    meta = metadata(row) if row else {}
+    if not meta.get("owner_relay"):
+        return False
+    if tool_names is None:
+        summary = meta.get("tools_summary")
+        tool_names = list(summary) if isinstance(summary, dict) else []
+        uncertain = uncertain or not isinstance(summary, dict)
+    tools = relay.acting(tool_names)
+    if not tools and not uncertain:
+        return False
+    pending_id = relay.notice_id(sid)
+    if await pending_outreach.exists(db, pending_id):
+        return False
+    peer = meta.get("peer_id", "a peer")
+    if ended is None:
+        ended = row.get("outcome") or row.get("status") or "unknown"
+        reason = row.get("outcome_reason")
+    if tools:
+        head = (
+            f"[{sid[:8]}] Acted on your behalf via {peer}: used {', '.join(tools)}; ended {ended}."
+        )
+        if uncertain:
+            head += " Its tool record may be incomplete."
+    else:
+        head = (
+            f"[{sid[:8]}] A relayed session via {peer} may have acted: its tool record "
+            f"is incomplete; ended {ended}."
+        )
+    channel = _owner_alert_channel()
+    text = f"{head} {relay.quoted(reason)}"
+    await pending_outreach.enqueue(
+        db,
+        # Escaped where the channel renders HTML: the summary is model-written.
+        message=text if channel == "email" else html.escape(text, quote=False),
+        category="alert",
+        channel=channel,
+        email_subject=OWNER_RELAY_ALERT_SUBJECT,
+        pending_id=pending_id,
+    )
+    return True
+
+
+def _owner_alert_channel() -> str:
+    """The owner's alert channel, as the outreach pipeline chooses one: the queue
+    stores a channel, so a literal would bypass the install's preference."""
+    from genesis.outreach.config import load_outreach_config
+
+    try:
+        prefs = load_outreach_config().channel_preferences
+    except Exception as exc:
+        logger.warning(
+            "Outreach config unreadable; owner alert on telegram (exception=%s)", type(exc).__name__
+        )
+        return "telegram"
+    channel = prefs.get("alert", prefs.get("default", "telegram"))
+    # The queue's channel column is NOT NULL: a blank or null preference would
+    # otherwise fail every finalization retry.
+    return channel if isinstance(channel, str) and channel.strip() else "telegram"
 
 
 def _failure_outcome(partial, error) -> tuple[str, str | None]:
@@ -128,9 +209,38 @@ async def reconcile_orphans(db) -> int:
         for row in await cc_sessions.query_active(db)
         if row.get("source_tag") == "agent_api" and "managed_fingerprint" in metadata(row)
     ]
+    skipped = 0
     for row in orphaned:
         meta = metadata(row)
         finished = _COMMITTED_STATUS.get(meta.get("native_state"))
+        outcome = reason = None
+        if finished == "failed":
+            outcome, reason = _failure_outcome(meta.get("result_partial"), meta.get("error"))
+        elif finished is None:
+            reason = "outcome_unknown"
+        # A relayed session cut off by a restart may have acted unseen. The alert
+        # is queued before the status leaves active: if it cannot be queued, the
+        # row stays active and the next boot tries again, rather than losing it.
+        try:
+            if meta.get("owner_relay"):
+                # The outcome update_status is about to store, its default included.
+                status = finished or "failed"
+                await _notify_owner_relay(
+                    db,
+                    row["id"],
+                    uncertain=True,
+                    ended=outcome or cc_sessions._DEFAULT_OUTCOME.get(status, status),
+                    reason=reason,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Owner-relay notice not queued for orphan %s; left for the next boot "
+                "(exception=%s)",
+                row["id"][:8],
+                type(exc).__name__,
+            )
+            skipped += 1
+            continue
         if finished is not None:
             usage = meta.get("usage")
             if isinstance(usage, dict):
@@ -143,9 +253,6 @@ async def reconcile_orphans(db) -> int:
                         output_tokens=int(usage.get("output_tokens") or 0),
                     )
             # The outcome _finalize would have recorded, from what it committed.
-            outcome = reason = None
-            if finished == "failed":
-                outcome, reason = _failure_outcome(meta.get("result_partial"), meta.get("error"))
             await cc_sessions.update_status(
                 db, row["id"], status=finished, outcome=outcome, outcome_reason=reason
             )
@@ -154,7 +261,7 @@ async def reconcile_orphans(db) -> int:
         await cc_sessions.update_status(
             db, row["id"], status="failed", outcome_reason="outcome_unknown"
         )
-    return len(orphaned)
+    return len(orphaned) - skipped  # the rows reconciled; skipped ones stay active
 
 
 async def run_managed(runner, request, sid: str, cancel: asyncio.Event):
@@ -170,7 +277,9 @@ async def run_managed(runner, request, sid: str, cancel: asyncio.Event):
     worker = None
     state, error = "failed", "execution_failed"
     result = DirectSessionResult(session_id=sid)
-    isolation = isolated_provider(contained=True) if request.contained_peer else contextlib.nullcontext()
+    isolation = (
+        isolated_provider(contained=True) if request.contained_peer else contextlib.nullcontext()
+    )
     with isolation, private_execution():
         try:
             row = await cc_sessions.get_by_id(db, sid)
@@ -255,7 +364,9 @@ async def _execute(runner, request, sid):
     _set_obs_session(sid)
     await runner._check_background(request)
     await runner._session_manager.start_prepared(sid)
-    await update_state(runner._session_manager.db, sid, "running")
+    # ``launched`` outlives the state: a cancel or deadline later rewrites
+    # native_state, and _finalize must still know the child ran.
+    await update_state(runner._session_manager.db, sid, "running", launched=True)
     start = time.monotonic()
     telemetry = []
 
@@ -291,8 +402,16 @@ async def _finalize(runner, request, result, state):
         committed = True
     except Exception:
         state, result.success, result.error = "failed", False, "result_unavailable"
+    launched = None
     while True:
         try:
+            if launched is None:
+                # Read before _store_result overwrites it: _execute marks the receipt
+                # running just before invoking the child, so only a run that got that
+                # far can have stopped with part of its stream unread.
+                row = await cc_sessions.get_by_id(runner._session_manager.db, result.session_id)
+                meta = metadata(row) if row else {}
+                launched = bool(meta.get("launched")) or meta.get("native_state") == "running"
             await runner._store_result(
                 result.session_id,
                 request,
@@ -326,6 +445,30 @@ async def _finalize(runner, request, result, state):
                 output_tokens=result.output_tokens,
             )
             if result.success:
+                outcome, reason = None, result.outcome_reason
+                ended = result.outcome or "unreported"  # what complete() would store
+            else:
+                outcome, reason = _failure_outcome(result.partial, result.error)
+                ended = outcome or "failed"
+            # Queued before the terminal status: a restart after that commit would
+            # otherwise lose the alert, since boot reconciliation reads only active
+            # sessions. Inside the retry loop, so a failed insert is retried, not
+            # dropped; the notice id makes a retry queue nothing twice.
+            await _notify_owner_relay(
+                runner._session_manager.db,
+                result.session_id,
+                [t.get("name") for t in result.tools_called or () if isinstance(t, dict)],
+                # A launched run that did not succeed may have stopped before its
+                # stream was read to the end, so its tool record may be missing calls.
+                uncertain=bool(
+                    result.partial
+                    or result.stream_lines_dropped
+                    or (launched and state != "succeeded")
+                ),
+                ended=ended,
+                reason=reason,
+            )
+            if result.success:
                 await runner._session_manager.complete(
                     result.session_id,
                     cost_usd=result.cost_usd,
@@ -336,7 +479,6 @@ async def _finalize(runner, request, result, state):
                     outcome_reason=result.outcome_reason,
                 )
             else:
-                outcome, reason = _failure_outcome(result.partial, result.error)
                 await runner._session_manager.fail(
                     result.session_id, reason=reason, outcome=outcome
                 )

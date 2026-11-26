@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_scripts.managed_code_intel_fixture import qualify_bytes
 from tests.test_scripts.test_codebase_managed_config import config
 from tests.test_scripts.test_codebase_managed_config import managed as managed  # noqa: F401
 from tests.test_scripts.test_codebase_managed_config import (
@@ -90,17 +91,15 @@ def test_inaccessible_mutable_state_refuses_without_writes(managed, tmp_path, mo
 
 
 def test_verified_binary_requires_effective_execute_access(managed, tmp_path, monkeypatch):
-    import hashlib
-
     binary = tmp_path / "owned-binary"
     binary.write_bytes(b"owned fixture bytes")
-    monkeypatch.setitem(managed.verified_binary.__globals__, "BUILD", hashlib.sha256(binary.read_bytes()).hexdigest())
+    digest, = qualify_bytes(monkeypatch, managed.qualified_release, binary.read_bytes())
     original_mode = binary.stat().st_mode
     binary.chmod(0o401)  # owner can read; only other users can execute
     try:
         if os.access(binary, os.X_OK, effective_ids=True):
             pytest.skip("effective accepted-binary execute-denial premise defeated")
-        with pytest.raises(ValueError, match="executable"), managed.verified_binary(binary):
+        with pytest.raises(ValueError, match="executable"), managed.verified_binary(binary, digest):
             pass
     finally:
         binary.chmod(original_mode)
@@ -170,8 +169,6 @@ def test_future_readwrite_file_needs_only_write_search_on_existing_parent(manage
 
 
 def test_execute_access_uses_the_accepted_inode(managed, tmp_path, monkeypatch):
-    import hashlib
-
     binary = tmp_path / "binary"
     binary.write_bytes(b"accepted")
     binary.chmod(0o500)
@@ -187,8 +184,8 @@ def test_execute_access_uses_the_accepted_inode(managed, tmp_path, monkeypatch):
         return real_access(path, mode, effective_ids=effective_ids)
 
     monkeypatch.setattr(os, "access", replace_before_access)
-    monkeypatch.setitem(managed.verified_binary.__globals__, "BUILD", hashlib.sha256(b"accepted").hexdigest())
-    with managed.verified_binary(binary) as stream:
+    digest, = qualify_bytes(monkeypatch, managed.qualified_release, b"accepted")
+    with managed.verified_binary(binary, digest) as stream:
         assert stream.read() == b"accepted"
     assert observed == [b"accepted"]
     assert binary.read_bytes() == b"foreign"

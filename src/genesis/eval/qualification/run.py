@@ -3,6 +3,7 @@
 import json
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 from genesis.eval.qualification import contracts, corpus, pinned, preflight, sampling
 from genesis.eval.qualification.accounting import reconstruct, validate_manifest
@@ -59,7 +60,7 @@ def admission_identity(checked):
     return deepcopy(shared)
 
 
-def validate_campaign(manifest, checked, alias, *, cases=None):
+def validate_campaign(manifest, checked, alias, *, cases=None, allow_native=False):
     """All frozen coordinates and wire bodies must match complete current admission."""
     validate_manifest(manifest)
     binding = manifest["binding"]
@@ -70,21 +71,18 @@ def validate_campaign(manifest, checked, alias, *, cases=None):
         raise Incomplete("campaign_transport_mismatch")
     transport = transports[alias]
     params, model = checked["parameters"][alias], checked["models"][alias]
-    required = {
-        "model": model, "params": params, "endpoint": pinned.ENDPOINT,
-        "generation_namespace": "openrouter",
-    }
-    if not isinstance(transport, dict) or any(
-        canonical(transport.get(key)) != canonical(value) for key, value in required.items()
-    ):
-        raise Incomplete("campaign_transport_mismatch")
-    identities = pinned.model_identities(transport)
-    receipt_policy = pinned.frozen_receipt_policy(transport)
+    from .transports import select
+
+    profile = select(alias, transport)
+    if profile is not pinned and not allow_native:
+        raise Incomplete("native_requires_bounded_study")
+    profile.validate_binding(transport, SimpleNamespace(model_id=model), params)
     fingerprint = transport.get("credential_fingerprint")
     if (not isinstance(fingerprint, str) or len(fingerprint) != 64
         or any(char not in "0123456789abcdef" for char in fingerprint)
         or any(not isinstance(transport.get(key), str) or not transport[key].strip()
-               for key in ("receipt_provider", "provider_identity_evidence"))):
+               for key in (("receipt_provider", "provider_identity_evidence") if profile is pinned
+                           else ("provider_identity_evidence",)))):
         raise Incomplete("campaign_identity_missing")
     selected = sampling.coordinates(manifest, checked, alias, cases=cases)
     expected = {}
@@ -94,15 +92,17 @@ def validate_campaign(manifest, checked, alias, *, cases=None):
                 continue
             for repetition in REPETITIONS:
                 coordinate = contract, checked["versions"][contract], identity, repetition, row["prompt_hash"]
-                expected[coordinate] = digest(pinned.request_body(model, params, contract, row["messages"]))
+                expected[coordinate] = digest(profile.request_body(model, params, contract, row["messages"]))
     actual = {}
     fields = {
         "alias": alias, "model": model, "upstream": params["upstream"],
-        "endpoint": pinned.ENDPOINT + "/chat/completions", "generation_namespace": "openrouter",
+        "endpoint": profile.ENDPOINT + "/chat/completions", "generation_namespace": profile.NAMESPACE,
         **{key: transport[key] for key in (
-            "credential_fingerprint", "receipt_provider", "provider_identity_evidence"
+            "credential_fingerprint", "provider_identity_evidence"
         )},
     }
+    if profile is pinned:
+        fields["receipt_provider"] = transport["receipt_provider"]
     mode = pinned.frozen_credential_mode(transport)
     for row in manifest["attempts"]:
         coordinate = tuple(row.get(key) for key in (
@@ -111,10 +111,9 @@ def validate_campaign(manifest, checked, alias, *, cases=None):
         if (any(not isinstance(coordinate[index], str) for index in (0, 1, 2, 4))
             or type(row.get("repetition")) is not int or coordinate in actual
             or pinned.frozen_credential_mode(row) != mode
-            or pinned.model_identities(row) != identities
-            or pinned.frozen_receipt_policy(row) != receipt_policy
             or any(canonical(row.get(key)) != canonical(value) for key, value in fields.items())):
             raise Incomplete("campaign_schedule_mismatch")
+        profile.validate_attempt(row, transport)
         actual[coordinate] = row["request_hash"]
     if canonical(sorted(actual.items())) != canonical(sorted(expected.items())):
         raise Incomplete("campaign_schedule_mismatch")
@@ -209,13 +208,16 @@ async def _case(name, case, router, sandbox):
         from genesis.eval.qualification.storage import replay
 
         mapping = contracts.candidate_mapping(case, messages, result["candidate_ids"])
+        attempt = router.campaign.attempt(router.served[case["id"]])
+        observation, = attempt["observations"]
         result["storage"] = await replay(
-            case, messages, mapping, content, sandbox, router.alias, router.cfg.model_id
+            case, messages, mapping, content, sandbox, router.alias, router.cfg.model_id,
+            served_model=observation.get("response_model"),
         )
     return result
 
 
-async def score(cases, router, temp_root):
+async def score(cases, router, temp_root, *, stop_on_error=False):
     """Serial orchestration. A local fault stops subsequent acquisition, not just scoring."""
     records, clamped, stopped = {}, {}, False
     attempts = {coordinate[:4]: attempt for coordinate, attempt in router.schedule.items()}
@@ -252,6 +254,9 @@ async def score(cases, router, temp_root):
                     else:
                         rows[identity] = _record(name, case, result)
                         clamped[name] += _clamped(name, router.calls[0][1])
+                        if stop_on_error and result["error"]:
+                            router.stop_processing(identity, Incomplete("model_output_invalid"))
+                            stopped = True
     return records, clamped
 
 
