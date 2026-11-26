@@ -13553,6 +13553,7 @@ _RECEIPT_ROWS = (
     "pin-receipts",
     "codex-at-head",
     "body-file",
+    "terminal-head",
     "review-body",
     "inline-findings",
     "scheduled-claude",
@@ -18204,6 +18205,9 @@ def _run_merge_and_push_gates() -> int:
                         file=sys.stderr,
                     )
                     return 2
+                # Both passes read the budget and judged it (below terminal, or at
+                # the terminal head): no sigil waives this gate, so it is only ok.
+                _RECEIPT_OUTCOMES["terminal-head"] = "ok"
 
                 # Unresolved review findings (review body) — AFTER freshness +
                 # binding (see the ordering note above). Waived by

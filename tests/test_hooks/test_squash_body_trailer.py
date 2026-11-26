@@ -609,7 +609,7 @@ def test_an_allowed_merge_leaves_its_receipt_in_the_body_file(monkeypatch, capsy
     assert receipt == {
         "Gate-verdict": "PASSED",
         # pin-receipts and rework are out of scope for this PR (n/a), not ok.
-        "Gate-rows": "mergeable=ok ci=ok base-branch=ok pin-receipts=n/a codex-at-head=ok body-file=ok review-body=ok inline-findings=ok scheduled-claude=ok rework=n/a",
+        "Gate-rows": "mergeable=ok ci=ok base-branch=ok pin-receipts=n/a codex-at-head=ok body-file=ok terminal-head=ok review-body=ok inline-findings=ok scheduled-claude=ok rework=n/a",
         "Gate-sigils": "none",
         "Gate-session": "abcdef12",
         "Gate-install": "1234abcd",
@@ -1159,3 +1159,38 @@ def test_the_override_merge_with_the_printed_command_gets_its_receipt(monkeypatc
     rc = _drive(monkeypatch, _merge("--body-file", path) + "  # ci-override")
     assert rc == 0, capsys.readouterr().err
     assert _receipt_of(path)["Gate-sigils"] == "ci-override=ci:green"
+
+
+# ── every blocking gate has a receipt row (round 2, #5027) ───────────────────
+
+#: Each gate call the merge branch makes, mapped to the receipt row it records.
+#: `_require_match_head` binds the merge to the head the Codex gate verified, so
+#: it belongs to that row; `_check_e2e_plan` is advisory and never blocks.
+_GATE_ROW = {
+    "_check_mergeable": "mergeable",
+    "_pr_ci_status": "ci",
+    "_check_base_is_default": "base-branch",
+    "_check_pin_receipts": "pin-receipts",
+    "_check_codex_reviewed_head": "codex-at-head",
+    "_require_match_head": "codex-at-head",
+    "_check_squash_body_file": "body-file",
+    "_check_past_terminal": "terminal-head",
+    "_check_pr_review_findings": "review-body",
+    "_check_inline_review_findings": "inline-findings",
+    "_check_scheduled_claude_reviewed_head": "scheduled-claude",
+    "_check_rework": "rework",
+}
+_ADVISORY = {"_check_e2e_plan"}
+
+
+def test_every_gate_the_merge_branch_runs_has_a_receipt_row():
+    """A gate added to the merge arm without a row would let a receipt read
+    PASSED without recording it (CodeRabbit, round 2): fail here instead."""
+    import re
+
+    src = Path(_mod.__file__).read_text()
+    start = src.index("        if merge_pr_segs:\n")
+    end = src.index("        # ── sqlite3 write operations", start)
+    called = set(re.findall(r"\b(_check_[a-z0-9_]+|_require_match_head|_pr_ci_status)\(", src[start:end]))
+    assert called - _ADVISORY <= set(_GATE_ROW), f"gate(s) with no receipt row: {called - _ADVISORY - set(_GATE_ROW)}"
+    assert set(_GATE_ROW.values()) == set(_mod._RECEIPT_ROWS)
