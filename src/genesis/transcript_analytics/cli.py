@@ -60,6 +60,13 @@ def _positive_window(value):
     return parsed
 
 
+def _is_default_projects(path) -> bool:
+    """Is ``path`` Claude Code's own projects directory, the shipped default?"""
+    from genesis.env import claude_home
+
+    return Path(path) == claude_home() / "projects"
+
+
 def cmd_ingest(args) -> int:
     from genesis.transcript_analytics import scrub, store
 
@@ -68,6 +75,13 @@ def cmd_ingest(args) -> int:
     if args.timer and _disabled(args):
         print("transcript-analytics: disabled by lever; nothing done")
         return 0
+    if args.timer and not os.path.lexists(args.projects) and _is_default_projects(args.projects):
+        # A fresh install has no transcripts until Claude Code first creates its
+        # own projects directory: a skipped tick, not a failure. A configured
+        # path that is missing is a wrong setting, so it still fails by name, as
+        # does a manual ingest and a dangling link (the store's strict resolve).
+        print(f"transcript-analytics: no transcripts yet at {args.projects}; skipped")
+        return 75  # the unit's SuccessExitStatus
     try:
         options = {"since_days": args.since}
         if getattr(args, "adopt_projects_root", False):
