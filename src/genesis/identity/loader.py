@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import logging
 import os
 import re
@@ -445,18 +446,23 @@ class IdentityLoader:
         The read-modify-write holds a lock on the identity directory (held for
         milliseconds; the server is the only writer today) and swaps in a
         fresh 0600 file, fsynced, created under a random name. Returns whether
-        a rule was written; each write is logged with the full rule.
+        a rule was written. Logs name a rule by a short key, never its text: the
+        text is private (gitignored, 0600) and the journal reaches diagnostics.
         """
         safe_rule = re.sub(r"(?m)^\s*---\s*$", "—", "\n".join(rule.strip().splitlines()))
         if not safe_rule:
             return False
-        if len(safe_rule) > _MAX_RULE_CHARS or any(
-            _STRUCTURE_LINE.search(line) for line in safe_rule.splitlines()
-        ):
+        structure = [
+            n for n, line in enumerate(safe_rule.splitlines(), 1) if _STRUCTURE_LINE.search(line)
+        ]
+        if len(safe_rule) > _MAX_RULE_CHARS or structure:
+            reason = (
+                f"over {_MAX_RULE_CHARS} chars"
+                if len(safe_rule) > _MAX_RULE_CHARS
+                else f"a heading, comment or note on line {structure[0]}"
+            )
             logger.warning(
-                "Steering rule refused: %d chars (at most %d) or a heading, comment "
-                "or note line: %r",
-                len(safe_rule), _MAX_RULE_CHARS, safe_rule[:200],
+                "Steering rule refused (%s; %d chars, key %s)", reason, len(safe_rule), _rule_tag(safe_rule)
             )
             return False
         path = self._dir / "STEERING.local.md"
@@ -465,8 +471,14 @@ class IdentityLoader:
             fcntl.flock(fd, fcntl.LOCK_EX)
             # First, so the resolver read below never opens a symlink or a FIFO.
             text = _read_regular_file(path)
-            in_force = self._parse_rules(read_identity("STEERING.md", self._dir) or "")
-            if _rule_key(safe_rule) in {_rule_key(r) for r in in_force}:
+            # A staging file only outlives a write killed mid-swap; the lock means
+            # no other writer is using one, so any left here is garbage. Only
+            # mkstemp's own names (8 of [a-z0-9_]) are removed.
+            for stale in self._dir.glob("." + "?" * 8 + "." + path.name):
+                if re.fullmatch(r"\.[a-z0-9_]{8}\." + re.escape(path.name), stale.name):
+                    stale.unlink(missing_ok=True)
+            if _rule_key(safe_rule) in _in_force_keys(read_identity("STEERING.md", self._dir) or ""):
+                logger.debug("Steering rule already in force (key %s)", _rule_tag(safe_rule))
                 return False
             # Every rule follows a separator, the first one too: the resolver
             # and _parse_rules read a file's first block as a preamble, never a
@@ -485,7 +497,7 @@ class IdentityLoader:
         finally:
             os.close(fd)
             self._cache.pop("STEERING.md", None)
-        logger.info("Steering rule written to %s (%d chars): %s", path, len(safe_rule), safe_rule)
+        logger.info("Steering rule written to %s (%d chars, key %s)", path.name, len(safe_rule), _rule_tag(safe_rule))
         return True
 
     def reload(self) -> None:
@@ -505,8 +517,30 @@ class IdentityLoader:
 
 
 def _rule_key(rule: str) -> str:
-    """A rule compared for duplicates: NFKC, whitespace runs collapsed."""
-    return " ".join(unicodedata.normalize("NFKC", rule).split())
+    """A rule compared for duplicates: NFC, whitespace runs collapsed.
+
+    NFC, never NFKC or casefold: those fold characters that mean different
+    things (a fullwidth digit, a superscript, a flag's case), and a false
+    match drops a distinct owner rule, where a missed one only stores a
+    duplicate.
+    """
+    return " ".join(unicodedata.normalize("NFC", rule).split())
+
+
+def _rule_tag(rule: str) -> str:
+    """A short, text-free name for a rule in logs."""
+    return hashlib.sha256(_rule_key(rule).encode("utf-8")).hexdigest()[:12]
+
+
+def _in_force_keys(resolved: str) -> set[str]:
+    """Keys of every block of the resolved steering text, the first one too: a
+    hand-written local or replace layer often has no separator. Whole blocks
+    only, never single lines: a line of a longer rule is not that rule, and a
+    false match would drop the new one. An accepted rule never holds a heading,
+    so it can never equal the shipped preamble or a shipped block.
+    """
+    resolved = re.sub(r"\A_\[The shipped .*?\]_\n\n", "", resolved)
+    return {_rule_key(b) for b in (b.strip() for b in ("\n" + resolved).split("\n---\n")) if b}
 
 
 def _read_regular_file(path: Path) -> str:

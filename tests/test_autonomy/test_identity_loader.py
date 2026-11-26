@@ -218,6 +218,55 @@ class TestAddSteeringRule:
         assert loader.steering_rules() == ["my rule", "new rule"]
         assert "replaced by STEERING.local.md" in loader.steering()
 
+    def test_logs_never_carry_the_rule_text(self, loader: IdentityLoader, caplog) -> None:
+        """The rule is private (gitignored, 0600); the journal reaches diagnostics."""
+        caplog.set_level("DEBUG", logger="genesis.identity.loader")
+        loader.add_steering_rule("Never mention PRIVATE-MARKER-1")
+        loader.add_steering_rule("PRIVATE-MARKER-2 " + "x" * 700)  # refused: too long
+        loader.add_steering_rule("# PRIVATE-MARKER-3")  # refused: a heading
+        text = " ".join(r.getMessage() for r in caplog.records)
+        assert "PRIVATE-MARKER" not in text, text
+        assert "written" in text and "refused" in text
+
+    @pytest.mark.parametrize(("first", "second"), [("report-1.csv", "report-\uff11.csv"), ("x\u00b2", "x2")])
+    def test_compatibility_variants_are_distinct_rules(self, loader: IdentityLoader, first, second) -> None:
+        """NFKC would fold these together and drop the second rule."""
+        assert loader.add_steering_rule(f"Never touch {first}")
+        assert loader.add_steering_rule(f"Never touch {second}")
+
+    def test_canonically_equal_rules_merge(self, loader: IdentityLoader) -> None:
+        assert loader.add_steering_rule("Never say caf\u00e9")
+        assert not loader.add_steering_rule("Never say cafe\u0301")
+
+    @pytest.mark.parametrize(
+        "local",
+        [
+            "Never X\n",  # local-only body, no separator
+            "<!-- genesis: replace -->\nNever X\n",  # hand-written replace layer
+        ],
+    )
+    def test_a_rule_already_in_force_is_not_added_again(self, loader: IdentityLoader, local) -> None:
+        (loader._dir / "STEERING.local.md").write_text(local, encoding="utf-8")
+        assert not loader.add_steering_rule("Never X")
+        assert (loader._dir / "STEERING.local.md").read_text(encoding="utf-8") == local
+
+    def test_a_line_of_a_longer_rule_does_not_block_a_new_rule(self, loader: IdentityLoader) -> None:
+        """A false duplicate would drop the new (here stronger) rule."""
+        (loader._dir / "STEERING.local.md").write_text(
+            "---\n\nNever push to main\nunless the owner approves in chat\n", encoding="utf-8"
+        )
+        assert loader.add_steering_rule("Never push to main")
+
+    def test_a_staging_file_left_by_a_killed_write_is_swept(self, loader: IdentityLoader) -> None:
+        stale = loader._dir / ".abcd1234.STEERING.local.md"
+        stale.write_text("half a write\n", encoding="utf-8")
+        mine = loader._dir / ".backup-1.STEERING.local.md"  # not a mkstemp name: kept
+        mine.write_text("kept\n", encoding="utf-8")
+        loader.add_steering_rule("Fresh rule")
+        assert loader.add_steering_rule("Fresh rule") is False  # a duplicate still sweeps
+        assert not stale.exists()
+        assert mine.exists()
+
     def test_cache_cleared_after_add(self, loader: IdentityLoader) -> None:
         # Read steering to populate cache
         original = loader.steering()

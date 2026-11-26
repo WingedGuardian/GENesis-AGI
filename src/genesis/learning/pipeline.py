@@ -491,7 +491,7 @@ def build_triage_pipeline(
         rule = user_text
         if not loader.add_steering_rule(rule):
             return None  # already in force: nothing written, nothing to emit
-        logger.info("Auto-added steering rule from user correction: %.80s...", rule)
+        logger.info("Auto-added steering rule from user correction (%d chars)", len(rule))
         # Return the written rule so the caller can distinguish a REAL write
         # from a directive-filter reject (the WS-3 gate-2 emit fires only on
         # actual writes -- a reject is a non-event).
@@ -521,7 +521,7 @@ def build_triage_pipeline(
             context=context,
             severity=0.5,  # Default; V4 will LLM-assess severity
         )
-        logger.info("BIS: captured behavioral correction: %.60s...", user_text)
+        logger.info("BIS: captured behavioral correction (%d chars)", len(user_text))
 
     def _record_call_site(*, triage_depth: str | None) -> None:
         """Best-effort record to call_site_last_run (async fire-and-forget)."""
