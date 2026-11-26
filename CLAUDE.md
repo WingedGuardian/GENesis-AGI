@@ -166,6 +166,15 @@ components — invoke the `genesis-development` skill via the Skill tool
 immediately. Do NOT load it for Genesis-as-tool work (using
 Genesis to research, summarize, write content, or do non-Genesis tasks).
 
+A foreground development session whose type the owner has not stated is a
+**spec session**: load `spec-session` and write no code unless the change is on
+the spec skill's skip list; otherwise the build happens in a
+build session once a spec and an approved plan exist. The owner names the other
+three (build, closing, validating) when opening the session, or hands over a
+handoff file whose `For:` line names the type, or a spec whose status is
+`approved`. A dispatched session takes its type from its dispatcher's prompt; a
+subagent and a channel conversation have none.
+
 ## Vision
 
 - **Philosophical foundation**: `docs/architecture/genesis-v3-vision.md` —
@@ -635,6 +644,10 @@ gate works, its exemption categories, and the unit rules for size bounds:
   lane and its threshold whenever a non-zero score passes under one, so "it did
   not block" never has to be guessed at. Table and rationale: closing-session
   skill, Pre-Merge Gate.
+  **Past the terminal round an agent merges at one head only** — the round-4 head
+  (the gate-fix lane: its confirmed head), or that head plus empty commits. Any
+  other head, and an unreadable round budget at any count, blocks at merge (the
+  `terminal-head` row): merging it is the user's own merge, or it goes back.
   A PR whose diff touches the
   enforcement-hook surface additionally runs the **gate-fix lane** — wider round 1, and
   a 2-round limit: after round 2, fix commits and one marked confirmation request
@@ -813,7 +826,8 @@ gate works, its exemption categories, and the unit rules for size bounds:
 - **Finish before you stop — the zero-drop rule.** A turn may run as long as
   the work requires; never yield with steps you could still complete AND are
   cleared to complete — stopping for an approval, a blocking question, plan
-  approval, or a designed hard stop is finishing correctly, not dropping
+  approval, a spec line or an approved plan step that cannot be built as
+  written, or a designed hard stop is finishing correctly, not dropping
   work. When something genuinely cannot finish this turn, every unfinished
   piece becomes a tracked row BEFORE stopping: ledger or follow-up — or an
   issue, which still owes the privacy scrub from "Where deferred work goes"

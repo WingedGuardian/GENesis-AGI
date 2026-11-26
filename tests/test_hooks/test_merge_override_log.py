@@ -453,7 +453,7 @@ class TestWiredIntoTheMergePath:
             _mod, "_check_pr_review_findings", lambda n, force=False, repo=None: (False, "")
         )
         monkeypatch.setattr(
-            _mod, "_check_inline_review_findings", lambda n, force=False, repo=None, uncounted_out=None, **_kw: (False, "")
+            _mod, "_check_inline_review_findings", lambda n, force=False, repo=None, uncounted_out=None, head=None, **_kw: (False, "")
         )
         monkeypatch.setattr(
             _mod,

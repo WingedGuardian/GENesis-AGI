@@ -52,7 +52,8 @@ review"). Naming them anchors nothing: it says where the diff is, not what to th
   (`.claude/agents/genesis-architect.md`): scope-drift check first, then the **premise check**
   (Step 0.6 — is this the right change at all, and is it the best available shape?), then the
   BLOCKER / SHOULD-FIX / NOTE ladder with per-finding `file:line` + confidence, completion
-  status last.
+  status, then the `Spec check:` line last. Whenever the build has a spec, the dispatch names
+  the spec's path and the plan's path; this dispatch is the one whose verdict counts.
 - **ALSO `genesis-security-reviewer`** when the diff touches auth, credentials/secrets,
   subprocess, SQL, path handling, external input (Telegram/dashboard/MCP), or hooks/gates.
 - Run them SEQUENTIALLY, almost never in parallel on the same diff (standing rule — the second

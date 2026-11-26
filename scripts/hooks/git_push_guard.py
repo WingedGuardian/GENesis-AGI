@@ -3542,6 +3542,117 @@ _PR_COMMITS_API_CAP = 250
 #: on the merge path, which the merge deadline bounds too; the cap matches the cited
 #: ids one finding may name, so a large round of real fixes is not refused.
 _FIX_CHECK_MAX_COMMITS = 64
+#: Compares (one per finding head) and blob reads one scan may make to check that a
+#: fix is still in the head being merged (#5000). MEASURED: at most 4 finding heads
+#: in one PR, over 264 past cleared findings.
+_FIX_CHECK_MAX_COMPARES = 16
+_FIX_CHECK_MAX_BLOB_READS = 16
+#: GitHub lists at most this many files in a compare; a file past it has no row.
+_COMPARE_FILES_CAP = 300
+#: A listed compare row with one of these statuses differs between the two commits.
+#: GitHub drops line counts and patches on a big compare (MEASURED, #5000: 14 real
+#: fixes listed ``modified`` with 0 changes), so the counts prove nothing; only a
+#: rename can leave the content as it was.
+_COMPARE_CHANGED = frozenset({"modified", "added", "removed", "changed"})
+_FIX_UNCHANGED = "the finding's file is unchanged since the finding was posted (fix reverted?)"
+
+
+def _compare_rows(orig: str, head: str, repo: str | None) -> tuple[str, list[dict]] | None:
+    """``compare/<orig>...<head>``: its status and file rows, or None when unreadable."""
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "api",
+                f"repos/{repo or ':owner/:repo'}/compare/{orig}...{head}",
+                "--jq",
+                "{status: .status, files: [.files[]? | "
+                "{f: .filename, p: .previous_filename, s: .status, c: .changes}]}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(8),
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout or "{}")
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("status"), str):
+        return None
+    files = data.get("files")
+    if not isinstance(files, list):
+        return None
+    return data["status"], [r for r in files if isinstance(r, dict)]
+
+
+#: The blob oid of one path at each of two commits (``_blob_oids``).
+_BLOB_OIDS_QUERY = (
+    "query($owner:String!,$name:String!,$a:String!,$b:String!){"
+    "repository(owner:$owner,name:$name){"
+    "a:object(expression:$a){__typename ... on Blob{oid}} "
+    "b:object(expression:$b){__typename ... on Blob{oid}}}}"
+)
+
+
+def _blob_oids(
+    repo: str | None, at_orig: tuple[str, str], at_head: tuple[str, str]
+) -> tuple[str | None, str | None] | None:
+    """The blob oid of each ``(commit, path)``, None for a path absent there, or None
+    for the pair when the read fails or either path is not a plain file.
+
+    GraphQL, because it answers "absent" as ``null`` apart from an error, where a
+    REST 404 through gh looks the same as a failed read.
+    """
+    if repo is not None and not isinstance(repo, str):
+        return None
+    try:
+        slug = _normalize_repo(repo) if repo else _derive_repo_from_cwd(os.getcwd())
+    except Exception:
+        return None
+    if not slug or "/" not in slug:
+        return None
+    owner, name = slug.split("/", 1)
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "api",
+                "graphql",
+                "-f",
+                f"query={_BLOB_OIDS_QUERY}",
+                "-f",
+                f"owner={owner}",
+                "-f",
+                f"name={name}",
+                "-f",
+                f"a={at_orig[0]}:{at_orig[1]}",
+                "-f",
+                f"b={at_head[0]}:{at_head[1]}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(8),
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout or "{}")
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("errors"):
+        return None
+    got = ((data.get("data") or {}).get("repository")) if isinstance(data.get("data"), dict) else None
+    if not isinstance(got, dict) or "a" not in got or "b" not in got:
+        return None
+    oids: list[str | None] = []
+    for obj in (got["a"], got["b"]):
+        if obj is None:
+            oids.append(None)
+        elif isinstance(obj, dict) and obj.get("__typename") == "Blob" and isinstance(obj.get("oid"), str):
+            oids.append(obj["oid"])
+        else:
+            return None
+    return oids[0], oids[1]
 
 
 class _FixEvidence:
@@ -3550,18 +3661,127 @@ class _FixEvidence:
     Evidence is a single-parent commit of THIS PR that descends from the head the
     finding was posted on and touches the finding's file, or the name a rename in
     this PR gave it. "Descends" is read from parent links: GitHub lists a PR's
-    commits by date, not ancestry (``review_budget``). It proves provenance, not
-    that the change is correct. Every read failure means "not verified": the finding
-    stays blocked and the reason says why, so ``# floor-accept`` is the way through.
+    commits by date, not ancestry (``review_budget``). The fix must also still be in
+    the head being merged (#5000): the cited commit is that head or one of its
+    ancestors, and the finding's file differs there from every head the finding was
+    posted on, so a fully reverted fix does not clear. A partial revert, or a revert
+    hidden by another change to the same file (another fix, a merge of main), still
+    clears; so does a reverted fix whose file was then moved past the compare's
+    300-file cap with its old name reused, or moved where the PR's own file list
+    (base to head) reads the move as a removal, as after a heavy rewrite before the
+    finding. Each needs a revert and a move together. It proves provenance, not that the change is correct. Every read failure means "not verified": the finding stays
+    blocked and the reason says why, so ``# floor-accept`` is the way through.
+
+    ``head`` is the head the merge is bound to; when the caller has none, the PR's
+    current head is read once, on first need.
     """
 
-    def __init__(self, pr_num: str, repo: str | None) -> None:
+    def __init__(self, pr_num: str, repo: str | None, head: str | None = None) -> None:
         self._pr_num = pr_num
         self._repo = repo
+        self._head_arg = head
+        self._head: str | None = None
+        self._head_read = False
         self._commits: tuple[list[dict] | None, bool] | None = None
         self._files: dict[str, set[str] | None] = {}
         self._ancestors: dict[str, set[str]] = {}
         self._claims: dict[str, list[str]] = {}
+        self._compares: dict[str, tuple[str, list[dict]] | None] = {}
+        self._kept_why: dict[tuple[str, str], str | None] = {}
+        self._blob_reads = 0
+
+    def _bound_head(self) -> str:
+        if not self._head_read:
+            self._head_read = True
+            raw = self._head_arg or _pr_head_sha(self._pr_num, repo=self._repo) or ""
+            self._head = raw.strip().lower() if isinstance(raw, str) else ""
+        return self._head or ""
+
+    def _kept(self, path: str, orig: str) -> str | None:
+        """None when ``path`` differs between ``orig`` and the head, otherwise why not."""
+        key = (orig, path)
+        if key not in self._kept_why:
+            self._kept_why[key] = self._kept_read(path, orig)
+        return self._kept_why[key]
+
+    def _kept_read(self, path: str, orig: str) -> str | None:
+        head = self._bound_head()
+        if orig not in self._compares:
+            if len(self._compares) >= _FIX_CHECK_MAX_COMPARES:
+                return f"compare cap reached ({_FIX_CHECK_MAX_COMPARES} finding heads)"
+            if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
+                return "fix could not be verified (merge deadline reached)"
+            self._compares[orig] = _compare_rows(orig, head, self._repo)
+        got = self._compares[orig]
+        if got is None:
+            return "fix could not be verified (compare with the head being merged unreadable)"
+        status, rows = got
+        if status == "identical":
+            return _FIX_UNCHANGED
+        if status != "ahead":
+            return f"fix could not be verified (compare status {status!r})"
+        # A rename's old name first, so a new file reusing that name cannot stand in; a
+        # copy of the file is not the file.
+        row = next((r for r in rows if r.get("p") == path and r.get("s") == "renamed"), None) or next(
+            (r for r in rows if r.get("f") == path and r.get("s") != "renamed"), None
+        )
+        if row is not None:
+            if row.get("s") in _COMPARE_CHANGED:
+                return None
+            if row.get("s") != "renamed":
+                return f"fix could not be verified (compare lists {path} as {row.get('s')!r})"
+            if isinstance(row.get("c"), int) and row["c"] > 0:
+                return None
+            at_head = row.get("f")
+        elif len(rows) < _COMPARE_FILES_CAP:
+            return _FIX_UNCHANGED
+        else:
+            at_head = path
+        capped = row is None
+        if not isinstance(at_head, str) or not at_head:
+            return "fix could not be verified (compare row unreadable)"
+        oids = self._blobs(orig, path, head, at_head)
+        if isinstance(oids, str):
+            return oids
+        if (
+            capped
+            and oids[0] is not None
+            and oids[1] is None
+            and _pr_changed_files(self._pr_num, repo=self._repo) is not None
+        ):
+            # Past the cap, the old path is gone at the head: deleted, or renamed. The
+            # PR's own file list (base to head, not inflated by a merge of main) says
+            # which; anything it cannot confirm stays unverified.
+            dest = _pr_rename_map(self._pr_num, repo=self._repo).get(path)
+            if isinstance(dest, str) and dest:
+                oids = self._blobs(orig, path, head, dest)
+                if isinstance(oids, str):
+                    return oids
+            elif _pr_file_statuses(self._pr_num, repo=self._repo).get(path) == "removed":
+                return None
+        if oids[0] is None or oids[1] is None:
+            return (
+                f"fix could not be verified ({path} at the finding's head, or its name at "
+                "the head being merged, unreadable or absent)"
+            )
+        return _FIX_UNCHANGED if oids[0] == oids[1] else None
+
+    def _blobs(
+        self, orig: str, path: str, head: str, at_head: str
+    ) -> tuple[str | None, str | None] | str:
+        """Blob oids of ``orig:path`` and ``head:at_head``, or why they were not read."""
+        if self._blob_reads >= _FIX_CHECK_MAX_BLOB_READS:
+            return f"blob-read cap reached ({_FIX_CHECK_MAX_BLOB_READS} reads)"
+        if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
+            return "fix could not be verified (merge deadline reached)"
+        self._blob_reads += 1
+        oids = _blob_oids(self._repo, (orig, path), (head, at_head))
+        if oids is None:
+            return (
+                f"fix could not be verified ({path} at the finding's head, or {at_head} at "
+                "the head being merged, unreadable)"
+            )
+        return oids
 
     def _commit_list(self) -> tuple[list[dict] | None, bool]:
         if self._commits is None:
@@ -3654,6 +3874,13 @@ class _FixEvidence:
                 "the head this finding was posted on is gone (rebased or force-pushed), "
                 "so a later fix cannot be proven; only the sigil clears it"
             )
+        head = self._bound_head()
+        if not re.fullmatch(r"[0-9a-f]{40}", head) or head not in parents:
+            return (
+                "the head being merged is unknown or not a full sha of this PR, so a fix "
+                "in it cannot be proven"
+            )
+        head_line = self._ancestry(head, parents) | {head}
         why = ""
         for token in cited:
             if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
@@ -3675,6 +3902,9 @@ class _FixEvidence:
             if not all(o in self._ancestry(sha, parents) for o in origs):
                 why = f"cited commit {token} does not come after the head the finding was posted on"
                 continue
+            if sha not in head_line:
+                why = f"cited commit {token} is not in the head being merged"
+                continue
             if sha not in self._files and len(self._files) >= _FIX_CHECK_MAX_COMMITS:
                 why = f"fix-check cap reached ({_FIX_CHECK_MAX_COMMITS} commits read)"
                 continue
@@ -3683,7 +3913,8 @@ class _FixEvidence:
                 why = f"fix could not be verified (file list of {token} unreadable)"
                 continue
             if touched & self._names(path):
-                return None
+                # Whether the file still differs is the same for every cited commit.
+                return next((w for o in dict.fromkeys(origs) if (w := self._kept(path, o))), None)
             why = f"cited commit {token} does not touch {path}"
         return why
 
@@ -3696,6 +3927,7 @@ def _check_inline_review_findings(
     floor_accept_used: set[int] | None = None,
     repo: str | None = None,
     uncounted_out: list[dict[str, int]] | None = None,
+    head: str | None = None,
     force_waived: list[str] | None = None,
 ) -> tuple[bool, str]:
     """Scan review findings from BOTH delivery channels and apply a weighted score.
@@ -3857,7 +4089,7 @@ def _check_inline_review_findings(
     devin_self_withdrawn: list[str] = []  # cleared by Devin's own reply only — surfaced
     devin_doc_skipped: list[str] = []  # scoring Devin findings on a doc path
     devin_off_diff: list[tuple[str, str]] = []  # scoring Devin findings outside the diff
-    evidence = _FixEvidence(pr_num, repo)
+    evidence = _FixEvidence(pr_num, repo, head)
     floor_verdicts: dict[tuple, bool] = {}
     floor_unmet: list[tuple[int, str, str | None]] = []  # (finding id, why open, its file)
     floor_fixed: set[int] = set()
@@ -5875,15 +6107,23 @@ def _format_rounds(result: dict) -> str:
 
 
 def _rounds_row(
-    pr_num: str, repo: str | None = None, budget_out: list[dict] | None = None
+    pr_num: str,
+    repo: str | None = None,
+    budget_out: list[dict] | None = None,
+    read_out: list[dict] | None = None,
 ) -> str:
     """The ``rounds`` line of ``--check-pr``: ADVISORY, never a failure.
 
     ``budget_out``, when given, receives the evaluator's result if it is ``ok``, so
-    the no-change note reads the same budget instead of fetching it a second time.
+    the no-change note reads the same budget instead of fetching it again.
+    ``read_out`` receives whatever this row read, unreadable included, so the
+    ``terminal-head`` row judges the very read this row printed and the two never
+    disagree.
 
-    The round budget is enforced where it acts (the review-request ask above and
-    the commit gate); counting it here too would be a second enforcer of one rule.
+    The round budget is enforced where it acts (the review-request ask above, the
+    commit gate, and at merge the ``terminal-head`` row, ``_check_past_terminal``,
+    which blocks an unreadable budget and a merge off the terminal head). This
+    line only displays the count.
     It is printed so the round number is read from the evaluator rather than
     re-derived by hand (#1719), with findings per round so a rising count is
     visible without remembering the last one (#1957).
@@ -5895,11 +6135,17 @@ def _rounds_row(
         return seam
     target = repo or _derive_repo_from_cwd(os.getcwd())
     if not target or _review_budget is None:
+        if read_out is not None:
+            read_out.append({"status": "unknown", "errors": ["no repository or evaluator"]})
         return "unreadable (no repository or evaluator)"
     try:
         result = _review_budget.evaluate_pr(target, pr_num, timeout_for=_gh_timeout)
     except Exception:  # noqa: BLE001 - an advisory row never takes the report down.
+        if read_out is not None:
+            read_out.append({"status": "unknown", "errors": ["lookup failed"]})
         return "unreadable (lookup failed)"
+    if read_out is not None:
+        read_out.append(result)
     if result.get("status") == "ok":
         import review_remaining  # noqa: PLC0415
 
@@ -6196,6 +6442,123 @@ def _stepped_merges_spare_review(
     return not (stepped & names)
 
 
+def _budget_commit_index(budget: dict) -> dict[str, tuple[str, list[str]]] | None:
+    """``{sha: (tree, parents)}`` for each budget commit whose tree and parents
+    were read, or None when a row is malformed. Shared by the no-change note and
+    the past-terminal walk, so both read the commit graph one way."""
+    known: dict[str, tuple[str, list[str]]] = {}
+    for c in budget.get("commits") or []:
+        if not isinstance(c, dict):
+            return None
+        sha, tree, parents = c.get("sha"), c.get("tree"), c.get("parents")
+        if isinstance(sha, str) and isinstance(tree, str) and tree and isinstance(parents, list):
+            known[sha.lower()] = (tree, [str(p).lower() for p in parents])
+    return known
+
+
+def _reaches_over_empty_commits(budget: dict, head: str, target: str) -> bool:
+    """Whether ``head`` reaches ``target`` through single-parent commits that
+    each have their parent's tree (empty commits), read from the budget's own
+    commit graph only. A merge, a commit that changed a file, or a commit whose
+    tree or parents were not read ends the walk: False. A tree comparison alone
+    is not enough (a head rebuilt on a newer base can carry the same tree and
+    squash to different content), hence the walk."""
+    known = _budget_commit_index(budget)
+    if not known:
+        return False
+    current = head.lower()
+    target = target.lower()
+    for _ in range(len(known) + 1):
+        if current == target:
+            return True
+        info = known.get(current)
+        if info is None or len(info[1]) != 1:
+            return False
+        parent = info[1][0]
+        parent_info = known.get(parent)
+        if parent_info is None or parent_info[0] != info[0]:
+            return False
+        current = parent
+    return False
+
+
+def _terminal_budget(pr_num: str, repo: str | None) -> dict:
+    """The review budget the past-terminal row judges. ``_TEST_TERMINAL_BUDGET``
+    (a JSON object) stands in for it, so merge and report tests make no live
+    GraphQL call. Anything that fails is an unknown budget, never a raise."""
+    seam = os.environ.get("_TEST_TERMINAL_BUDGET")
+    if seam is not None:
+        try:
+            got = json.loads(seam)
+        except ValueError:
+            got = None
+        return got if isinstance(got, dict) else {"status": "unknown", "errors": ["test_seam"]}
+    target = repo or _derive_repo_from_cwd(os.getcwd())
+    if not target or _review_budget is None:
+        return {"status": "unknown", "errors": ["no repository or evaluator"]}
+    try:
+        return _review_budget.evaluate_pr(target, pr_num, timeout_for=_gh_timeout)
+    except Exception:  # noqa: BLE001 - an unreadable budget is a block, never a crash.
+        return {"status": "unknown", "errors": ["lookup failed"]}
+
+
+def _check_past_terminal(
+    pr_num: str, repo: str | None, head: str | None, budget: dict | None = None
+) -> tuple[bool, str]:
+    """``(should_block, message)``: the past-terminal merge check (owner rulings
+    3f6ad6fb and cc17ee20, 2026-11-25). BLOCKING, shared by the merge arm and the
+    ``terminal-head`` row of ``--check-pr``, so the two cannot disagree.
+
+    - The budget unreadable: block, at any round count, since unknown cannot tell
+      below terminal from past it.
+    - Below terminal: pass.
+    - Past terminal: pass only when ``head`` (the merge's ``--match-head-commit``)
+      is the terminal head, or is the budget's current head and reaches the
+      terminal head over empty commits only. Otherwise block: the owner merges
+      with a bang command, or the PR is sent back. No sigil waives it."""
+    if budget is None:
+        budget = _terminal_budget(pr_num, repo)
+    owner_route = (
+        f"the owner merges with a bang command (`! gh pr merge {pr_num} ...`), "
+        "or the PR is sent back"
+    )
+    if budget.get("status") != "ok":
+        errors = ", ".join(str(e) for e in budget.get("errors") or []) or "evidence unknown"
+        return True, (
+            f"the review budget is unreadable ({errors}); an agent merge needs a readable "
+            f"budget at any round count. Retry, or {owner_route}."
+        )
+    state = budget.get("terminal_state")
+    if state == "below":
+        return False, "below terminal"
+    lane_limit = (
+        _review_budget.GATE_DISCOVERY_ROUND_LIMIT
+        if budget.get("gate_surface")
+        else _review_budget.STANDING_REVIEWED_HEAD_LIMIT
+    )
+    terminal = budget.get("terminal_head")
+    if state != "past" or not isinstance(terminal, str) or not terminal:
+        why = budget.get("terminal_error") or f"terminal state {state!r}"
+        return True, (
+            f"past round {lane_limit} the terminal head cannot be placed ({why}); "
+            f"merge or send back is the owner's call — {owner_route}."
+        )
+    terminal = terminal.lower()
+    merging = (head or "").strip().lower()
+    if merging and merging == terminal:
+        return False, f"past terminal, merging at the terminal head {terminal[:12]}"
+    current = str(budget.get("current_head") or "").lower()
+    if merging and merging == current and _reaches_over_empty_commits(budget, merging, terminal):
+        return False, (
+            f"past terminal, head {merging[:12]} reaches the terminal head "
+            f"{terminal[:12]} over empty commits only"
+        )
+    return True, (
+        f"past round {lane_limit} the PR moved off its terminal head {terminal}; "
+        f"merge or send back is the owner's call — {owner_route}."
+    )
+
+
 def _no_change_note(
     pr_num: str, repo: str | None, budget: dict, *, clock: Callable[[], float] = time.monotonic
 ) -> str | None:
@@ -6241,13 +6604,9 @@ def _no_change_note(
         return None
     stop_at = clock() + _NO_CHANGE_BUDGET_S
 
-    known: dict[str, tuple[str, list[str]]] = {}
-    for c in budget.get("commits") or []:
-        if not isinstance(c, dict):
-            return None
-        sha, tree, parents = c.get("sha"), c.get("tree"), c.get("parents")
-        if isinstance(sha, str) and isinstance(tree, str) and tree and isinstance(parents, list):
-            known[sha.lower()] = (tree, [str(p).lower() for p in parents])
+    known = _budget_commit_index(budget)
+    if known is None:
+        return None
 
     def lookup(sha: str) -> tuple[str, str, list[str]] | None:
         if sha in known:
@@ -17444,11 +17803,15 @@ def _run_merge_and_push_gates() -> int:
                 # every gate passed (plus head 6 when unbound), to learn whether
                 # the body file can be produced; it spends only what the gates
                 # left, and a drained budget there only skips the requirement.
-                # Writing the receipt
-                # (#5027) at the end is local (no network). A hook SIGKILLed
-                # before that write lets the command run with the bare body the
-                # argv-stage strip left, so that merge has no receipt: absence
-                # means "no gate record", never proof of a bypass.
+                # Every merge also pays the past-terminal budget read
+                # (`_check_past_terminal`, one `evaluate_pr`, each gh call clamped
+                # by `_gh_timeout` to what is left): a drained budget there reads
+                # as unknown and BLOCKS, so this read is not counted in the 62s
+                # above. Writing the receipt (#5027) at the end is local (no
+                # network). A hook SIGKILLed before that write lets the command
+                # run with the bare body the argv-stage strip left, so that merge
+                # has no receipt: absence means "no gate record", never proof of
+                # a bypass.
                 # A timing-out fail-closed gate returns BLOCK immediately, so
                 # the additive worst case needs every call slow-but-successful.
                 mergeable = _check_mergeable(pr_num, repo=merge_repo)
@@ -17825,6 +18188,23 @@ def _run_merge_and_push_gates() -> int:
                         return 2
                     _RECEIPT_OUTCOMES["body-file"] = "ok"
 
+                # Past-terminal head check (owner rulings 3f6ad6fb and cc17ee20,
+                # 2026-11-25). Every route that moves a head converges here, so the
+                # merge is bound to the terminal head past round 4 (the gate lane's
+                # confirmed head), and an unreadable budget blocks at any count.
+                # It judges the command's own --match-head-commit, which GitHub
+                # enforces atomically. No sigil waives it: the owner's route is a
+                # bang-command merge, which runs no hook. One budget read, clamped
+                # to the shared deadline by `_gh_timeout`; a drained deadline reads
+                # as unknown and blocks.
+                term_block, term_msg = _check_past_terminal(pr_num, merge_repo, merge_head)
+                if term_block:
+                    print(
+                        f"BLOCKED: PR #{pr_num} — {_sanitize_gate_text(term_msg)}",
+                        file=sys.stderr,
+                    )
+                    return 2
+
                 # Unresolved review findings (review body) — AFTER freshness +
                 # binding (see the ordering note above). Waived by
                 # # review-override (the FINDINGS sigil — not the stale one).
@@ -17875,6 +18255,9 @@ def _run_merge_and_push_gates() -> int:
                     pr_num,
                     force=force_override,
                     repo=merge_repo,
+                    # The head the merge is bound to; under a stale-review-override
+                    # with no binding, the fix check reads the current head itself.
+                    head=verified_head or merge_head or None,
                     **floor_kwargs,
                 )
                 if floor_accept_used:
@@ -18601,9 +18984,29 @@ def check_pr_report(
         # gate disagree on exactly one gate.
         _print_gate_detail(msg)
     failures += 1 if blocked else 0
-    # Advisory: never touches `failures` (see `_rounds_row`).
+    # Advisory: never touches `failures` (see `_rounds_row`); the blocking half of
+    # the budget is the `terminal-head` row just below.
     _budget_seen: list[dict] = []
-    print(f"rounds         : {_rounds_row(pr_num, repo, budget_out=_budget_seen)}")
+    _budget_read: list[dict] = []
+    print(
+        "rounds         : "
+        f"{_rounds_row(pr_num, repo, budget_out=_budget_seen, read_out=_budget_read)}"
+    )
+    # BLOCKING, the same function the merge arm runs, judged at the head the
+    # merge-with line binds. It judges the rounds row's own read, unreadable
+    # included, so the two rows never show different budgets.
+    _term_budget = _budget_read[0] if _budget_read else None
+    _term_head = verified_head or (_term_budget or {}).get("current_head")
+    blocked, msg = _check_past_terminal(pr_num, repo, _term_head, budget=_term_budget)
+    print(
+        "terminal-head  : "
+        + ("BLOCK — " if blocked else "ok (")
+        + _sanitize_gate_text(msg).splitlines()[0]
+        + ("" if blocked else ")")
+    )
+    if blocked:
+        _print_gate_detail(msg)
+    failures += 1 if blocked else 0
     # Advisory too, and printed only when it fires: a push since the last review
     # that changed no file (see `_no_change_note`). It reuses the budget above.
     if _budget_seen:
@@ -18687,7 +19090,7 @@ def check_pr_report(
         {"floor_accept": floor_accept, "floor_accept_used": floor_used} if floor_accept else {}
     )
     blocked, msg = _check_inline_review_findings(
-        pr_num, repo=repo, uncounted_out=uncounted, **floor_kwargs
+        pr_num, repo=repo, uncounted_out=uncounted, head=verified_head or None, **floor_kwargs
     )
     inline_state = (
         "BLOCK — " + msg.splitlines()[0]
