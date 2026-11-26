@@ -2,7 +2,8 @@
 
 Shared by the PreToolUse gates that judge a create by its body, so the rules are
 one: a ``--body`` literal with no ``$`` or backtick, a ``--body-file`` no earlier
-step of the same command can have written, or the quoted heredoc on ``-F -``.
+step of the same command can have written, the quoted heredoc on ``-F -``, or the
+excised ``--body "$(cat <<'EOF' ...)"`` idiom.
 Anything else is unknown (None), and each caller decides what unknown means.
 
 Stdlib only, and it reads nothing but the body file it is given: the caller parses

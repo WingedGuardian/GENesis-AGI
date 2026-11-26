@@ -1182,8 +1182,8 @@ def test_a_poisoned_parser_blocks_only_a_named_create(tmp_path, command, dispatc
     [("gh issue create -R acme/widget -t x -b short", 2), ("echo hello", 0)],
 )
 def test_a_poisoned_body_reader_blocks_only_a_named_create(tmp_path, command, expected):
-    """The shared body reader loads with the parsers, so a broken copy of it leaves
-    the repair path (any other command) open."""
+    """The shared body reader loads with the parsers, so a broken copy of it blocks only
+    a command that names an issue create (as a broken parser does); others stay open."""
     root = _tree(tmp_path, "pr_body_reader.py")
     res = _subprocess(root / "scripts" / "hooks" / "issue_premise_gate.py", command)
     assert res.returncode == expected, res.stderr
