@@ -56,11 +56,20 @@ mechanically so that two runs on the same text agree:
 - **Acceptance items are numbered separately**, as `A-1`, `A-2`, … in document
   order: every item under a heading named Acceptance, Acceptance criteria,
   Tests or Done when. Such an item is an `A-n` only, never also an `R-n`.
+- **`Decided` and `Ruled out` items are requirements** (`R-n`), each list
+  item one, like any other list item. This holds even though a `Ruled out`
+  item reads like an out-of-scope one: only an item under a heading such as
+  Out of scope or Non-goals is excluded below.
+- **`Definition of Verified` items are numbered separately**, as `V-1`, `V-2`,
+  … in document order. They are checked after merge, so they are never also an
+  `R-n` or an `A-n`.
 - **Not requirements:** headings, rationale, examples, quotations,
   out-of-scope items, and a sentence that only points back to another
   requirement without adding to it ("the limit is the one set in step 2"). A
   sentence that restates another with a different value IS a requirement, so
-  the duplication pass can see it.
+  the duplication pass can see it. Items under `Clarifications` and
+  `Amendments` are not numbered: an amendment changes an item that keeps its
+  own id.
 - **A `## Spec analysis:` or `## Convergence` section and everything after it
   is a report, not the spec**, and is never numbered. So a report kept at the
   end of a spec does not change the numbers of a later run.
@@ -71,7 +80,7 @@ Record the line each one starts on.
 If the spec has no requirement at all, report that as one CRITICAL finding and
 stop: there is nothing to check a build against.
 
-## Step 2: the six passes
+## Step 2: the seven passes
 
 Run every pass. Cite a line for every finding.
 
@@ -99,6 +108,20 @@ Run every pass. Cite a line for every finding.
    documents; an entity the plan names that the spec never does, or the
    reverse; an order that cannot work (a step that uses what a later step
    creates, with no stated dependency); two requirements that cannot both hold.
+7. **Required sections (`SEC`).** Every spec carries these sections: `Summary`,
+   `Confidence`, `Premise checks`, `Definition of Verified`, `Decided`,
+   `Ruled out` and `Acceptance`. Each one missing, or holding only a
+   placeholder (`TBD`, `TODO`, `n/a` with no reason, or an empty body), is one
+   HIGH finding with the id `SEC-<section name>` (`SEC-Ruled out`). A body with
+   some real content beside a placeholder is not placeholder-only. A heading
+   matches by its text, in any case, with or without a number prefix (`## 0.
+   Summary`, `## 7. Confidence`); `Acceptance` also matches Acceptance criteria,
+   Tests and Done when. The pass applies only to a spec dated on or after
+   2026-11-24: its frontmatter `updated:` date, or, only when it has no
+   frontmatter date, the date in its file name. A spec with neither date counts
+   as after it. Older specs were written before these sections were required.
+   A saved issue (`issue-<N>.md`) is not checked by this pass: its contract is
+   the nine premise items.
 
 **The cross-document rule.** Before reporting anything as undefined (`UND`) or
 missing from the spec (`INC`), look for it in every document you were given:
@@ -175,17 +198,28 @@ it, and an old report's `R-4` can then name a different requirement. So the
 report records, for each requirement a finding anchors to, its id together
 with its first words, and anything that refers back to an earlier report (a
 converge run, an owner exception, a reviewer) matches by those words, never
-by the id alone. After the spec changes, run the pass again rather than
-reusing old ids.
+by the id alone. Before approval, after the spec changes, run the pass again
+rather than reusing old ids. All of this holds for `V-n` as for `R-n` and
+`A-n`.
+
+**Once `<spec stem>.approved.analysis.md` exists beside the spec, its ids are
+frozen.** That report is the run made at approval (`spec-session`, step 7),
+written once and never overwritten. It is the authority for each id and for
+the spec's hash; later runs take ids from it and never from a fresh
+numbering, and write `<spec stem>.analysis.md` as usual. An approved spec
+changes only through its `## Amendments` section, the last section of the
+file, headed exactly `## Amendments`. Its items are not numbered, and an item
+an amendment names is judged by that amendment's new text (the newest one,
+when there are two).
 
 ## Step 5: the report
 
 ```
 ## Spec analysis: <spec file name>
-Inputs: spec <path>; plan <path | none>; tickets <path | none>
+Inputs: spec <path>; plan <path | none>; tickets <path | none>; sha256 <hex>
 Standing rules read: CLAUDE.md, premise-check.md, <cited ids read>; not read: <ids, or none>
-Requirements: <n> (R-1 to R-n); acceptance items: <n> (A-1 to A-n)
-Index: R-1 L<n> "<first words>"; R-2 L<n> "<first words>"; ... A-1 L<n> "<first words>"; ...
+Requirements: <n> (R-1 to R-n); acceptance items: <n> (A-1 to A-n); verified items: <n> (V-1 to V-n)
+Index: R-1 L<n> "<first words>"; ... A-1 L<n> "<first words>"; ... V-1 L<n> "<first words>"; ...
 
 | Id | Pass | Severity | Location | Summary | Recommendation |
 |---|---|---|---|---|---|
@@ -195,8 +229,43 @@ Coverage (tickets only):
 | Requirement | Ticket(s) | Notes |
 |---|---|---|
 
-Counts: CRITICAL <n> (excepted <n>), HIGH <n>, MEDIUM <n>, LOW <n>; by pass DUP <n> AMB <n> UND <n> RULE <n> COV <n|skipped> INC <n>
+Counts: CRITICAL <n> (excepted <n>), HIGH <n>, MEDIUM <n>, LOW <n>; by pass DUP <n> AMB <n> UND <n> RULE <n> COV <n|skipped> INC <n> SEC <n|skipped>
 Dropped: <n> findings over the cap (<severity of the lowest kept>)
+```
+
+`SEC` reads `skipped` for a spec dated before the pass's start date.
+
+**The `sha256` is the hash of the spec's body**, so that a changed spec is
+noticed: the lines after its YAML frontmatter, up to the first line outside a
+fenced code block (as CommonMark defines one: opened by a run of three or more
+backticks or tildes indented at most three spaces, and closed by a run of the
+same character at least as long, with nothing after it but spaces) that is
+exactly `## Amendments` or starts `## Spec analysis:`, or to
+the end of the
+file when there is neither; trailing whitespace-only lines removed; joined
+with `\n`, ending in one `\n`, encoded UTF-8. Setting `status: approved` and
+adding the first amendment, with or without a blank line before its heading,
+leave it unchanged. Compute it with this snippet, saved to a scratch file and
+run as `python3 <file> <spec>`; the reviewer runs the same one:
+
+```python
+import hashlib, re, sys
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+if lines and lines[0] == "---":  # skip the YAML frontmatter
+    lines = lines[lines.index("---", 1) + 1 :]
+body, fence = [], ""  # the open code fence's marker run; a delimiter inside one is not one
+for line in lines:
+    m = re.match(r" {0,3}(`{3,}(?=[^`]*$)|~{3,})(.*)$", line)  # no backtick after a backtick run
+    if m and not fence:
+        fence = m.group(1)
+    elif m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not m.group(2).strip():
+        fence = ""
+    elif not fence and (line == "## Amendments" or line.startswith("## Spec analysis:")):
+        break
+    body.append(line)
+while body and not body[-1].strip():
+    body.pop()
+print(hashlib.sha256(("\n".join(body) + "\n").encode("utf-8")).hexdigest())
 ```
 
 Order the table by severity, then by id. At most 50 rows: when there are more,
@@ -214,7 +283,8 @@ The report goes with the spec. When `spec-session` hands a spec to a builder,
 every CRITICAL finding is fixed (and the pass run again) or carries a valid
 owner exception; every HIGH finding is
 fixed or carried with a reason; the final report travels with the handoff
-(see `spec-session`, which keeps the report in a file beside the spec). An
+(see `spec-session`, which keeps the report in a file beside the spec, and
+saves the run made at approval once as `<spec stem>.approved.analysis.md`). An
 architect review puts the CRITICAL findings on its own severity ladder
 (`genesis-architect`, Step 0.8).
 

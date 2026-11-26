@@ -31,8 +31,8 @@ grown to 16 with 6 unnamed here, and nothing marked the list partial.)
 
 **Absence from this file is never absence in Genesis.** The map is deliberately
 incomplete. Verify by enumeration before any "Genesis lacks X" claim — the
-audit-by-enumeration protocol in the spec-session skill ("Auditing Existing
-Capabilities").
+audit-by-enumeration protocol in
+`.claude/skills/spec-session/references/existing-capabilities.md`.
 
 **How this file stays honest.** Every entry claims its top-level
 `src/genesis` modules in a fenced `yaml subsystem-map` block and carries a
@@ -73,10 +73,11 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 273642a5e 2026-11-22
+verified: e063fcd73 2026-11-25
 ```
 
-The 2026-11-22 verification covers weekly dream centrality. The 2026-11-07
+The 2026-11-25 verification covers labelled graph neighbours. The 2026-11-22
+verification covers weekly dream centrality. The 2026-11-07
 verification covers the request-owned memory thread boundaries below.
 Other memory descriptions retain their individually cited verification dates.
 
@@ -237,6 +238,12 @@ Easy-to-forget mechanisms:
   in another process that commits in between makes it write nothing
   (`CredentialKeyChanged`); the ingest then re-reads and runs again, up to five
   times, so every writer in a race lands, and a sixth change reaches the caller.
+  The write's plan (its masks, target entry, sameness and a new entry's
+  candidates) is built from a read of the name's entries before the knowledge
+  writer lock, a file lock every ingest takes, and read again under it; when
+  those entries or the key changed, the plan is built again under the lock
+  (`_credential_plan`), so the value of a same-name write that committed in
+  between is masked in this write's name and tags.
   Only `reference_ops` reads the secret row: `compose_body` puts the value and
   the description back for `reference_lookup` (behind its audit log),
   `reveal_reference` returns both for the dashboard's reveal, and
@@ -629,6 +636,33 @@ ignores `valid_at` (the bake-off oracle's as-of shape would hide the 5.7% of
 rows with a NULL `valid_at`). Consequence to carry into MW-5: this also shrinks
 the graph `centrality_scores` runs on, hence the shield's bridge-node
 population.
+
+**Labelled neighbours (2026-11-25, memory spec MW-11)** — `memory_expand` and
+`memory_recall` neighbours carry a `relation` (`supports`/`extends` read as
+`similar`, an untyped FalkorDB edge as `linked`, a typed edge as its type;
+depth 2 as `via <relation>`, the type of the path's last edge) and, where the
+text may be shown, a `label`: a few words of the neighbour's own text
+(`memory/neighbour_labels.py`: indexed SQLite lookups decide what may be
+labelled, then one batched Qdrant `retrieve` off the loop reads the text; the
+hook runs only the SQLite half on its pooled read connection). The proactive hook's breadcrumbs get the same labels
+(`→ id:x (six words)`, `related_ids` unchanged). No label for a credential entry
+(the reference store's row test, plus the point's own credential header or tag:
+older entries still hold the value in their text), external or unknown-origin
+text (the injection gate's predicate, stored origin first; no origin at all
+counts as unknown), garbage, a missing point, or a hidden memory the caller did not
+ask for; the hook never labels a hidden one. A failed credential, origin or
+(without opt-in) visibility read withholds every label in the response. An expand
+records its launch-time Claude Code session id, its nearest `claude` process pid
+and that process's start time (`claude_pid`, `claude_started`) on its
+`recall_used` event, and the hook's recall trace records the hint ids shown
+(`hints`). Nothing reads them together yet: the followed-link read (a one-off
+query, 14 days after deploy) can join the two on the process, since
+`cc_sessions.pid` maps each traced conversation to it, and falls back to the
+session id where a row has no pid. The session id alone goes stale after a
+conversation reset, and a process's newest `cc_sessions` row can be a background
+agent's. Attribution is per process: one Claude Code process's conversations and
+agents count together. MEASURED on a live install: hook
+label step p50 6-13 ms, max 14-28 ms over 20 prompts per run.
 
 **Merge link rewiring** — the live merge (`_synthesize_and_deprecate`) COPIES
 each original's external `memory_links` edges onto the synthesis
@@ -2882,8 +2916,11 @@ verified: 204c69c1f 2026-11-22
   it), with no 30 s probe: the next check judges health. It restarts once
   itself on exit 4, on exit 1 after the manifest save when the engine's view
   shows the drop done, and on exit 5 only while the pre-drop server still
-  runs. An outcome it did not see (timeout, 130/143, an unknown code) records
-  the attempt in the Guardian state, which names it in the next diagnosis:
+  runs. The attempt is recorded in the Guardian state, and saved to disk,
+  before the engine call (#5007); a clean refusal (200, 2, 97, the deploy
+  marker, or "nothing changed" by the engine's words or its view) puts back
+  the record that was there before. An outcome it did not see (timeout,
+  130/143, an unknown code) keeps it, and the next diagnosis names it:
   while the checkout has not settled since, nothing is proposed; once the
   drop finished, a server not booted from `live`'s tip is offered a restart
   before any further drop. The record lasts until a healthy snapshot. While
@@ -2894,7 +2931,21 @@ verified: 204c69c1f 2026-11-22
   while that drop may still be running says at Gate 2 that it would interrupt
   it, and an approved action held back by the backoff says it did not run.
   Off, the
-  behaviour above is unchanged and no candidate is read. The diagnosis
+  behaviour above is unchanged and no candidate is read. On every install
+  (#5007): each approved action, before it runs, counts its attempt and saves
+  RECOVERED to disk (the backoff is re-stamped when it ends); when that save
+  fails, nothing runs, the checkpoint's changes are put back, the episode's
+  alert latch is cleared so the next check asks again, and one CRITICAL alert
+  names the state file. The checkpoint is written with that latch clear (on
+  disk only). A killed tick (systemd's stop or TimeoutStartSec) saves nothing
+  more, so the disk holds either that checkpoint (outcome unknown: the next
+  tick diagnoses afresh) or the previous tick's state; a RECOVERING read from disk goes on as RECOVERED. A cancelled
+  `incus exec` client is killed and reaped. An approved action held back by a
+  backoff of at most 900 s (one that ran out between two reads included) is
+  waited out inside the tick, then runs unless Genesis is back, paused, or the
+  Guardian stood down (the latch is then cleared, as on a DENY); a proposal whose own budget is spent (IO_TRIAGE's
+  counter for IO_TRIAGE, the main one for the rest) becomes ESCALATE on the
+  re-diagnosis path before Gate 1, and on every path before Gate 2. The diagnosis
   snapshot carries the boot repair's
   `live-move repair:` journal lines and a summary of the newest
   `deploy-backups/*-live-move-repair/REPAIR.json` that is neither dismissed

@@ -241,6 +241,20 @@ def _hermetic_rounds_row(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_terminal_budget(monkeypatch):
+    """Pin the budget the past-terminal merge check reads (the merge arm and the
+    ``terminal-head`` row of ``--check-pr``) to a readable one below terminal, for
+    the reason above: unpinned, every merge test makes a live GraphQL call. The
+    check itself is tested in tests/test_hooks/test_past_terminal_merge.py, which
+    sets this per case."""
+    monkeypatch.setenv(
+        "_TEST_TERMINAL_BUDGET",
+        '{"status": "ok", "terminal_state": "below", "terminal_head": null}',
+    )
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_delivery_row(monkeypatch):
     """Pin the ``--check-pr`` ``delivery`` row for EVERY hook test, for the reason
     above: the row reads the PR's comments and a GraphQL timeline, and report tests

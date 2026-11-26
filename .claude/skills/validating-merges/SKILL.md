@@ -79,9 +79,9 @@ not proof that no issue exists.
 
 ## Rules for every validator, Claude or Codex
 
-These bind every validator session: Claude Code or Codex, standing or one-off.
+These bind every validating session: Claude Code or Codex, standing or one-off.
 
-**Only the owner starts a validator.** A validator session starts only when the
+**Only the owner starts a validator.** A validating session starts only when the
 owner types its start command in a terminal. No session starts one for the
 owner: not by typing into another slot (`tmux send-keys`), not through
 `direct_session_run`, not through a workflow tool. A post-merge test of a
@@ -206,11 +206,11 @@ Three session types touch a PR and they are not phases of one life:
 |---|---|---|
 | **build** | an item from Ready until its PR exists | `build-session` |
 | **closing** | the open-PR queue, until merged | `closing-session` |
-| **validator** | the MERGED PR, until its obligation is discharged | this one |
+| **validating** | the MERGED PR, until its obligation is discharged | this one |
 
-If the job is "make the change", you are a build session. If it is "get the PRs
-merged", you are a closing session. If it is "did the merged thing actually
-work", you are here.
+For a foreground session, a job does not decide the type: the core's router (`genesis-development`, "Which session are you?") decides a
+session's type. A validating
+session asks whether the merged thing actually works.
 
 ---
 
@@ -499,7 +499,7 @@ to it" is never CANNOT-VERIFY.* Ask: **could I have done this with the access an
 the time I actually had?** If yes, it is NOT-YET-DONE — do it, or record each step
 as a `not_yet_done` gap with its `command`, which derives `not-yet-done`: the row
 stays open with the command at the head of its note, where the next validator
-starts. Measured instance, the first validator session's own first PR: a
+starts. Measured instance, the first validating session's own first PR: a
 sub-claim was labelled unverifiable when it was reachable on that very box with a
 throwaway venv; it had been skipped for cost. If CANNOT-VERIFY becomes the
 routine escape, `closed` degrades to "we looked at it" and the word stops
@@ -565,7 +565,7 @@ author's hint from when they knew most — read it first. It is not the boundary
 of the job: **assume an E2E is owed and hunt for the real effect.** A bare
 `E2E: none` on a code PR is a reason to look harder, not a release.
 
-Two things follow, both measured on the first validator session's pilots:
+Two things follow, both measured on the first validating session's pilots:
 
 - **Roughly half the backlog carries no declaration at all**, so deriving the
   verification from the diff is the common mode, not the exception.
@@ -802,6 +802,13 @@ because each pilot broke a field the obvious version would have had:
   neighbour, because `pass-mechanical` asserts that nothing was left out. A claim
   this install cannot reach is `NOT_VERIFIABLE_HERE`. A claim you could have run
   but did not is a `not_yet_done` gap with its `command`, which keeps the row open.
+  **A PR built from a spec (its body carries a `Spec:` line) is verified against
+  the spec first:** read the spec's `Definition of Verified` section before the
+  PR's own claims, list each of its `A-n` and `V-n` items that the PR's plan parts
+  name as its own claim, with the item's id at the start of the claim text
+  (`V-2: ...`). The PR's `<met>/<total>` is then the count of those claims that
+  pass over the count listed; say it in your report. A PR that cites no spec is
+  verified against its own claims, as above.
 - **`e2e[]`** — explicit coverage of the PR's declared E2E work. Each entry has
   `step` (the exact declaration text without the `E2E:` prefix) and exactly one
   zero-based `claim` or `gap` index into `claims[]` or `gaps[]`, for example:
