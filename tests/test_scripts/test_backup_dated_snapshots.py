@@ -1386,6 +1386,12 @@ def test_smb_offsite_refuses_a_name_that_could_leave_its_quotes(backup_env):
     assert not any("COMPLETE" in ln and "put" in ln for ln in cmds.splitlines()), cmds
 
 
+def _skip_unless_unreadable(path: Path) -> None:
+    """The permission cases need a runner that chmod 0 actually stops (not root)."""
+    if os.access(path, os.R_OK):
+        pytest.skip("this runner reads through chmod 0 (root or DAC override)")
+
+
 def _own_identity_dir(backup_env) -> Path:
     """The sandbox's own identity directory (the fixture keeps it empty and apart
     from the repo's)."""
@@ -1461,6 +1467,7 @@ def test_identity_unlistable_dir_keeps_every_copy(backup_env, tmp_path):
     assert (repo_ident / "USER.md.gpg").is_file()
     ident.chmod(0o000)
     try:
+        _skip_unless_unreadable(ident)
         proc = _run_local(backup_env, offsite)
     finally:
         ident.chmod(0o755)
@@ -1609,6 +1616,7 @@ def test_identity_capture_gaps_are_reported(backup_env, tmp_path):
     (ident / "-x.local.md").write_text("dashed\n")
     (ident / "LOCKED.local.md").write_text("secret\n")
     (ident / "LOCKED.local.md").chmod(0)
+    locked = not os.access(ident / "LOCKED.local.md", os.R_OK)  # False as root
     offsite = tmp_path / "offsite"
     offsite.mkdir()
     try:
@@ -1617,9 +1625,10 @@ def test_identity_capture_gaps_are_reported(backup_env, tmp_path):
         (ident / "LOCKED.local.md").chmod(0o600)
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     names = {p.name for p in (_repo(backup_env) / "identity").iterdir()}
-    assert names == {"STEERING.local.md.gpg"}, names
+    assert names == {"STEERING.local.md.gpg"} | (set() if locked else {"LOCKED.local.md.gpg"}), names
     status = _status(backup_env)
-    assert status["extras_complete"] is False and status["extra_dirs_skipped"] == 3, status
+    assert status["extras_complete"] is False, status
+    assert status["extra_dirs_skipped"] == (3 if locked else 2), status
     assert (
         "not captured" in proc.stdout + proc.stderr
         or "failed to encrypt" in proc.stdout + proc.stderr
@@ -1870,6 +1879,7 @@ def test_user_config_unlistable_dir_keeps_every_copy(backup_env, tmp_path):
     assert copy.is_file()
     (cfg / "modules").chmod(0o000)
     try:
+        _skip_unless_unreadable(cfg / "modules")
         proc = _run_local(backup_env, offsite)
     finally:
         (cfg / "modules").chmod(0o755)
@@ -2015,6 +2025,91 @@ def test_user_config_both_layouts_of_a_path_restore_without_failing(
     else:
         assert (cfg / "modules" / "tool.yaml").read_text() == "enabled: true\n", r.stdout[-3000:]
     assert "conflicts with the file or directory already at its path" in r.stdout, r.stdout[-3000:]
+
+
+def test_a_kept_copy_the_new_passphrase_cannot_open_is_a_gap(backup_env, tmp_path):
+    """A copy kept after its source was deleted is never re-encrypted. After a
+    passphrase change restore cannot open it, so that run reports it once and sets
+    it aside (kept, out of what restore and the off-site upload read); the next run
+    is clean. Identity copies are handled the same way."""
+    cfg = _seed_user_config(backup_env["home"])
+    ident = _own_identity_dir(backup_env)
+    (ident / "STEERING.local.md").write_text("rule\n")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    assert _run_local(backup_env, offsite).returncode == 0
+    assert _status(backup_env)["extras_complete"] is True
+    (cfg / "ego.local.yaml").unlink()
+    (ident / "STEERING.local.md").unlink()
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_PASSPHRASE": "newpass"})
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    status = _status(backup_env)
+    assert status["extras_complete"] is False and status["extra_dirs_skipped"] == 2, status
+    repo = _repo(backup_env)
+    assert not (repo / "user_config" / "ego.local.yaml.gpg").exists()
+    assert not (repo / "identity" / "STEERING.local.md.gpg").exists()
+    assert [p.name.rsplit(".", 2)[0] for p in (repo / "user_config" / "unopenable").iterdir()] == ["ego.local.yaml"]
+    assert [p.name.rsplit(".", 2)[0] for p in (repo / "identity" / "unopenable").iterdir()] == ["STEERING.local.md"]
+    assert proc.stdout.count("set aside in") == 2, proc.stdout[-3000:]
+    host = next((offsite / "Genesis").iterdir())
+    newest = sorted(d for d in host.iterdir() if _STAMP_RE.fullmatch(d.name))[-1]
+    assert not (newest / "user_config" / "unopenable").exists()
+
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_PASSPHRASE": "newpass"})
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert _status(backup_env)["extras_complete"] is True, _status(backup_env)
+    # The set-aside copies survive the next run's plaintext purge (they end in .gpg).
+    assert len(list((repo / "user_config" / "unopenable").iterdir())) == 1
+    assert len(list((repo / "identity" / "unopenable").iterdir())) == 1
+
+
+def test_a_kept_copy_that_fails_for_another_reason_stays_in_place(backup_env, tmp_path):
+    """Only gpg's own wrong-passphrase verdict sets a copy aside. A damaged copy
+    (or any other failure) is reported and left where restore can still try it."""
+    cfg = _seed_user_config(backup_env["home"])
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    assert _run_local(backup_env, offsite).returncode == 0
+    (cfg / "ego.local.yaml").unlink()
+    copy = _repo(backup_env) / "user_config" / "ego.local.yaml.gpg"
+    data = bytearray(copy.read_bytes())
+    data[len(data) // 2] ^= 0xFF  # damaged data (zlib error), not a passphrase verdict
+    copy.write_bytes(bytes(data))
+    proc = _run_local(backup_env, offsite)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert copy.is_file(), "a copy that failed for another reason must stay in place"
+    assert not (_repo(backup_env) / "user_config" / "unopenable").exists()
+    assert "could not be verified with the current passphrase; left in place" in proc.stdout, proc.stdout[-3000:]
+    assert _status(backup_env)["extras_complete"] is False
+
+
+def test_no_backup_passphrase_is_a_gap_for_identity_and_config(backup_env, tmp_path):
+    """Without a passphrase nothing per-install is captured (plaintext is refused),
+    and the run says so instead of reading complete."""
+    _seed_user_config(backup_env["home"])
+    ident = _own_identity_dir(backup_env)
+    (ident / "STEERING.local.md").write_text("rule\n")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_PASSPHRASE": ""})
+    out = proc.stdout + proc.stderr
+    assert "skipping identity files (refusing plaintext)" in out, out[-3000:]
+    assert "skipping user config (refusing plaintext)" in out, out[-3000:]
+    status = _status(backup_env)
+    assert status["extras_complete"] is False and status["extra_dirs_skipped"] >= 2, status
+
+
+def test_a_missing_config_subdir_extra_entry_is_a_skip_not_covered(backup_env, tmp_path):
+    """An extra entry naming a config subdirectory that does not exist is reported,
+    not waved through as covered."""
+    _seed_user_config(backup_env["home"])
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/.genesis/config/gone"})
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert "which §6g backs up — not archived again" not in proc.stdout, proc.stdout[-2000:]
+    status = _status(backup_env)
+    assert status["extra_dirs_skipped"] == 1 and status["extras_complete"] is False, status
 
 
 def test_user_config_extra_entry_is_covered_not_a_gap(backup_env, tmp_path):
@@ -2302,7 +2397,8 @@ def test_core_overlap_leaves_out_only_the_named_entry(tmp_path):
     (home / ".genesis" / "config").mkdir(parents=True)
     core = _BACKUP.parent / "lib" / "backup_core_paths.sh"
     cfg = str(home / ".genesis" / "config")
-    for gdir, want_rc in ((home / "genesis", 1), (home / ".genesis", 0)):
+    # The checkout at the config path itself: its own entry still protects it.
+    for gdir, want_rc in ((home / "genesis", 1), (home / ".genesis", 0), (home / ".genesis" / "config", 0)):
         env = {
             **os.environ,
             "HOME": str(home),
@@ -2312,7 +2408,7 @@ def test_core_overlap_leaves_out_only_the_named_entry(tmp_path):
         }
         env.pop("GENESIS_HOME", None)
         proc = subprocess.run(
-            ["bash", "-c", f'source "{core}"; backup_core_overlap "$1" "$2"', "x", cfg, cfg],
+            ["bash", "-c", f'source "{core}"; backup_core_overlap "$1" config', "x", cfg],
             env=env,
             capture_output=True,
             text=True,

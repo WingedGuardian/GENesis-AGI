@@ -1629,7 +1629,7 @@ if [ -d "$BACKUP_DIR/user_config" ]; then
                 done
                 continue
             fi
-            mkdir -p "$(dirname "$dst")"
+            mkdir -p "$(dirname "$dst")" || { warn "user config: cannot create the directory for $rel"; continue; }
             decrypt_file "$src" "$dst" || { warn "user config decrypt failed: $rel"; continue; }
             _USER_CONFIG_RESTORED=$(( _USER_CONFIG_RESTORED + 1 ))
         done < <(_ucfg_by_depth | sort -z -t $'\t' -k1,1r -k2,2)
@@ -1760,7 +1760,7 @@ elif find "$BACKUP_DIR/extra" -maxdepth 1 -type f -name '*.tar.gpg' -print -quit
         _xt_skip_core=""
         case "$_xt_resolved/" in
             "$_xt_cfg"/*)
-                _dir_has_flat_gpg "$BACKUP_DIR/user_config" || _xt_skip_core="$HOME/.genesis/config" ;;
+                _dir_has_flat_gpg "$BACKUP_DIR/user_config" || _xt_skip_core=config ;;
         esac
         _xt_core="$(backup_core_overlap "$_xt_resolved" "$_xt_skip_core")" || _xt_core_rc=$?
         if [ "$_xt_core_rc" -eq 0 ]; then
