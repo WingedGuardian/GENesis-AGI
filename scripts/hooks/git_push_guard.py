@@ -6554,6 +6554,13 @@ def _check_past_terminal(
 _CODEX_MENTION_RE = re.compile(r"(?<![\w@])@codex\b", re.IGNORECASE)
 _API_PR_THREAD_RE = re.compile(r"/?repos/([^/\s]+/[^/\s]+)/(?:issues|pulls)/(\d+)/(?:comments|reviews)/?\Z")
 _API_COMMENT_RE = re.compile(r"/?repos/[^/\s]+/[^/\s]+/(?:issues|pulls)/comments/(\d+)/?\Z")
+# GraphQL mutations that delete, edit or hide a PR comment. A match is denied while
+# the repo has any open PR: resolving the target node to its PR would need the node
+# id out of the query or its variables, and this is the simpler of the two rules.
+_GRAPHQL_COMMENT_REWRITE_RE = re.compile(
+    r"\b(?:deleteIssueComment|updateIssueComment|minimizeComment"
+    r"|deletePullRequestReviewComment|updatePullRequestReviewComment)\b"
+)
 
 
 def _past_terminal(budget) -> bool:
@@ -6580,7 +6587,10 @@ def _push_dest_branches(argv: list[str], cur: str | None) -> list[str]:
     """The branches a ``git push`` writes or deletes on the remote, from argv: the
     DESTINATION of each refspec (``HEAD``/``@`` read as the current branch), or the
     current branch for a push with no refspec (R-S1). A ``+`` force refspec is not a
-    positional; a force push to the public repo is blocked before this is asked."""
+    positional; a force push to the public repo is blocked before this is asked.
+    Stated residual: ``--all``/``--mirror``, ``push.default=upstream`` to a
+    differently-named branch and configured push refspecs are read as the current
+    branch only (or nothing), so they keep today's behaviour."""
     specs = _push_positionals(argv)[1:]
     if not specs:
         return [cur] if cur and "--tags" not in argv else []
@@ -6594,9 +6604,14 @@ def _push_dest_branches(argv: list[str], cur: str | None) -> list[str]:
     return out
 
 
-def _open_prs_for_branch(branch: str, cwd: str | None) -> list[tuple[str, str]]:
+def _open_prs_for_branch(
+    branch: str, cwd: str | None, push_urls: set[str]
+) -> list[tuple[str, str]]:
     """``[(number, OWNER/REPO)]`` of the open same-repository PRs headed by
-    ``branch``, in the repo gh resolves at ``cwd``; empty on any failure. Seam
+    ``branch``, in the repo gh resolves at ``cwd``; empty on any failure. As in
+    ``_open_pr_count_for_branch``, a PR counts only when every push URL names its
+    repository (read from the PR's own URL, so it costs no second call): gh may
+    resolve a different repo than the one the push reaches. Seam
     ``_TEST_GH_BRANCH_PRS``: a JSON object mapping a branch to ``gh pr list --json
     number,url,isCrossRepository`` rows."""
     raw = os.environ.get("_TEST_GH_BRANCH_PRS")
@@ -6615,7 +6630,11 @@ def _open_prs_for_branch(branch: str, cwd: str | None) -> list[tuple[str, str]]:
     out = []
     for row in rows if isinstance(rows, list) else []:
         url = _PR_URL_RE.match(str(row.get("url") or "")) if isinstance(row, dict) else None
-        if url and row.get("isCrossRepository") is False:
+        if (
+            url
+            and row.get("isCrossRepository") is False
+            and _urls_name_repo(push_urls, f"https://github.com/{url.group(1)}")
+        ):
             out.append((url.group(2), url.group(1)))
     return out
 
@@ -6628,8 +6647,9 @@ def _past_terminal_push_deny(seg, cur: str | None, remote: str | None, cwd: str 
     (it moves nothing) are None."""
     if _push_is_dry_run(seg) or not _push_dest_meets_origin(remote, cwd, False):
         return None
+    urls = _push_dest_urls(remote, cwd=cwd) if remote else set()
     for branch in _push_dest_branches(seg.argv, cur):
-        for pr_num, repo in _open_prs_for_branch(branch, cwd):
+        for pr_num, repo in _open_prs_for_branch(branch, cwd, urls):
             budget = _terminal_budget(pr_num, repo)
             if _past_terminal(budget):
                 what = f"this push moves the head of '{branch}'"
@@ -6639,19 +6659,19 @@ def _past_terminal_push_deny(seg, cur: str | None, remote: str | None, cwd: str 
 
 def _pr_is_open(kind: str, ident: str, repo: str | None, cwd: str | None) -> bool:
     """Whether ``ident`` is an OPEN pull request (``kind`` "pr"; "" is the current
-    branch's), or a comment on one (``kind`` "comment"; ``ident`` is the endpoint
-    as typed). False on any failed read: best effort, by owner ruling. Seam
-    ``_TEST_GH_PR_STATE``: a JSON object mapping ``"pr:<n>"`` or
-    ``"comment:<id>"`` to ``OPEN``/``CLOSED``/``ISSUE``."""
+    branch's), a comment on one (``kind`` "comment"; ``ident`` is the endpoint), or
+    (``kind`` "repo") whether the repo has any open PR. False on any failed read:
+    best effort, by owner ruling. Seam ``_TEST_GH_PR_STATE``: a JSON object mapping
+    ``"pr:<n>"``, ``"comment:<id>"`` or ``"repo:"`` to ``OPEN``/``CLOSED``/``ISSUE``."""
     raw = os.environ.get("_TEST_GH_PR_STATE")
     if raw is not None:
-        key = ident if kind == "pr" else (_API_COMMENT_RE.match(ident) or [None, ""])[1]
+        key = ident if kind != "comment" else (_API_COMMENT_RE.match(ident) or [None, ""])[1]
         try:
             return str(json.loads(raw).get(f"{kind}:{key}") or "").upper() == "OPEN"
         except Exception:  # noqa: BLE001
             return False
 
-    def gh(*args: str) -> str:
+    def _route_gh(*args: str) -> str:
         got = subprocess.run(
             ["gh", *args], capture_output=True, text=True, timeout=_gh_timeout(8), cwd=cwd or None
         )
@@ -6660,34 +6680,51 @@ def _pr_is_open(kind: str, ident: str, repo: str | None, cwd: str | None) -> boo
     try:
         if kind == "pr":
             target = [ident] if ident else []
-            return gh("pr", "view", *target, *_repo_args(repo), "--json", "state", "--jq", ".state") == "OPEN"
-        parent = gh("api", ident.lstrip("/"), "--jq", ".issue_url // .pull_request_url")
+            return _route_gh("pr", "view", *target, *_repo_args(repo), "--json", "state", "--jq", ".state") == "OPEN"
+        if kind == "repo":
+            got = _route_gh("pr", "list", *_repo_args(repo), "--state", "open", "--limit", "1",
+                     "--json", "number", "--jq", "length")
+            return got.isdigit() and int(got) > 0
+        parent = _route_gh("api", ident.lstrip("/"), "--jq", ".issue_url // .pull_request_url")
         parent = parent.removeprefix("https://api.github.com/")
         if not parent.startswith("repos/"):
             return False
         jq = 'if (.pull_request != null or .head != null) then .state else "issue" end'
-        return gh("api", parent, "--jq", jq) == "open"
+        return _route_gh("api", parent, "--jq", jq) == "open"
     except Exception:  # noqa: BLE001
         return False
 
 
-def _route_target(seg, verb: str) -> tuple[str | None, str | None]:
-    """``(pr_number, explicit_repo)`` of a ``gh pr review|update-branch`` segment:
-    its first bare word after ``verb`` (a number, ``#N`` or a PR URL), skipping the
-    values of its value flags."""
+def _route_target(seg, verb: str) -> tuple[str | None, str | None] | None:
+    """``(pr_number, explicit_repo)`` of a ``gh pr|issue comment``, ``gh pr review``
+    or ``gh pr update-branch`` segment: its first bare word after ``verb`` (a number,
+    ``#N`` or a PR URL); a None number means no target (the current branch's PR).
+    None when the target or the repo cannot be read literally (an expansion such as
+    ``"$N"``, a branch name, an unmodelled flag): no match, never a judgement of some
+    other PR (best effort, owner ruling)."""
     argv = seg.argv
-    words, skip = [], False
-    for tok in argv[argv.index(verb) + 1:] if verb in argv else []:
-        if skip or tok in ("-b", "--body", "-F", "--body-file", "-R", "--repo"):
-            skip = not skip
-            continue
-        if not tok.startswith("-"):
-            words.append(tok)
+    if verb == "comment":
+        tok, bad = _comment_positional(argv)
+        if bad or _unresolvable_identity(argv) is not None:
+            return None
+        words = [tok] if tok else []
+    else:
+        words, skip = [], False
+        for tok in argv[argv.index(verb) + 1:] if verb in argv else []:
+            if skip or tok in ("-b", "--body", "-F", "--body-file", "-R", "--repo"):
+                skip = not skip
+                continue
+            if not tok.startswith("-"):
+                words.append(tok)
     repo = _comment_repo(argv)
+    if repo is not None and ("$" in repo or "`" in repo):
+        return None
     if not words:
         return None, repo
     num, url = _PR_NUMBER_RE.match(words[0]), _PR_URL_RE.match(words[0])
-    return (num.group(1) if num else url.group(2) if url else None), repo or (url and url.group(1))
+    if not (num or url):
+        return None
+    return (num.group(1), repo) if num else (url.group(2), repo or url.group(1))
 
 
 def _past_terminal_route_deny(segs, cmd: str, payload: dict) -> str | None:
@@ -6705,7 +6742,16 @@ def _past_terminal_route_deny(segs, cmd: str, payload: dict) -> str | None:
       (``--delete-last``/``--edit-last``, ``gh api -X DELETE|PATCH
       …/{issues,pulls}/comments/<id>``): deleting a reviewer's comment lowers the
       round count, and a pin lives in a comment. A bare comment id costs two API
-      reads to find its PR; a failed read allows (best effort, owner ruling)."""
+      reads to find its PR; a failed read allows (best effort, owner ruling). The
+      GraphQL comment mutations (``_GRAPHQL_COMMENT_REWRITE_RE``) are denied while the
+      repo has any open PR, one read.
+
+    A target or repo that cannot be read literally is no match (``_route_target``).
+    With no PR number the current branch's PR is resolved, and with no explicit repo
+    the repo is derived, from the command's own resolved cwd only, as the
+    review-request gate does; with no such cwd the route is not judged, never
+    against the hook's own directory. An absolute ``https://api.github.com/`` URL
+    is read as its path."""
     for seg in segs:
         inv = gh_command(seg.argv) if seg.exe == "gh" else None
         if inv is None or gh_requests_help(seg.argv):
@@ -6714,37 +6760,61 @@ def _past_terminal_route_deny(segs, cmd: str, payload: dict) -> str | None:
         cwd = cwd if isinstance(cwd, str) else None
         verb = (inv.group, inv.subcommand)
         api = gh_api_request(seg.argv) if inv.group == "api" else None
-        num, repo, body = None, None, None
+        target: tuple[str | None, str | None] | None = (None, None)
+        body = None
         if verb in (("pr", "comment"), ("issue", "comment")):
-            num, repo = _comment_target(seg.argv)
+            target = _route_target(seg, "comment")
+            if target is None:
+                continue  # an unresolvable identity is no match (best effort)
             flags = {name for name, _ in gh_option_values(seg.argv, frozenset({"--delete-last", "--edit-last"}))}
-            if flags and _pr_is_open("pr", num or "", repo, cwd):
-                return _comment_rewrite_text(seg.raw)
-            if verb == ("pr", "comment") and _comment_review_request(seg.argv)[2] is not False:
-                continue  # a review request: _check_codex_round_escalation judges it
+            if flags:
+                num, repo = target
+                if (num or cwd) and (repo or cwd) and _pr_is_open("pr", num or "", repo, cwd):
+                    return _comment_rewrite_text(seg.raw)
+            elif (
+                verb == ("pr", "comment")
+                and target[0]
+                and _comment_review_request(seg.argv)[2] is not False
+            ):
+                continue  # a numbered review request: _check_codex_round_escalation judges it
             body = _comment_body(seg.argv)[0]
         elif api is not None and api.endpoint:
-            if api.method in ("DELETE", "PATCH") and _API_COMMENT_RE.match(api.endpoint):
-                if _pr_is_open("comment", api.endpoint, None, cwd):
+            endpoint = api.endpoint.removeprefix("https://api.github.com/")
+            literal = "{" not in endpoint and ":owner" not in endpoint
+            if endpoint.lstrip("/") == "graphql":
+                query = " ".join(v for k, v in api.fields if k == "query")
+                if (
+                    _GRAPHQL_COMMENT_REWRITE_RE.search(query)
+                    and cwd
+                    and _pr_is_open("repo", "", None, cwd)
+                ):
                     return _comment_rewrite_text(seg.raw)
                 continue
-            thread = _API_PR_THREAD_RE.match(api.endpoint)
-            if thread and api.method == "POST":
-                num, repo = thread.group(2), thread.group(1)
-                body = " ".join(v for k, v in api.fields if k == "body")
+            if api.method in ("DELETE", "PATCH") and _API_COMMENT_RE.match(endpoint):
+                if (literal or cwd) and _pr_is_open("comment", endpoint, None, cwd):
+                    return _comment_rewrite_text(seg.raw)
+                continue
+            thread = _API_PR_THREAD_RE.match(endpoint)
+            if not (thread and api.method == "POST"):
+                continue
+            target = (thread.group(2), thread.group(1) if literal else None)
+            body = " ".join(v for k, v in api.fields if k == "body")
         elif verb in (("pr", "review"), ("pr", "update-branch")):
-            num, repo = _route_target(seg, inv.subcommand)
+            target = _route_target(seg, inv.subcommand)
+            if target is None:
+                continue
             if verb == ("pr", "review"):
                 body = _comment_body(["comment", *seg.argv[seg.argv.index("review") + 1:]])[0]
         update = verb == ("pr", "update-branch")
         if not update and not (body and _CODEX_MENTION_RE.search(body)):
             continue
-        if num is None and update:
-            num = _resolve_pr_number("", cwd=cwd) if not repo else None
-        if not num:
+        num, repo = target
+        if num is None and not repo and cwd:
+            num = _resolve_pr_number("", cwd=cwd)
+        if not repo and cwd:
+            repo = _derive_repo_from_cwd(cwd)
+        if not num or not repo:
             continue
-        if not repo or "{" in repo or repo.startswith(":"):
-            repo = _derive_repo_from_cwd(cwd or os.getcwd())
         budget = _terminal_budget(num, repo)
         if not _past_terminal(budget):
             continue

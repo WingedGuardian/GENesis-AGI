@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -35,6 +36,9 @@ T = "a" * 40  # the terminal head
 MOVED = "b" * 40  # a head after it that changed a file
 REPO = "example/repo"
 PR_URL = f"https://github.com/{REPO}/pull/7"
+# A resolved cwd for the command; the repo it resolves to comes from a seam.
+HERE = str(Path(__file__).resolve().parent)
+CTX = {"cwd": HERE}
 
 
 def _budget(*, current: str, state: str = "past", status: str = "ok") -> dict:
@@ -68,7 +72,7 @@ def _seams(monkeypatch, budget: dict, *, prs=None, states=None) -> None:
     monkeypatch.setenv("_TEST_GH_DERIVED_REPO", REPO)
 
 
-def _main(monkeypatch, command: str, cwd: str | None = None, *, dispatched=False) -> int:
+def _main(monkeypatch, command: str, cwd: str | None = HERE, *, dispatched=False) -> int:
     monkeypatch.delenv("CLAUDE_TOOL_INPUT", raising=False)
     if dispatched:
         monkeypatch.setenv("GENESIS_CC_SESSION", "1")
@@ -89,11 +93,10 @@ def _git(cwd, *args) -> str:
 
 @pytest.fixture
 def repo(tmp_path):
-    """A checkout on branch ``other`` with a local bare ``origin`` and a ``feat``
-    branch, so no push spelling below reaches the network."""
-    bare = tmp_path / "origin.git"
+    """A checkout on branch ``other`` with a ``feat`` branch and an ``origin`` whose
+    URL names the PR's repo (the deny checks that). A deny returns before any network
+    call; a test that lets the push through stubs the dry run (``_no_network``)."""
     work = tmp_path / "work"
-    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
     subprocess.run(["git", "init", "-q", "-b", "other", str(work)], check=True)
     _git(
         work,
@@ -107,7 +110,7 @@ def repo(tmp_path):
         "-m",
         "x",
     )
-    _git(work, "remote", "add", "origin", str(bare))
+    _git(work, "remote", "add", "origin", f"https://github.com/{REPO}.git")
     _git(work, "branch", "feat")
     return work
 
@@ -184,8 +187,46 @@ def test_unknown_evidence_at_the_push_allows(monkeypatch, capsys, repo):
     the unreadable result carries a stale ``past`` (the status term decides)."""
     _seams(monkeypatch, _budget(current=T, status="unknown"))
     assert _push_verdict(repo, "git push origin feat") is None
+    _no_network(monkeypatch)
     assert _main(monkeypatch, "git push origin feat", str(repo)) == 0
     assert "past its terminal review round" not in capsys.readouterr().err
+
+
+def _no_network(monkeypatch) -> None:
+    """The push arm's own probes that would reach the remote: the dry run and the
+    remote-branch read. None is their documented "could not tell"."""
+    monkeypatch.setattr(G, "_push_dry_run_verdict", lambda *a, **k: None)
+    monkeypatch.setattr(G, "_remote_branch_sha", lambda *a, **k: None)
+
+
+def _verdict(monkeypatch, capsys, cmd: str, cwd: str) -> tuple[int, str, str]:
+    rc = _main(monkeypatch, cmd, cwd)
+    got = capsys.readouterr()
+    return rc, got.out, got.err
+
+
+def test_below_terminal_a_push_keeps_its_old_verdict(monkeypatch, capsys, repo):
+    """main(): a PR branch below terminal gets exactly the verdict a branch with no
+    PR gets, so the lookup changes nothing there."""
+    _no_network(monkeypatch)
+    _seams(monkeypatch, _budget(current=T, state="below"), prs={})
+    without = _verdict(monkeypatch, capsys, "git push origin feat", str(repo))
+    _seams(monkeypatch, _budget(current=T, state="below"))
+    with_pr = _verdict(monkeypatch, capsys, "git push origin feat", str(repo))
+    assert with_pr == without
+    assert with_pr[0] == 0 and "past its terminal" not in with_pr[2]
+
+
+def test_a_pr_whose_repo_is_not_the_push_destination_is_ignored(monkeypatch, repo):
+    """gh may resolve another repo than the one the push reaches; the PR's own URL
+    must name the push destination, as `_open_pr_count_for_branch` requires."""
+    elsewhere = {
+        "feat": [
+            {"number": 7, "url": "https://github.com/other/repo/pull/7", "isCrossRepository": False}
+        ]
+    }
+    _seams(monkeypatch, _budget(current=T), prs=elsewhere)
+    assert _push_verdict(repo, "git push origin feat") is None
 
 
 def test_a_cross_repository_pr_on_the_same_branch_name_is_ignored(monkeypatch, repo):
@@ -239,19 +280,19 @@ def test_codex_at_the_terminal_head_is_unchanged(monkeypatch, cmd):
     """F-B3: at the terminal head an @codex request opens no round, and Codex at
     the head is needed to merge."""
     _seams(monkeypatch, _budget(current=T))
-    assert G._past_terminal_route_deny(G.analyze(cmd), cmd, {}) is None
+    assert G._past_terminal_route_deny(G.analyze(cmd), cmd, CTX) is None
 
 
 def test_the_review_request_ask_stays_at_the_terminal_head(monkeypatch):
     _seams(monkeypatch, _budget(current=T))
     cmd = CODEX_ROUTES[0]
-    assert G._check_codex_round_escalation(G.analyze(cmd), cmd, {})[0] == "ask"
+    assert G._check_codex_round_escalation(G.analyze(cmd), cmd, CTX)[0] == "ask"
 
 
 def test_the_review_request_ask_becomes_a_deny_off_the_terminal_head(monkeypatch):
     _seams(monkeypatch, _budget(current=MOVED))
     cmd = CODEX_ROUTES[0]
-    decision, reason = G._check_codex_round_escalation(G.analyze(cmd), cmd, {})
+    decision, reason = G._check_codex_round_escalation(G.analyze(cmd), cmd, CTX)
     assert decision == "deny"
     assert "past its terminal review round" in reason
 
@@ -260,19 +301,19 @@ def test_the_review_request_ask_becomes_a_deny_off_the_terminal_head(monkeypatch
 def test_codex_on_a_number_that_is_not_a_pr_is_unaffected(monkeypatch, cmd):
     """R-S3: an issue number reads as an unknown budget (GraphQL has no such PR)."""
     _seams(monkeypatch, {"status": "unknown", "errors": ["graphql_errors"]})
-    assert G._past_terminal_route_deny(G.analyze(cmd), cmd, {}) is None
+    assert G._past_terminal_route_deny(G.analyze(cmd), cmd, CTX) is None
 
 
 def test_codex_below_terminal_is_unaffected(monkeypatch):
     _seams(monkeypatch, _budget(current=MOVED, state="below"))
     for cmd in CODEX_ROUTES[1:]:
-        assert G._past_terminal_route_deny(G.analyze(cmd), cmd, {}) is None
+        assert G._past_terminal_route_deny(G.analyze(cmd), cmd, CTX) is None
 
 
 def test_a_comment_without_codex_is_unaffected(monkeypatch):
     _seams(monkeypatch, _budget(current=MOVED))
     cmd = f'gh issue comment 7 --repo {REPO} --body "Fixed in abc123"'
-    assert G._past_terminal_route_deny(G.analyze(cmd), cmd, {}) is None
+    assert G._past_terminal_route_deny(G.analyze(cmd), cmd, CTX) is None
 
 
 # -- F-S2: deleting or editing a comment on an open PR -------------------------
@@ -309,13 +350,13 @@ def test_a_comment_rewrite_off_an_open_pr_is_unaffected(monkeypatch, cmd, state)
     effort, by owner ruling."""
     states = {} if state is None else {"pr:7": state, "comment:123": state}
     _seams(monkeypatch, _budget(current=T, state="below"), states=states)
-    assert G._past_terminal_route_deny(G.analyze(cmd), cmd, {}) is None
+    assert G._past_terminal_route_deny(G.analyze(cmd), cmd, CTX) is None
 
 
 def test_a_get_of_a_comment_is_not_a_rewrite(monkeypatch):
     _seams(monkeypatch, _budget(current=T), states={"comment:123": "OPEN"})
     cmd = f"gh api repos/{REPO}/issues/comments/123"
-    assert G._past_terminal_route_deny(G.analyze(cmd), cmd, {}) is None
+    assert G._past_terminal_route_deny(G.analyze(cmd), cmd, CTX) is None
 
 
 # -- F-S5: the stale-base advice past terminal ---------------------------------
@@ -340,3 +381,102 @@ def test_stale_base_advice_past_terminal_does_not_say_update(monkeypatch):
     assert past and "send it back" in past
     assert "`! gh pr update-branch 7 --repo example/repo`" in past
     assert "If they may, update the branch" not in past
+# -- review findings on b426a8ff8 ----------------------------------------------
+
+
+def test_codex_review_at_the_terminal_head_still_asks_through_main(monkeypatch, capsys):
+    """main(), F-B3: at the terminal head `@codex review` keeps the native ask."""
+    _seams(monkeypatch, _budget(current=T))
+    assert _main(monkeypatch, CODEX_ROUTES[0]) == 0
+    assert json.loads(capsys.readouterr().out)["hookSpecificOutput"]["permissionDecision"] == "ask"
+
+
+NUMBERLESS_CODEX = [
+    'gh pr comment --body "@codex please look again"',
+    'gh pr comment --body "@codex review"',
+    'gh pr review --comment -b "@codex review"',
+]
+
+
+@pytest.mark.parametrize("cmd", NUMBERLESS_CODEX)
+def test_codex_with_no_pr_number_resolves_the_current_branch_pr(monkeypatch, capsys, cmd):
+    _seams(monkeypatch, _budget(current=MOVED))
+    seen = []
+    monkeypatch.setattr(
+        G, "_resolve_pr_number", lambda c, repo=None, cwd=None: seen.append(cwd) or "7"
+    )
+    assert _main(monkeypatch, cmd) == 2
+    assert "PR #7, which is past its terminal review round" in capsys.readouterr().err
+    assert seen == [HERE]  # resolved in the command's own cwd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        'gh pr comment --body "@codex please look again"',
+        'gh api repos/{owner}/{repo}/issues/7/comments -f body="@codex review"',
+        "gh pr comment --delete-last --yes",
+    ],
+)
+def test_with_no_resolved_cwd_and_no_repo_a_route_is_not_judged(monkeypatch, cmd):
+    """Never the hook's own directory: with no cwd in the payload and no -R, the
+    route keeps today's behaviour."""
+    _seams(monkeypatch, _budget(current=MOVED), states={"pr:": "OPEN"})
+    monkeypatch.setattr(G, "_resolve_pr_number", lambda *a, **k: pytest.fail("resolved"))
+    monkeypatch.setattr(G, "_derive_repo_from_cwd", lambda *a, **k: pytest.fail("derived"))
+    assert G._past_terminal_route_deny(G.analyze(cmd), cmd, {}) is None
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        'gh pr comment "$N" --delete-last --yes',
+        'gh issue comment 7 -R "$R" --edit-last --body x',
+        'gh pr update-branch "$N"',
+        'gh pr review "$N" --comment -b "@codex review"',
+    ],
+)
+def test_an_unresolvable_target_is_no_match(monkeypatch, cmd):
+    """A target the guard cannot read is not judged against the current branch's
+    PR: best effort, by owner ruling."""
+    _seams(monkeypatch, _budget(current=MOVED), states={"pr:": "OPEN", "pr:7": "OPEN"})
+    monkeypatch.setattr(G, "_resolve_pr_number", lambda *a, **k: "7")
+    assert G._past_terminal_route_deny(G.analyze(cmd), cmd, CTX) is None
+
+
+def test_an_absolute_api_url_is_read_as_its_path(monkeypatch, capsys):
+    _seams(monkeypatch, _budget(current=MOVED), states={"comment:123": "OPEN"})
+    delete = f"gh api -X DELETE https://api.github.com/repos/{REPO}/issues/comments/123"
+    assert _main(monkeypatch, delete) == 2
+    assert "deletes or edits a comment" in capsys.readouterr().err
+    codex = f'gh api https://api.github.com/repos/{REPO}/issues/7/comments -f "body=@codex review"'
+    assert _main(monkeypatch, codex) == 2
+    assert "past its terminal review round" in capsys.readouterr().err
+
+
+GRAPHQL = "gh api graphql -f query='mutation {{ {name}(input: {{id: \"IC_x\"}}) {{ clientMutationId }} }}'"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "deleteIssueComment",
+        "updateIssueComment",
+        "minimizeComment",
+        "deletePullRequestReviewComment",
+        "updatePullRequestReviewComment",
+    ],
+)
+def test_graphql_comment_rewrites_are_denied_while_an_open_pr_exists(monkeypatch, capsys, name):
+    cmd = GRAPHQL.format(name=name)
+    _seams(monkeypatch, _budget(current=T, state="below"), states={"repo:": "OPEN"})
+    assert _main(monkeypatch, cmd) == 2
+    assert "deletes or edits a comment" in capsys.readouterr().err
+    _seams(monkeypatch, _budget(current=T, state="below"), states={})
+    assert G._past_terminal_route_deny(G.analyze(cmd), cmd, CTX) is None
+
+
+def test_a_graphql_read_is_not_a_rewrite(monkeypatch):
+    cmd = "gh api graphql -f query='query { viewer { login } }'"
+    _seams(monkeypatch, _budget(current=T), states={"repo:": "OPEN"})
+    assert G._past_terminal_route_deny(G.analyze(cmd), cmd, CTX) is None

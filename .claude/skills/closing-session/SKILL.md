@@ -548,7 +548,9 @@ comment and label moves it.
    --pr <N> --head <the head you read> --verdict <V> --scope <S> --checker
    other --body-file <prose>` (plus `--intended`, `--change`, `--coderabbit` as
    they apply; `--help` lists them), then run the one `gh` command it prints
-   (the script never posts). Answer the
+   (the script never posts). It always posts a NEW comment, which supersedes an
+   earlier marker (the newest governs); never edit the old one, since the push
+   guard denies an agent's comment edit on an open PR. Answer the
    author's open questions in the same comment, except one Devin's bot is waiting
    on: that answer goes in its own comment without `(aside)`. Record `--checker other`: you
    are not the builder. If this session built the PR, the read is done by a
