@@ -56,6 +56,7 @@ _REASON_FORBIDDEN = re.compile(r"[\x00-\x1f\x7f]|::")
 #: The scratch tree names each commit by this many characters
 #: (``materialize`` in scripts/ci/leak_scan_added_lines.py).
 _COMMIT_PREFIX = 12
+_HEX_PREFIX = re.compile(rf"[0-9a-f]{{{_COMMIT_PREFIX}}}")
 
 
 class AllowlistError(Exception):
@@ -135,21 +136,26 @@ def _key(entry: dict) -> tuple[str, str, str, str]:
 def _resolve_prefixes(results: dict) -> dict[str, str]:
     """Map short commit prefixes from result filenames to full 40-char SHAs.
 
-    Each unique prefix is resolved via ``git rev-parse``.  An unresolvable or
-    ambiguous prefix is omitted: its findings stay (fail closed).
+    Enumerate object IDs without interpreting the prefix as a revision name.
+    Only a single matching commit object can authorize suppression. Missing,
+    ambiguous and non-commit objects leave their findings visible.
     """
     prefixes: set[str] = set()
     for filename in results.get("results", {}):
         prefix, sep, _ = filename.partition("/")
-        if sep:
+        if sep and _HEX_PREFIX.fullmatch(prefix):
             prefixes.add(prefix)
     mapping: dict[str, str] = {}
     for prefix in prefixes:
-        proc = _git("rev-parse", "--verify", "--quiet", prefix)
-        if proc.returncode == 0:
-            full = proc.stdout.strip()
-            if _HEX40.fullmatch(full):
-                mapping[prefix] = full
+        proc = _git("rev-parse", f"--disambiguate={prefix}")
+        if proc.returncode != 0:
+            continue
+        full = proc.stdout.strip()
+        if not _HEX40.fullmatch(full) or not full.startswith(prefix):
+            continue
+        kind = _git("--no-replace-objects", "cat-file", "-t", full)
+        if kind.returncode == 0 and kind.stdout.strip() == "commit":
+            mapping[prefix] = full
     return mapping
 
 

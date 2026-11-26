@@ -154,6 +154,45 @@ def test_a_different_commit_sharing_the_prefix_is_not_suppressed():
     assert f"{_C40[:12]}/src/n.py" in results["results"]
 
 
+@pytest.mark.parametrize(
+    ("objects", "object_type", "resolved"),
+    [
+        (_C40 + "\n", (0, "commit\n"), True),
+        ("", None, False),
+        (_C40 + "\n" + _C40[:12] + "b" * 28 + "\n", None, False),
+        ("b" * 40 + "\n", None, False),
+        (_C40 + "\n", (0, "blob\n"), False),
+        (_C40 + "\n", (1, ""), False),
+    ],
+    ids=["commit", "missing", "ambiguous", "different-prefix", "non-commit", "unreadable"],
+)
+def test_resolver_requires_a_unique_commit_object(monkeypatch, objects, object_type, resolved):
+    prefix = _C40[:12]
+    replies = {("rev-parse", f"--disambiguate={prefix}"): (0, objects)}
+    if object_type is not None:
+        replies[("--no-replace-objects", "cat-file", "-t", _C40)] = object_type
+    calls = []
+
+    def fake_git(*args):
+        calls.append(args)
+        rc, output = replies[args]
+        return subprocess.CompletedProcess(args, rc, output, "")
+
+    monkeypatch.setattr(lha, "_git", fake_git)
+    results = _results((f"{prefix}/src/n.py", _finding()))
+    assert lha._resolve_prefixes(results) == ({prefix: _C40} if resolved else {})
+    assert calls == list(replies)
+
+
+def test_resolver_ignores_noncanonical_result_paths(monkeypatch):
+    def unexpected_git(*args):
+        pytest.fail(f"looked up an invalid commit prefix: {args!r}")
+
+    monkeypatch.setattr(lha, "_git", unexpected_git)
+    results = _results(("src/n.py", _finding()), (f"{_C40[:11]}/src/n.py", _finding()))
+    assert lha._resolve_prefixes(results) == {}
+
+
 def test_a_dropped_finding_leaves_its_neighbours():
     entry = _entry()
     keep = _finding(hashed_secret="d" * 40, line_number=2)
