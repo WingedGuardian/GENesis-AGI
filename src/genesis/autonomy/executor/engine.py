@@ -1251,12 +1251,13 @@ class CCSessionExecutor:
 
     async def _create_worktree(self, task_id: str) -> Path:
         """Create a git worktree for code task isolation."""
+        await _worktree.assert_fresh_task(task_id, _REPO_ROOT, _WORKTREE_BASE)
         base = await self._resolve_and_record_base(task_id)
         wt_path = await _worktree.create_worktree(
             task_id, _REPO_ROOT, _WORKTREE_BASE, base=base,
         )
-        self._worktree_paths[task_id] = wt_path
         await self._set_output(task_id, "worktree_path", str(wt_path))
+        self._worktree_paths[task_id] = wt_path
         return wt_path
 
     async def _resolve_and_record_base(self, task_id: str) -> _worktree.BaseRef | None:
@@ -1331,14 +1332,9 @@ class CCSessionExecutor:
 
         # Worktree gone but branch might still exist — recreate
         try:
-            base = await self._resolve_and_record_base(task_id)
-            wt_path = await _worktree.create_worktree(
-                task_id, _REPO_ROOT, _WORKTREE_BASE, base=base,
-            )
-            self._worktree_paths[task_id] = wt_path
-            await self._set_output(task_id, "worktree_path", str(wt_path))
+            wt_path = await self._create_worktree(task_id)
             logger.info(
-                "Recreated worktree at %s for task %s (branch recovered)",
+                "Recreated worktree at %s for task %s after missing saved path",
                 wt_path, task_id,
             )
             return True
