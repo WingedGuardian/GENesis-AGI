@@ -653,3 +653,81 @@ async def test_outbox_poll_logs_served_ids_and_byte_length_never_text(http_bridg
         expected = f"peer=alpha message_id={env.message_id} text_bytes={len(text.encode('utf-8'))}"
         assert any(line.endswith(expected) for line in served)
     assert not any(text in line for text in texts for line in served)
+
+
+REFERENCED = "Earlier messages Genesis sent this peer, which the peer referenced"
+
+
+async def _sent(box, peer, text, context=None):
+    env, _ = await box.prepare(peer, text, context)
+    await box.put(env)
+    return env
+
+
+async def _ask(bridge, text, context=None):
+    from tests.test_peers.test_conversation import incoming, settle
+
+    payload = message(context=context)
+    payload["message"]["parts"] = [{"text": text}]
+    await settle(bridge, await bridge.service.send(bridge.identities["alpha"], incoming(payload)))
+    return bridge.invoker.run_streaming.call_args.args[0].prompt
+
+
+async def test_peer_naming_our_outbox_id_from_a_new_context_sees_its_text(bridge):
+    box = Outbox(bridge.registry)
+    ours = await _sent(box, "alpha", "Please confirm the appointment time")
+    theirs = await _sent(box, "beta", "A note for the other peer only")
+    unnamed = await _sent(box, "alpha", "A message nobody names")
+    # Shape of the live case: full ids in prose, plus a context id that is not a message.
+    prompt = await _ask(
+        bridge,
+        f"What was your outbox message {ours.message_id} (context {ours.context_id}) about? "
+        f"Also {theirs.message_id}, {ours.message_id.upper()} and {unnamed.message_id[:8]}.",
+    )
+    assert REFERENCED in prompt
+    assert prompt.count("Please confirm the appointment time") == 1  # deduped across case
+    assert prompt.index("Please confirm the appointment time") < prompt.index("Latest peer message")
+    assert "A note for the other peer only" not in prompt  # another peer's row
+    assert "A message nobody names" not in prompt  # a bare prefix is not a reference
+    # Another peer's row in the SAME epoch: only the peer filter can exclude it.
+    same_epoch = str(uuid4())
+    await bridge.db.execute(
+        "INSERT INTO peer_outbox(peer_id,epoch,message_id,context_id,message,created_at) "
+        "VALUES('beta',?,?,?,?,'2026-01-01T00:00:00+00:00')",
+        (bridge.identities["alpha"].peer["epoch"], same_epoch, str(uuid4()),
+         json.dumps({"parts": [{"text": "Beta row in alpha's epoch"}]})),
+    )
+    await bridge.db.commit()
+    prompt = await _ask(bridge, f"Only uppercase: {ours.message_id.upper()} and {same_epoch}")
+    assert "Please confirm the appointment time" in prompt  # case-folded match
+    assert "Beta row in alpha's epoch" not in prompt
+
+
+async def test_referenced_outbox_ignores_other_epochs_and_old_same_context_rows_still_show(bridge):
+    box = Outbox(bridge.registry)
+    first = await _sent(box, "alpha", "The oldest message in this thread")
+    for i in range(10):  # push it out of the bounded history window
+        await _sent(box, "alpha", f"Later message {i}", first.context_id)
+    stale = str(uuid4())
+    await bridge.db.execute(
+        "INSERT INTO peer_outbox(peer_id,epoch,message_id,context_id,message,created_at) "
+        "VALUES('alpha',?,?,?,?,'2026-01-01T00:00:00+00:00')",
+        ("0" * 32, stale, str(uuid4()),
+         json.dumps({"parts": [{"text": "Text from an earlier enrollment"}]})),
+    )
+    await bridge.db.commit()
+    prompt = await _ask(bridge, f"About {first.message_id} and {stale}?", first.context_id)
+    assert "The oldest message in this thread" in prompt
+    assert "Text from an earlier enrollment" not in prompt
+
+
+async def test_referenced_outbox_is_bounded_with_a_visible_marker(bridge):
+    box = Outbox(bridge.registry)
+    sent = [await _sent(box, "alpha", f"Numbered message {i:02d}") for i in range(9)]
+    prompt = await _ask(bridge, " ".join(env.message_id for env in sent))
+    assert sum(f"Numbered message {i:02d}" in prompt for i in range(9)) == 8
+    assert "[1 more referenced message omitted]" in prompt
+    long = await _sent(box, "alpha", "Long note " + "word " * 2000 + "THE-TAIL")
+    prompt = await _ask(bridge, f"About {long.message_id}")
+    assert "Long note" in prompt and "[remainder omitted]" in prompt
+    assert "THE-TAIL" not in prompt  # each text is bounded
