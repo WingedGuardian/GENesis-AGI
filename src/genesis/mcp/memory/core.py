@@ -11,6 +11,7 @@ from genesis.memory import graph_expansion
 from genesis.memory.activation import compute_activation
 from genesis.memory.graph import traverse as graph_traverse
 from genesis.memory.graph_telemetry import begin_tally, end_tally
+from genesis.memory.neighbour_labels import neighbour_labels
 from genesis.memory.provenance import (
     is_external,
     is_proactive_noise,
@@ -542,6 +543,7 @@ async def memory_recall(
                                 "link_type": n.link_type,
                                 "depth": n.depth,
                                 "strength": n.strength,
+                                "relation": _relation(n.link_type, n.depth),
                                 # A `hidden` key may be added below, after the loop —
                                 # see `_label_hidden_neighbours`. Labelling is one
                                 # scoped query over the ids actually collected, so it
@@ -567,6 +569,9 @@ async def memory_recall(
         memory_mod._db, enriched, include_deprecated=include_deprecated
     ):
         _mark_visibility_unknown(enriched)
+    await _label_neighbours(
+        memory_mod._db, memory_mod._qdrant, enriched, include_hidden=include_deprecated
+    )
 
     # Selective corrective retrieval (CRAG) — high-stakes explicit recall path.
     # Default ON; gated + fail-fast so a confident/healthy recall is untouched.
@@ -717,6 +722,81 @@ async def _label_hidden_neighbours(db, results: list[dict], *, include_deprecate
     return True
 
 
+_SIMILAR_LINKS = frozenset({"supports", "extends"})
+
+
+def _relation(link_type: str | None, depth: int) -> str:
+    """A plain word for how a neighbour relates to the memory it hangs off.
+
+    ``supports`` and ``extends`` are both written from one similarity score
+    (``linker.py``), so they read as ``similar``; an untyped edge (the FalkorDB
+    projection carries none) reads as ``linked``; a typed edge keeps its type.
+    At depth 2 the type is that of the path's last edge (the one into the
+    neighbour), not of an edge at the root, so it is shown as ``via <relation>``.
+    """
+    if link_type in _SIMILAR_LINKS:
+        relation = "similar"
+    elif link_type:
+        relation = link_type.replace("_", " ")
+    else:
+        relation = "linked"
+    return f"via {relation}" if depth >= 2 else relation
+
+
+def _expanding_identity() -> tuple[str | None, int | None, str | None]:
+    """(launch-time Claude Code session id, nearest ``claude`` ancestor pid, its start).
+
+    The id alone cannot name the conversation: a stdio child's
+    ``CLAUDE_CODE_SESSION_ID`` is a launch-time snapshot that a conversation
+    reset leaves stale, and the newest ``cc_sessions`` row for the process can
+    belong to a background agent of the same process rather than the
+    conversation the hook traces. ``cc_sessions`` maps each traced conversation
+    to its pid, so the followed-link read can join on the process; the start
+    time tells a reused pid apart. Attribution is then per process: every
+    conversation and agent of one Claude Code process counts together. Never
+    raises.
+    """
+    from genesis.caller_context import caller_context
+
+    snapshot = caller_context().transcript_id or None
+    try:
+        import os
+
+        from genesis.util.proc_io import claude_ancestor, read_proc_start_iso
+
+        pid = claude_ancestor(os.getpid())
+        return snapshot, pid, (read_proc_start_iso(pid) if pid else None)
+    except Exception:
+        return snapshot, None, None
+
+
+async def _label_neighbours(db, qdrant, results: list[dict], *, include_hidden: bool) -> None:
+    """Give each neighbour a short ``label`` of its own text, in ONE pass.
+
+    Runs after the loop, like ``_label_hidden_neighbours``. ``include_hidden``
+    is the caller's visibility choice: without it a hidden neighbour gets no
+    label. A neighbour that may not be shown (credential entry, external or
+    unknown origin, garbage, missing) simply has no ``label`` key; if a read that
+    keeps text out fails, no neighbour in the response gets one
+    (``memory.neighbour_labels``). Never raises: labels are an enrichment.
+    """
+    ids = [n.get("memory_id") for r in results for n in r.get("graph_neighbors") or ()]
+    if not ids or qdrant is None:
+        return
+    try:
+        labels = await neighbour_labels(
+            db, qdrant, ids, include_hidden=include_hidden, max_words=12
+        )
+    except Exception:
+        logger.warning("neighbour labelling failed; neighbours returned unlabelled", exc_info=True)
+        return
+    for r in results:
+        for n in r.get("graph_neighbors") or ():
+            label = (labels or {}).get(n.get("memory_id"))
+            if label:
+                n["label"] = label
+
+
 def _mark_visibility_unknown(results: list[dict]) -> None:
     """Withdraw the absence-means-visible contract for this response.
 
@@ -785,7 +865,8 @@ async def memory_expand(
     or bare 8-char hex prefixes). Returns full RetrievalResult data with graph
     enrichment for each ID found; unresolved or ambiguous handles are reported
     in a trailing ``{"not_found": [...], "ambiguous": [...]}`` entry instead
-    of being silently dropped.
+    of being silently dropped. Each neighbour has a plain ``relation`` and, when
+    its text may be shown, a short ``label``.
 
     Args:
         memory_ids: Full UUIDs or short ``id:`` handles to expand.
@@ -807,7 +888,7 @@ async def memory_expand(
     # made the tool asymmetric with itself — handing back the memory while
     # suppressing its edges is the #1896 symptom left in place as a default.
     #
-    # Who it bites decided it: the proactive hook emits `[→ related: id:xxx]`
+    # Who it bites decided it: the proactive hook emits `→ id:xxx` hint
     # handles and this tool is the documented expansion path, so a caller
     # following that hint has no signal the handle is deprecated, no reason to
     # set a flag, and no way to tell "hidden neighbours" from "no neighbours".
@@ -855,10 +936,17 @@ async def memory_expand(
         try:
             from genesis.eval.j9_hooks import emit_recall_used
 
+            # Who expanded, so the expand joins the hook hints that same Claude
+            # Code process was shown (see `_expanding_identity`). None outside
+            # Claude Code.
+            session_id, claude_pid, claude_started = _expanding_identity()
             await emit_recall_used(
                 memory_mod._db,
                 memory_ids=list(found_ids),
                 source="memory_expand",
+                session_id=session_id,
+                claude_pid=claude_pid,
+                claude_started=claude_started,
             )
         except Exception:
             logger.debug("eval: recall_used emit failed", exc_info=True)
@@ -946,6 +1034,7 @@ async def memory_expand(
                             "link_type": n.link_type,
                             "depth": n.depth,
                             "strength": n.strength,
+                            "relation": _relation(n.link_type, n.depth),
                             # A `hidden` key may be added after the loop — see
                             # `_label_hidden_neighbours`. This tool defaults the flag
                             # ON, so the label is the ordinary case here rather than
@@ -968,6 +1057,9 @@ async def memory_expand(
         memory_mod._db, results, include_deprecated=include_deprecated
     ):
         _mark_visibility_unknown(results)
+    await _label_neighbours(
+        memory_mod._db, memory_mod._qdrant, results, include_hidden=include_deprecated
+    )
 
     # WS-3 B1 gate 4 (injection): shadow-record external content reaching this
     # expand prompt (observe-only). memory_mod._db is asserted non-None above.

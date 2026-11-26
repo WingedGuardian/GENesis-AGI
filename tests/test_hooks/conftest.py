@@ -177,6 +177,17 @@ def _hermetic_commit_lookup(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_edit_history(monkeypatch):
+    """Give EVERY hook test reviewer comments that nobody edited (#5001).
+
+    The inline scan reads the edit history of every reviewer comment; without
+    this pin a test carrying a bot comment would make a live GraphQL call.
+    Tests of the edit check set ``_TEST_GH_EDIT_HISTORY`` themselves."""
+    monkeypatch.setenv("_TEST_GH_EDIT_HISTORY", "clean")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_e2e_declaration(monkeypatch):
     """Keep the ADVISORY E2E read hermetic for EVERY hook test (§8.12).
 
@@ -251,6 +262,17 @@ def _hermetic_terminal_budget(monkeypatch):
         "_TEST_TERMINAL_BUDGET",
         '{"status": "ok", "terminal_state": "below", "terminal_head": null}',
     )
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_route_lookups(monkeypatch):
+    """Pin the past-terminal route lookups (a push destination's open PRs, and
+    whether a PR or a comment's PR is open) to "none", for the reason above: the
+    push path and every comment delete or edit would otherwise call gh live.
+    tests/test_hooks/test_past_terminal_routes.py sets them per case."""
+    monkeypatch.setenv("_TEST_GH_BRANCH_PRS", "{}")
+    monkeypatch.setenv("_TEST_GH_PR_STATE", "{}")
     yield
 
 

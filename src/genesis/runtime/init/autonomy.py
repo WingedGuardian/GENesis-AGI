@@ -104,16 +104,17 @@ async def init(rt: GenesisRuntime) -> None:
                 rt._outreach_pipeline.set_autonomous_send_notify(_notify)
 
             rt._autonomous_cli_policy_exporter = AutonomousCliPolicyExporter()
+            # Persisted approvals survive a router outage. Keep their shared
+            # resolution and Sentinel recovery path available with just the DB.
+            rt._autonomous_cli_approval_gate = AutonomousCliApprovalGate(
+                runtime=rt,
+                approval_manager=rt._approval_manager,
+            )
+            try:
+                await rt._autonomous_cli_approval_gate.hydrate_delivery_map(rt._db)
+            except Exception:
+                logger.warning("Failed to hydrate delivery-to-request map", exc_info=True)
             if rt._router is not None:
-                rt._autonomous_cli_approval_gate = AutonomousCliApprovalGate(
-                    runtime=rt,
-                    approval_manager=rt._approval_manager,
-                )
-                # Restore quote-reply map from DB (survives restart)
-                try:
-                    await rt._autonomous_cli_approval_gate.hydrate_delivery_map(rt._db)
-                except Exception:
-                    logger.warning("Failed to hydrate delivery-to-request map", exc_info=True)
                 rt._autonomous_dispatcher = AutonomousDispatchRouter(
                     router=rt._router,
                     approval_gate=rt._autonomous_cli_approval_gate,

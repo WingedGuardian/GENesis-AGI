@@ -73,10 +73,11 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 273642a5e 2026-11-22
+verified: e063fcd73 2026-11-25
 ```
 
-The 2026-11-22 verification covers weekly dream centrality. The 2026-11-07
+The 2026-11-25 verification covers labelled graph neighbours. The 2026-11-22
+verification covers weekly dream centrality. The 2026-11-07
 verification covers the request-owned memory thread boundaries below.
 Other memory descriptions retain their individually cited verification dates.
 
@@ -635,6 +636,33 @@ ignores `valid_at` (the bake-off oracle's as-of shape would hide the 5.7% of
 rows with a NULL `valid_at`). Consequence to carry into MW-5: this also shrinks
 the graph `centrality_scores` runs on, hence the shield's bridge-node
 population.
+
+**Labelled neighbours (2026-11-25, memory spec MW-11)** — `memory_expand` and
+`memory_recall` neighbours carry a `relation` (`supports`/`extends` read as
+`similar`, an untyped FalkorDB edge as `linked`, a typed edge as its type;
+depth 2 as `via <relation>`, the type of the path's last edge) and, where the
+text may be shown, a `label`: a few words of the neighbour's own text
+(`memory/neighbour_labels.py`: indexed SQLite lookups decide what may be
+labelled, then one batched Qdrant `retrieve` off the loop reads the text; the
+hook runs only the SQLite half on its pooled read connection). The proactive hook's breadcrumbs get the same labels
+(`→ id:x (six words)`, `related_ids` unchanged). No label for a credential entry
+(the reference store's row test, plus the point's own credential header or tag:
+older entries still hold the value in their text), external or unknown-origin
+text (the injection gate's predicate, stored origin first; no origin at all
+counts as unknown), garbage, a missing point, or a hidden memory the caller did not
+ask for; the hook never labels a hidden one. A failed credential, origin or
+(without opt-in) visibility read withholds every label in the response. An expand
+records its launch-time Claude Code session id, its nearest `claude` process pid
+and that process's start time (`claude_pid`, `claude_started`) on its
+`recall_used` event, and the hook's recall trace records the hint ids shown
+(`hints`). Nothing reads them together yet: the followed-link read (a one-off
+query, 14 days after deploy) can join the two on the process, since
+`cc_sessions.pid` maps each traced conversation to it, and falls back to the
+session id where a row has no pid. The session id alone goes stale after a
+conversation reset, and a process's newest `cc_sessions` row can be a background
+agent's. Attribution is per process: one Claude Code process's conversations and
+agents count together. MEASURED on a live install: hook
+label step p50 6-13 ms, max 14-28 ms over 20 prompts per run.
 
 **Merge link rewiring** — the live merge (`_synthesize_and_deprecate`) COPIES
 each original's external `memory_links` edges onto the synthesis
@@ -2764,6 +2792,13 @@ verified: 204c69c1f 2026-11-22
   would expire before the next window) wait for `snapshots.deletion_window`,
   default 05:00-07:00 in the user's timezone, because deleting a large btrfs
   subvolume can stall filesystem commits for minutes under quota accounting.
+  The window's zone is `snapshots.deletion_window_timezone`, else a configured
+  user timezone, else the host clock's zone (a host Guardian usually has no
+  genesis.yaml; a UTC host clock does not count), else UTC; `disk-status`
+  reports which (`config|user|system|fallback`). Guardian log stamps carry
+  their UTC offset. The gateway `set-timezone <zone>` verb sets the host
+  clock's zone, then the container's, with the installers' calls; host jobs
+  then follow local time, as on a fresh install.
   The healthy snapshot is still created on its cadence. Reserve relief and
   delete-first never wait; early relief waits only while the pool stays above
   its reserve until the window opens. `any` restores immediate scheduling.
@@ -3123,14 +3158,22 @@ verified: 204c69c1f 2026-11-22
   alarms are all WARNING, but only when the alarm dispatch would lead with is
   that challenger and passes backoff; a park with any CRITICAL trigger is never
   taken over, and a cancel that fails keeps the park. The cancelled pattern
-  starts the 15-minute resolved cooldown. A declined dispatch or action is
-  quiet for 24 h through `handle_approval_resolution` (every pattern).
+  starts the 15-minute resolved cooldown. Alarm clearance likewise preserves
+  the park when cancellation refuses or fails. Both paths verify the same
+  park under the state lock before clearing state or starting its cooldown,
+  so a late cancellation cannot overwrite a newer approval. Recovery uses the
+  time recorded on the cancellation row to restore only the remaining cooldown.
+  The shared approval gate can reconcile persisted requests while the model
+  router is down if the approval database is available. A declined dispatch or
+  action is quiet for 24 h through `handle_approval_resolution` (every pattern).
 - **sentinel/codex_mcp_inventory.py** reads the managed daemon's loaded thread
   inventory and MCP groups once per minute while the learning scheduler runs.
   Daily pruning applies a 72-hour cutoff to aggregate `codex.mcp_inventory`
   events. Thread and process group identifiers used for comparisons stay in
   memory. See the [MCP process report](../reference/mcp-process-report.md) for
-  limitations and the collection switch.
+  limitations and the collection switch. Shadow evidence compares the
+  scan-wide threshold with repeated post-unload growth on the verified
+  daemon. Sentinel's activation rule continues to use the raw threshold.
 - **sentinel/process_stop.py** (`python -m genesis.sentinel.process_stop`):
   the Failure Inventory remedy for ONE runaway process. Dry-run by default;
   `--execute` only inside an approved action. Resolves targets when it runs:
@@ -4972,9 +5015,9 @@ logger or unrelated exceptions with copied text and no provenance.
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
   item into the Genesis trash (`~/.genesis/trash`) with a tombstone, never
   copying, and refuses an item on another volume;
-  `python -m genesis.trash list|restore`. Callers: cognitive rollback, the
-  orphan task-worktree reset, and the dashboard's file-browser and memory-file
-  deletes (`docs/reference/trash.md`). Stdlib only.
+  `python -m genesis.trash list|restore`. Callers: cognitive rollback and the
+  dashboard's file-browser and memory-file deletes (`docs/reference/trash.md`).
+  Task-worktree creation now refuses retained or occupied state. Stdlib only.
 - **Worktree reaper trash** (`scripts/worktree_lifecycle.py`, outside `src/`;
   read at 26218b962, 2026-11-10): the daily hygiene run archives stale
   worktrees into `~/.genesis/worktree-trash`. An entry has two forms: a

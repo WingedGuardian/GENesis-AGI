@@ -107,11 +107,16 @@ PUBLISHING_GUARD_FUNCTIONS = (
     "_main_with_note",
     "_neighbours_are_inert",
     "_open_pr_count_for_branch",
+    "_open_prs_for_branch",
     "_parse_push_porcelain",
+    "_past_terminal_push_deny",
+    "_past_terminal_route_deny",
     "_push_boolean_options",
     "_push_carries_command_config",
     "_push_compound_is_inert",
     "_push_config_is_simple",
+    "_push_dest_branches",
+    "_push_dest_meets_origin",
     "_push_dest_urls",
     "_push_dry_run",
     "_push_dry_run_verdict",
@@ -137,7 +142,7 @@ PUBLISHING_GUARD_FUNCTIONS = (
     "_seg_dash_C",
     "main",
 )
-PUBLISHING_GUARD_DIGEST = "cb753e50fa1504c87165950ddb7f3d9d9b74ea1fe7a4cb48d4bb27d9d8bafbea"
+PUBLISHING_GUARD_DIGEST = "d0782c8307f2eb84f1e8e4ea3511157a499d51abd69ea009cd2a8c646be2e179"
 
 
 def direct_publishing_allowance(request, guard):

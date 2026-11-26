@@ -36,6 +36,7 @@ from genesis.cc.reflection_bridge._prompts import (
 from genesis.cc.reflection_bridge.reflection_models_config import effort_for_depth, model_for_depth
 from genesis.cc.types import CCInvocation, CCModel, EffortLevel, SessionType, background_session_dir
 from genesis.db.crud import cc_sessions as cc_sessions_crud
+from genesis.identity.paths import read_identity
 from genesis.observability.call_site_recorder import record_last_run
 from genesis.observability.session_context import set_session_id as _set_obs_session
 from genesis.observability.spans import SpanKind, start_span
@@ -887,11 +888,9 @@ class CCReflectionBridge:
         """Load SOUL.md + USER.md + STEERING.md from identity directory."""
         parts: list[str] = []
         for fname in ("SOUL.md", "USER.md", "STEERING.md"):
-            path = self._prompt_dir / fname
-            if path.exists():
-                content = path.read_text().strip()
-                if content:
-                    parts.append(content)
+            content = (read_identity(fname, self._prompt_dir) or "").strip()
+            if content:
+                parts.append(content)
         return "\n\n".join(parts)
 
     def _load_prompt_file(self, filename: str) -> str:

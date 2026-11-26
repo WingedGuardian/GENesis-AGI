@@ -293,8 +293,9 @@ holds for any local checker whose answer is about a remote object.
 - **Repo TOOLING** (`--check-pr`, the flow-rate script, any `scripts/…` helper)
   runs from a tree at **freshly-fetched `origin/main`**. An old worktree runs an
   old gate.
-- **TESTS** run from **the PR's branch, rebased onto or merged with
-  freshly-fetched `origin/main`**. Testing `main` would tell you nothing about
+- **TESTS** run from **the PR's branch, merged with freshly-fetched
+  `origin/main`** (never rebased: a rebase of a reviewed branch strands its
+  round's reflection; build-session, "Once a branch is pushed"). Testing `main` would tell you nothing about
   the change under review — and step 3 requires the PR's code checked out, since
   verifying a finding means reading the code the finding is about.
 
@@ -548,7 +549,9 @@ comment and label moves it.
    --pr <N> --head <the head you read> --verdict <V> --scope <S> --checker
    other --body-file <prose>` (plus `--intended`, `--change`, `--coderabbit` as
    they apply; `--help` lists them), then run the one `gh` command it prints
-   (the script never posts). Answer the
+   (the script never posts). It always posts a NEW comment, which supersedes an
+   earlier marker (the newest governs); never edit the old one, since the push
+   guard denies an agent's comment edit on an open PR. Answer the
    author's open questions in the same comment, except one Devin's bot is waiting
    on: that answer goes in its own comment without `(aside)`. Record `--checker other`: you
    are not the builder. If this session built the PR, the read is done by a
@@ -589,8 +592,8 @@ comment and label moves it.
    `- CHANGED:` and `- UNVERIFIABLE:`; `Wrong fix named by the issue: "<...>":
    not taken (`path:line`) | taken | none named`; `Scope: <clean, or the
    unrequested part>`; and `Author questions: <each, answered here>`. A
-   DELIVERS needs at least one `- DONE:` line citing a file the PR changes. One owner
-   comment per PR, edited in place when the read is redone; a block by anyone
+   DELIVERS needs at least one `- DONE:` line citing a file the PR changes. A redone
+   read is a NEW owner comment (step 7), never an edit; the newest governs. A block by anyone
    else, or in a review body, does not count. The comment is public: technical
    content only.
 8. **Then act on the verdict.** DELIVERS: continue the loop. PARTIAL or
@@ -793,7 +796,12 @@ agent's merge is bound to the round-4 head, the 4th round by `opened_at`
 moved off it (a fix, a merge of main, a force-push) blocks at merge unless every
 commit after it is empty, and merging that head is the owner's bang-command merge
 (`! gh pr merge …`) or a send-back. A round-4 head that cannot be placed blocks
-too. When the owner rules "merge at head X", at any round count, post a PR comment
+too. Past round 4 the push guard also denies an agent's push onto the PR's
+branch (any spelling), `gh pr update-branch`, and an `@codex` mention once the
+head is off the round-4 head; on any open PR it denies deleting or editing a
+comment. Each deny names the owner's bang command. A push to a fork PR's branch is
+not covered (a stated residual).
+When the owner rules "merge at head X", at any round count, post a PR comment
 carrying `<!-- genesis-pin head=<full 40-hex sha of X> -->`: an agent merge then
 passes only at X, on top of the round-4 rule, and a pin outside the PR's commits,
 or two pins naming different heads, blocks. Only a maintainer's pin counts (author
@@ -1677,7 +1685,10 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   the review does complete the round; when the newest such round (opened after
   the go-live cutover) has no reflection naming it, the gate says so in an
   advisory. A rebase or force-push that drops the reviewed head from the PR still
-  ends the round silently.
+  ends the round silently, and a LOCAL rebase that has not been pushed leaves the
+  round open with its reflection unreachable, so every fix commit is refused.
+  Bring a base or main into a reviewed branch with a merge (build-session, "Once
+  a branch is pushed").
 
   An unreadable review budget keeps the gate's existing path (the round-approval
   ask in the foreground, a deny when dispatched). Anything else Rule R cannot read
@@ -2457,6 +2468,14 @@ The review-findings gate specifically:
      `--check-pr <N> --floor-accept <ids>` previews it and prints the merge-with line.
 
    The gate prints each open finding's id and why it is still open.
+   **An edited finding (#5001).** The gate reads GitHub's edit history for every
+   review comment it may score (all but CodeQL) and each reviewer's replies to its own
+   comments. A finding edited by anyone but its reviewer (a P1 made a P2, a stripped
+   badge) is listed `[edited by <login>]`; no fix reply clears it, only the owner's
+   `# floor-accept=<id>`. The off-diff and doc exclusions still apply, and an excluded
+   edited finding is listed, never scored. A reviewer's reply edited by someone else
+   (one rewritten into "Resolved") is ignored: it withdraws nothing and supplies no
+   fix sha. A history it cannot read gives one block: retry.
    It is a RULE because it used to be an ACCIDENT: before the lanes existed the
    single threshold was 1.0 and a P1 scores exactly 1.0, so the floor held by
    arithmetic, unnamed and untested — and raising any threshold would have

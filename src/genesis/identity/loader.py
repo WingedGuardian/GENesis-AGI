@@ -8,6 +8,8 @@ from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 
+from genesis.identity.paths import effective_sources, read_identity
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_DIR = Path(__file__).parent
@@ -151,7 +153,11 @@ class IdentityLoader:
         (The 2026-06-30 incident flattened the file because the old parser
         split per line and dropped every ``#`` header and ``---`` separator.)
         """
-        text = self.steering()
+        return self._parse_rules(self.steering())
+
+    @staticmethod
+    def _parse_rules(text: str) -> list[str]:
+        """Split STEERING text into its rule blocks (the preamble excluded)."""
         if not text:
             return []
         blocks: list[str] = []
@@ -423,7 +429,18 @@ class IdentityLoader:
         into two blocks on the next read→write round-trip.
         """
         path = self._dir / "STEERING.md"
-        rules = self.steering_rules()
+        if path.exists() and [p.name for p in effective_sources("STEERING.md", self._dir)] == [
+            "STEERING.local.md"
+        ]:
+            # A replace layer is in force, so no reader sees STEERING.md. The rule is
+            # still kept there (recoverable) until the layered writer moves it.
+            logger.warning(
+                "Steering rule saved to STEERING.md, which the STEERING.local.md replace "
+                "layer hides: it is not in force until that layer includes it"
+            )
+        # Parse the file this writes, never the layered text steering() returns:
+        # a STEERING.local.md rule must not be copied into the shipped file.
+        rules = self._parse_rules(path.read_text(encoding="utf-8").strip() if path.exists() else "")
         safe_rule = re.sub(r"(?m)^\s*---\s*$", "—", rule.strip())
         rules.append(safe_rule)
         # FIFO eviction — drop oldest if over cap
@@ -438,12 +455,12 @@ class IdentityLoader:
     def _load(self, filename: str) -> str:
         if filename in self._cache:
             return self._cache[filename]
-        path = self._dir / filename
-        if not path.exists():
-            logger.debug("Identity file not found: %s", path)
+        text = read_identity(filename, self._dir)
+        if text is None:
+            logger.debug("Identity file not found: %s", self._dir / filename)
             self._cache[filename] = ""
             return ""
-        text = path.read_text(encoding="utf-8").strip()
+        text = text.strip()
         self._cache[filename] = text
         return text
 

@@ -442,8 +442,8 @@ autonomy.
   evaluate applicability (>80% match = follow it), and note deviations.
   Update via `procedure_store` if the procedure is outdated.
 - **Expand related memory hints.** When proactive results show
-  `[→ related: id:xxx]`, use `memory_expand` to get full context when the
-  topic is actively relevant.
+  `→ id:xxx (a few words)`, use `memory_expand` to get full context when the
+  topic is actively relevant; the words are the linked memory's own label.
 - **Don't wait to be asked.** When a topic comes up that likely has prior
   context (recurring themes, named entities, project references),
   proactively recall before responding. The user should not have to say
@@ -613,7 +613,9 @@ gate works, its exemption categories, and the unit rules for size bounds:
   blocks a merge by itself — the always-fix floor, which stops a Codex **P1** the
   same way, in EVERY lane, before any score is consulted; a Devin non-severe
   finding weighs like a P2. Unless the configured documentation-path exclusion
-  applies. When Codex is out, a user-approved `# substitute-review` lets another
+  applies. A reviewer's finding comment edited by anyone but that reviewer counts as a floor
+  finding whatever it now says (the off-diff and doc exclusions still apply), and
+  only the owner's `# floor-accept` clears it. When Codex is out, a user-approved `# substitute-review` lets another
   reviewer's review at the exact head stand in for Codex (any GitHub App reviewer,
   such as Devin or CodeRabbit, except a bot the PR's own workflow drives and CodeQL)
   — ask the user in conversation each time; the sigil records the yes.

@@ -90,6 +90,13 @@
       "type": "Hex High Entropy String",
       "sha1": "5ebf695ceb7bedfd0d1a37259f394ca4a6c16a5d",
       "reason": "Public Git commit ID in the main-integration merge message for PR 4687. The SHA-1 of the referenced public main commit ID matches the detector digest."
+    },
+    {
+      "commit": "5bcedbf8ae24dda435b210e1e738096314d23dab",
+      "path": "COMMIT_MESSAGE",
+      "type": "Hex High Entropy String",
+      "sha1": "b36fcf28e69d23a87a4f9a687a690176c38fd0d7",
+      "reason": "Public main Git commit ID in the generated merge message for PR 4987. Its SHA-1 matches the detector digest."
     }
   ]
 }
