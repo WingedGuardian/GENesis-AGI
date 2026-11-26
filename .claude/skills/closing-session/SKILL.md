@@ -293,8 +293,9 @@ holds for any local checker whose answer is about a remote object.
 - **Repo TOOLING** (`--check-pr`, the flow-rate script, any `scripts/…` helper)
   runs from a tree at **freshly-fetched `origin/main`**. An old worktree runs an
   old gate.
-- **TESTS** run from **the PR's branch, rebased onto or merged with
-  freshly-fetched `origin/main`**. Testing `main` would tell you nothing about
+- **TESTS** run from **the PR's branch, merged with freshly-fetched
+  `origin/main`** (never rebased: a rebase of a reviewed branch strands its
+  round's reflection; build-session, "Once a branch is pushed"). Testing `main` would tell you nothing about
   the change under review — and step 3 requires the PR's code checked out, since
   verifying a finding means reading the code the finding is about.
 
@@ -1663,7 +1664,10 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   the review does complete the round; when the newest such round (opened after
   the go-live cutover) has no reflection naming it, the gate says so in an
   advisory. A rebase or force-push that drops the reviewed head from the PR still
-  ends the round silently.
+  ends the round silently, and a LOCAL rebase that has not been pushed leaves the
+  round open with its reflection unreachable, so every fix commit is refused.
+  Bring a base or main into a reviewed branch with a merge (build-session, "Once
+  a branch is pushed").
 
   An unreadable review budget keeps the gate's existing path (the round-approval
   ask in the foreground, a deny when dispatched). Anything else Rule R cannot read
