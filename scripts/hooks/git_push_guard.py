@@ -6521,8 +6521,8 @@ def _check_past_terminal(
     if pin_error:
         named = ", ".join(str(p) for p in pins) if isinstance(pins, list) else "unreadable"
         why = {
-            "malformed_pin": "a maintainer's `genesis-pin` comment is not exactly "
-            "`<!-- genesis-pin head=<full 40-hex sha> -->`",
+            "malformed_pin": "a maintainer's comment starts with a `genesis-pin` marker "
+            "whose first line is not exactly `<!-- genesis-pin head=<full 40-hex sha> -->`",
             "pin_not_in_pr": "a pin names a commit that is not in the PR",
             "pins_disagree": "two pins name different heads",
         }.get(str(pin_error), "the pins could not be read")

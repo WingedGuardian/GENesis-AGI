@@ -797,9 +797,10 @@ too. When the owner rules "merge at head X", at any round count, post a PR comme
 carrying `<!-- genesis-pin head=<full 40-hex sha of X> -->`: an agent merge then
 passes only at X, on top of the round-4 rule, and a pin outside the PR's commits,
 or two pins naming different heads, blocks. Only a maintainer's pin counts (author
-association OWNER, MEMBER or COLLABORATOR); anyone else's is ignored. Write the
-marker exactly: a maintainer's malformed one (a short sha, a quoted sha) blocks, and
-one inside a code block, inline code or a `>` quote line does not count. Only the owner removes or edits a pin;
+association OWNER, MEMBER or COLLABORATOR); anyone else's is ignored. The pin
+comment's first line is the marker, with nothing else on that line: post it as its
+own comment. A first line that starts the marker but is malformed (a short sha, no
+`-->`) blocks, and a marker on any later line is ignored. Only the owner removes or edits a pin;
 a deleted pin leaves no trace on GitHub, so that limit is stated, best effort. A
 fifth round exists only by explicit user approval, re-asked every round, and
 each of those is terminal in the same way (this replaced "round 6 and later are

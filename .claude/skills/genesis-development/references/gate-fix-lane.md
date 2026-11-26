@@ -36,9 +36,10 @@ Applies to any PR whose diff touches the enforcement-hook surface (`scripts/revi
   budget blocks every agent merge (`git_push_guard.py` `_check_past_terminal`, the
   `terminal-head` row of `--check-pr`). Any other head is the owner's bang-command
   merge or a send-back. An owner's "merge at head X" is pinned with a PR comment
-  carrying `<!-- genesis-pin head=<full sha> -->` from a maintainer's account (any
-  other author's pin, and one in code or a quote, is ignored; a malformed one
-  blocks); the merge must then be at X as well, and only
+  from a maintainer's account whose first line is the marker
+  `<!-- genesis-pin head=<full sha> -->`, nothing else on that line: post it as its
+  own comment (any other author's pin, and a marker on a later line, is ignored;
+  a malformed first-line marker blocks); the merge must then be at X as well, and only
   the owner removes a pin (a deletion leaves no trace on GitHub,
   so that limit is best effort).
 

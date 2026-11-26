@@ -1090,6 +1090,17 @@ def test_the_review_budget_answer_carries_only_what_the_document_selects(tmp_pat
     assert "files" not in pull
 
 
+def test_the_review_budget_answer_serves_comment_author_association(tmp_path):
+    """GitHub answers ``authorAssociation`` on every comment node the budget reads
+    (the pin rule needs it), so the replayed answer has the same shape."""
+    doc = GRAPHQL_DOCUMENTS["review_budget"]
+    proc = _fake_gh(tmp_path, ["api", "graphql", "-f", f"query={doc}", *_VARS])
+    assert proc.returncode == 0, proc.stderr
+    nodes = json.loads(proc.stdout)["data"]["repository"]["pullRequest"]["comments"]["nodes"]
+    assert nodes, "the replayed fixture carries no issue comment, so this checks nothing"
+    assert all(isinstance(n.get("authorAssociation"), str) for n in nodes), nodes
+
+
 def _module_strings(path: Path) -> tuple[dict[str, str], ast.Module]:
     """Module-level string constants of ``path``, read as text and never imported:
     the corpus mutates these files, and an import would hand the test the mutant."""

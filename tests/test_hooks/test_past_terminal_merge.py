@@ -487,7 +487,7 @@ def _pin(
         "login": login,
         "type": "User" if login else None,
         "author_association": assoc,
-        "body": f"Owner ruled: merge at this head.\n<!-- genesis-pin head={head} -->",
+        "body": f"<!-- genesis-pin head={head} -->\nOwner ruled: merge at this head.",
         "created_at": when,
     }
 
@@ -569,18 +569,42 @@ def _says(body: str, *, assoc: str | None = "OWNER", when=None, edited=None) -> 
     }
 
 
+PIN3 = f"<!-- genesis-pin head={H3} -->"
+
+
 @pytest.mark.parametrize(
-    "marker",
+    "body",
+    [
+        pytest.param(PIN3, id="marker-alone"),
+        pytest.param(f"\n\n  {PIN3}  \nOwner ruled: merge here.", id="after-blank-lines"),
+        pytest.param(PIN3.upper().replace(H3.upper(), H3), id="upper-case-marker"),
+        pytest.param(f"<!--genesis-pin   head={H3}-->", id="tight-spacing"),
+        pytest.param(f"   {PIN3}", id="three-space-indent"),
+        pytest.param(f"\ufeff{PIN3}", id="leading-bom"),
+        pytest.param(f"\u200b{PIN3}", id="leading-zero-width-space"),
+    ],
+)
+def test_a_first_line_strict_pin_binds(body):
+    got = _ev(head=H5, comments=(_says(body),))
+    assert got["pin_heads"] == [H3] and got["pin_error"] is None
+
+
+@pytest.mark.parametrize(
+    "first_line",
     [
         pytest.param(f"<!-- genesis-pin head={H3[:7]} -->", id="short-sha"),
         pytest.param(f'<!-- genesis-pin head="{H3}" -->', id="quoted-sha"),
         pytest.param(f"<!-- genesis-pin head={H3} by=owner -->", id="extra-attribute"),
         pytest.param(f"<!-- genesis-pin {H3} -->", id="no-head-key"),
-        pytest.param("<!--\ngenesis-pin head=<sha>\n-->", id="placeholder-multiline"),
+        pytest.param(f"<!-- genesis-pin head={H3}", id="unterminated"),
+        pytest.param(f"<!-- genesis-pin head={H3} --> trailing text", id="text-after-marker"),
+        pytest.param("<!-- genesis-pin", id="bare-keyword"),
+        pytest.param(f"<!--- genesis-pin head={H3} -->", id="three-dash-opener"),
+        pytest.param(f"\u200b<!-- genesis-pin head={H3[:7]} -->", id="zero-width-then-short"),
     ],
 )
-def test_a_maintainers_malformed_pin_blocks_never_binds_nothing(marker):
-    got = _ev(head=H5, comments=(_says(f"Ruling: merge here.\n{marker}"),))
+def test_a_maintainers_malformed_first_line_pin_blocks(first_line):
+    got = _ev(head=H5, comments=(_says(f"{first_line}\nRuling: merge here."),))
     assert got["pin_error"] == "malformed_pin", got["pin_heads"]
     blocked, msg = G._check_past_terminal("7", "o/r", H5, budget=got)
     assert blocked is True
@@ -593,55 +617,63 @@ def test_a_strangers_malformed_pin_is_ignored():
 
 
 @pytest.mark.parametrize(
-    "body",
+    "first_line",
     [
-        pytest.param(f"> <!-- genesis-pin head={H3} -->", id="quote-line"),
-        pytest.param(f"Example:\n  >> <!-- genesis-pin head={H2} -->", id="nested-quote"),
-        pytest.param(f"```\n<!-- genesis-pin head={H3} -->\n```", id="backtick-fence"),
-        pytest.param(f"~~~md\n<!-- genesis-pin head={H2} -->\n~~~", id="tilde-fence"),
-        pytest.param(f"To pin, post `<!-- genesis-pin head={H3} -->`.", id="inline-code"),
-        pytest.param("To pin, post `<!-- genesis-pin head=<sha> -->`.", id="inline-placeholder"),
-        pytest.param(f"```\n<!-- genesis-pin head={H3[:7]} -->\n```", id="malformed-in-fence"),
-        pytest.param(f"> <!-- genesis-pin head={H3[:7]} -->", id="malformed-in-quote"),
+        pytest.param("<!-- genesis-pin-help -->", id="genesis-pin-help"),
+        pytest.param("<!-- not-a-genesis-pin -->", id="not-a-genesis-pin"),
+        pytest.param(f"<!-- genesis-review-request head={H3} kind=confirmation -->", id="other"),
     ],
 )
-def test_a_quoted_or_code_pin_is_ignored(body):
+def test_a_first_line_that_only_resembles_a_pin_is_ignored(first_line):
+    got = _ev(head=H5, comments=(_says(f"{first_line}\n{PIN3}"),))
+    assert got["pin_heads"] == [] and got["pin_error"] is None
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(f"> {PIN3}", id="quote-line"),
+        pytest.param(f"```\n{PIN3}\n```", id="backtick-fence"),
+        pytest.param(f"````\n```\n{PIN3}\n```\n````", id="nested-fence"),
+        pytest.param(f"~~~md\n{PIN3}\n~~~", id="tilde-fence"),
+        pytest.param(f"Example:\n\n    {PIN3}", id="indented-code"),
+        pytest.param(f"  ```\n{PIN3}\n  ```", id="indented-fence"),
+        pytest.param(f"To pin, post `{PIN3}`.", id="inline-code"),
+        pytest.param(f"To pin, post ``\n{PIN3}\n``.", id="inline-code-across-lines"),
+        pytest.param(f"`{PIN3}`", id="inline-code-first-line"),
+        pytest.param(f"```\n<!-- genesis-pin head={H3[:7]} -->\n```", id="malformed-in-fence"),
+        pytest.param(f"> <!-- genesis-pin head={H3[:7]} -->", id="malformed-in-quote"),
+        pytest.param(f"Ruling below.\n<!-- genesis-pin head={H3[:7]}", id="unterminated-later"),
+        pytest.param(f"    {PIN3}", id="first-line-indented-code"),
+        pytest.param(f"\t{PIN3}", id="first-line-tab-indent"),
+        pytest.param(f"    <!-- genesis-pin head={H3[:7]} -->", id="indented-malformed"),
+    ],
+)
+def test_a_quoted_or_example_pin_never_binds_and_never_blocks(body):
     # The agent posts from the maintainer account: an example it quotes must not bind.
     got = _ev(head=H5, comments=(_says(body),))
     assert got["pin_heads"] == [] and got["pin_error"] is None
 
 
-def test_a_pin_after_a_closed_fence_still_counts():
-    body = f"```\nexample\n```\n<!-- genesis-pin head={H3} -->"
-    got = _ev(head=H5, comments=(_says(body),))
-    assert got["pin_heads"] == [H3] and got["pin_error"] is None
-
-
-def test_a_stray_backtick_never_swallows_a_pin_in_another_paragraph():
-    body = f"it`s ruled.\n\n<!-- genesis-pin head={H3} -->\n\nsee `x`"
-    got = _ev(head=H5, comments=(_says(body),))
-    assert got["pin_heads"] == [H3] and got["pin_error"] is None
+def test_a_pin_on_a_later_line_is_ignored():
+    """The one fail-open edge of the first-line rule: a real pin placed below other
+    text is not read, so it binds nothing. Accepted, because the agent posts a pin
+    in a controlled format (the marker as its own comment's first line), and the
+    rule's job is to make every quoted or example marker inert."""
+    got = _ev(head=H5, comments=(_says(f"Owner ruled: merge at this head.\n{PIN3}"),))
+    assert got["pin_heads"] == [] and got["pin_error"] is None
 
 
 def test_a_pin_added_by_editing_a_comment_counts():
-    got = _ev(
-        head=H5, comments=(_says(f"<!-- genesis-pin head={H3} -->", when=_at(1), edited=_at(9)),)
-    )
+    got = _ev(head=H5, comments=(_says(PIN3, when=_at(1), edited=_at(9)),))
     assert got["pin_heads"] == [H3] and got["pin_error"] is None
 
 
-def test_two_identical_markers_in_one_comment_are_one_pin():
-    marker = f"<!-- genesis-pin head={H3} -->"
-    got = _ev(head=H5, comments=(_says(f"{marker}\n{marker}"),))
-    assert got["pin_heads"] == [H3] and got["pin_error"] is None
-
-
-def test_two_different_markers_in_one_comment_disagree():
-    body = f"<!-- genesis-pin head={H2} -->\n<!-- genesis-pin head={H3} -->"
-    got = _ev(head=H5, comments=(_says(body),))
-    assert got["pin_error"] == "pins_disagree"
-
-
+def test_a_second_marker_in_one_comment_is_ignored():
+    # Only the first line is read, so a second marker, same or different, adds nothing.
+    for second in (PIN3, f"<!-- genesis-pin head={H2} -->"):
+        got = _ev(head=H5, comments=(_says(f"{PIN3}\n{second}"),))
+        assert got["pin_heads"] == [H3] and got["pin_error"] is None, second
 def test_a_pin_landing_between_the_two_reads_is_unknown(monkeypatch):
     """The double read compares the pin fields too: a pin posted mid-evaluation
     is a policy change, never silently dropped."""

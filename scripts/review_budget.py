@@ -170,44 +170,38 @@ _CONFIRMATION_RE = re.compile(
 )
 #: An owner's "merge at head X" ruling, posted as a PR comment (owner ruling
 #: 3f6ad6fb, F-B2). It only restricts which head an agent may merge.
-_PIN_RE = re.compile(r"\s*genesis-pin\s+head=([0-9a-fA-F]{40})\s*", re.IGNORECASE)
-#: Any HTML comment mentioning ``genesis-pin``. One the strict form does not fully
-#: match is a malformed pin: the ruling was meant, so it blocks rather than binding nothing.
-_PIN_LOOSE_RE = re.compile(r"<!--((?:(?!-->).)*?\bgenesis-pin\b(?:(?!-->).)*)-->", re.I | re.S)
-_INLINE_CODE_RE = re.compile(r"(`+)[^\n]*?\1")  # one line: never crosses a paragraph
+_PIN_RE = re.compile(r"<!--\s*genesis-pin\s+head=([0-9a-fA-F]{40})\s*-->", re.IGNORECASE)
+#: A first line that STARTS a pin marker (``genesis-pin`` as a whole word, so not
+#: ``genesis-pin-help``) but is not the strict form: a malformed pin, which blocks.
+_PIN_START_RE = re.compile(r"<!--+\s*genesis-pin(?![\w-])", re.IGNORECASE)
+#: Zero-width characters str.strip() keeps; a leading one must not hide a pin.
+_INVISIBLE = "\ufeff\u200b\u200c\u200d\u2060"
 #: The GitHub ``authorAssociation`` values whose pin comments count: the repo's maintainers.
 _PIN_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 
 Runner = Callable[..., tuple[int, str, str]]
 
 
-def _pin_markers(body: str) -> tuple[set[str], bool]:
-    """``(heads, malformed)``: the pins in a comment body, read only from its prose.
-
-    Fenced code, ``>`` quote lines and inline code are dropped first: the agent
-    posts from the maintainer's account, so an example it quotes must never bind.
-    An unclosed fence runs to the end of the body, as GitHub renders it."""
-    kept: list[str] = []
-    fence = ""
-    for line in body.splitlines():
-        stripped = line.lstrip()
-        if fence:
-            fence = "" if stripped.startswith(fence) else fence
-            continue
-        if stripped[:3] in ("```", "~~~"):
-            fence = stripped[:3]
-            continue
-        if not stripped.startswith(">"):
-            kept.append(line)
-    heads: set[str] = set()
-    malformed = False
-    for comment in _PIN_LOOSE_RE.finditer(_INLINE_CODE_RE.sub("", "\n".join(kept))):
-        strict = _PIN_RE.fullmatch(comment.group(1))
-        if strict is None:
-            malformed = True
-        else:
-            heads.add(strict.group(1).lower())
-    return heads, malformed
+def _pin_marker(body: str) -> tuple[str | None, bool]:
+    """``(head, malformed)``: the pin a comment carries, read from its FIRST
+    non-blank line only, which must be the whole strict marker. Every other line
+    is ignored, wherever ``genesis-pin`` appears in it: the agent posts from the
+    maintainer's account, so an example it quotes (in code, a quote or prose) must
+    never bind, and no markdown model is needed to tell an example from a pin.
+    A first line that starts a marker but is not the strict form is malformed.
+    A first line indented four or more columns (or by a tab) is an indented code
+    block as GitHub renders it, so it is an example: never a pin, never malformed.
+    Leading zero-width characters are dropped first, so they cannot hide a pin."""
+    lines = (line.lstrip(_INVISIBLE) for line in body.splitlines())
+    raw = next((line for line in lines if line.strip()), "")
+    indent = raw[: len(raw) - len(raw.lstrip(" \t"))]
+    if "\t" in indent or len(indent) >= 4:
+        return None, False
+    first = raw.strip()
+    strict = _PIN_RE.fullmatch(first)
+    if strict is not None:
+        return strict.group(1).lower(), False
+    return None, _PIN_START_RE.match(first) is not None
 
 
 def _parse_external_identity_scalar(raw: str) -> object:
@@ -886,8 +880,9 @@ def evaluate_evidence(
         # stranger's stale or disagreeing pin would block every agent merge until the
         # owner removed it. Anyone else's pin-shaped text, or a deleted author's, is ignored.
         if login is not None and item.get("author_association") in _PIN_ASSOCIATIONS:
-            marked_pins, malformed_pin = _pin_markers(body)
-            pin_heads |= marked_pins
+            pin_head, malformed_pin = _pin_marker(body)
+            if pin_head is not None:
+                pin_heads.add(pin_head)
             pin_malformed = pin_malformed or malformed_pin
         for index, pattern in enumerate(identities):
             for match in pattern.finditer(body):

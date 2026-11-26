@@ -442,6 +442,8 @@ def _review_budget_answer(state: dict, connections: tuple[str, ...]) -> dict:
             "body": c["body"],
             "createdAt": c["created_at"],
             "updatedAt": c["updated_at"],
+            # REST's own field; GitHub always answers one, so a fixture without it is NONE.
+            "authorAssociation": c.get("author_association", "NONE"),
             "author": _graphql_author(c["user"]),
         }
         for c in api[f"issues/{pr}/comments"]
