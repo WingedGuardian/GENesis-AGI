@@ -4014,7 +4014,9 @@ def _check_inline_review_findings(
             replies_to.setdefault(r.get("reply_to"), []).append(r)
     used_ids = floor_accept_used if floor_accept_used is not None else set()
 
-    def _floor_cleared(group: list[dict], paths: list | None = None) -> bool:
+    def _floor_cleared(
+        group: list[dict], paths: list | None = None, sigil_copies: list[dict] | None = None
+    ) -> bool:
         """Whether a floor finding (one comment, or a Devin group) is cleared.
 
         A fix is tried first, so an id named in ``# floor-accept`` is only spent on a
@@ -4022,7 +4024,14 @@ def _check_inline_review_findings(
         commit (MEASURED 0 of 23), so on a thread carrying it Devin's own replies may
         supply the id; the id still has to pass the whole test. ``paths`` names the
         files a duplicated finding scored on: each one needs its own fix.
+
+        ``sigil_copies`` (default ``group``) is the copies whose ids the sigil may name and the
+        block reports: a Devin group's untouched copies, while its edited ones still
+        lend their reply threads. A yes to an edit never clears the twin (owner
+        ruling, 2026-11-25).
         """
+        sigil_copies = group if sigil_copies is None else sigil_copies
+        sigil_ids = {cp.get("id") for cp in sigil_copies}
         key = tuple(cp.get("id") for cp in group)
         if key in floor_verdicts:
             return floor_verdicts[key]
@@ -4076,7 +4085,7 @@ def _check_inline_review_findings(
             if rested_on_devin:
                 floor_devin_only.add(key)
         if not cleared:
-            named = {i for i in key if i in floor_accept}
+            named = {i for i in key if i in floor_accept and i in sigil_ids}
             if named and _is_dispatched():
                 floor_refused.update(named)
                 why = "'# floor-accept' records the owner's yes, and a dispatched session has no owner present"
@@ -4084,7 +4093,7 @@ def _check_inline_review_findings(
                 used_ids.update(named)
                 cleared = True
         if not cleared:
-            floor_unmet.append((group[0].get("id"), why, open_path))
+            floor_unmet.append((sigil_copies[0].get("id"), why, open_path))
         floor_verdicts[key] = cleared
         return cleared
 
@@ -4193,21 +4202,12 @@ def _check_inline_review_findings(
 
     def _tamper_excluded(path: str | None) -> bool:
         # The exclusions an edited finding keeps (the floor's reading of the doc
-        # lever: excluded only under `skip`), shared by the taint and the branch.
+        # lever: excluded only under `skip`), shared by the edited-finding branch.
         return _off_diff(path) or (_is_doc_path(path or "") and _doc_findings_mode() == "skip")
 
-    # A Devin finding posted twice is one finding: one tampered copy taints all.
-    # Only an in-scope copy taints, and only in-scope twins: an excluded copy
-    # never moves the group's verdict, so its edit must not either.
-    for copies in devin_copies.values():
-        editors = [
-            tampered[cp.get("id")]
-            for cp in copies
-            if cp.get("id") in tampered and not _tamper_excluded(cp.get("path"))
-        ]
-        for cp in copies:
-            if editors and cp.get("id") not in tampered and not _tamper_excluded(cp.get("path")):
-                tampered[cp.get("id")] = editors[0]
+    # A Devin finding posted twice: its edited copies are one edited entry, and its
+    # untouched copies are judged on their own text in the Devin branch, so a yes to
+    # the edit never clears an untouched copy (owner ruling, 2026-11-25).
 
     for c in raw:
         login, utype = c.get("login") or "", c.get("type") or ""
@@ -4234,6 +4234,10 @@ def _check_inline_review_findings(
             # current text is not the reviewer's, so nothing in it is believed. The
             # path is REST metadata an edit cannot change, so its exclusions stand.
             path = c.get("path")
+            # Known limit: the group key is the finding id in the CURRENT text, so an
+            # edit can move a copy into another group. The edit itself still blocks
+            # until the sigil, and a floor copy needs a fix sha that no Resolved
+            # reply carries; only the original text would close it, which is not read.
             fid = _devin_finding(body)[0] if login in devin_logins else None
             group = devin_copies.get((login, fid), [c]) if fid is not None else [c]
             gkey = tuple(cp.get("id") for cp in group)
@@ -4248,10 +4252,16 @@ def _check_inline_review_findings(
                         )
                     )
                 continue
-            if gkey in tampered_seen:
+            # The finding's in-scope edited copies: one entry, cleared only by their ids.
+            edited = tuple(
+                cp.get("id")
+                for cp in group
+                if cp.get("id") in tampered and not _tamper_excluded(cp.get("path"))
+            )
+            if edited in tampered_seen:
                 continue
-            tampered_seen.add(gkey)
-            named = {i for i in gkey if i in floor_accept}
+            tampered_seen.add(edited)
+            named = {i for i in edited if i in floor_accept}
             why = (
                 f"edited by {tampered[c.get('id')]} after the reviewer posted it; "
                 "only the owner's sigil clears it"
@@ -4363,7 +4373,9 @@ def _check_inline_review_findings(
             elif disp == "doc":
                 devin_doc_skipped.append(title)
             elif sev == "floor":
-                if _floor_cleared(group_all, [t[0].get("path") for t in eligible if t[2] == "floor"]):
+                if _floor_cleared(
+                    group_all, [t[0].get("path") for t in eligible if t[2] == "floor"], sigil_copies=copies
+                ):
                     if tuple(cp.get("id") for cp in group_all) in floor_devin_only:
                         _list_self_withdrawn(dkey, copies, always=True)
                     continue

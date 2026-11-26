@@ -940,7 +940,7 @@ class TestEditedFindings:
             block, msg, _ = _scan(guard, monkeypatch, [c])
             assert block and "edit history unreadable for 1" in msg, c["login"]
 
-    def test_an_excluded_devin_copys_edit_does_not_taint_its_twin(self, guard, monkeypatch):
+    def test_an_excluded_devin_copys_edit_does_not_block_its_twin(self, guard, monkeypatch):
         """Review 4692642192: an off-diff copy never moves the group, so its edit cannot."""
         self._history(monkeypatch, {1: _node(1, "devin-ai-integration", OWNER_EDIT)})
         comments = [
@@ -950,7 +950,7 @@ class TestEditedFindings:
         block, msg, _ = _scan(guard, monkeypatch, comments)
         assert not block, msg
 
-    def test_an_in_diff_edit_still_taints_an_off_diff_twin_once(
+    def test_an_in_diff_edit_is_one_entry_beside_an_off_diff_twin(
         self, guard, monkeypatch, capsys, offdiff_lock
     ):
         offdiff_lock.expected()
@@ -1008,6 +1008,39 @@ class TestEditedFindings:
         block, msg, _ = _scan(guard, monkeypatch, comments)
         assert not block, msg
 
+    def test_a_sigil_on_the_edited_copy_does_not_clear_its_untouched_twin(
+        self, guard, monkeypatch, offdiff_lock
+    ):
+        """Owner ruling 2026-11-25: a yes to an edit never waves through the twin."""
+        offdiff_lock.expected()
+        self._history(monkeypatch, {1: _node(1, "devin-ai-integration", OWNER_EDIT)})
+        comments = [
+            _finding(1, _devin(), login=DEVIN, path="src/elsewhere.py"),
+            _finding(2, _devin(), login=DEVIN),
+        ]
+        block, msg, _ = _scan(guard, monkeypatch, comments, floor_accept=frozenset({1}))
+        assert block and "1 Devin severe" in msg
+        # The block names the untouched copy, the id that clears it.
+        assert "finding 2 (src/benign.py)" in msg and "finding 1 (" not in msg
+
+    def test_a_sigil_on_an_untouched_copy_does_not_clear_the_edited_entry(
+        self, guard, monkeypatch, offdiff_lock
+    ):
+        offdiff_lock.expected()
+        self._history(monkeypatch, {2: _node(2, "devin-ai-integration", OWNER_EDIT)})
+        comments = [
+            _finding(1, _devin(), login=DEVIN, path="src/elsewhere.py"),
+            _finding(2, _devin(), login=DEVIN),
+        ]
+        block, msg, _ = _scan(guard, monkeypatch, comments, floor_accept=frozenset({1}))
+        assert block and "1 edited reviewer" in msg
+        used: set[int] = set()
+        block, msg, _ = _scan(
+            guard, monkeypatch, comments, floor_accept=frozenset({2}), floor_accept_used=used
+        )
+        assert not block, msg
+        assert used == {2}
+
     def test_an_edited_finding_posted_twice_off_the_diff_counts_once(
         self, guard, monkeypatch, offdiff_lock
     ):
@@ -1050,12 +1083,43 @@ class TestEditedFindings:
         assert "[doc] [edited by a-maintainer]" in capsys.readouterr().err
         assert uncounted[0]["exact"]["doc_path"] == 1
 
-    def test_one_edited_devin_copy_taints_the_finding_once(self, guard, monkeypatch):
+    def test_an_edited_devin_copy_and_its_untouched_twin_count_apart(self, guard, monkeypatch):
+        """Owner ruling 2026-11-25: no taint. The edit is its own entry; the twin scores."""
         self._history(monkeypatch, {2: _node(2, "devin-ai-integration", OWNER_EDIT)})
         comments = [_finding(1, _devin(), login=DEVIN), _finding(2, _devin(), login=DEVIN)]
         block, msg, _ = _scan(guard, monkeypatch, comments)
-        # Counted once, as edited, never also as the untouched twin's Devin severe.
-        assert block and "0 Devin severe + 1 edited reviewer" in msg
+        assert block and "1 Devin severe + 1 edited reviewer" in msg
+
+    @pytest.mark.parametrize("accepted", [{1}, {2}])
+    def test_one_sigil_never_clears_both_in_diff_copies(self, guard, monkeypatch, accepted):
+        self._history(monkeypatch, {2: _node(2, "devin-ai-integration", OWNER_EDIT)})
+        comments = [_finding(1, _devin(), login=DEVIN), _finding(2, _devin(), login=DEVIN)]
+        block, msg, _ = _scan(guard, monkeypatch, comments, floor_accept=frozenset(accepted))
+        assert block, msg
+        if accepted == {2}:
+            assert "1 Devin severe + 0 edited reviewer" in msg and "finding 1 (" in msg
+        else:
+            assert "0 Devin severe + 1 edited reviewer" in msg and "finding 2 (" in msg
+
+    def test_an_off_diff_edited_copys_id_never_clears_the_in_diff_one(
+        self, guard, monkeypatch, offdiff_lock
+    ):
+        offdiff_lock.expected()
+        self._history(
+            monkeypatch, {i: _node(i, "devin-ai-integration", OWNER_EDIT) for i in (1, 2)}
+        )
+        comments = [
+            _finding(1, _devin(), login=DEVIN, path="src/elsewhere.py"),
+            _finding(2, _devin(), login=DEVIN),
+        ]
+        block, msg, _ = _scan(guard, monkeypatch, comments, floor_accept=frozenset({1}))
+        assert block and "1 edited reviewer" in msg and "finding 2 (" in msg
+
+    def test_both_sigils_clear_the_pair(self, guard, monkeypatch):
+        self._history(monkeypatch, {2: _node(2, "devin-ai-integration", OWNER_EDIT)})
+        comments = [_finding(1, _devin(), login=DEVIN), _finding(2, _devin(), login=DEVIN)]
+        block, msg, _ = _scan(guard, monkeypatch, comments, floor_accept=frozenset({1, 2}))
+        assert not block, msg
 
     def test_an_edited_resolved_reply_withdraws_nothing(self, guard, monkeypatch):
         """Devin's own Resolved reply supplies the fix sha; an owner edit of it does not."""

@@ -6,7 +6,9 @@
    warning), and 🔍 is informational, surfaced and never scored. The marker agrees
    with the metadata `kind` on every comment measured. A
    marker outside that closed set is FORMAT DRIFT: surfaced, never scored. A
-   finding Devin posted twice counts once (dedup on its metadata `id`). It is
+   finding Devin posted twice counts once (dedup on its metadata `id`), unless
+   someone else edited a copy: the edited copies and the untouched ones then
+   count apart (#5001). It is
    parsed only for the `devin-ai-integration[bot]` Bot account, and its branch
    runs before the Codex badge match, so a Devin body QUOTING `![P1 Badge]` is
    scored once, as Devin. CodeRabbit Minor and below stay SURFACE-ONLY by owner
