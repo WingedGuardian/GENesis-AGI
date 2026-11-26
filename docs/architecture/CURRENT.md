@@ -73,10 +73,11 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 273642a5e 2026-11-22
+verified: e063fcd73 2026-11-25
 ```
 
-The 2026-11-22 verification covers weekly dream centrality. The 2026-11-07
+The 2026-11-25 verification covers labelled graph neighbours. The 2026-11-22
+verification covers weekly dream centrality. The 2026-11-07
 verification covers the request-owned memory thread boundaries below.
 Other memory descriptions retain their individually cited verification dates.
 
@@ -635,6 +636,33 @@ ignores `valid_at` (the bake-off oracle's as-of shape would hide the 5.7% of
 rows with a NULL `valid_at`). Consequence to carry into MW-5: this also shrinks
 the graph `centrality_scores` runs on, hence the shield's bridge-node
 population.
+
+**Labelled neighbours (2026-11-25, memory spec MW-11)** — `memory_expand` and
+`memory_recall` neighbours carry a `relation` (`supports`/`extends` read as
+`similar`, an untyped FalkorDB edge as `linked`, a typed edge as its type;
+depth 2 as `via <relation>`, the type of the path's last edge) and, where the
+text may be shown, a `label`: a few words of the neighbour's own text
+(`memory/neighbour_labels.py`: indexed SQLite lookups decide what may be
+labelled, then one batched Qdrant `retrieve` off the loop reads the text; the
+hook runs only the SQLite half on its pooled read connection). The proactive hook's breadcrumbs get the same labels
+(`→ id:x (six words)`, `related_ids` unchanged). No label for a credential entry
+(the reference store's row test, plus the point's own credential header or tag:
+older entries still hold the value in their text), external or unknown-origin
+text (the injection gate's predicate, stored origin first; no origin at all
+counts as unknown), garbage, a missing point, or a hidden memory the caller did not
+ask for; the hook never labels a hidden one. A failed credential, origin or
+(without opt-in) visibility read withholds every label in the response. An expand
+records its launch-time Claude Code session id, its nearest `claude` process pid
+and that process's start time (`claude_pid`, `claude_started`) on its
+`recall_used` event, and the hook's recall trace records the hint ids shown
+(`hints`). Nothing reads them together yet: the followed-link read (a one-off
+query, 14 days after deploy) can join the two on the process, since
+`cc_sessions.pid` maps each traced conversation to it, and falls back to the
+session id where a row has no pid. The session id alone goes stale after a
+conversation reset, and a process's newest `cc_sessions` row can be a background
+agent's. Attribution is per process: one Claude Code process's conversations and
+agents count together. MEASURED on a live install: hook
+label step p50 6-13 ms, max 14-28 ms over 20 prompts per run.
 
 **Merge link rewiring** — the live merge (`_synthesize_and_deprecate`) COPIES
 each original's external `memory_links` edges onto the synthesis

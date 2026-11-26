@@ -442,8 +442,8 @@ autonomy.
   evaluate applicability (>80% match = follow it), and note deviations.
   Update via `procedure_store` if the procedure is outdated.
 - **Expand related memory hints.** When proactive results show
-  `[→ related: id:xxx]`, use `memory_expand` to get full context when the
-  topic is actively relevant.
+  `→ id:xxx (a few words)`, use `memory_expand` to get full context when the
+  topic is actively relevant; the words are the linked memory's own label.
 - **Don't wait to be asked.** When a topic comes up that likely has prior
   context (recurring themes, named entities, project references),
   proactively recall before responding. The user should not have to say
