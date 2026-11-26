@@ -1,0 +1,446 @@
+"""Procedure writes never store a credential in their text (#4859). All values here
+are synthetic."""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from genesis.db.crud import procedural
+from genesis.learning.procedural.credential_scrub import scrub_text, scrub_value
+
+FAKE = "Zq7-fake-Secret!9"
+
+
+@pytest.mark.parametrize(
+    ("text", "kept"),
+    [
+        (f"run sshpass -p '{FAKE}' ssh user@host.example", "ssh user@host.example"),
+        (f"run sshpass -p {FAKE} ssh h", "ssh h"),
+        (f"log in with password {FAKE} then sync", "then sync"),
+        (f"password '{FAKE}' then go", "then go"),
+        (f"passphrase {FAKE}", "passphrase"),
+        (f"the password: {FAKE}", "the password"),
+        ("export EXAMPLE_API_KEY=abcdef0123456789abcdef && make", "&& make"),
+    ],
+)
+def test_credential_values_are_redacted_and_the_rest_survives(text, kept):
+    cleaned, found = scrub_text(text)
+    assert FAKE not in cleaned and "abcdef0123456789abcdef" not in cleaned
+    assert "redacted" in cleaned.lower() and kept in cleaned and found
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        # sshpass -p's argument is always the password, whatever its length.
+        ("sshpass -p ab ssh h", "ab"),
+        ("sshpass -p a ssh h", " a "),
+        ("sshpass -p 'q' ssh h", "'q'"),
+        ("sshpass -p'ab' ssh h", "'ab'"),
+        ("sshpass -p '$lit9' ssh h", "$lit9"),  # single quotes: literal, not a variable
+        # A quoted value holding the other quote kind is redacted whole.
+        ("sshpass -p 'Zq7\"fake!9' ssh h", "Zq7"),
+        ('sshpass -p "Zq7\'fake!9" ssh h', "Zq7"),
+        ("password 'Zq7\"fake!9' then go", "Zq7"),
+        ('password "Zq7\'fake!9" then go', "Zq7"),
+        # A $ after the first character is a symbol, not a variable.
+        ("password abcde$ then go", "abcde"),
+        # Single quotes: a $ is literal text, not a variable (#4872 review).
+        ("password '$uperman99' then go", "uperman99"),
+        # sshpass reads its options as getopt does (#4872 review): a value
+        # continued or quoted across lines, a prompt argument that starts with a
+        # hyphen, -p in a cluster, a quoted option, a literal after a variable.
+        ("sshpass -p abc\\\nremaining ssh h", "remaining"),
+        ("sshpass -p 'abc\nremaining' ssh h", "remaining"),
+        ('sshpass -p "abc\nremaining" ssh h', "remaining"),
+        ("sshpass -P -prompt -p ab ssh h", "ab"),
+        ("sshpass -vp ab ssh h", "ab"),
+        ("sshpass -vpabc123xyz ssh h", "abc123xyz"),
+        ("sshpass -ep Zq7k ssh h", "Zq7k"),
+        ('sshpass "-p" Zq7k ssh h', "Zq7k"),
+        ('sshpass -p "$SSHPASS" -p Zq7k ssh h', "Zq7k"),
+        # Quote removal comes first: a quoted option letter, an empty attachment,
+        # a literal $ in single quotes, a capital S.
+        ('sshpass -"p" Zq7kfake9 ssh h', "Zq7kfake9"),
+        ("sshpass -'p' Zq7kfake9 ssh h", "Zq7kfake9"),
+        ("sshpass -\\p Zq7kfake9 ssh h", "Zq7kfake9"),
+        ('sshpass -v"p" Zq7kfake9 ssh h', "Zq7kfake9"),
+        ('sshpass -p"" Zq7kfake9 ssh h', "Zq7kfake9"),
+        ("sshpass '-p''$ecret99' ssh h", "ecret99"),
+        ("Sshpass -p Zq7kfake9 ssh h", "Zq7kfake9"),
+        # $ forms bash reads as literal text.
+        ("sshpass -p $'Zq7k fake9' ssh h", "fake9"),
+        ("sshpass -p$'Zq7kfake9' ssh h", "Zq7kfake9"),
+        ('sshpass -p $"Zq7kfake9" ssh h', "Zq7kfake9"),
+        ("sshpass -p $%Zq7kfake9 ssh h", "Zq7kfake9"),
+        # Options before -p; -P keeps its prompt argument.
+        ("sshpass -e -p Zq7k ssh h", "Zq7k"),
+        ("sshpass -v -p Zq7k ssh h", "Zq7k"),
+        ("sshpass -o x -p Zq7k ssh h", "Zq7k"),
+        # A newline, a backslash-newline or a non-breaking space before the value.
+        ("sshpass -p\nZq7k ssh h", "Zq7k"),
+        ("sshpass -p \\\nZq7k ssh h", "Zq7k"),
+        ("sshpass -p Zq7k ssh h", "Zq7k"),
+    ],
+)
+def test_short_mixed_quote_and_dollar_values_are_redacted(text, secret):
+    cleaned, found = scrub_text(text)
+    assert secret not in cleaned and "[redacted]" in cleaned and found
+    assert cleaned.split("[redacted]")[1].strip() in ("ssh h", "then go")
+
+
+def test_the_sshpass_prompt_option_keeps_its_argument():
+    cleaned, _ = scrub_text("sshpass -P assword: -p Zq7k ssh h")
+    assert cleaned == "sshpass -P assword: -p [redacted] ssh h"
+
+
+@pytest.mark.parametrize("prompt", ['"Enter password:"', "'pass word'", '""', "-Pprompt"])
+def test_a_quoted_prompt_with_a_space_does_not_hide_the_password(prompt):
+    opt = prompt if prompt.startswith("-P") else f"-P {prompt}"
+    cleaned, _ = scrub_text(f"sshpass {opt} -p Zq7wXvk ssh h")
+    assert cleaned == f"sshpass {opt} -p [redacted] ssh h"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "sshpass -e ssh -p 2222 host",
+        "sshpass -f pw.txt ssh -p 22 host",
+        "sshpass -P assword: -e ssh -p 22 host",
+        'sshpass -p "$SSHPASS" ssh -p 2222 host',
+        "sshpass -d 3 scp -P 2222 a host:b",
+    ],
+)
+def test_options_after_the_command_are_not_sshpass_options(text):
+    """sshpass stops reading options at the command it runs, as getopt does, so
+    ssh's own -p port is kept (#4872 review)."""
+    assert scrub_text(text) == (text, [])
+
+
+def test_each_sshpass_command_is_judged_alone():
+    text = "sshpass -p abc123xyz ssh h1 && sshpass -p Zq7kdef2 ssh h2 'reboot'"
+    cleaned, _ = scrub_text(text)
+    assert cleaned == "sshpass -p [redacted] ssh h1 && sshpass -p [redacted] ssh h2 'reboot'"
+
+
+@pytest.mark.parametrize(
+    "rest",
+    [
+        "Step 2: run the tests",
+        "Step 2: don't forget the tests\nStep 3: it's done",
+        'Step 2: say "hi" to the team',
+    ],
+)
+def test_an_unclosed_quote_stops_at_the_line_end(rest):
+    """A later quote mid-word does not close it (#4872 review)."""
+    cleaned, _ = scrub_text(f"sshpass -p 'abc123xyz then\n{rest}")
+    assert cleaned == f"sshpass -p [redacted]\n{rest}"
+
+
+def test_a_prompt_and_shell_operators_bound_the_value():
+    assert scrub_text('sshpass -P "sshpass -p Enter" ssh h') == (
+        'sshpass -P "sshpass -p Enter" ssh h',
+        [],
+    )
+    cleaned, _ = scrub_text("sshpass -p Zq7k;echo ok")
+    assert cleaned == "sshpass -p [redacted];echo ok"
+
+
+def test_many_sshpass_words_stay_linear():
+    import time
+
+    start = time.perf_counter()
+    scrub_text("sshpass " * 5000 + "-e ssh h")
+    scrub_text("sshpass " + "-v " * 5000 + "-p x ssh h")
+    assert time.perf_counter() - start < 0.5
+
+
+def test_a_blank_line_after_dash_p_is_not_read_as_its_value():
+    text = "sshpass -p\n\nThe next paragraph"
+    assert scrub_text(text) == (text, [])
+
+
+def test_a_variable_reference_keeps_the_rest_of_the_command():
+    """The shared redactor may take the reference itself (accepted: a lost name,
+    never a leaked value), but the command around it survives."""
+    cleaned, _ = scrub_text("export GITHUB_TOKEN=$GH_TOKEN && gh pr list && echo done")
+    assert cleaned.endswith("&& gh pr list && echo done")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "password: $uperman99 then",
+        "PASSWORD=$uperman99 then",
+        'DB_PASSWORD="$uperman99" then',
+        "TOKEN='$Zq7fakeSecret9' then",
+    ],
+)
+def test_a_dollar_prefixed_literal_under_a_label_is_redacted(text):
+    cleaned, _ = scrub_text(text)
+    assert "uperman99" not in cleaned and "Zq7fakeSecret9" not in cleaned
+    assert cleaned.endswith(" then")
+
+
+def test_a_value_under_a_credential_key_is_redacted_and_other_members_survive():
+    found: list[str] = []
+    value = {
+        "password": "x7!Secret",
+        "secret": "abc",
+        "token": 5,
+        "userPassword": "q",
+        "api_key": "short",
+        "passphrase": "$Zq7wXv1k",  # a $-prefixed value under a key is still a value
+        "description": "then check the log",
+        "times_hit": 3,
+        "transient": True,
+    }
+    out = scrub_value([value], found)[0]
+    for key in ("password", "secret", "token", "userPassword", "api_key", "passphrase"):
+        assert out[key] == "[redacted]", key
+    assert out["description"] == "then check the log" and out["times_hit"] == 3
+    assert out["transient"] is True and found
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "password reset flow",
+        "store the password in a password manager",
+        'sshpass -p "$SSHPASS" ssh host',
+        "sshpass -p $(pass show edge) ssh host",
+        "a password-protected archive",
+        "reset password via /login",
+        "find the password reference_lookup entry",
+        "sshpass -p ${SSHPASS} ssh host",
+        "log in with password $HOME_PW then sync",
+        "the password manager costs $5",
+    ],
+)
+def test_ordinary_text_and_variable_references_are_left_alone(text):
+    assert scrub_text(text) == (text, [])
+
+
+def _row(**over):
+    base = dict(
+        id="p1",
+        task_type="t",
+        principle="use the edge box",
+        tools_used=["Bash"],
+        context_tags=["x"],
+        created_at="2026-11-17T00:00:00+00:00",
+        steps=[f"sshpass -p '{FAKE}' ssh host", "then check the log"],
+    )
+    base.update(over)
+    return base
+
+
+@pytest.mark.asyncio
+async def test_create_stores_redacted_steps_as_valid_json(db):
+    await procedural.create(db, **_row())
+    row = await procedural.get_by_id(db, "p1")
+    steps = row["steps"] if isinstance(row["steps"], list) else json.loads(row["steps"])
+    assert FAKE not in json.dumps(steps) and steps[1] == "then check the log"
+
+
+@pytest.mark.asyncio
+async def test_update_redacts_a_json_string_field_without_breaking_it(db):
+    await procedural.create(db, **_row(steps=["fine"]))
+    await procedural.update(db, "p1", steps=json.dumps([f"login with password {FAKE}", "b"]))
+    row = await procedural.get_by_id(db, "p1")
+    steps = row["steps"] if isinstance(row["steps"], list) else json.loads(row["steps"])
+    assert steps == ["login with password [redacted]", "b"]
+
+
+@pytest.mark.asyncio
+async def test_upsert_redacts_too(db):
+    await procedural.upsert(db, **{k: v for k, v in _row().items() if k != "scenario"})
+    row = await procedural.get_by_id(db, "p1")
+    assert FAKE not in json.dumps(row, default=str)
+
+
+@pytest.mark.asyncio
+async def test_a_clean_procedure_is_stored_unchanged(db):
+    await procedural.create(db, **_row(steps=["git status", "pytest tests/x.py"]))
+    row = await procedural.get_by_id(db, "p1")
+    steps = row["steps"] if isinstance(row["steps"], list) else json.loads(row["steps"])
+    assert steps == ["git status", "pytest tests/x.py"] and row["principle"] == "use the edge box"
+
+
+@pytest.mark.asyncio
+async def test_a_scrub_failure_withholds_the_field_and_still_writes(db, monkeypatch):
+    """Protecting a secret never drops a write: the field is withheld, the row lands."""
+    from genesis.learning.procedural import credential_scrub
+
+    def boom(text):
+        raise credential_scrub.ScrubFailed("unavailable")
+
+    monkeypatch.setattr(credential_scrub, "_shared_scrub", boom)
+    await procedural.create(db, **_row(steps=["git status"]))
+    row = await procedural.get_by_id(db, "p1")
+    steps = row["steps"] if isinstance(row["steps"], list) else json.loads(row["steps"])
+    assert steps == [procedural._WITHHELD] and row["principle"] == procedural._WITHHELD
+
+
+@pytest.mark.asyncio
+async def test_the_scrub_keeps_non_ascii_in_a_json_field_it_re_dumps(db):
+    """update() with a JSON string is parsed, scrubbed and re-dumped; the re-dump must
+    not rewrite the text (create()'s own json.dumps is unchanged by this PR)."""
+    await procedural.create(db, **_row(steps=["fine"]))
+    await procedural.update(db, "p1", steps=json.dumps(["vérifier le café"], ensure_ascii=False))
+    raw = await (await db.execute("SELECT steps FROM procedural_memory WHERE id='p1'")).fetchone()
+    assert "vérifier" in raw[0]
+
+
+@pytest.mark.asyncio
+async def test_a_json_field_with_surrounding_whitespace_is_still_parsed(db):
+    """Whitespace before the document used to send it down the prose path."""
+    await procedural.create(db, **_row(steps=["fine"]))
+    doc = "  \n" + json.dumps([{"password": "x7!Secret", "note": "keep"}]) + "\n "
+    await procedural.update(db, "p1", steps=doc)
+    row = await procedural.get_by_id(db, "p1")
+    assert json.loads(row["steps"]) == [{"password": "[redacted]", "note": "keep"}]
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_credential_condition_counts_one_failure_mode(db):
+    """The stored description is scrubbed; the incoming one is compared scrubbed too."""
+    from genesis.learning.procedural.operations import record_failure
+
+    await procedural.create(db, **_row(steps=["fine"]))
+    condition = f"auth failed for sshpass -p '{FAKE}' ssh host"
+    for _ in range(2):
+        assert await record_failure(db, "p1", condition=condition)
+    modes = json.loads((await procedural.get_by_id(db, "p1"))["failure_modes"])
+    assert len(modes) == 1 and modes[0]["times_hit"] == 2
+    assert FAKE not in json.dumps(modes)
+
+
+@pytest.mark.asyncio
+async def test_record_failure_survives_a_withheld_failure_modes_field(db, monkeypatch):
+    from genesis.learning.procedural import credential_scrub
+    from genesis.learning.procedural.operations import record_failure
+
+    await procedural.create(db, **_row(steps=["fine"]))
+
+    def boom(text):
+        raise credential_scrub.ScrubFailed("unavailable")
+
+    monkeypatch.setattr(credential_scrub, "_shared_scrub", boom)
+    assert await record_failure(db, "p1", condition="timeout")
+    monkeypatch.undo()
+    assert await record_failure(db, "p1", condition="timeout")
+    modes = json.loads((await procedural.get_by_id(db, "p1"))["failure_modes"])
+    assert modes[-1]["description"] == "timeout"
+
+
+# More quoted spans than the shared scrubber's budget (64): it withholds the text.
+OVERSIZED = '"a" ' * 70
+
+
+@pytest.mark.asyncio
+async def test_one_oversized_step_is_withheld_alone(db):
+    await procedural.create(db, **_row(steps=["git status", OVERSIZED, "pytest tests/x.py"]))
+    row = await procedural.get_by_id(db, "p1")
+    assert json.loads(row["steps"]) == ["git status", procedural._WITHHELD, "pytest tests/x.py"]
+
+
+@pytest.mark.asyncio
+async def test_one_oversized_failure_mode_is_withheld_alone(db):
+    from genesis.learning.procedural.operations import record_failure
+
+    await procedural.create(db, **_row(steps=["fine"]))
+    for condition in ("timeout", "timeout", OVERSIZED):
+        assert await record_failure(db, "p1", condition=condition)
+    modes = json.loads((await procedural.get_by_id(db, "p1"))["failure_modes"])
+    assert modes[0]["description"] == "timeout" and modes[0]["times_hit"] == 2
+    assert modes[1]["description"] == procedural._WITHHELD and modes[1]["times_hit"] == 1
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'password "abc\\"remaining" then go',
+        "pwd `abc\\`remaining` then go",
+    ],
+)
+def test_an_escaped_quote_does_not_end_the_value(text):
+    """A backslash-escaped quote is part of the value, so the rest of it is
+    redacted too (#4872 review)."""
+    cleaned, _ = scrub_text(text)
+    assert "remaining" not in cleaned
+
+
+def test_many_options_before_a_missing_dash_p_stay_linear():
+    """The generic sshpass option arm is disjoint from -P/-f/-d/-o, so a long
+    run of options with no -p does not backtrack exponentially (#4872 review)."""
+    import time
+
+    # 21 options: seconds with overlapping arms (it doubles per option), about a
+    # millisecond without; small enough that a regression fails rather than hangs.
+    start = time.perf_counter()
+    scrub_text("sshpass " + "-Pabc " * 21 + "ssh host")
+    assert time.perf_counter() - start < 0.5
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'password "C:\\keys\\abc123xyz\\" then go',
+        'password "abc123xyz\\" then go',
+        "password 'abc123xyz\\' then go",
+    ],
+)
+def test_a_quoted_value_ending_in_a_backslash_is_still_redacted(text):
+    cleaned, _ = scrub_text(text)
+    assert "abc123xyz" not in cleaned and "then go" in cleaned
+
+
+def _shared_down(monkeypatch):
+    """A full outage: neither the text scrub nor the key policy can answer."""
+    from genesis.learning.procedural import credential_scrub
+
+    def boom(*_args):
+        raise credential_scrub.ScrubFailed("unavailable")
+
+    monkeypatch.setattr(credential_scrub, "_shared_scrub", boom)
+    monkeypatch.setattr(credential_scrub, "credential_key", boom)
+
+
+def test_a_failure_mode_keeps_its_shape_when_the_scrub_cannot_run(monkeypatch):
+    """A procedure document's own field names survive a full outage, and so do its
+    numbers, so failure_modes stays a list the promoter can read (#4872 review)."""
+    from genesis.learning.procedural.credential_scrub import WITHHELD
+    from genesis.learning.procedural.promoter import _check_demotion
+
+    _shared_down(monkeypatch)
+    found: list[str] = []
+    modes = scrub_value(
+        [{"description": "timeout", "conditions": "timeout", "times_hit": 2, "transient": False}],
+        found,
+    )
+    assert modes == [
+        {"description": WITHHELD, "conditions": WITHHELD, "times_hit": 2, "transient": False}
+    ]
+    assert "withheld" in found
+    row = {"failure_modes": json.dumps(modes), "failure_count": 5, "success_count": 0}
+    assert _check_demotion(row) is False  # reads the document; 2 hits is under the bar
+
+
+def test_an_unknown_key_is_withheld_when_the_scrub_cannot_run(monkeypatch):
+    """Only the documents' own field names are kept as they are: a token-shaped key
+    is not, and a value under an unknown key is redacted."""
+    _shared_down(monkeypatch)
+    token = "ghp_" + "abc123xyz" * 4
+    out = scrub_value({token: "value", "times_hit": 1}, [])
+    assert token not in json.dumps(out)
+    assert out == {"[withheld key 1]": "[redacted]", "times_hit": 1}
+
+
+def test_the_kept_field_names_include_every_lesson_key():
+    from genesis.learning.procedural.credential_scrub import _SCHEMA_KEYS
+    from genesis.learning.procedural.lesson_shape import _LESSON_KEYS
+
+    assert _LESSON_KEYS <= _SCHEMA_KEYS

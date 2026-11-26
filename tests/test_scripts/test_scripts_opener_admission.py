@@ -78,6 +78,7 @@ _ALLOWLIST: dict[str, str] = {
     "dev/mw2_classifier_probe.py": _OPERATOR_ONE_OFF,
     "ambient_replay.py": _OPERATOR_ONE_OFF,
     "apply_entity_seed.py": _OPERATOR_ONE_OFF,
+    "audit_procedure_secrets.py": _OPERATOR_ONE_OFF,  # read-only (mode=ro) report
     "backfill_memory_taxonomy.py": _OPERATOR_ONE_OFF,
     "backfill_observation_embeddings.py": _OPERATOR_ONE_OFF,
     "backfill_observation_ttls.py": _OPERATOR_ONE_OFF,
