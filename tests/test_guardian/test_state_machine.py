@@ -868,3 +868,37 @@ class TestUpdateLockWait:
                     if hit:
                         writers.append(f"{path.name}:{fn.name}")
         assert sorted(set(writers)) == ["state_machine.py:stamp_alert"], writers
+
+    # ── #5042 round 3 ────────────────────────────────────────────────────────
+
+    def test_a_held_alert_never_delays_the_first_frozen_gate(
+        self, sm: ConfirmationStateMachine
+    ) -> None:
+        """c4701698319: the gate's retry floor counts failed gate deliveries
+        only; a held alert a minute ago leaves the first gate due at once."""
+        sm.mark_waiting()
+        sm.stamp_alert()  # a held-lock alert, just now
+        assert sm.gate_due(600) is True
+        sm.stamp_gate_attempt()  # a gate that could not be delivered
+        assert sm.gate_due(600) is False and sm.state.frozen_gate_sent is False
+        sm.state.gate_attempt_at = _ago_iso(601)
+        assert sm.gate_due(600) is True
+        sm.stamp_alert(gate=True)
+        assert sm.gate_due(600) is False
+
+    def test_an_owner_approval_is_kept_until_the_wait_ends(
+        self, sm: ConfirmationStateMachine
+    ) -> None:
+        """c4701689631: an approved frozen-gate restart held by its backoff is
+        kept on disk (a tick ends) and ends with the wait, never sooner."""
+        sm.mark_waiting()
+        assert sm.kept_approval_s() is None
+        sm.keep_approval()
+        again = StateData.from_dict(json.loads(json.dumps(sm.state.to_dict())))
+        assert again.frozen_approved_at == sm.state.frozen_approved_at
+        assert 0 <= sm.kept_approval_s() < 5
+        sm.state.gate_attempt_at = _ago_iso(5)
+        sm.end_wait()
+        assert sm.state.frozen_approved_at is None and sm.state.gate_attempt_at is None
+        assert StateData.from_dict({}).frozen_approved_at is None
+        assert StateData.from_dict({"frozen_approved_at": 3}).frozen_approved_at is None

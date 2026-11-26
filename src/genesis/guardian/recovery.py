@@ -81,14 +81,16 @@ _UNDER_LOCK = live_drop.under_lock
 
 class _Held(str):
     """An action's detail when update.lock held its restart back on `live`.
-    ``clean``: nothing ran before it was held, so it costs no attempt."""
+    ``clean``: nothing ran before it was held, so it costs no attempt;
+    ``kind``: the wait it starts (held, or unreadable)."""
 
     clean = False
+    kind = live_drop.WAITING_ON_LOCK
 
 
-def _held(text: str, clean: bool = False) -> _Held:
+def _held(text: str, clean: bool = False, kind: str = live_drop.WAITING_ON_LOCK) -> _Held:
     held = _Held(text)
-    held.clean = clean
+    held.clean, held.kind = clean, kind
     return held
 
 
@@ -295,7 +297,7 @@ class RecoveryEngine:
             else:  # F: the backoff runs from the end of the work that ran
                 self._sm.state.last_recovery_at = datetime.now(UTC).isoformat()
             ran = "" if clean else f"The approved {action.value} step"
-            return await self._lock_deferred(action, live_drop.WAITING_ON_LOCK, detail, ran)
+            return await self._lock_deferred(action, detail.kind, detail, ran)
 
         # Counted above; the backoff runs from the action's end.
         self._sm.state.last_recovery_at = datetime.now(UTC).isoformat()
@@ -569,7 +571,11 @@ class RecoveryEngine:
                     f"avg60={avg60:.1f}%) — standing down"
                 )
 
-        # 3. Kill top consumer only (one per cycle)
+        # 3. Kill top consumer only (one per cycle). update.lock again first: a
+        #    deploy that took it during the sample is the likely top consumer.
+        kind, why = await live_drop.lock_blocks(self._config)
+        if kind:
+            return False, _held(f"nothing was killed: {why}", clean=True, kind=kind)
         target = top_pids[0]
         killed = await kill_pid(target["pid"], container=container)
         if not killed:

@@ -1170,6 +1170,9 @@ def test_the_lock_the_server_environment_file_names_is_read_too(tmp_path):
         _end(holder)
 
 
+@pytest.mark.skipif(  # c4701698325: root reads through a mode-000 dir
+    __import__("os").geteuid() == 0, reason="root reads a mode-000 dir: no failed lookup"
+)
 def test_the_wrappers_unreadable_exit_is_74_not_a_command_code(tmp_path):
     """NOTE: 3 could be the command's own exit; 74 is reserved for the lookup."""
     home = tmp_path / "gh"
@@ -1402,3 +1405,178 @@ def test_the_resolver_makes_one_systemctl_call_of_at_most_3_s():
     """NOTE: the restart shares the 30 s exec with the resolver."""
     assert live_drop._RESOLVER.count('"systemctl"') == 1
     assert "timeout=3" in live_drop._RESOLVER
+
+
+# ── #5042 round 3: held wins over every failed lookup ───────────────────────
+
+
+def _holding(lock):
+    """A context that holds ``lock`` (flock) until it exits."""
+    import contextlib
+    import subprocess
+    import time
+
+    @contextlib.contextmanager
+    def held():
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        holder = subprocess.Popen(["flock", str(lock), "sleep", "30"], start_new_session=True)
+        try:
+            deadline = time.monotonic() + 10
+            while subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0:
+                assert time.monotonic() < deadline
+                time.sleep(0.05)
+            yield
+        finally:
+            _end(holder)
+
+    return held()
+
+
+def _sealed(path):
+    """``path``'s parent made unsearchable; returns the undo."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(0o000)
+    return lambda: path.parent.chmod(0o755)
+
+
+def _failing(tmp_path, kind):
+    """_sh keywords for one failed lookup of each kind, and the undo."""
+    env = tmp_path / "server.env"
+    if kind == "login":
+        return {"login_value": "relative/home"}, None
+    if kind == "unit_environment":
+        return {"env_line": '"GENESIS_HOME=/a b"'}, None
+    if kind == "unit_environment_files":
+        return {"files_line": "/a b.env (ignore_errors=yes)"}, None
+    if kind in ("file_value", "file_expansion"):
+        env.write_text('GENESIS_HOME="/a b"\n' if kind == "file_value" else "GENESIS_HOME=$HOME/g\n")
+        return {"env_file": env}, None
+    if kind == "file_unreadable":
+        sealed = tmp_path / "sealed" / "server.env"
+        undo = _sealed(sealed)
+        return {"env_file": sealed}, undo
+    if kind == "lock_dir_unsearchable":
+        return {"unit_home": tmp_path / "shut" / "gh"}, _sealed(tmp_path / "shut" / "gh")
+    # lock_unopenable: the locks dir exists, update.lock cannot be created in it
+    locks = tmp_path / "ro" / "locks"
+    locks.mkdir(parents=True)
+    locks.chmod(0o500)
+    return {"unit_home": tmp_path / "ro"}, lambda: locks.chmod(0o755)
+
+
+_ROOT_ONLY_PASSES = {"file_unreadable", "lock_dir_unsearchable", "lock_unopenable"}
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "login", "unit_environment", "unit_environment_files", "file_value", "file_expansion",
+        "file_unreadable", "lock_dir_unsearchable", "lock_unopenable",
+    ],
+)
+def test_a_held_lock_reads_held_whatever_other_lookup_failed(tmp_path, kind):
+    """c4701698302: a failed lookup never preempts a confirmed hold. The held
+    lock is one only the fd scan finds (tested last), so every failure comes
+    before it; without the holder the same failure reads unreadable (74)."""
+    import os
+
+    if kind in _ROOT_ONLY_PASSES and os.geteuid() == 0:
+        pytest.skip("root bypasses the permission a failed lookup needs")
+    kw, undo = _failing(tmp_path, kind)
+    home = tmp_path / "gh"
+    try:
+        with _holding(tmp_path / "elsewhere" / "locks" / "update.lock"):
+            r = _sh(live_drop._LOCK_PROBE, home, **kw)
+            assert r.returncode == 75, r.stdout
+            r = _sh(live_drop.under_lock("echo ran"), home, **kw)
+            assert r.returncode == 75 and "ran" not in r.stdout
+        r = _sh(live_drop.under_lock("echo ran"), home, **kw)
+        assert r.returncode == 74 and "ran" not in r.stdout and "unreadable=" in r.stdout
+    finally:
+        if undo:
+            undo()
+
+
+@pytest.mark.parametrize(
+    "line,rc",
+    [
+        ("GENESIS_HOME = {h}\n", 75),  # c4701698308: whitespace around the key
+        ("  export GENESIS_HOME={h}\n", 75),
+        ("GENESIS_HOME={h}\r\n", 75),  # CRLF
+        ('GENESIS_HOME="{h}"   \n', 75),
+        ("GENESIS_HOME='{h}'\n", 75),
+        ("#GENESIS_HOME=/a b\n;GENESIS_HOME=/a b\nGENESIS_HOME={h}\n", 75),  # comments
+        ("GENESIS_HOME_X={h}\n", 0),  # another variable
+        ("GENESIS_HOME=$HOME/g\n", 74),  # expansion it cannot resolve safely
+        ("GENESIS_HOME=${{X}}/g\n", 74),
+    ],
+)
+def test_an_environment_file_genesis_home_is_parsed_as_systemd_reads_it(tmp_path, line, rc):
+    """The fd scan is off (scan_max=0), so only the parsed path can show the hold."""
+    unit = tmp_path / "relocated"
+    env = tmp_path / "server.env"
+    env.write_bytes(line.format(h=unit).encode())
+    with _holding(unit / "locks" / "update.lock"):
+        r = _sh(live_drop._LOCK_PROBE, tmp_path / "gh", env_file=env, scan_max=0)
+    assert r.returncode == rc, r.stdout
+
+
+
+@pytest.mark.parametrize("gone", [("cmdline",), ("cmdline", "comm")])
+async def test_a_confirmed_holder_is_kept_when_its_process_cannot_be_read(
+    tmp_path, monkeypatch, gone
+):
+    """c4701698276: a pid /proc/locks (200) or the fd scan (300) confirmed is
+    named even when its cmdline, or its comm, cannot be read: never "none seen"."""
+    _host(tmp_path, monkeypatch)
+    for pid in ("200", "300"):
+        for name in gone:
+            (tmp_path / "proc" / pid / name).unlink()
+    unknown = "comm" in gone
+    assert cgroup_ops.lock_holders("genesis", "77") == [(200, "name unknown" if unknown else "flock")]
+    assert cgroup_ops.lock_holders("genesis", "79") == [(300, "name unknown" if unknown else "bash")]
+    hint = await live_drop.host_hint("genesis", "77")
+    assert "pid 200" in hint and "none seen" not in hint
+
+
+@pytest.mark.parametrize("lock", [75, 1])
+async def test_io_triage_reads_the_lock_again_before_it_kills(monkeypatch, lock):
+    """CodeRabbit outside-diff (recovery.py:574): a deploy that takes the lock
+    during the I/O sample is likely the top consumer; it is never killed on a
+    lock read from before the sample. The hold costs no attempt."""
+    from genesis.guardian.recovery import _Held
+
+    kill = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        cgroup_ops, "find_top_io_pids_rate",
+        lambda *_a: [{"pid": 4242, "comm": "update.sh", "total_rate": 9e6}],
+    )
+    monkeypatch.setattr(cgroup_ops, "read_io_pressure", lambda *_a: None)
+    monkeypatch.setattr(cgroup_ops, "kill_pid", kill)
+    engine = _engine()
+    with _patched(LockBox(lock=(lock,))):
+        ok, detail = await engine._io_triage("genesis")
+    kill.assert_not_awaited()
+    assert not ok and isinstance(detail, _Held) and detail.clean
+    with _patched(LockBox(lock=(0,))):
+        ok, _detail = await engine._io_triage("genesis")
+    kill.assert_awaited_once()  # control: a free lock kills as before
+
+
+async def test_io_triage_held_at_the_kill_waits_with_no_attempt_counted(tmp_path, monkeypatch):
+    engine, path = _loaded_engine(tmp_path)
+    kill = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        cgroup_ops, "find_top_io_pids_rate",
+        lambda *_a: [{"pid": 4242, "comm": "update.sh", "total_rate": 9e6}],
+    )
+    monkeypatch.setattr(cgroup_ops, "read_io_pressure", lambda *_a: None)
+    monkeypatch.setattr(cgroup_ops, "kill_pid", kill)
+    with (
+        _patched(LockBox(lock=(0, 0, 75))),
+        patch.object(engine._snapshots, "safe_to_snapshot", AsyncMock(return_value=False)),
+    ):
+        result = await engine.execute(_drop_diagnosis(RecoveryAction.IO_TRIAGE))
+    kill.assert_not_awaited()
+    saved = _on_disk(path)
+    assert result.waiting and saved["io_triage_attempts"] == 0 and saved["waiting_on_update_lock"]

@@ -221,7 +221,8 @@ def lock_holders(container: str, inode: str = "") -> list[tuple[int, str]]:
     level lists none); else (no inode, or no live row: a deploy's `flock FD`
     helper exits and the kernel then hides its row) the processes whose open
     fds point at update.lock, where the host can read them; else the
-    processes whose command line names a deploy script. Only the name (comm) is returned, never argv, which
+    processes whose command line names a deploy script. Only the name (comm,
+    or "name unknown" where it cannot be read) is returned, never argv, which
     can carry anything a holder was given. Measured readable by the Guardian's
     host user (B2). A hint for alert text, never a rule; raises OSError when
     the host cannot read."""
@@ -252,13 +253,20 @@ def lock_holders(container: str, inode: str = "") -> list[tuple[int, str]]:
     by_lock = by_lock or by_fd
     out = []
     for pid in sorted(by_lock or pids):
+        # A pid the lock row or an fd confirmed is kept whatever else cannot be
+        # read; argv is read only for the name match.
         try:
-            name = (_PROC / str(pid) / "comm").read_text().strip()
-            argv = (_PROC / str(pid) / "cmdline").read_bytes().decode(errors="replace")
+            name = (_PROC / str(pid) / "comm").read_text().strip() or "name unknown"
         except OSError:
-            continue
-        if by_lock or any(deploy in argv for deploy in _DEPLOY_NAMES):
-            out.append((pid, name))
+            name = "name unknown"
+        if not by_lock:
+            try:
+                argv = (_PROC / str(pid) / "cmdline").read_bytes().decode(errors="replace")
+            except OSError:
+                continue
+            if not any(d in argv for d in _DEPLOY_NAMES):
+                continue
+        out.append((pid, name))
     return out
 
 

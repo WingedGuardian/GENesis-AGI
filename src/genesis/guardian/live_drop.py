@@ -118,22 +118,23 @@ HALF_DONE_DROP = "half_done_drop"
 #: from none of these sources, with its lock not yet taken, is not seen.
 _RESOLVER = r"""
 import fcntl, os, re, subprocess, sys, time
-def die(why):
-    print("unreadable=" + why.replace("\n", " "))
-    sys.exit(74)
+failed = []
 def absent(path):
     try:
         os.stat(path)
     except FileNotFoundError:
         return True
     except OSError as e:
-        die(f"{path}: {e.strerror}")
+        failed.append(f"{path}: {e.strerror}")
+        return None
     return False
 def clean(v, where):
+    v = v.strip()
     if len(v) > 1 and v[0] == v[-1] and v[0] in "\"'":
         v = v[1:-1]
     if not v.startswith("/") or re.search(r"[\s\"'\\$`]", v):
-        die("cannot parse GENESIS_HOME in " + where)
+        failed.append("cannot parse GENESIS_HOME in " + where)
+        return None
     return v
 home = os.environ["HOME"]
 login = os.environ.get("GENESIS_HOME")
@@ -154,13 +155,14 @@ if props.get("LoadState") != ["loaded"]:
     props = {}
 hits = [t for t in " ".join(props.get("Environment", [])).split()
         if t.lstrip("\"'").startswith("GENESIS_HOME=")]
-if hits:
-    if not hits[-1].startswith("GENESIS_HOME="):
-        die("cannot parse GENESIS_HOME in the unit Environment")
+if hits and not hits[-1].startswith("GENESIS_HOME="):
+    failed.append("cannot parse GENESIS_HOME in the unit Environment")
+elif hits:
     homes.append(clean(hits[-1][13:], "the unit Environment"))
 files = " ".join(props.get("EnvironmentFiles", []))
 if not re.fullmatch(r"(?:\S+ \(ignore_errors=(?:yes|no)\)\s*)*", files):
-    die("cannot parse the unit EnvironmentFiles")
+    failed.append("cannot parse the unit EnvironmentFiles")
+    files = ""
 for path in re.findall(r"(\S+) \(ignore_errors=(?:yes|no)\)", files):
     try:
         with open(path, encoding="utf-8") as fh:
@@ -168,10 +170,18 @@ for path in re.findall(r"(\S+) \(ignore_errors=(?:yes|no)\)", files):
     except FileNotFoundError:
         continue
     except (OSError, ValueError) as e:
-        die(f"{path}: {e}")
-    vals = [ln.strip()[13:] for ln in text.splitlines() if ln.strip().startswith("GENESIS_HOME=")]
+        failed.append(f"{path}: {e}")
+        continue
+    vals = []
+    for ln in text.splitlines():
+        k, sep, v = ln.strip().partition("=")
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[7:].strip()
+        if sep and k == "GENESIS_HOME":
+            vals.append(v)
     if vals:
-        homes.append(clean(vals[-1].strip(), path))
+        homes.append(clean(vals[-1], path))
 def scanned():
     under = os.environ.get("GENESIS_LOCK_SCAN_UNDER", "/")
     most = int(os.environ.get("GENESIS_LOCK_SCAN_MAX", "20000"))
@@ -205,14 +215,15 @@ def held(path):
         pass
     sys.exit(75)
 fds, seen = [], set()
-for g in dict.fromkeys(homes):
-    if absent(g + "/locks"):
+for g in dict.fromkeys(h for h in homes if h):
+    if absent(g + "/locks") is not False:
         continue
     path = g + "/locks/update.lock"
     try:
         fd = os.open(path, os.O_RDONLY | os.O_CREAT, 0o644)
     except OSError as e:
-        die(f"{path}: {e.strerror}")
+        failed.append(f"{path}: {e.strerror}")
+        continue
     st = os.fstat(fd)
     if (st.st_dev, st.st_ino) in seen:  # one file named twice: locked already
         os.close(fd)
@@ -223,8 +234,13 @@ for g in dict.fromkeys(homes):
     except BlockingIOError:
         held(path)
     except OSError as e:
-        die(f"{path}: {e.strerror}")
+        failed.append(f"{path}: {e.strerror}")
+        os.close(fd)
+        continue
     fds.append(fd)
+if failed:
+    print("unreadable=" + "; ".join(failed).replace("\n", " "))
+    sys.exit(74)
 sys.exit(subprocess.run(sys.argv[1:]).returncode if sys.argv[1:] else 0)
 """
 
@@ -553,8 +569,9 @@ async def send_wait_alert(
     (asking nothing) goes through send_or_queue instead. ``frozen``: it stands
     for this wait's frozen gate. A gate or stand-in sent or durably queued is
     stamped as the gate (the next in 2 h); one neither sent nor queued is
-    stamped as a plain alert, so it retries after StateMachine.gate_due's
-    bound, never every tick; any other alert is stamped only once delivered."""
+    stamped as a failed gate attempt, so it retries after
+    StateMachine.gate_due's bound, never every tick; any other alert is
+    stamped only once delivered."""
     frozen = frozen or bool(plain)
     if plain and gate is not None:
         sent = await gate.send_text(f"<b>{escape(title)}</b>\n{escape(body)}")
@@ -564,9 +581,13 @@ async def send_wait_alert(
             return sent
     alert = Alert(severity=AlertSeverity.EMERGENCY, title=title, body=plain or body)
     delivered = await dispatcher.send_or_queue(alert)
-    if delivered or frozen:
-        sm.stamp_alert(gate=bool(delivered and frozen))
-        sm.persist()
+    if delivered:
+        sm.stamp_alert(gate=frozen)
+    elif frozen:
+        sm.stamp_gate_attempt()
+    else:
+        return None
+    sm.persist()
     return None
 
 

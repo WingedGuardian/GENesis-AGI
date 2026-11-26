@@ -2912,10 +2912,16 @@ verified: 204c69c1f 2026-11-22
   `GENESIS_HOME` line of its `EnvironmentFile=` files (read as plain
   key=value, never evaluated; each deploy script resolves it from its own
   environment), by a stdlib program run in the container as `python3 -I
-  -S -c` (nothing read from the checkout); held at any reads held. Every
+  -S -c` (nothing read from the checkout). Every
   read follows one rule: only ENOENT is absence, and any other failure, or
-  a value it cannot parse safely (a quote, a space), reads unreadable
-  (exit 74). A user manager that does not answer, or a genesis-server unit
+  a value it cannot parse safely (a quote or space inside it, a `$`
+  expansion), is a failed lookup. A failed lookup never stops the
+  resolver: every path it found is still flock-tested, the fd scan
+  included, and a lock held at any path reads held (exit 75) whatever else
+  failed; only with none held does a failed lookup read unreadable (exit
+  74), and the wrapped command never runs then. An `EnvironmentFile=` line
+  is read as systemd reads it: whitespace around the key and value, an
+  `export ` prefix, `#`/`;` comment lines, CRLF and one pair of quotes. A user manager that does not answer, or a genesis-server unit
   systemd does not report loaded, is best effort (owner rulings 14abd7df,
   b5dff1b1): the default and login-shell paths only, and the wait text
   says the relocated path could not be checked. An fd scan backs it:
@@ -2946,7 +2952,9 @@ verified: 204c69c1f 2026-11-22
   `live`, RESOURCE_CLEAR's cleanup) keeps it, its backoff counted from the
   end of that work. A waiting episode is CONFIRMED_DEAD
   with persisted fields (`waiting_on_update_lock`, `waiting_since`,
-  `last_alert_at`, the last written only by `stamp_alert`), the auto-reset is
+  `last_alert_at`, the last written only by `stamp_alert`; `gate_attempt_at`,
+  a frozen gate that could not be delivered, so a held alert never delays a
+  gate; `frozen_approved_at`, a kept approval), the auto-reset is
   skipped while it waits, and each tick reads the lock instead of staying
   latched: off `live` the wait ends quietly; on it, free, or the container
   stopped, reopens it into a fresh diagnosis
@@ -2966,11 +2974,18 @@ verified: 204c69c1f 2026-11-22
   tried again after 10 min, never every tick. A held wait's plain alert
   counts only once sent or queued. The gate waits 50 min for a reply, on
   every path (getUpdates conflicts included), inside the unit's 3900 s
-  timeout; then the wait goes on. Before an APPROVE runs, a stand-down (maintenance, gateway pause,
+  timeout; then the wait goes on, and a reply read after that deadline is
+  not acted on (and said). Before an APPROVE runs, a stand-down (maintenance, gateway pause,
   Genesis paused) holds it and the lock is read again: held refuses, free or
-  a stopped container declines the stale approval and the episode reopens
-  at the next tick (with its full time budget), and only an unreadable lock
-  runs the approved restart. That stand-down and health check (signals
+  a stopped container, or a checkout no longer on `live`, declines the
+  stale approval and the episode reopens at the next tick (with its full
+  time budget), and only an unreadable lock on `live` runs the approved
+  restart. An APPROVE its recovery backoff holds is kept on disk, not
+  waited out in the tick (the reply can come at the gate's deadline, and
+  the post-approval reads take most of what the unit timeout leaves): the
+  first tick after the backoff runs it through the same checks, without
+  asking again; a lock that then reads held, a spent budget, the end of
+  the wait or 2 h kept drops it, and each is said. That stand-down and health check (signals
   read again after APPROVE, before anything runs) is one check shared with
   Gate 2's APPROVE and its deferred wait, on every install: a healthy
   Genesis or a stand-down runs nothing. Each wait event
@@ -2982,9 +2997,12 @@ verified: 204c69c1f 2026-11-22
   host can read them, else the processes naming a deploy script; only the process name and pid are
   shown, never its arguments; the inode is the one at the path the probe
   resolved; a host that could not read says "cannot tell", never "none
-  seen"; bounded at 2 s), which
+  seen", and a pid the lock row or an fd confirmed is named even when its
+  name cannot be read; bounded at 2 s), which
   never changes the rule. Turning the flag off, or leaving `live`, ends the
-  wait. Residual: while the lock is free, the probe and the queued restart
+  wait. IO_TRIAGE reads the lock again after its I/O sample, just before
+  the kill: held or unreadable kills nothing and waits, at no attempt.
+  Residual: while the lock is free, the probe and the queued restart
   hold it for an instant, so an update.sh starting in that instant fails fast
   with "update in progress" and can simply be re-run.
   Off, the

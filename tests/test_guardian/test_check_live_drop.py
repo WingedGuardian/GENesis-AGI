@@ -1444,7 +1444,7 @@ async def test_a_gate_stand_in_that_was_neither_sent_nor_queued_retries_after_10
     assert d1.send.await_count == 1 and sm.state.frozen_gate_sent is False
     d2, _, _ = await _tick(config, sm, box, channel=channel, undelivered=True)
     assert d2.send.await_count == 0  # within 10 min: no retry
-    sm.state.last_alert_at = _ago(11 * 60)
+    sm.state.gate_attempt_at = _ago(11 * 60)  # c4701698319: the gate's own stamp
     d3, _, _ = await _tick(config, sm, box, channel=channel, undelivered=True)
     assert d3.send.await_count == 1
 
@@ -1636,3 +1636,104 @@ async def _run_gates_after_approve(signals, config=None):
         )
     engine.execute.assert_not_awaited()
     return False, [c.args[0] for c in channel.send_text.await_args_list], engine
+
+
+# ── #5042 round 3: approval timing ───────────────────────────────────────────
+
+
+class BranchFlip(LockContainer):
+    """LockContainer whose checkout leaves `live` after ``live_reads`` reads."""
+
+    def __init__(self, live_reads: int, **kw):
+        super().__init__(**kw)
+        self.live_reads = live_reads
+
+    async def __call__(self, *args, timeout=10.0, **kwargs):
+        cmd = args[-1] if args[1:2] == ("exec",) else " ".join(args)
+        if "symbolic-ref" in cmd:
+            self.live_reads -= 1
+            self.on_live = self.live_reads >= 0
+        return await super().__call__(*args, timeout=timeout, **kwargs)
+
+
+def _texts(channel) -> list[str]:
+    return [c.args[0] for c in channel.send_text.await_args_list]
+
+
+async def test_a_frozen_approve_after_the_checkout_left_live_restarts_nothing():
+    """c4701698285: the approval was for an unreadable lock ON `live`; off it,
+    main's path (a fresh diagnosis and both gates) decides at the next tick."""
+    config = _armed()
+    sm = _waiting_sm(config, 2.5)
+    box = BranchFlip(1, lock=(1,))
+    channel = _frozen_channel("APPROVE")
+    await _tick(config, sm, box, channel=channel)
+    assert not box.sent("incus restart")
+    assert any("no longer on `live`" in t for t in _texts(channel)), _texts(channel)
+    assert sm.state.waiting_on_update_lock is False and sm.state.down_alert_sent is False
+
+
+async def test_a_frozen_approve_held_by_its_backoff_is_kept_and_run_after_it():
+    """c4701689631: the owner's yes is never dropped or asked again. The tick
+    keeps it on disk (a wait in the tick could pass TimeoutStartSec: the reply
+    can come at the gate's deadline), and the first tick after the backoff
+    runs the restart with every post-approval check."""
+    config = _armed()
+    sm = _waiting_sm(config, 2.5)
+    sm.state.recovery_attempts, sm.state.last_recovery_at = 1, _ago(10)  # 90 s to go
+    box = LockContainer(lock=(1,))
+    channel = _frozen_channel("APPROVE")
+    await _tick(config, sm, box, channel=channel)
+    assert not box.sent("incus restart") and sm.state.frozen_approved_at
+    assert any("kept" in t for t in _texts(channel)), _texts(channel)
+    sm._state = StateData.from_dict(json.loads(json.dumps(sm.state.to_dict())))  # a new tick
+    channel = _frozen_channel()
+    dispatcher, _, _ = await _tick(config, sm, box, channel=channel)  # still in the backoff
+    assert _gates(channel) == 0 and not box.sent("incus restart")
+    dispatcher.send.assert_not_awaited()
+    sm.state.last_recovery_at = _ago(200)
+    sm.state.last_alert_at = _ago(3 * 3600)  # past the 2 h re-ask: the approval still wins
+    await _tick(config, sm, box, channel=channel)
+    assert box.sent("incus restart genesis") and _gates(channel) == 0
+    assert sm.state.frozen_approved_at is None
+
+
+@pytest.mark.parametrize("lock,said", [((75,), "held"), ((1,), "expired")])
+async def test_a_kept_approval_that_no_longer_stands_is_dropped_and_said(lock, said):
+    """Never silently: a lock now held refuses it, and one kept past 2 h
+    expires and the gate asks again."""
+    config = _armed()
+    sm = _waiting_sm(config, 2.5)
+    sm.state.frozen_gate_sent = True
+    sm.keep_approval(_ago(3 * 3600) if said == "expired" else _ago(60))
+    box = LockContainer(lock=lock)
+    channel = _frozen_channel("DENY")
+    await _tick(config, sm, box, channel=channel)
+    assert not box.sent("incus restart") and sm.state.frozen_approved_at is None
+    assert any("approval" in t and said in t for t in _texts(channel)), _texts(channel)
+
+
+async def test_a_frozen_reply_that_arrives_after_the_deadline_is_not_acted_on():
+    """c4701698294: a poll started before the deadline that returns APPROVE
+    after it is rejected, and the owner is told."""
+    import time
+
+    config = _armed()
+    sm = _waiting_sm(config, 2.5)
+    channel = _frozen_channel()
+    channel.poll_for_keyword = AsyncMock(side_effect=lambda *_a: time.sleep(0.2) or "APPROVE")
+    box = LockContainer(lock=(1,))
+    with patch("genesis.guardian.check._FROZEN_GATE_WAIT_S", 0.1):
+        await _tick(config, sm, box, channel=channel)
+    assert channel.poll_for_keyword.await_count == 1
+    assert not box.sent("incus restart") and sm.state.waiting_on_update_lock is True
+    assert any("after the approval window" in t for t in _texts(channel)), _texts(channel)
+
+
+async def test_a_held_alert_just_sent_leaves_the_first_frozen_gate_due_at_once():
+    """c4701698319 at the tick: the held alert a minute ago is not a gate attempt."""
+    config = _armed()
+    sm = _waiting_sm(config, 0)  # the held alert went out just now
+    channel = _frozen_channel("DENY")
+    await _tick(config, sm, LockContainer(lock=(1,)), channel=channel)
+    assert _gates(channel) == 1

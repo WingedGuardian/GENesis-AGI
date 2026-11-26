@@ -108,6 +108,12 @@ class StateData:
     # the first unreadable read on a running container gates at once, then 2 h.
     # A field because last_alert_at cannot tell a held re-alert from a gate.
     frozen_gate_sent: bool = False
+    # A frozen gate that could not be delivered: its retry floor, kept apart
+    # from last_alert_at so a held alert never delays a gate (c4701698319).
+    gate_attempt_at: str | None = None
+    # An owner APPROVE of the frozen gate that its backoff held: kept for the
+    # first tick after the backoff, never asked again (c4701689631).
+    frozen_approved_at: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -140,6 +146,8 @@ class StateData:
             "waiting_since": self.waiting_since,
             "last_alert_at": self.last_alert_at,
             "frozen_gate_sent": self.frozen_gate_sent,
+            "gate_attempt_at": self.gate_attempt_at,
+            "frozen_approved_at": self.frozen_approved_at,
         }
 
     @classmethod
@@ -178,6 +186,8 @@ class StateData:
             waiting_since=_text(data.get("waiting_since")),
             last_alert_at=_text(data.get("last_alert_at")),
             frozen_gate_sent=data.get("frozen_gate_sent") is True,
+            gate_attempt_at=_text(data.get("gate_attempt_at")),
+            frozen_approved_at=_text(data.get("frozen_approved_at")),
         )
 
 
@@ -923,6 +933,8 @@ class ConfirmationStateMachine:
         self._state.waiting_on_update_lock = False
         self._state.waiting_since = None
         self._state.frozen_gate_sent = False
+        self._state.gate_attempt_at = None
+        self._state.frozen_approved_at = None
 
     def stamp_alert(self, *, gate: bool = False) -> None:
         """The one writer of last_alert_at: every wait alert is recorded here,
@@ -945,20 +957,41 @@ class ConfirmationStateMachine:
         start = _usable(self._state.waiting_since, now)
         return (start is not None and last < start) or (now - last).total_seconds() >= every_s
 
+    def stamp_gate_attempt(self) -> None:
+        """A frozen gate (or its stand-in) that was neither sent nor queued."""
+        self._state.gate_attempt_at = datetime.now(UTC).isoformat()
+
     def gate_due(self, retry_s: float) -> bool:
         """The frozen gate of this wait, sent once: due while it is not sent,
-        unless the wait's last alert is within ``retry_s`` (a stand-in that
-        could not be delivered retries no faster than that)."""
+        unless a delivery of it failed within ``retry_s`` (then it retries no
+        faster than that). Other wait alerts never delay it."""
         if self._state.frozen_gate_sent:
             return False
         now = datetime.now(UTC)
-        last = _usable(self._state.last_alert_at, now)
+        last = _usable(self._state.gate_attempt_at, now)
         start = _usable(self._state.waiting_since, now)
         return (
             last is None
             or (start is not None and last < start)
             or (now - last).total_seconds() >= retry_s
         )
+
+    def keep_approval(self, since: str | None = None) -> None:
+        """The owner approved the frozen gate and its backoff held the restart:
+        kept until acted on or the wait ends, dated ``since`` (when it was
+        first given) or now."""
+        self._state.frozen_approved_at = since or datetime.now(UTC).isoformat()
+
+    def take_approval(self) -> str | None:
+        """The kept approval's date, removed: whoever acts on it keeps it again."""
+        given, self._state.frozen_approved_at = self._state.frozen_approved_at, None
+        return given
+
+    def kept_approval_s(self) -> float | None:
+        """How long ago the kept approval was given, or None (none, or unusable)."""
+        now = datetime.now(UTC)
+        given = _usable(self._state.frozen_approved_at, now)
+        return None if given is None else (now - given).total_seconds()
 
     def waited_s(self) -> float | None:
         start = _usable(self._state.waiting_since, datetime.now(UTC))
