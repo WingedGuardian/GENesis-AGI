@@ -2264,6 +2264,27 @@ findings below, a gated `gh pr merge`:
 - must carry `--admin` (explicit approval flag) and be bound to the reviewed head
   via `--match-head-commit` (GitHub rejects it server-side if the head moved —
   TOCTOU defense); the `--check-pr` command supplies this;
+- should carry the `--body-file` that `--check-pr` writes (#5027): the merge arm
+  writes its **receipt** into that file at allow time, as trailers in the squash
+  commit on main. `Gate-rows` gives each blocking gate's own outcome: `ok`
+  (judged, passed), `n/a` (out of its scope here), `unverified` (passed unjudged:
+  a fail-open read, or a sigil that skips the gate without reading it) or
+  `waived` (a sigil let through what the gate would have blocked).
+  `Gate-verdict` is `PASSED`, `PASSED-UNVERIFIED` or `OVERRIDDEN` (any row
+  waived, or any gate a sigil skipped). `Gate-sigils`, `Gate-stand-in`,
+  `Gate-session` and `Gate-install` complete it. `--check-pr` prints the command
+  in a `body-file :` row even when other rows block, so a merge under the owner's
+  sigils uses it too: append only the sigils approved. A merge under any
+  override sigil is refused without the file whenever the gate can produce it
+  for that head, and the refusal prints the command with the file already
+  written. If the only obstacle is a PR-body line starting with a gate-only
+  trailer key, the refusal names the key: reword the line. A plain merge may
+  leave the file off, and where no file can be produced (250 or more commits,
+  an unreadable PR body) any merge goes on without one:
+  **no receipt means "no gate record", never proof of a bypass**. A receipt is written just before `gh`
+  runs; if another hook then stops the command, the next attempt clears it at
+  its first check and writes its own at the end. Malformed extra text in the
+  file is refused;
 - requires Codex to have reviewed the **current head** — Codex does NOT auto-review
   a later fix-commit, so comment `@codex review` and wait after any push.
   **A clean Codex signal counts only when its id RESOLVES to the head** (the rules

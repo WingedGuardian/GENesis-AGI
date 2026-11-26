@@ -351,11 +351,16 @@ try:
         body_file_path,
         body_file_path_problem,
         command_words,
+        compose_receipt,
         compose_squash_body,
         files_trusted,
         is_help_only,
+        matches_with_receipt,
         read_body_file,
+        reserved_trailer_key,
         shell_rewrites,
+        strip_receipt,
+        with_receipt,
         write_body_file,
     )
     from git_repo_selection import (  # noqa: E402
@@ -725,7 +730,8 @@ def _api_merge_deny(segs, cmd: str, payload: dict) -> str | None:
             head,
             f"Merge with the gated command instead: run `python3 "
             f"scripts/hooks/git_push_guard.py --check-pr {pr}` and use its merge-with "
-            f"line (`gh pr merge {pr} --squash --admin --match-head-commit <sha>`).",
+            f"line (`gh pr merge {pr} --squash --admin --match-head-commit <sha> "
+            f"--body-file <path>`); its body file carries the merge receipt.",
         ]
         if found.hint:
             lines.append(found.hint)
@@ -3922,8 +3928,13 @@ def _check_inline_review_findings(
     repo: str | None = None,
     uncounted_out: list[dict[str, int]] | None = None,
     head: str | None = None,
+    force_waived: list[str] | None = None,
 ) -> tuple[bool, str]:
     """Scan review findings from BOTH delivery channels and apply a weighted score.
+
+    ``force_waived`` (the merge receipt, #5027) gets one entry for each block that
+    ``force`` let through: a scan that did not read everything, or a score at or
+    over the lane threshold. It stays empty when ``force`` changed nothing.
 
     Despite the name, this reads two endpoints. ``pulls/N/comments`` carries
     findings anchored inside the diff. ``pulls/N/reviews`` carries the ones
@@ -3985,6 +3996,8 @@ def _check_inline_review_findings(
             file=sys.stderr,
         )
         _amend_note("review-override", waived="review-body+inline-scan-unread")
+        if force_waived is not None:
+            force_waived.append("unread")
         return False, ""
 
     scanner_sets, table_block = _enforced_logins_or_block()
@@ -5212,7 +5225,11 @@ def _check_inline_review_findings(
         )
     if force:
         # '# review-override': no floor finding this scan read is open.
-        return _waived_unread("an incomplete inline scan") if not complete else (False, "")
+        if not complete:
+            return _waived_unread("an incomplete inline scan")
+        if score >= threshold and force_waived is not None:
+            force_waived.append("score")
+        return False, ""
     if score >= threshold:
         # Floor findings cannot reach here — the floor above returned on any of
         # them — so this branch is purely an accumulation of 0.5-weight findings
@@ -7445,6 +7462,19 @@ _PR_RE = re.compile(r"^[0-9]{1,12}$")
 #: outcome is only known at the end; ``main`` clears it on entry, so a second
 #: call in the same process (the tests, and only the tests) cannot inherit rows.
 _PENDING_OVERRIDES: list[dict] = []
+#: Each merge gate's outcome for the receipt (#5027), recorded by the gate's own
+#: call site in the merge arm as it decides: row name -> ok | n/a | unverified |
+#: waived. ``main`` clears it on entry, like ``_PENDING_OVERRIDES``.
+_RECEIPT_OUTCOMES: dict[str, str] = {}
+#: Rows a sigil made the gate skip unread: ``unverified`` in the receipt, yet the
+#: verdict is OVERRIDDEN, since the owner's sigil, not a read, let them pass.
+_RECEIPT_SKIPPED: set[str] = set()
+
+
+def _receipt_skip(row: str) -> None:
+    """Record that a sigil made ``row``'s gate skip its read."""
+    _RECEIPT_OUTCOMES[row] = "unverified"
+    _RECEIPT_SKIPPED.add(row)
 
 #: Set by :func:`_ask` when the guard hands the decision to the user. Read by the
 #: flush to tell an ask from an allow — both exit 0. Cleared by ``main`` on entry.
@@ -11156,6 +11186,12 @@ def _check_e2e_plan(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
     return _e2e_undeclared(pr_num, detail, mod)
 
 
+#: How the last pin-receipt check PASSED when it judged nothing (``reason="n/a"``:
+#: the PR leaves the pin file alone). Read by the merge receipt (#5027) instead of
+#: re-deriving the outcome from the message text, like ``_FRESHNESS_PASS``.
+_PIN_PASS: dict[str, str] = {}
+
+
 def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str]:
     """Block a PR that moves the Claude Code pin FORWARD without its gate receipts.
 
@@ -11216,6 +11252,7 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
          — and with CONTENT (requires receipts) still distinguished from PLUMBING
          (non-blocking note), which is the axis above applied to the base side.
     """
+    _PIN_PASS.clear()
     checker = _load_pin_receipt_checker()
     if checker is None:
         return False, "NOTE: pin-receipt checker not importable — receipts NOT verified."
@@ -11303,6 +11340,7 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
             if edits_pin is False
             else "the same blob at the head and the base (changed-file list unavailable)"
         )
+        _PIN_PASS["reason"] = "n/a"
         return False, (
             f"CC pin{named}: {_PIN_FILE_PATH} is unchanged by this PR — {why}, so it "
             f"cannot have moved the pin. No receipts "
@@ -13504,16 +13542,127 @@ def _recheck_squash_body_file(path: str, expected: str) -> str | None:
     return None
 
 
+#: The merge arm's blocking checks, in the order it runs them: the rows a receipt
+#: reports (#5027). Each gate records its own outcome in :data:`_RECEIPT_OUTCOMES`
+#: where it decides (``gh_merge.RECEIPT_GRAMMAR`` defines the four values), never
+#: re-inferred afterwards from which sigils were present.
+_RECEIPT_ROWS = (
+    "mergeable",
+    "ci",
+    "base-branch",
+    "pin-receipts",
+    "codex-at-head",
+    "body-file",
+    "terminal-head",
+    "review-body",
+    "inline-findings",
+    "scheduled-claude",
+    "rework",
+)
+
+
+def _ci_receipt_outcome(ci_state: str, canonical: bool, override: bool) -> str:
+    """The ``ci`` row for a CI state the arm let through. ``# ci-override`` is
+    ``waived`` only where that state blocks without it: red and pending always,
+    absent and incomplete on the canonical repo. Off it those two pass by policy
+    (``n/a``), and unknown passes fail-open, unjudged (``unverified``)."""
+    if ci_state == "green":
+        return "ok"
+    if ci_state in ("red", "pending"):
+        return "waived"
+    if ci_state in ("absent", "incomplete"):
+        return ("waived" if override else "ok") if canonical else "n/a"
+    return "unverified"
+
+
+def _receipt_session(payload: object) -> str | None:
+    """The merging session's id prefix: the hook payload's ``session_id`` (the
+    session actually running this merge; an inherited env var can name a
+    parent), then ``GENESIS_SESSION_ID``, then ``CLAUDE_CODE_SESSION_ID``
+    (``CLAUDE_SESSION_ID`` is a dead payload variable; the payload replaces it).
+    The leading 8 hex of a UUID, or None."""
+    raw = (
+        (payload.get("session_id") if isinstance(payload, dict) else None)
+        or os.environ.get("GENESIS_SESSION_ID")
+        or os.environ.get("CLAUDE_CODE_SESSION_ID")
+        or ""
+    )
+    m = re.match(r"([0-9a-fA-F]{8})", str(raw))
+    return m.group(1).lower() if m else None
+
+
+def _receipt_install() -> str | None:
+    """This install's public id prefix, as ``prepare-commit-msg`` stamps it on
+    every commit (``Install:``): ``GENESIS_INSTALL_ID``, else the leading 8 hex of
+    ``install_id`` in ``${GENESIS_HOME:-~/.genesis}/install.json``. Read, never
+    created: the merge path must not write an identity file."""
+    raw = os.environ.get("GENESIS_INSTALL_ID", "")
+    if not raw:
+        home = os.environ.get("GENESIS_HOME") or os.path.expanduser("~/.genesis")
+        try:
+            with open(os.path.join(home, "install.json"), encoding="utf-8") as fh:
+                raw = str(json.load(fh).get("install_id", ""))
+        except (OSError, ValueError, AttributeError):
+            return None
+    m = re.match(r"([0-9a-fA-F]{8})", raw)
+    return m.group(1).lower() if m else None
+
+
+def _merge_receipt(payload: object, head: str, substitute_used: list[dict]) -> str:
+    """The ``Gate-*`` lines for the merge this arm is about to allow, from the
+    outcomes each gate recorded. A row no gate recorded makes both the rows and the
+    verdict unknown (named in ``Gate-incomplete``), never a silent ``ok``."""
+    outcomes = [_RECEIPT_OUTCOMES.get(r) for r in _RECEIPT_ROWS]
+    rows = verdict = None
+    if all(outcomes):
+        rows = " ".join(f"{r}={o}" for r, o in zip(_RECEIPT_ROWS, outcomes, strict=True))
+        if "waived" in outcomes or _RECEIPT_SKIPPED:
+            verdict = "OVERRIDDEN"
+        elif "unverified" in outcomes:
+            verdict = "PASSED-UNVERIFIED"
+        else:
+            verdict = "PASSED"
+    sigils = ",".join(f"{r['sigil']}={r['waived']}" for r in _PENDING_OVERRIDES if r.get("sigil")) or "none"
+    stand_in = None
+    if substitute_used and substitute_used[0].get("reviewers"):
+        stand_in = ",".join(substitute_used[0]["reviewers"]) + "@" + head[:12]
+    return compose_receipt(
+        {
+            "Gate-verdict": verdict,
+            "Gate-rows": rows,
+            "Gate-sigils": sigils,
+            "Gate-session": _receipt_session(payload),
+            "Gate-install": _receipt_install(),
+            # Present only when a substitute stood in: absent means not applicable,
+            # whereas a None value means unknown and is named in Gate-incomplete.
+            **({"Gate-stand-in": stand_in} if stand_in else {}),
+        }
+    )
+
+
+def _write_merge_receipt(path: str, expected: str, receipt: str) -> str | None:
+    """Rewrite the body file as ``expected`` plus the receipt, atomically. None on
+    success, else a block message: a merge the gate cannot record does not run."""
+    try:
+        write_body_file(path, with_receipt(expected, receipt))
+    except OSError as exc:
+        return f"the merge receipt could not be written to {path} ({exc.strerror or exc})."
+    return None
+
+
 def _check_squash_body_file(
     pr_num: str, repo: str | None, head: str, path: str, *, expected_out: list[str] | None = None
 ) -> str | None:
     """None when ``path`` holds exactly the body recomputed for ``head``, else a
     block message. Every failure blocks: the remedy (drop --body-file, or re-run
-    --check-pr) is always available, so nothing here needs a sigil. On success the
-    approved body is appended to ``expected_out`` for :func:`_recheck_squash_body_file`."""
+    --check-pr) is always available, so nothing here needs a sigil. On success the approved body is
+    appended to ``expected_out`` for :func:`_recheck_squash_body_file`. A receipt
+    an earlier attempt left was already stripped at the argv stage (#5027), so the
+    file must now be exactly the body."""
     remedy = (
-        "Re-run --check-pr and use its merge-with line, or drop --body-file to merge "
-        "without the provenance trailer."
+        "Re-run --check-pr and use the command its body-file row prints. A merge "
+        "with no override sigil may instead drop --body-file, merging without the "
+        "provenance trailer and the merge receipt."
     )
     text, why = read_body_file(path)
     if text is None:
@@ -13548,6 +13697,11 @@ def _prepare_squash_body_file(pr_num: str, repo: str | None, head: str) -> tuple
     problem = body_file_path_problem(path)
     if problem:
         return None, f"the body file path {path!r} is unusable: {problem}"
+    current, _why = read_body_file(path)
+    if current is not None and matches_with_receipt(current, body):
+        # Already this body (with or without an earlier attempt's receipt): a
+        # report poll must not wipe the receipt a merge in flight just wrote.
+        return path, ""
     try:
         write_body_file(path, body)
     except OSError as exc:
@@ -16417,6 +16571,9 @@ def main() -> int:
     """
     global _ASK_EMITTED, _merge_deadline
     _PENDING_OVERRIDES.clear()  # a second call in-process must not inherit rows
+    _RECEIPT_OUTCOMES.clear()
+    _RECEIPT_SKIPPED.clear()
+    _PIN_PASS.clear()
     _MERGE_READ_CACHE.clear()  # nor reads cached during another invocation
     _ASK_EMITTED = False
     outcome = "error"
@@ -17573,7 +17730,23 @@ def _run_merge_and_push_gates() -> int:
                         file=sys.stderr,
                     )
                     return 2
+                # The receipt (#5027) rides in the body file, so only a merge that
+                # carries one gets a receipt. Optional by owner ruling: a merge with
+                # no receipt means "no gate record", never proof of a bypass.
                 if body_file is not None:
+                    # An earlier attempt's receipt goes NOW, before any network
+                    # gate: a hook killed later must leave gh the bare body.
+                    _bf_text, _ = read_body_file(body_file)
+                    if _bf_text is not None and strip_receipt(_bf_text) != _bf_text:
+                        try:
+                            write_body_file(body_file, strip_receipt(_bf_text))
+                        except OSError as exc:
+                            print(
+                                f"BLOCKED: PR #{pr_num} — an earlier merge receipt in "
+                                f"{body_file} could not be cleared ({exc.strerror or exc}).",
+                                file=sys.stderr,
+                            )
+                            return 2
                     _bf_why = ""
                     if not merge_head:
                         _bf_why = "it is not bound with --match-head-commit"
@@ -17626,11 +17799,20 @@ def _run_merge_and_push_gates() -> int:
                 # recompute right after the binding (commits 15 + body 6, each
                 # clamped by `_gh_timeout` to what is left): a drained budget
                 # there BLOCKS ("could not be recomputed"), never allows, and a
-                # merge without --body-file pays none of it. Every merge then
-                # pays the past-terminal budget read (`_check_past_terminal`,
-                # one `evaluate_pr`, each gh call clamped by `_gh_timeout` to
-                # what is left): a drained budget there reads as unknown and
-                # BLOCKS, so this read is not counted in the 62s above.
+                # merge without --body-file pays none of it, except an OVERRIDE
+                # merge without one, which pays the same recompute LAST, after
+                # every gate passed (plus head 6 when unbound), to learn whether
+                # the body file can be produced; it spends only what the gates
+                # left, and a drained budget there only skips the requirement.
+                # Every merge also pays the past-terminal budget read
+                # (`_check_past_terminal`, one `evaluate_pr`, each gh call clamped
+                # by `_gh_timeout` to what is left): a drained budget there reads
+                # as unknown and BLOCKS, so this read is not counted in the 62s
+                # above. Writing the receipt (#5027) at the end is local (no
+                # network). A hook SIGKILLed before that write lets the command
+                # run with the bare body the argv-stage strip left, so that merge
+                # has no receipt: absence means "no gate record", never proof of
+                # a bypass.
                 # A timing-out fail-closed gate returns BLOCK immediately, so
                 # the additive worst case needs every call slow-but-successful.
                 mergeable = _check_mergeable(pr_num, repo=merge_repo)
@@ -17667,6 +17849,7 @@ def _run_merge_and_push_gates() -> int:
                         file=sys.stderr,
                     )
                     return 2
+                _RECEIPT_OUTCOMES["mergeable"] = "ok"
 
                 # CI-status gate. On an unprotected default branch,
                 # mergeStateStatus=CLEAN is NOT a CI verdict (it only means "no
@@ -17687,6 +17870,11 @@ def _run_merge_and_push_gates() -> int:
                 # verdict is known, record WHICH state was waived.
                 if ci_override:
                     _amend_note("ci-override", waived=f"ci:{ci_state}")
+                # Recorded before the blocks below: a state that blocks returns, so
+                # only an allowed state ever reaches the receipt.
+                _RECEIPT_OUTCOMES["ci"] = _ci_receipt_outcome(
+                    ci_state, _scheduled_gate_applies(merge_repo), ci_override
+                )
                 if ci_state in ("red", "pending") and not ci_override:
                     print(
                         f"BLOCKED: PR #{pr_num} CI is {ci_state.upper()} "
@@ -17787,6 +17975,10 @@ def _run_merge_and_push_gates() -> int:
                     )
                     print(_defang_gate_text(base_msg), file=sys.stderr)
                     return 2
+                if stale_override:
+                    _receipt_skip("base-branch")  # the sigil returns before any read
+                else:
+                    _RECEIPT_OUTCOMES["base-branch"] = "ok"
 
                 # Pin receipts. This is the AUTHORITY for the two release gates
                 # (changelog read, local-first soak), deliberately not a CI
@@ -17813,6 +18005,16 @@ def _run_merge_and_push_gates() -> int:
                     )
                     print(_defang_gate_text(receipts_msg), file=sys.stderr)
                     return 2
+                # A PR that leaves the pin file alone owes no receipts: out of scope,
+                # not judged-and-passed, as the gate itself records in _PIN_PASS. A
+                # NOTE is the gate's documented fail-open return (printed below).
+                _RECEIPT_OUTCOMES["pin-receipts"] = (
+                    "unverified"
+                    if receipts_msg.startswith("NOTE:")
+                    else "n/a"
+                    if _PIN_PASS.get("reason") == "n/a"
+                    else "ok"
+                )
                 if receipts_msg.startswith("NOTE:"):
                     # A NOTE means the gate did NOT verify the receipts and is allowing the
                     # merge anyway. That is the fail-open direction, so it has to be VISIBLE
@@ -17910,6 +18112,12 @@ def _run_merge_and_push_gates() -> int:
                     )
                     print(_defang_gate_text(fresh_msg), file=sys.stderr)
                     return 2
+                if stale_override:
+                    # The core's force arm returns before reading any review.
+                    _receipt_skip("codex-at-head")
+                else:
+                    # A dispatched session's substitute is refused just below.
+                    _RECEIPT_OUTCOMES["codex-at-head"] = "waived" if substitute_used else "ok"
                 bind_source = "Codex-verified"
                 if substitute_used:
                     # A stand-in satisfied freshness. The owner approves each use IN
@@ -17968,9 +18176,9 @@ def _run_merge_and_push_gates() -> int:
                 # The squash body's CONTENT, right after the binding and before the
                 # slow scanners, for the binding's reason: a hook killed at its wall
                 # clock lets the command run, so the leak boundary goes early.
-                # A merge WITHOUT --body-file is allowed silently: the advisory for
-                # it lives in --check-pr's merge-with line, which is read, whereas
-                # stderr on this hook's exit-0 path is not delivered.
+                # A merge WITHOUT --body-file is allowed silently and carries no
+                # receipt: the advisory for it lives in --check-pr's body-file row,
+                # which is read, whereas stderr on this hook's exit-0 path is not.
                 body_expected: list[str] = []
                 if body_file is not None:
                     body_msg = _check_squash_body_file(
@@ -17979,6 +18187,7 @@ def _run_merge_and_push_gates() -> int:
                     if body_msg:
                         print(f"BLOCKED: PR #{pr_num} — {body_msg}", file=sys.stderr)
                         return 2
+                    _RECEIPT_OUTCOMES["body-file"] = "ok"
 
                 # Past-terminal head check (owner rulings 3f6ad6fb and cc17ee20,
                 # 2026-11-25). Every route that moves a head converges here, so the
@@ -17996,6 +18205,9 @@ def _run_merge_and_push_gates() -> int:
                         file=sys.stderr,
                     )
                     return 2
+                # Both passes read the budget and judged it (below terminal, or at
+                # the terminal head): no sigil waives this gate, so it is only ok.
+                _RECEIPT_OUTCOMES["terminal-head"] = "ok"
 
                 # Unresolved review findings (review body) — AFTER freshness +
                 # binding (see the ordering note above). Waived by
@@ -18019,6 +18231,10 @@ def _run_merge_and_push_gates() -> int:
                     # anyway so the two arms cannot drift apart again.)
                     print(_sanitize_gate_text(review_msg), file=sys.stderr)
                     return 2
+                if force_override:
+                    _receipt_skip("review-body")  # the sigil returns before any scan
+                else:
+                    _RECEIPT_OUTCOMES["review-body"] = "ok"
 
                 # Inline review comments (Codex P1/P2 badges) — separate
                 # endpoint, separate check. Weighted score: P1=1.0, P2=0.5;
@@ -18031,12 +18247,14 @@ def _run_merge_and_push_gates() -> int:
                         file=sys.stderr,
                     )
                 floor_accept_used: set[int] = set()
-                floor_kwargs: dict = {}
+                # Passed only under the sigil, like the floor kwargs: the plain call
+                # keeps its signature.
+                inline_force_waived: list[str] = []
+                floor_kwargs: dict = {"force_waived": inline_force_waived} if force_override else {}
                 if floor_accept_ids:
-                    floor_kwargs = {
-                        "floor_accept": floor_accept_ids,
-                        "floor_accept_used": floor_accept_used,
-                    }
+                    floor_kwargs.update(
+                        floor_accept=floor_accept_ids, floor_accept_used=floor_accept_used
+                    )
                 should_block, inline_msg = _check_inline_review_findings(
                     pr_num,
                     force=force_override,
@@ -18069,6 +18287,9 @@ def _run_merge_and_push_gates() -> int:
                     # recolour the BLOCKED: line a human is reading to decide.
                     print(_sanitize_gate_text(inline_msg), file=sys.stderr)
                     return 2
+                _RECEIPT_OUTCOMES["inline-findings"] = (
+                    "waived" if (floor_accept_used or inline_force_waived) else "ok"
+                )
 
                 # Scheduled Claude review at HEAD — its OWN fail-closed gate with its OWN
                 # sigil (# scheduled-review-override waives ONLY this gate; independent of
@@ -18100,6 +18321,12 @@ def _run_merge_and_push_gates() -> int:
                     merge_repo,
                     force=sched_override,
                 )
+                if not _scheduled_gate_applies(merge_repo):
+                    _RECEIPT_OUTCOMES["scheduled-claude"] = "n/a"  # out of scope here
+                elif sched_override:
+                    _receipt_skip("scheduled-claude")  # the sigil returns before any read
+                else:
+                    _RECEIPT_OUTCOMES["scheduled-claude"] = "ok"
                 if sched_msg:
                     print(
                         f"BLOCKED: PR #{pr_num} — required scheduled Claude review(s) "
@@ -18124,6 +18351,13 @@ def _run_merge_and_push_gates() -> int:
                     )
                     print(_defang_gate_text(rw_msg), file=sys.stderr)
                     return 2
+                if rework_override:
+                    _receipt_skip("rework")  # the sigil returns before any read
+                else:
+                    _RECEIPT_OUTCOMES["rework"] = {
+                        REWORK_NA: "n/a",
+                        REWORK_UNCHECKED: "unverified",
+                    }.get(rw_state, "ok")
                 if rw_state == REWORK_UNCHECKED:
                     print(
                         f"NOTE: rework gate could not check PR #{pr_num} — "
@@ -18135,8 +18369,60 @@ def _run_merge_and_push_gates() -> int:
                 # Last, just before this arm allows: the body file once more.
                 if body_file is not None and body_expected:
                     late_msg = _recheck_squash_body_file(body_file, body_expected[0])
+                    if not late_msg:
+                        # Every gate has passed or been waived: record the decision
+                        # in the file gh is about to read (#5027). Local, no network.
+                        late_msg = _write_merge_receipt(
+                            body_file,
+                            body_expected[0],
+                            _merge_receipt(payload, merge_head, substitute_used),
+                        )
                     if late_msg:
                         print(f"BLOCKED: PR #{pr_num} — {late_msg}", file=sys.stderr)
+                        return 2
+                elif body_file is None and _PENDING_OVERRIDES:
+                    # Owner rulings 1101933a and cfdd23b2: an OVERRIDE merge carries
+                    # the receipt whenever this gate can produce its body file now,
+                    # by the same producer as --check-pr's body-file row, so report
+                    # and arm cannot disagree. LAST, after every gate has passed:
+                    # its reads (head when unbound 6 + commits 15 + body 6, clamped)
+                    # come out of what the gates left, so it never starves one of
+                    # them, and a merge another gate refuses never pays for it.
+                    # Where it cannot produce one (a capped commit list, an
+                    # unreadable body, an unusable directory, CI, the test pin, a
+                    # drained budget) the merge goes on with no receipt: "no gate
+                    # record". The one cause the author can fix at once, a PR-body
+                    # line starting with a gate-only trailer key, is refused.
+                    _sig_head = merge_head or (_pr_head_sha(pr_num, repo=merge_repo) or "")
+                    _sig_head = _sig_head.strip().lower()
+                    _sig_path, _sig_why = (
+                        _prepare_squash_body_file(pr_num, merge_repo, _sig_head)
+                        if _sig_head
+                        else (None, "")
+                    )
+                    if _sig_path:
+                        print(
+                            f"BLOCKED: PR #{pr_num} — a merge under an override sigil "
+                            f"carries the merge receipt, so it needs --body-file. The "
+                            f"file is written; merge with `"
+                            f"{_suggested_merge_cmd(pr_num, _sig_head, merge_repo)} "
+                            f"--body-file {_sig_path}` and the same sigils appended, as "
+                            f"its own command.",
+                            file=sys.stderr,
+                        )
+                        return 2
+                    # Only after a real attempt failed (CI and the test pin return no
+                    # reason); the body read is cached by then, so this is free.
+                    _key = _sig_why and reserved_trailer_key(_pr_body_text(pr_num, merge_repo))
+                    if _key:
+                        print(
+                            f"BLOCKED: PR #{pr_num} — a merge under an override sigil "
+                            f"carries the merge receipt, and this PR's body has a line "
+                            f"starting with {_key!r}:, a trailer key only the gate "
+                            f"writes. Reword that line, then re-run --check-pr and use "
+                            f"its body-file command.",
+                            file=sys.stderr,
+                        )
                         return 2
 
         # ── sqlite3 write operations ────────────────────────────────
@@ -18880,20 +19166,43 @@ def check_pr_report(
     # Emit the actionable merge command ONLY when EVERY gate passed — printing it earlier
     # (right after codex-at-head) suggested a mergeable PR even when the scheduled or finding
     # gate below would block. Bound to the Codex-verified head (the TOCTOU pin).
-    if failures == 0 and verified_head:
-        # The squash body carries `Squashed-From: <head>` plus the branch's session
-        # trailers. The merge arm recomputes it, so the file is a convenience for gh,
-        # never a source of trust. On a failure the plain command still merges.
-        merge_cmd = _suggested_merge_cmd(pr_num, verified_head, repo)
-        body_path, body_why = _prepare_squash_body_file(pr_num, repo, verified_head)
-        if body_path:
-            merge_cmd += f" --body-file {body_path}"
-        elif body_why:
+    # The body file, for the PR's CURRENT head, whatever the rows above say: a merge
+    # made under the owner's sigils carries a receipt (#5027) only if it carries this
+    # file, since the merge arm writes the receipt into it. Optional: a merge without
+    # it is allowed and records nothing. It carries `Squashed-From: <head>` plus the
+    # branch's session trailers; the arm recomputes it, so the file is never a
+    # source of trust.
+    writes = not (os.environ.get("GITHUB_ACTIONS") or os.environ.get("_TEST_SQUASH_BODY_FILE") == "off")
+    body_head = verified_head or (_pr_head_sha(pr_num, repo) if writes else None)
+    if body_head:
+        body_path, body_why = _prepare_squash_body_file(pr_num, repo, body_head)
+    elif not writes:
+        body_path, body_why = None, "not written in CI or under the test pin"
+    else:
+        body_path, body_why = None, "the PR head could not be read"
+    if body_path:
+        print(
+            "body-file      : "
+            + _suggested_merge_cmd(pr_num, body_head, repo)
+            + f" --body-file {body_path}"
+        )
+        if not (failures == 0 and verified_head):
             print(
-                f"NOTE: PR #{pr_num} — no squash body file ({body_why}); the merge-with "
-                f"line below merges without the Squashed-From trailer.",
+                "NOTE: a merge under the owner's sigils that should carry the merge "
+                "receipt uses the body-file command above, with only the approved "
+                "sigils appended.",
                 file=sys.stderr,
             )
+    else:
+        print(
+            "body-file      : none here"
+            + (f" ({body_why})" if body_why else "")
+            + "; a merge without one carries no receipt"
+        )
+    if failures == 0 and verified_head:
+        merge_cmd = _suggested_merge_cmd(pr_num, verified_head, repo)
+        if body_path:
+            merge_cmd += f" --body-file {body_path}"
         if floor_used:
             merge_cmd += "  # floor-accept=" + ",".join(str(i) for i in sorted(floor_used))
         print("merge-with     : " + merge_cmd)

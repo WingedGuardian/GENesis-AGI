@@ -178,6 +178,81 @@
    approvals are decisions rather than sigils and are deliberately not written as
    reusable receipts.
 
+## Merge receipt
+
+   The override log is local to one install. The **receipt** (#5027) is the
+   public record: the merge arm appends `Gate-*` lines to the squash body file at
+   allow time, in the same final paragraph as `Squashed-From`, so they land as
+   trailers in the squash commit on main and `git log --format=%(trailers)` reads
+   them on any clone.
+
+   | Trailer | Grammar | Meaning |
+   |---|---|---|
+   | `Gate-verdict` | `PASSED` \| `PASSED-UNVERIFIED` \| `OVERRIDDEN` | derived from the rows: `OVERRIDDEN` when any row is `waived` or a sigil made a gate skip its read; else `PASSED-UNVERIFIED` when any row is `unverified`; else `PASSED` |
+   | `Gate-rows` | `<row>=ok\|n/a\|unverified\|waived …` | each blocking gate's outcome, in the arm's order (`_RECEIPT_ROWS`), recorded by that gate as it decides |
+   | `Gate-sigils` | `none` \| `<sigil>=<waived>,…` | each noted sigil with the override log's `waived` value, used or not |
+   | `Gate-stand-in` | `<login>[,…]@<head12>` | the substitute reviewer(s), when one stood in |
+   | `Gate-session` | 8 hex | the merging session: the hook payload's `session_id`, then `GENESIS_SESSION_ID`, then `CLAUDE_CODE_SESSION_ID` |
+   | `Gate-install` | 8 hex | the install id, the same prefix the `Install:` commit trailer carries |
+   | `Gate-incomplete` | field names | a field that was unknown or failed its grammar, left out rather than written raw |
+
+   Row values (owner rulings, #5027 round 1):
+
+   - `ok`: the gate read and passed it.
+   - `n/a`: out of the gate's scope here. CI `absent` or `incomplete` off the
+     canonical repo, the scheduled-review gate off it, a pin file this PR leaves
+     alone, a PR that is not a rework.
+   - `unverified`: passed without being judged. A fail-open read (CI `unknown`, a
+     pin check that could not verify, an unreadable rework contract), or a sigil
+     that makes the gate skip its read: `stale-review-override` on
+     `codex-at-head` and `base-branch`, `review-override` on `review-body`,
+     `scheduled-review-override`, `rework-override`. Nobody knows whether those
+     gates would have blocked, so the row never claims a waiver; the verdict
+     still reads `OVERRIDDEN`, since the sigil, not a read, let them pass.
+   - `waived`: a sigil let through what the gate would have blocked. `ci` under
+     `# ci-override` on red or pending, or on absent or incomplete on the
+     canonical repo. `codex-at-head` when a substitute stood in.
+     `inline-findings` when `# floor-accept` was used, or when `#
+     review-override` let an unreadable scan or a score at the lane threshold
+     through (that scan still runs under the sigil, so the gate knows).
+
+   A sigil present but unused (CI already green, a substitute Codex made
+   unnecessary) changes no row. Every grammar is closed
+   (`gh_merge.RECEIPT_GRAMMAR`), so no path, hostname or message can reach a
+   public commit. A row no gate recorded leaves `Gate-rows` and `Gate-verdict`
+   out, named in `Gate-incomplete`, and never reads `ok`.
+
+   **Read it with `git log --format=%(trailers)`**, which reads the commit's final
+   trailer block, the one the gate writes. `git interpret-trailers --parse` splits
+   on a `---` line and can land on an earlier block. A PR body line starting with
+   an exact key the gate writes (`Squashed-From:`, `Genesis-Session:`, or a
+   receipt key such as `Gate-rows:`, in any case and after leading blanks, since
+   git's trailer readers match keys case-insensitively) is refused when the merge
+   carries the body file, so the PR text cannot pose as a receipt. `gate-surface:`
+   and other look-alikes are not reserved.
+
+   **The receipt is a record, not a signature, and not universal.** The arm writes
+   it only when the merge carries `--body-file`. An override merge (any noted
+   sigil) without the file is refused whenever the gate can produce one for that
+   head, by the same producer as `--check-pr`'s `body-file` row, and the refusal
+   prints the command with the file written (owner ruling, #5027). The check runs
+   last, after every gate has passed, so it spends only the budget they left. An
+   override merge whose PR body has a line starting with a gate-only key is
+   refused with that key named, to be reworded. A plain merge
+   may leave the file off. So **no receipt means "no gate record"**, never proof
+   of a bypass: a plain merge left the file off, the PR could not be composed (250
+   or more commits, an unreadable body), or a hook was killed before the write. Nothing
+   authenticates a receipt either: a merge outside the gate (the web UI, another
+   harness) can carry receipt-shaped lines. An audit counts receipts it finds; it
+   cannot infer anything from their absence.
+
+   A file holding the body plus exactly one valid receipt is accepted (an earlier
+   attempt that another PreToolUse hook stopped). The arm strips that receipt at
+   the argv stage, before any network gate, so a hook killed during the slow gates
+   leaves `gh` the bare body and never an earlier decision. The gate's own receipt
+   is written last, after every check and a strict re-read. Any other extra text
+   is refused.
+
 ## Scheduled-review inventory
 
   Why an inventory and not a diagnosis: the previous shape picked one cause per kind and

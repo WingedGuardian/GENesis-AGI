@@ -470,6 +470,12 @@ def compose_squash_body(pr_body: str | None, head: str, messages: list[str | Non
     if not _FULL_SHA.match(head or ""):
         raise ValueError("head must be a full lowercase 40-hex sha")
     body = (pr_body or "").replace("\r\n", "\n").rstrip()
+    if reserved_trailer_key(body):
+        raise ValueError(
+            "the PR body has a line starting with a trailer key only the gate writes "
+            "(Squashed-From:, Genesis-Session: or a Gate- receipt key); reword it, or "
+            "merge without --body-file"
+        )
     sessions: list[str] = []
     for message in messages:
         paragraphs = [p for p in (message or "").replace("\r\n", "\n").split("\n\n") if p.strip()]
@@ -479,6 +485,129 @@ def compose_squash_body(pr_body: str | None, head: str, messages: list[str | Non
                 sessions.append(m.group(1).lower())
     trailers = "\n".join([f"Squashed-From: {head}"] + [f"Genesis-Session: {s}" for s in sessions])
     return (body + "\n\n" if body else "") + trailers + "\n"
+
+
+#: The merge receipt (#5027): ``Gate-*`` trailer lines the merge arm appends to
+#: the squash body at allow time, in the same final paragraph as ``Squashed-From``,
+#: so the decision lands in the squash commit on main with no extra API call.
+#: Every value is checked against a CLOSED grammar before it is written, so no
+#: free text (a path, a hostname, a message) can ride into a public commit.
+#: A row is ``ok`` (the gate judged it and it passed), ``n/a`` (out of the gate's
+#: scope here), ``unverified`` (it passed without being judged: a fail-open read,
+#: or a sigil that skips the gate unread) or ``waived`` (a sigil let through what
+#: the gate would have blocked). The verdict follows from the rows: OVERRIDDEN when
+#: any is waived or a sigil made a gate skip its read (that row is ``unverified``),
+#: else PASSED-UNVERIFIED when any is unverified, else PASSED.
+RECEIPT_GRAMMAR: dict[str, re.Pattern] = {
+    "Gate-verdict": re.compile(r"PASSED|PASSED-UNVERIFIED|OVERRIDDEN"),
+    "Gate-rows": re.compile(
+        r"[a-z][a-z-]{0,31}=(ok|n/a|waived|unverified)"
+        r"( [a-z][a-z-]{0,31}=(ok|n/a|waived|unverified)){0,31}"
+    ),
+    "Gate-sigils": re.compile(
+        r"none|[a-z][a-z-]{0,31}=[a-z][a-z0-9:+-]{0,63}(,[a-z][a-z-]{0,31}=[a-z][a-z0-9:+-]{0,63}){0,15}"
+    ),
+    "Gate-stand-in": re.compile(
+        r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(\[bot\])?(,[A-Za-z0-9][A-Za-z0-9-]{0,38}(\[bot\])?){0,7}@[0-9a-f]{12}"
+    ),
+    "Gate-session": re.compile(r"[0-9a-f]{8}"),
+    "Gate-install": re.compile(r"[0-9a-f]{8}"),
+    "Gate-incomplete": re.compile(r"[A-Za-z-]{1,32}(,[A-Za-z-]{1,32}){0,7}"),
+}
+_RECEIPT_ORDER = tuple(RECEIPT_GRAMMAR)
+#: Lines only the gate writes into a squash body: a PR body line starting with one
+#: of these exact keys could pass for a receipt to a reader that picks an earlier
+#: trailer block (``git interpret-trailers --parse`` after a ``---`` line), so it
+#: is refused. In ANY case and after leading blanks, because git's trailer readers
+#: match keys case-insensitively (MEASURED: ``%(trailers:key=gate-verdict)`` reads
+#: ``Gate-verdict``). Only the exact keys: ``gate-surface:`` and the like pass.
+_RESERVED_TRAILER = re.compile(
+    r"(?mi)^[ \t]*(Squashed-From|Genesis-Session|"
+    + "|".join(re.escape(k) for k in RECEIPT_GRAMMAR)
+    + r")[ \t]*:"
+)
+
+
+def reserved_trailer_key(pr_body: str | None) -> str | None:
+    """The first gate-only trailer key a PR body line starts with, as written
+    (never the rest of the line), or None. :func:`compose_squash_body` refuses
+    such a body; the merge arm names the key so the author can reword it."""
+    m = _RESERVED_TRAILER.search((pr_body or "").replace("\r\n", "\n"))
+    return m.group(1) if m else None
+
+
+def compose_receipt(fields: dict[str, str | None]) -> str:
+    """The receipt's lines, in a fixed order. A field whose value fails its
+    grammar, or is given as None (unknown), is left out and named in
+    ``Gate-incomplete`` rather than written raw. A key absent from ``fields`` (not
+    applicable, e.g. ``Gate-stand-in`` with no stand-in) is simply not written."""
+    lines: list[str] = []
+    bad: list[str] = []
+    for key in _RECEIPT_ORDER:
+        if key == "Gate-incomplete" or key not in fields:
+            continue
+        if fields[key] is None:
+            bad.append(key)  # unknown: named, so an absence is visible
+            continue
+        value = str(fields[key])
+        if RECEIPT_GRAMMAR[key].fullmatch(value):
+            lines.append(f"{key}: {value}")
+        else:
+            bad.append(key)
+    if bad:
+        lines.append("Gate-incomplete: " + ",".join(bad))
+    return "\n".join(lines)
+
+
+def with_receipt(body: str, receipt: str) -> str:
+    """``body`` (a :func:`compose_squash_body` result) with the receipt lines
+    joined to its trailer paragraph."""
+    return body.rstrip("\n") + "\n" + receipt + "\n" if receipt else body
+
+
+def strip_receipt(text: str) -> str:
+    """``text`` without a trailing receipt block: the last lines, from the first
+    ``Gate-*`` line on, when every one of them parses under the grammar. Local and
+    network-free, so the merge arm can clear an earlier attempt's receipt before
+    any slow gate runs. Anything else is returned unchanged for the full check
+    to judge."""
+    lines = text.rstrip("\n").split("\n")
+    i = len(lines)
+    while i > 0 and lines[i - 1].startswith("Gate-"):
+        i -= 1
+    tail = lines[i:]
+    if not tail or i == 0:
+        return text
+    for line in tail:
+        key, sep, value = line.partition(": ")
+        if not sep or key not in RECEIPT_GRAMMAR or not RECEIPT_GRAMMAR[key].fullmatch(value):
+            return text
+    return "\n".join(lines[:i]) + "\n"
+
+
+def matches_with_receipt(text: str, expected: str) -> bool:
+    """True when ``text`` is ``expected`` alone, or ``expected`` plus exactly one
+    receipt block every line of which parses under :data:`RECEIPT_GRAMMAR`: the
+    file as an earlier attempt of this same merge left it when another hook
+    stopped the command after this gate allowed it."""
+    if text == expected:
+        return True
+    head = expected.rstrip("\n") + "\n"
+    if not text.startswith(head) or not text.endswith("\n"):
+        return False
+    lines = text[len(head) :].rstrip("\n").split("\n")
+    seen: set[str] = set()
+    for line in lines:
+        key, sep, value = line.partition(": ")
+        if (
+            not sep
+            or key not in RECEIPT_GRAMMAR
+            or key in seen
+            or not RECEIPT_GRAMMAR[key].fullmatch(value)
+        ):
+            return False
+        seen.add(key)
+    return True
 
 
 def body_file_path_problem(path: str) -> str | None:
