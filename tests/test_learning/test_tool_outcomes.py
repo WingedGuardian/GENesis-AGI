@@ -285,6 +285,33 @@ async def test_the_extraction_job_records_outcomes_from_its_spine(db, transcript
     assert (await cur.fetchone())[0] == 4
 
 
+async def test_an_overflowing_timestamp_does_not_drop_the_transcript_batch(db, tmp_path):
+    from genesis.memory import extraction_job
+
+    day = _day()
+    outside_utc = "0001-01-01T00:00:00+01:00"
+    records = [
+        _use("toolu_ancient", "Bash", {"command": "ls"}, ts=outside_utc),
+        _result("toolu_ancient", "ok", ts=outside_utc),
+        _use("toolu_recent", "Bash", {"command": "ls"}, ts=f"{day}T15:30:15+05:30:15"),
+        _result("toolu_recent", "ok", ts=f"{day}T15:30:16+05:30:15"),
+    ]
+    transcript = tmp_path / f"{SID}.jsonl"
+    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+
+    await extraction_job._record_tool_outcomes_from(db, transcript, SID)
+
+    cur = await db.execute(
+        "SELECT tool_use_id, datetime(timestamp), datetime(recorded_at), success "
+        "FROM tool_call_outcomes"
+    )
+    rows = await cur.fetchall()
+    assert [(row[0], row[1], row[3]) for row in rows] == [
+        ("toolu_recent", f"{day} 10:00:01", 1),
+    ]
+    assert rows[0][2] is not None
+
+
 async def test_prune_drops_old_rows_and_old_failure_text_only(db):
     """Retention: rows past 180 days go; failure text past 90 days is cleared;
     both timestamp spellings the table holds are compared as instants."""
