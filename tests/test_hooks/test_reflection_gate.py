@@ -120,6 +120,7 @@ def _reflection(head: str, keys=("c11",), *, premise_round: bool = False) -> str
                 *premise,
                 "Premise-why: the bound is checked in one place and trusted in another",
                 "Impossible: route every reader through the one checked helper",
+                "Alternative: none found: searched scripts/ for an existing checked helper",
                 "Scope: covered: the bound holds at the edge (tests/test_x.py)",
                 "Decision: close-class",
                 "Decision-why: the same unchecked read appears at both call sites",
@@ -203,6 +204,8 @@ def test_a_content_commit_is_denied_while_the_round_owes_a_reflection(
     assert "Owed: c11." in res.stderr
     assert "review_reflection.py status" in res.stderr
     assert "--allow-empty --cleanup=verbatim -F" in res.stderr
+    # #4676: a field the writer must fill is named in the text the gate prints.
+    assert f"From {rr.ALTERNATIVE_CUTOVER_ISO[:10]}, a fix-now disposition also needs an `Alternative:` line" in res.stderr
 
 
 def test_the_deny_names_the_second_reflection_route_before_a_push(repo, home, monkeypatch):
@@ -573,7 +576,9 @@ def test_snapshot_exemption_keeps_real_reader_late_debt(repo, quiet, monkeypatch
     assert quiet == []
 
 
-def _late_reflection_problem(repo, monkeypatch, tmp_path, *, owed, names, late_rounds):
+def _late_reflection_problem(
+    repo, monkeypatch, tmp_path, *, owed, names, late_rounds, edit=lambda text: text
+):
     """Admission at round 2 with ``owed`` owed (c11 a late key whose round
     contexts, as review_late would place them, are ``late_rounds``) for a
     round-1-style reflection (Premise: LEAD) naming ``names``."""
@@ -591,7 +596,7 @@ def _late_reflection_problem(repo, monkeypatch, tmp_path, *, owed, names, late_r
         "_contexts",
         lambda *a, **k: [review_late.RoundContext(n, None, ()) for n in late_rounds],
     )
-    msg = _write_reflection(tmp_path, _reflection(head, keys=tuple(names)))
+    msg = _write_reflection(tmp_path, edit(_reflection(head, keys=tuple(names))))
     command = f"git commit --allow-empty --cleanup=verbatim -F {msg}"
     segs, _ = _gate.analyze_checked(command)
     state = {
@@ -636,6 +641,37 @@ def test_admission_follows_what_the_debt_reader_would_credit(
         repo, monkeypatch, tmp_path, owed=owed, names=names, late_rounds=late_rounds
     )
     assert problem is not None and why in problem, problem
+
+
+_ALTERNATIVE = "Alternative: none found: searched scripts/ for an existing checked helper\n"
+
+
+@pytest.mark.parametrize("late_round", [0, 1])
+def test_after_the_cutover_a_fix_now_without_its_alternative_is_refused(
+    repo, monkeypatch, tmp_path, late_round
+):
+    """Spec 5.8: admission judges the line as committed now, in every round
+    (round 0 included), and the refusal names the line (#4676: the writer
+    learns a field from the gate's own text)."""
+    monkeypatch.setattr(rr, "ALTERNATIVE_CUTOVER_ISO", "2026-01-01T00:00:00+00:00")
+    problem = _late_reflection_problem(
+        repo, monkeypatch, tmp_path, owed=["c11"], names=["c11"], late_rounds=[late_round],
+        edit=lambda text: text.replace(_ALTERNATIVE, ""),
+    )
+    assert problem is not None and "'Alternative: <it>'" in problem, problem
+    assert _late_reflection_problem(
+        repo, monkeypatch, tmp_path, owed=["c11"], names=["c11"], late_rounds=[late_round]
+    ) is None
+
+
+def test_before_the_cutover_a_fix_now_without_its_alternative_is_admitted(
+    repo, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(rr, "ALTERNATIVE_CUTOVER_ISO", "2099-01-01T00:00:00+00:00")
+    assert _late_reflection_problem(
+        repo, monkeypatch, tmp_path, owed=["c11"], names=["c11"], late_rounds=[1],
+        edit=lambda text: text.replace(_ALTERNATIVE, ""),
+    ) is None
 
 
 def test_a_late_round_one_key_is_admitted_through_the_real_reader(repo, monkeypatch, tmp_path):

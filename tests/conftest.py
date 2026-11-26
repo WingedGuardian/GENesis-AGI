@@ -43,6 +43,14 @@ import os  # noqa: E402
 import shutil  # noqa: E402
 import subprocess  # noqa: E402
 
+# Before child conftests can resolve Hypothesis storage. Keep examples and
+# constants between runs, inside the existing test-owned cache directory.
+# Explicit caller/CI storage (including an empty value) retains precedence.
+os.environ.setdefault(
+    "HYPOTHESIS_STORAGE_DIRECTORY",
+    str(_WORKTREE_SRC.parent / ".pytest_cache" / "hypothesis"),
+)
+
 import aiosqlite  # noqa: E402
 import pytest  # noqa: E402
 
@@ -398,6 +406,7 @@ pytest_plugins = [
     "tests._live_closure",
     "tests._live_outbound",
     "tests._live_writes",
+    "tests._rerun_ledger",
     "tests._session_config",
 ]
 

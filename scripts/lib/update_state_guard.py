@@ -376,6 +376,21 @@ _LIVE = "the live checkout is half-written"
 #: killed partway), which the repair finishes toward the tag (#3492 PR D1f).
 #: Main's forward case keeps _FORWARD and its --post-merge remedy.
 _LIVE_FORWARD = "the live checkout is at the rebuilt tip"
+#: ... and on a `live` row in a phase after `merging` (bootstrap, migrations,
+#: health_check) with HEAD on `live`: the update failed there or was killed
+#: there, and nothing finishes its rollback yet (#3722). Only the text differs
+#: from main's: the verdicts and exit codes stay main's, since every caller
+#: keys on the exit code.
+_LIVE_LATER = "a `live` update stopped in phase"
+#: The one way forward that exists for those rows, said honestly (#3722).
+_LIVE_RETRY = (
+    "Nothing finishes that rollback automatically yet (#3722). The one way forward "
+    "that exists retries the update: scripts/update.sh --post-merge re-runs bootstrap, "
+    "the migrations and the health check on the same code, so a step that failed may "
+    "fail again, and its database snapshot replaces the update's earlier one and may be "
+    "taken after the migration, so a rollback after it can keep the migrated database"
+)
+_LATER_PHASES = ("bootstrap", "migrations", "health_check")
 
 #: HOLD remedies, one per kind of state. None recommends --post-merge: it
 #: refuses every one of them.
@@ -400,6 +415,19 @@ _IN_MERGE = (
     "none is (the dashboard's update card shows none running and "
     "~/.genesis/update_in_progress.pid names no live process), saving any edits "
     "you want before git merge --abort; otherwise wait for it"
+)
+#: A `live` row after `merging` with HEAD on `live` back at the rollback tag:
+#: the rollback put the checkout there itself, but the record cannot show that
+#: its later steps ran (#3722).
+_LIVE_AT_TAG = (
+    "The update most likely failed and was rolling back: the rollback put the "
+    "checkout back at the tag, but it may not have finished putting back the git "
+    "hooks, the repair kit, the packages and the database, or restarting. Nothing "
+    "finishes that automatically yet (#3722). Dismiss the update on the dashboard's "
+    "update card and run scripts/update.sh again: it starts the update over from the "
+    "tag, and it may fail the same way (if a rebuild then refuses on the installed git "
+    "hooks, run the sync it names). The database may still be the migrated one; "
+    "restoring it by hand is not advised here (no restore of that snapshot is tested)"
 )
 _NO_TAG = (
     "Without its rollback tag the checkout cannot be checked for a half-written "
@@ -456,16 +484,26 @@ def _shown(record: str) -> str:
 
 
 def _mixed(
-    tag: str, to: str, residue: list[str], *, forward: bool = False, live: bool = False
+    tag: str,
+    to: str,
+    residue: list[str],
+    *,
+    forward: bool = False,
+    live: bool = False,
+    later: str = "",
 ) -> tuple[str, str]:
     """MIXED_TREE, its reason naming the two commits and listing every path.
     ``forward``: HEAD is at ``to``, not the tag. ``live``: a `live` row, which
-    the repair heals at either end; else main's, which finishes forward."""
+    the repair heals at either end; else main's, which finishes forward.
+    ``later``: a `live` row's phase after `merging` (#3722), which nothing heals."""
     lines = [_shown(r) for r in residue] or [
         "(the rebuild recorded that git wrote part of the tree)"
     ]
     where = (
-        f"{_LIVE_FORWARD if live else _FORWARD} ({to[:12]}), half-written back toward {tag[:12]}"
+        f"{_LIVE_LATER} '{later}' with the checkout at the rebuilt tip ({to[:12]}), "
+        f"half-written back toward {tag[:12]}"
+        if forward and later
+        else f"{_LIVE_FORWARD if live else _FORWARD} ({to[:12]}), half-written back toward {tag[:12]}"
         if forward
         else f"{_LIVE if live else 'the checkout is half-written'} between {tag[:12]} and "
         f"{to[:12] or 'its merge'}"
@@ -473,7 +511,9 @@ def _mixed(
     return MIXED_TREE, where + ":\n" + "\n".join("  " + ln for ln in lines)
 
 
-def _forward(repo: str, tag: str, to: str, *, live: bool = False) -> tuple[str, str] | None:
+def _forward(
+    repo: str, tag: str, to: str, *, live: bool = False, later: str = ""
+) -> tuple[str, str] | None:
     """HEAD is at ``to``, the update's new code: MIXED_TREE (forward) when the
     two-dot residue back toward the tag is non-empty, the paths a rollback
     checkout from ``to`` to the tag writes (one killed partway leaves HEAD at
@@ -489,7 +529,7 @@ def _forward(repo: str, tag: str, to: str, *, live: bool = False) -> tuple[str, 
     (test_merging_at_the_tag_with_tracked_changes_guards), not a safety need,
     and changing it is tracked on its own (#3566)."""
     residue = _merge_residue(repo, to, tag, two_dot=True, ephemeral_ok=True)
-    return _mixed(tag, to, residue, forward=True, live=live) if residue else None
+    return _mixed(tag, to, residue, forward=True, live=live, later=later) if residue else None
 
 
 def _on_live(repo: str) -> bool:
@@ -533,6 +573,15 @@ def _live_verdict(state: dict, repo: str, to: str, move_phase: str) -> tuple[str
         )
     return _hold(
         "the checkout is neither at its rollback tag nor at the rebuilt live tip", _MOVED_AWAY
+    )
+
+
+def _live_later(state: dict, repo: str) -> bool:
+    """#3722's rows: a phase after `merging`, recorded from `live`, HEAD on `live`."""
+    return (
+        state.get("phase") in _LATER_PHASES
+        and state.get("original_branch") == "live"
+        and _on_live(repo)
     )
 
 
@@ -629,7 +678,8 @@ def state_verdict(state: object, repo: str, conflicts_path: str | None = None) -
         # live wording, whose remedy the repair finishes (#3492 PR D1f); in any
         # other phase the repair does not act, so main's wording stays.
         live = phase == "merging" and _adopted_tip(state, repo) == own and _on_live(repo)
-        mixed = _forward(repo, tag, own, live=live)
+        later = phase if not live and _live_later(state, repo) else ""
+        mixed = _forward(repo, tag, own, live=live, later=later)
         if mixed:
             return mixed
     if phase == "fetching":
@@ -702,12 +752,29 @@ def state_verdict(state: object, repo: str, conflicts_path: str | None = None) -
             # is the operator's call.
             return GUARDS, "it merged code bootstrap has not run on"
         return _hold("the checkout is neither at its rollback tag nor at its merge", _MOVED_AWAY)
-    if phase in ("bootstrap", "migrations", "health_check"):
+    if phase in _LATER_PHASES:
+        on_live = bool(own) and _live_later(state, repo)
         if own and head != own:
+            if on_live and tag and head == tag:
+                return _hold(
+                    f"{_LIVE_LATER} '{phase}' with the checkout back at its rollback tag "
+                    f"({tag[:12]})",
+                    _LIVE_AT_TAG,
+                )
             return _hold(f"it stopped in phase '{phase}', and HEAD is not its code", _MOVED_AWAY)
         if own and not tag:
             return _hold(
                 f"it stopped in phase '{phase}'; its rollback tag cannot be resolved", _NO_TAG
+            )
+        if on_live and tag and own != tag:
+            # Cell A (#3722): a kill in that phase, a rollback stopped before its
+            # checkout, and one whose checkout was refused all look like this
+            # (review S2), so the text names them all.
+            return GUARDS, (
+                f"{_LIVE_LATER} '{phase}' with the checkout whole at the rebuilt tip "
+                f"({own[:12]}); it was killed in that phase, or it failed there and its "
+                f"rollback to {tag[:12]} stopped, or had its checkout refused, before the "
+                "checkout moved"
             )
         return GUARDS, f"it stopped in phase '{phase}'"
     if isinstance(phase, str) and phase:
@@ -772,6 +839,16 @@ def message(state_path: str, verdict_: str, reason: str) -> str:
                 "update card (or remove update_state.json). Do NOT run scripts/update.sh "
                 "--post-merge: it refuses a half-written tree."
             )
+        if reason.startswith(_LIVE_LATER):
+            # #3722 cell B: only a rollback writes the tag's files here; the
+            # repair does not handle the phase, and HEAD is past bootstrap.
+            why = (
+                "HEAD is the rebuilt tip, so the checkout then holds that tree again. The update "
+                "most likely failed in that phase and its rollback was stopped while rolling "
+                "back the checkout. "
+            )
+            last = ". Restore the listed paths first: until then --post-merge refuses."
+            return head + by_hand + why + _LIVE_RETRY + last
         head += by_hand
         # Restoring to HEAD gives back whichever tree HEAD is: the code that ran
         # before at the tag, the rebuilt tip at it, so the last step differs.
@@ -799,6 +876,11 @@ def message(state_path: str, verdict_: str, reason: str) -> str:
             "nothing was merged. Resolve them (Resolve with Opus on the dashboard's "
             "update card, or merge the deploy_head in update_conflicts.json and run "
             "scripts/update.sh --post-merge), or Dismiss it on the dashboard's update card."
+        )
+    if reason.startswith(_LIVE_LATER):
+        return (
+            f"{state_path} records an earlier update that has not finished: {reason}. "
+            f"{_LIVE_RETRY}."
         )
     return (
         f"{state_path} records an earlier update that has not finished ({reason}). "

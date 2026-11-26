@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from contextlib import contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from functools import wraps
 from pathlib import Path
 
@@ -97,7 +97,9 @@ def decision_gate(db, api, *, native=False, admission=None):
     """
     active = False
     try:
-        with api['_legacy']._lock(api['marker_dir'](), api['OUTCOME_LOCK_WAIT_S']):
+        with api['_legacy']._lock(api['marker_dir'](), api['OUTCOME_LOCK_WAIT_S']), ExitStack() as stack:
+            if db is None:
+                db = stack.enter_context(closing(api['_connect_existing']()))
             with api['_transaction'](db):
                 admission_schema(db, api['SCHEMA_VERSION'], api['_native'], require_native=native)
                 imported = api['_legacy'].drain(api['marker_dir'](), db, api['_import_one'], api['_fsync_dir'])

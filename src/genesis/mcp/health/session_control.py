@@ -27,13 +27,16 @@ async def _impl_session_set_model(session_id: str, model: str) -> dict:
     try:
         from genesis.db.crud import cc_sessions
 
-        updated = await cc_sessions.update_model_effort(
-            _service._db, session_id, model=model,
-        )
-        if not updated:
+        # The effort the switch stored (a per-model default may apply, #4854),
+        # returned by the write itself, never a later read.
+        effort = await cc_sessions.apply_model_effort(_service._db, session_id, model=model)
+        if effort is None:
             return {"error": f"Session '{session_id}' not found"}
-        _persist_session_config(model=model)
-        return {"success": True, "model": model, "note": "Takes effect on your next response."}
+        _persist_session_config(model=model, effort=effort)
+        result = {"success": True, "model": model, "note": "Takes effect on your next response."}
+        if effort:
+            result["effort"] = effort
+        return result
     except Exception as exc:
         logger.error("session_config model failed for %s: %s", session_id[:8], exc, exc_info=True)
         return {"error": f"Failed to update session model: {type(exc).__name__}: {exc}"}
@@ -106,15 +109,18 @@ async def session_config(
     if _service is None or _service._db is None:
         return {"error": "Database not available"}
 
-    # Single DB call with both params — update_model_effort handles None params
+    # Single DB call with both params. It returns the effort it stored, so a
+    # model-only switch reports the per-model default it may have taken.
     try:
         from genesis.db.crud import cc_sessions
 
-        updated = await cc_sessions.update_model_effort(
+        stored = await cc_sessions.apply_model_effort(
             _service._db, session_id, model=clean_model, effort=clean_effort,
         )
-        if not updated:
+        if stored is None:
             return {"error": f"Session '{session_id}' not found"}
+        if clean_model is not None and clean_effort is None:
+            clean_effort = stored
     except Exception as exc:
         logger.error("session_config failed for %s: %s", session_id[:8], exc, exc_info=True)
         return {"error": f"Failed to update session: {type(exc).__name__}: {exc}"}

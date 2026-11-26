@@ -41,9 +41,10 @@ skill_type: workflow
 
 ## Load Gate
 
-This skill is for **closing** work, not building it. If the task is "implement
-X and open a PR", you are a build session — load `build-session` instead.
-If the task is "take the open PRs and get them merged", you are here.
+This skill is for **closing** work, not building it. For a foreground session, a
+task does not decide the type: the core's router (`genesis-development`, "Which session are you?") decides a
+session's type. A closing session takes the open PRs
+and gets them merged.
 
 The two are different SESSION TYPES, not two phases of one session's life.
 
@@ -443,6 +444,15 @@ comment and label moves it.
    this way. **Fast path:** a PR with basis `claim` whose diff only changes
    dependency pins or lockfiles is read by confirming exactly that, and that
    the new versions are the ones the PR names, and recorded DELIVERS, CLEAN. Anything else in the diff ends the fast path.
+
+   **A PR body with a `Spec:` line**, whatever its basis is, also gets the
+   spec read: open the spec and its `## Amendments`, and judge the PR against
+   the items its plan parts name. These are delivery defects, fixed before
+   merge: no `Amended:` line; `Amended: none` while the spec or the plan
+   carries an `AM-n` or `PC-n` for the PR's plan parts; an `AM-n` or `PC-n` id
+   that matches no entry; and a missing or non-`CLEAN` copied `Spec check:`
+   line. The fix for a non-`CLEAN` line is to run the reviewer again after the
+   owner's answers are recorded, and copy the new line.
 2. **Read the basis in full**, thread included. From an issue take: what is
    wrong; where it says the intended behaviour is stated; every sentence that
    says what a fix must do (its `Acceptance:` answer, or on older issues a Fix,
@@ -748,7 +758,9 @@ words: "You don't block on the things that aren't blocking."
 
 **Reply in-thread to every finding, including the ones you reject.** An
 unanswered finding blocks the gate even when the code is already fixed —
-observed on PR #1541. A reasoned rejection is a valid resolution; silence is not.
+observed on PR #1541. Below the floor, a reasoned rejection is a valid resolution;
+silence is not. **A floor finding clears only on a reply saying `Fixed in <sha>`
+(or `at`/`by`), or on the owner's `# floor-accept=<id>`** (the Pre-Merge Gate, (a)).
 The gate clears a finding from the score only when a MAINTAINER account replied
 IN ITS THREAD: it reads `in_reply_to_id` from `pulls/N/comments`.
 `gh pr comment N --body ...` creates an ISSUE comment, which has no
@@ -775,7 +787,13 @@ Post the round ledger and get a fresh decision.
 
 **ROUND 4 IS TERMINAL** (owner ruling, 2026-09-25). There is no ordinary round
 5. At four rounds the decision is not "another round": it is to MERGE
-with the outstanding issues accepted and filed, or to SEND IT BACK for rework. A
+with the outstanding issues accepted and filed, or to SEND IT BACK for rework. An
+agent's merge is bound to the round-4 head, the 4th round by `opened_at`
+(`terminal_head`; owner rulings 3f6ad6fb and cc17ee20, 2026-11-25): a head that
+moved off it (a fix, a merge of main, a force-push) blocks at merge unless every
+commit after it is empty, and merging that head is the owner's bang-command merge
+(`! gh pr merge …`) or a send-back. A round-4 head that cannot be placed blocks
+too. A
 fifth round exists only by explicit user approval, re-asked every round, and
 each of those is terminal in the same way (this replaced "round 6 and later are
 strongly discouraged", which read round 5 as ordinary; the discouragement was never a
@@ -951,6 +969,11 @@ it** (owner ruling, 2026-10-19):
   its delivery read recorded `intended=not-stated|unsupported` (step 1a);
 - a PR that departs from its issue's named fix (a CHANGED named fix in its
   delivery read), or whose read records a DRIFT that adds a mechanism;
+- a PR whose `Amended:` line names an amendment (`AM-n`) or plan revision
+  (`PC-n`) with no `Confirmed:` line. Ask the owner yourself: a builder's
+  relay is not the confirmation. On a yes, append to that item
+  `Confirmed: <date> "<the owner's words>" (PR #<N>)`, the only edit a closing
+  session makes there; an item with that line asks nothing of a later PR;
 - a design, premise or user-impact question the review raised.
 
 Authorization never carries over from an earlier session, and a peer session's
@@ -988,7 +1011,10 @@ Two triggers, two labels:
      builder": findings by class; what is kept; what is deleted; the prescribed
      mechanism; the SPLIT plan (the `PR-shape:` line, as a list of PRs); every
      decided question; acceptance. The builder is often Codex or Devin on
-     another machine, building cold from this comment alone.
+     another machine, building cold from this comment alone. For a PR built
+     from a spec, what is kept and what is dropped are listed against the
+     spec's ids, and a drop needs the owner's yes recorded on the PR (a cut is
+     a spec amendment).
      - Questions only the owner can answer get asked BEFORE posting.
      - Any question left to the builder says "answer it in the PR body".
      - Never post a bare open-questions list, and never omit the PR-shape
@@ -1373,7 +1399,9 @@ Where a real external backstop exists, name it and cite the query that proved it
 
 **Close every review with a verdict.** End each review with an explicit
 `Ready to merge: Yes | No | With fixes` + a one-line reason, alongside the
-DONE / DONE_WITH_CONCERNS completion status. And the DON'Ts that keep a review
+DONE / DONE_WITH_CONCERNS completion status. A `genesis-architect` review puts
+these above its `Contradicts:`/`Differs:` lines and ends on its `Spec check:`
+line (its Completion Status Protocol). And the DON'Ts that keep a review
 honest: never "looks good" without reading the code; never a finding on code you
 did not read; never vague ("improve error handling") — always `file:line` + why it
 matters. (Deliberately NOT a "praise-first / acknowledge strengths" balance: an
@@ -1400,9 +1428,11 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   says" is SOUND-BUT-INFERIOR with the better shape named. Render a
   better-shape finding on the severity ladder too (normally SHOULD-FIX), or it
   is invisible to every surface that scores findings.
-- **Completion status last**: every review (and every skill workflow that
-  concludes work) ends with exactly one of DONE / DONE_WITH_CONCERNS /
-  BLOCKED / NEEDS_CONTEXT — with concerns listed, or blocker + what was
+- **Completion status, then the architect's verdict line**: every review (and
+  every skill workflow that concludes work) ends with exactly one of DONE /
+  DONE_WITH_CONCERNS / BLOCKED / NEEDS_CONTEXT, placed as the architect's
+  Completion Status Protocol says for a `genesis-architect` review, whose
+  `Spec check:` line is always last — with concerns listed, or blocker + what was
   tried, or exactly what context is missing. Findings use the
   BLOCKER / SHOULD-FIX / NOTE severity ladder with per-finding confidence
   and the pre-emit quote gate (a finding must quote its motivating
@@ -1606,8 +1636,12 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   `git commit --allow-empty --cleanup=verbatim -F <file>`. A valid reflection commit
   is admitted without the round-approval ask. Then commit the fix. Rule R runs before
   the docs/config skip and before Rule 2, so a docs-only fix or `# review-override`
-  does not dodge it. What the reflection must cite comes from
-  `review_reflection.obligations()`:
+  does not dodge it. A reflection with any `fix-now` disposition also carries
+  `Alternative: <what already does or decides this>` (or `Alternative: none found:
+  searched <what>`), owed for reflections committed from
+  `review_reflection.ALTERNATIVE_CUTOVER_ISO` on; the next round's premise check
+  confirms or refutes that line (premise-check.md, step 5). What the reflection must
+  cite comes from `review_reflection.obligations()`:
 
   A finding that is not a defect uses `Disposition: c<ID> no-defect reply=<ID>`
   (a maintainer reply to that inline finding), or `Disposition: r<reviewID>:<count>
@@ -1668,14 +1702,15 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   `review_budget.evaluate_evidence`; read those, not this paragraph, for an edge case.
   Ordinary PRs carry standing authorization through four rounds. Starting with the
   fifth review request or the fix commit after four rounds, every action needs its
-  own native user approval. Round 4 is terminal (step 3).
+  own native user approval. Round 4 is terminal (step 3): past it an agent merges
+  only at the round-4 head.
 
   This approval is never a shell sigil and is never persisted. `# escalation-ack` and
   `# final-round-accept` are retired syntax and authorize no current gate. An earlier "okay" cannot authorize a later request or
   commit. Foreground sessions receive the native approval dialog at the action;
   autonomous/dispatched sessions are denied because nobody is present to answer it.
   Unreadable or ambiguous GitHub evidence takes the same ask/deny direction and never
-  becomes zero rounds. Multiple gated actions must be split so one approval cannot cover
+  becomes zero rounds; at merge it blocks every agent merge, at any count. Multiple gated actions must be split so one approval cannot cover
   several commits or review requests.
 
   The native approval enforcement in this section is implemented at Claude Code's
@@ -1781,13 +1816,35 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   review comment's abbreviated SHA is resolved against the PR's full commit list,
   and an ambiguous prefix makes the result unknown. `--check-pr` prints the count
   as an advisory `rounds` row, with findings per round and a RISING marker; it
-  never moves the verdict. Under it, and only when it applies, an advisory
+  never moves the verdict. The `terminal-head` row after it is BLOCKING, and the
+  merge arm runs the same check (`_check_past_terminal`): an unreadable budget
+  blocks an agent merge at any round count, and past terminal the merge must be
+  at the terminal head (below). Under it, and only when it applies, an advisory
   `NOTE: … the PR's own commits since that review changed no file` says a push
   after the last review (a message-only rewrite or an empty commit, possibly under
   a later merge of main) carries the reviewed tree unchanged. Read it before
   accepting a "fixed" claim on that push: the code does not show one. It steps
   back over a merge only when the merge touches none of the PR's files, and it
   prints nothing when anything it needs is unreadable.
+  The advisory `delivery` row after it reads the owner's delivery marker through
+  `scripts/delivery_marker.py`'s own parser and selection. It is `ok` only for a
+  DELIVERS read at head, or carried to head when the PR's own change is provably
+  unchanged, made by another reader (or by the builder on a prose-only PR, marked
+  `self-attested`), with nothing since that may void it. Otherwise it is
+  `advisory —` and names why: no read recorded, another verdict (with its `Asked:`
+  line), a carry the PR's diff cannot confirm, the builder's own read, a changed or
+  underivable basis, or a later owner block that does not parse. It also names what
+  changed after the read: a base retarget, or on an issue basis the issue edited,
+  retitled, closed or reopened, or a comment added or edited, judged against the
+  read's head commit time; on a claim basis the PR body or title edited after the
+  marker was last posted or edited (bots rewrite PR bodies after most pushes, so
+  re-recording the read is what clears it; post the composed marker promptly, since
+  an edit between `compose` and the post goes unseen). It names, without demoting, a
+  weak basis (a ledger row, a follow-up or the PR's own claim), a source it cannot
+  check (a spec, plan, ledger row or follow-up), and issue comments past the newest
+  100. A failed or cut-short read is named (`... could not check`) and keeps the row
+  advisory; only an unreadable comment list makes the whole row `could not check`.
+  It never moves the verdict.
 
 - **GATE-FIX LANE** (hook-surface PRs): `.claude/skills/genesis-development/references/gate-fix-lane.md`.
 
@@ -2174,12 +2231,12 @@ authority over any summary of them elsewhere in this skill.
 `python3 scripts/hooks/git_push_guard.py --check-pr <N> [--repo OWNER/REPO]`
 BEFORE proposing a merge. It runs the SAME check functions the enforcement gate uses, in this REPORT order
 (mergeable → CI → base-invariant → pin-receipts → e2e-plan *(advisory)* →
-Codex-freshness → rounds *(advisory)* → scheduled-Claude-review → review-body →
-inline findings → main-reverts *(advisory)* → rework),
+Codex-freshness → rounds *(advisory)* → delivery *(advisory)* → scheduled-Claude-review →
+review-body → inline findings → main-reverts *(advisory)* → rework),
 so the two use the same checks. The merge arm checks review-body and inline
 findings before scheduled review, runs `rework` last (waived only by the logged
-`# rework-override`, which needs the owner's yes), blocks on none of the three
-advisory rows, and additionally applies the
+`# rework-override`, which needs the owner's yes), blocks on none of the four
+advisory rows (it prints no delivery row at all), and additionally applies the
 `--match-head-commit` binding, which has no report row —
 this `--check-pr` read IS the mandatory pre-merge step: **always run it and read
 the PR's automated-review comments (Codex, leak/CI, the scheduled Claude review)
@@ -2322,7 +2379,10 @@ findings below, a gated `gh pr merge`:
   or a differently-named suite). Waive with `# ci-override`
   (never `--admin`).
 - **Override sigils are split by boundary** — `# review-override` waives ONLY the
-  finding scans (review-body + inline P1s); `# scheduled-review-override` waives
+  finding scans (the review-body verdict, an unreadable inline scan and the P2
+  score), and **never an inline floor finding it can read** (#4933; whether the
+  body verdict should survive it is #4994); `# floor-accept=<id>[,<id>]` accepts
+  named floor findings on the owner's yes; `# scheduled-review-override` waives
   ONLY the scheduled-Claude-review gate; CI is `# ci-override`. Append several in
   one trailing comment when several waivers are genuinely intended.
   **`# stale-review-override` is the EXCEPTION and is wider than its name.**
@@ -2368,7 +2428,27 @@ The review-findings gate specifically:
    merge outright — whatever the change is. This is
    `floor_hits = len(p1) + len(cr_block) + len(devin_block)` in
    `_check_inline_review_findings`.
-   The doctrinal floor is wider than this check: a P1, a security defect, anything destructive or fail-open is fixed, never accepted, whatever label a reviewer attached.
+   The doctrinal floor is wider than this check: a P1, a security defect, anything destructive or fail-open is fixed, never accepted by a session, whatever label a reviewer attached; only the owner accepts one, through `# floor-accept`.
+   **What clears a floor finding (#4933).** Only one of two things:
+   - An in-thread maintainer reply with a line that STARTS with `Fixed in <sha>` (or
+     `at`/`by`), where the sha is one of the PR's own single-parent commits, descending
+     from the head the finding was posted on (if a force-push removed that head, order
+     cannot be proven and only the sigil clears it), and touching the finding's file or
+     the name a rename in the PR gave it. The fix must still be in the head being merged
+     (#5000): the cited commit is that head or its ancestor, and the finding's file
+     differs there from the head the finding was posted on, so a fully reverted fix clears
+     nothing (a revert hidden by another change to the same file, such as another fix or
+     a merge of main, still clears). Quoted, coded, struck or hedged text ("will be
+     fixed in", "Fixed in X, pending CI"), and a claim in the middle of a line, claim
+     nothing. Write the claim as its own line: `Fixed in <sha>.` then any explanation. Cite the commit that made the fix,
+     never a merge of main. A reply that defers, accepts, disputes or says "partly
+     fixed" clears nothing.
+   - The owner's `# floor-accept=<id>[,<id>]` on the merge command, for a fix in another
+     file or a finding the owner accepts. **Ask the owner first, every time**; the sigil
+     records that yes, is logged, and is refused in a dispatched session.
+     `--check-pr <N> --floor-accept <ids>` previews it and prints the merge-with line.
+
+   The gate prints each open finding's id and why it is still open.
    It is a RULE because it used to be an ACCIDENT: before the lanes existed the
    single threshold was 1.0 and a P1 scores exactly 1.0, so the floor held by
    arithmetic, unnamed and untested — and raising any threshold would have
@@ -2417,6 +2497,7 @@ The review-findings gate specifically:
    to merge unreviewed — re-trigger and check the INLINE endpoint.
 5. **Override**: Append `# review-override` to the merge command to
    bypass the gate (e.g., `gh pr merge 123 --squash --admin  # review-override`).
+   It does not cover a floor finding: see (a) above.
    The override is logged: `.claude/skills/genesis-development/references/merge-gate-findings.md`, "Override log".
 6. **Read the PR's warning comments before merging — not just the hard gate.**
    Beyond Codex, a structural-review bot posts under the repo-owner account

@@ -1,5 +1,6 @@
 """Explicit exact-row orphan reconciliation on real scratch SQL and kernel files."""
 
+import os
 import runpy
 import time
 from contextlib import closing
@@ -47,11 +48,22 @@ def orphan_case(queue, scope, evidence):
     return modules, claimed, reserved, registered, leaf, proc
 
 
-def reconcile(case):
+def reconcile(case, *, automatic=False):
     modules, claimed, _, _, _, proc = case
     queue = modules["queue"]
     with queue._queue_gate(native=True) as db:
-        return operation()(modules, claimed["context"], db, proc=proc)
+        boot = modules["scope"]._boot(proc) if automatic else None
+        return operation()(modules, claimed["context"], db, proc=proc, automatic_boot=boot)
+
+
+@pytest.fixture(params=[False, True], ids=["explicit", "automatic"])
+def automatic_mode(request, orphan_case, monkeypatch):
+    if request.param:
+        # This fixture simulates the original cgroup. Proc visibility itself
+        # is covered by the full/filtered view and actual captured-runner tests.
+        scope = orphan_case[0]["scope"]
+        monkeypatch.setattr(scope, "automatic_owner_boot", scope._boot)
+    return request.param
 
 
 def register(case, *, intent=False, success=False):
@@ -115,6 +127,27 @@ def test_unregistered_no_intent_structural_exception_is_neutral_and_held(orphan_
     assert queue.claim_native(claimed["hash"], provider="gitnexus") is not None
 
 
+def test_automatic_unregistered_closure_refuses_late_registration_and_intent(orphan_case, monkeypatch):
+    modules, claimed, _, registration, _, _ = orphan_case
+    queue = modules["queue"]
+    scope = modules["scope"]
+    monkeypatch.setattr(scope, "automatic_owner_boot", scope._boot)
+    reconcile(orphan_case, automatic=True)
+    context = claimed["context"]
+    closed = queue.execution_status(context)
+    assert closed["launch_permission"] == "cancelled" and closed["cleanup_proof"] is None
+    with pytest.raises(RuntimeError, match="inflight|reservation"):
+        queue.register_scope(context, registration)
+    begin = dict(
+        source=_source(), executable=dict(device=7, inode=88, sha256="f" * 64),
+        facts=registration["facts"], registration_sha256=queue._native.digest(registration),
+        before_ns=time.monotonic_ns(),
+    )
+    with pytest.raises(RuntimeError, match="inflight|authority"):
+        queue.begin_native(context, begin)
+    assert queue.execution_status(context) == closed
+
+
 @pytest.mark.parametrize("pointer", ["original", "absent", "newer"])
 def test_exact_unreserved_context_cannot_reconstruct_pointer_ownership(
     queue, evidence, tmp_path, pointer
@@ -150,13 +183,13 @@ def test_exact_unreserved_context_cannot_reconstruct_pointer_ownership(
     [(False, False, "unstarted", 0), (True, False, "unknown", 1), (True, True, "success", 0)],
 )
 def test_registered_removed_original_settles_once_without_resend(
-    orphan_case, intent, success, expected, debt
+    orphan_case, automatic_mode, intent, success, expected, debt
 ):
     modules, claimed, _, _, _, _ = orphan_case
     queue = modules["queue"]
     register(orphan_case, intent=intent, success=success)
     remove_group(orphan_case)
-    reconcile(orphan_case)
+    reconcile(orphan_case, automatic=automatic_mode)
     before = queue.execution_status(claimed["context"])
     assert before["completion_kind"] == expected and before["typed_charged_attempts"] == debt
     assert before["control_closure"]["data"]["state"] == "orphaned"
@@ -165,26 +198,26 @@ def test_registered_removed_original_settles_once_without_resend(
         and before["cleanup_proof"]["data"]["state"] == "removed"
     )
     assert queue.get_inflight(claimed["hash"]) is None
-    reconcile(orphan_case)
+    reconcile(orphan_case, automatic=automatic_mode)
     assert queue.execution_status(claimed["context"]) == before
     assert queue.claim_native(claimed["hash"], provider="cbm") is None
     assert queue.get_failed(claimed["hash"], provider="cbm") is None
 
 
 @pytest.mark.parametrize("population", [0, 1])
-def test_original_existing_group_without_owned_wait_is_not_clean(orphan_case, population):
+def test_original_existing_group_without_owned_wait_is_not_clean(orphan_case, automatic_mode, population):
     modules, claimed, _, _, leaf, _ = orphan_case
     queue = modules["queue"]
     register(orphan_case, intent=True)
     (leaf / "cgroup.events").write_text(f"populated {population}\n")
     with pytest.raises(ValueError):
-        reconcile(orphan_case)
+        reconcile(orphan_case, automatic=automatic_mode)
     status = queue.execution_status(claimed["context"])
     assert status["control_closure"] is None and status["typed_applied_state"] is None
     assert queue.get_inflight(claimed["hash"]) is not None
 
 
-def test_dead_owner_with_live_original_reporter_refuses(orphan_case):
+def test_dead_owner_with_live_original_reporter_refuses(orphan_case, automatic_mode):
     _, _, _, registered, _, proc = orphan_case
     register(orphan_case, intent=True)
     remove_group(orphan_case)
@@ -193,7 +226,7 @@ def test_dead_owner_with_live_original_reporter_refuses(orphan_case):
     target.mkdir()
     (target / "stat").write_text("1234 (still live) " + " ".join(["S", "1"] + ["0"] * 17 + ["100"]))
     with pytest.raises(ValueError):
-        reconcile(orphan_case)
+        reconcile(orphan_case, automatic=automatic_mode)
 
 
 def test_unaccounted_missing_pointer_cannot_recreate_ownership(orphan_case):
@@ -216,6 +249,81 @@ def test_matching_live_owner_is_not_reconciled(orphan_case):
     with pytest.raises(ValueError, match="owner"):
         reconcile(orphan_case)
     assert modules["queue"].execution_status(claimed["context"])["control_closure"] is None
+
+
+def test_automatic_final_observer_refusal_leaves_exact_execution_held(orphan_case, monkeypatch):
+    modules, claimed, reservation, _, _, proc = orphan_case
+    queue = modules["queue"]
+
+    def denied():
+        raise PermissionError("final observer denied")
+
+    monkeypatch.setattr(queue._recovery, "owner_identity", denied)
+    before = queue.execution_status(claimed["context"])
+    collector = operation()
+    with pytest.raises(collector.__globals__["OrphanHeld"]), queue._queue_gate(native=True) as db:
+        collector(modules, claimed["context"], db, proc=proc, automatic_boot=reservation["owner"]["boot_id"])
+    assert queue.execution_status(claimed["context"]) == before
+
+
+@pytest.mark.parametrize("case", ["absent", "reused", "zombie", "missing-stat", "denied", "boot-change", "reboot"])
+def test_automatic_owner_proof_refuses_ambiguous_lifetimes(orphan_case, monkeypatch, case):
+    modules, _, reservation, _, _, proc = orphan_case
+    scope, proof = modules["scope"], modules["proof"]
+    owner = reservation["owner"]
+    boot = owner["boot_id"]
+    boot_path = proc / "sys/kernel/random/boot_id"
+    if case in ("reboot", "boot-change"):
+        boot = "00000000-0000-0000-0000-000000000002"
+        boot_path.write_text(boot)
+    target = proc / str(owner["pid"])
+    if case in ("reused", "zombie", "missing-stat"):
+        target.mkdir()
+        if case != "missing-stat":
+            state, ticks = ("S", 101) if case == "reused" else ("Z", 100)
+            (target / "stat").write_text(
+                f"{owner['pid']} (owner) " + " ".join([state, "1"] + ["0"] * 17 + [str(ticks)])
+            )
+    if case == "denied":
+        def deny(*_):
+            raise PermissionError("proc observation denied")
+
+        monkeypatch.setattr(proof, "_process_identity", deny)
+    if case == "boot-change":
+        observed = iter((boot, owner["boot_id"]))
+        monkeypatch.setitem(scope.owner_ended.__globals__, "_boot", lambda _: next(observed))
+    if case in ("missing-stat", "denied", "boot-change"):
+        with pytest.raises(scope.OwnerObservationUnavailable):
+            scope.owner_ended(owner, vars(proof), proc=proc, automatic_boot=boot)
+    else:
+        assert scope.owner_ended(owner, vars(proof), proc=proc, automatic_boot=boot) == (
+            case in ("absent", "reboot")
+        )
+    if case == "reused":
+        assert scope.owner_ended(owner, vars(proof), proc=proc), "explicit recovery retains its existing proof"
+
+
+@pytest.mark.parametrize("view", ["full", "hidepid", "subset", "mismatched-self", "ancestor-namespace"])
+def test_automatic_proc_view_requires_local_full_visibility(orphan_case, tmp_path, view):
+    modules, _, reservation, _, _, _ = orphan_case
+    scope = modules["scope"]
+    proc = tmp_path / "proc-view"
+    pid = str(os.getpid())
+    entry = proc / (pid if view != "mismatched-self" else "1")
+    entry.mkdir(parents=True)
+    (proc / "self").symlink_to(entry.name)
+    namespace = f"1111\t{pid}" if view == "ancestor-namespace" else pid
+    (entry / "status").write_text(f"NSpid:\t{namespace}\n")
+    options = {"hidepid": ",hidepid=invisible", "subset": ",subset=pid"}.get(view, "")
+    (entry / "mountinfo").write_text(f"4 3 0:1 / {proc} rw - proc proc rw{options}\n")
+    boot = proc / "sys/kernel/random/boot_id"
+    boot.parent.mkdir(parents=True)
+    boot.write_text(reservation["owner"]["boot_id"])
+    if view == "full":
+        assert scope.automatic_owner_boot(proc) == reservation["owner"]["boot_id"]
+    else:
+        with pytest.raises(scope.OwnerObservationUnavailable):
+            scope.automatic_owner_boot(proc)
 
 
 @pytest.mark.parametrize("role", ["owner", "reporter"])
@@ -251,7 +359,7 @@ def test_terminal_leader_cannot_close_control_or_release_original_pointer(
 
 
 def test_reboot_closes_original_lifetime_without_comparing_old_monotonic_times(
-    orphan_case, monkeypatch
+    orphan_case, automatic_mode, monkeypatch
 ):
     modules, claimed, _, _, _, proc = orphan_case
     queue = modules["queue"]
@@ -260,7 +368,7 @@ def test_reboot_closes_original_lifetime_without_comparing_old_monotonic_times(
     (proc / "sys/kernel/random/boot_id").write_text(boot)
     observer = queue._recovery.owner_identity()
     monkeypatch.setattr(queue._recovery, "owner_identity", lambda: {**observer, "boot_id": boot})
-    reconcile(orphan_case)
+    reconcile(orphan_case, automatic=automatic_mode)
     status = queue.execution_status(claimed["context"])
     assert status["cleanup_proof"]["data"]["state"] == "rebooted"
     assert status["control_closure"]["data"]["observer"]["boot_id"] == boot
@@ -347,7 +455,7 @@ def test_already_applied_unknown_is_not_charged_again_when_control_closes(orphan
     assert queue.get_inflight(claimed["hash"]) is None
 
 
-def test_reconciliation_rollback_keeps_original_control_and_accounting(orphan_case, monkeypatch):
+def test_reconciliation_rollback_keeps_original_control_and_accounting(orphan_case, automatic_mode, monkeypatch):
     modules, claimed, _, _, _, _ = orphan_case
     queue = modules["queue"]
     register(orphan_case, intent=True)
@@ -361,10 +469,10 @@ def test_reconciliation_rollback_keeps_original_control_and_accounting(orphan_ca
     with monkeypatch.context() as patch:
         patch.setattr(queue._native, "reconcile_execution", failed)
         with pytest.raises(OSError, match="injected"):
-            reconcile(orphan_case)
+            reconcile(orphan_case, automatic=automatic_mode)
     assert queue.execution_status(claimed["context"]) == before
     assert queue._native.reconcile_execution is reducer
-    reconcile(orphan_case)
+    reconcile(orphan_case, automatic=automatic_mode)
     assert queue.execution_status(claimed["context"])["typed_charged_attempts"] == 1
 
 
@@ -378,7 +486,7 @@ def test_orphan_collector_requires_existing_admitted_transaction(orphan_case):
 
 
 def test_existing_valid_original_wait_is_reused_truthfully_with_fresh_population(
-    orphan_case, monkeypatch
+    orphan_case, automatic_mode, monkeypatch
 ):
     modules, claimed, _, registered, leaf, proc = orphan_case
     queue = modules["queue"]
@@ -396,9 +504,54 @@ def test_existing_valid_original_wait_is_reused_truthfully_with_fresh_population
         return original(*args, **kwargs)
 
     monkeypatch.setattr(modules["scope"], "cleanup_observation", collect)
-    reconcile(orphan_case)
+    reconcile(orphan_case, automatic=automatic_mode)
     status = queue.execution_status(claimed["context"])
     assert observed == [False]  # Fresh no-wait observation is never relabelled.
     assert status["cleanup_proof"]["data"] == waited
     assert status["control_closure"]["data"]["state"] == "orphaned"
     assert queue.get_inflight(claimed["hash"]) is None
+
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("retained resource evidence lacks its original binding"),
+        FileNotFoundError("retained spool vanished"),
+        PermissionError("retained spool unreadable"),
+    ],
+    ids=["unbound-evidence", "vanished-spool", "permission"],
+)
+def test_unusable_retained_evidence_holds_only_in_the_automatic_sweep(
+    orphan_case, automatic_mode, monkeypatch, error
+):
+    """Retained evidence the lifetime re-read cannot use holds that one execution
+    in the automatic sweep, as unavailable proof does, so unrelated work still
+    reconciles. The explicit path raises as before, and a permission error still
+    stops the sweep (#4979 review)."""
+    modules, claimed, _, registered, leaf, proc = orphan_case
+    queue = modules["queue"]
+    register(orphan_case, intent=True)
+    (leaf / "cgroup.events").write_text("populated 0\n")
+    waited = modules["scope"].cleanup_observation(
+        registered, queue._native.digest(registered), modules["proof"], owned_wait=True, proc=proc
+    )
+    queue.remember_native_event(claimed["context"], "cleanup", waited)
+    reads = []
+
+    def unusable(*_args, **_kwargs):
+        reads.append(True)
+        raise error
+
+    monkeypatch.setattr(queue, "_fresh_cleanup", unusable)
+    supervisor = runpy.run_path(str(ROOT / "scripts/lib/code_intel_supervisor.py"))
+    held = automatic_mode and not isinstance(error, PermissionError)
+    with queue._queue_gate(native=True) as db:
+        boot = modules["scope"]._boot(proc) if automatic_mode else None
+        with pytest.raises(supervisor["OrphanHeld"] if held else type(error)) as raised:
+            supervisor["reconcile_orphan"](
+                modules, claimed["context"], db, proc=proc, automatic_boot=boot
+            )
+    assert reads == [True]
+    assert ("retained lifetime evidence" in str(raised.value)) is held
+    assert queue.execution_status(claimed["context"])["control_closure"] is None

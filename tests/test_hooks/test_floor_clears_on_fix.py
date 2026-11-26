@@ -1,0 +1,1266 @@
+"""#4933: a floor finding clears only on a verified fix or the owner's per-finding sigil.
+
+The fix test reads the PR's commits and the cited commit's files through
+``_fetch_comments_paged``, which is faked here by endpoint so each cell states exactly
+what GitHub returned.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+_HOOKS = Path(__file__).resolve().parents[2] / "scripts" / "hooks"
+_GUARD = _HOOKS / "git_push_guard.py"
+
+P1 = "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange)</sub></sub> Real defect**"
+P2 = "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow)</sub></sub> Smaller defect**"
+MAJOR = "_🩺 Stability & Availability_ | _🟠 Major_ | _⚡ Quick win_\n\n**A major defect.**"
+MINOR = "_🩺 Stability & Availability_ | _🟡 Minor_ | _⚡ Quick win_\n\n**A minor defect.**"
+PATH = "src/benign.py"
+BASE = "1" * 40
+FIX = "abcdef1" + "2" * 33
+LATER = "abcdef9" + "3" * 33
+MERGE = "fedcba1" + "4" * 33
+MAIN = "0" * 40  # the base branch: a parent outside the PR
+FOUND_AT = "2026-01-02T05:00:00Z"
+DEVIN = "devin-ai-integration[bot]"
+
+
+def _devin(marker: str = "🔴", fid: str = "BUG_pr-review-job-aaa_0001") -> str:
+    meta = '{"id": "' + fid + '", "file_path": "' + PATH + '", "severity": "x", "kind": "bug"}'
+    return f"<!-- devin-review-comment {meta} -->\n\n{marker} **A Devin finding**\n\nDetail."
+
+
+def _row(sha: str, parents: list | None = None, *, date: str = "2026-01-02T06:00:00Z") -> dict:
+    return {"sha": sha, "parents": [MAIN] if parents is None else parents, "date": date}
+
+
+COMMITS = [
+    _row(BASE, date="2026-01-02T01:00:00Z"),
+    _row(FIX, [BASE]),
+    _row(MERGE, [FIX, MAIN]),
+]
+
+
+@pytest.fixture(scope="module")
+def guard():
+    sys.path.insert(0, str(_HOOKS))
+    spec = importlib.util.spec_from_file_location("git_push_guard_4933", _GUARD)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+CHANGED = (
+    "ahead",
+    [{"f": f, "p": None, "s": "modified", "c": 1} for f in (PATH, "src/second.py", "src/new.py")],
+)
+
+
+@pytest.fixture(autouse=True)
+def _hermetic(monkeypatch, guard):
+    monkeypatch.setenv("_TEST_DOC_FINDINGS_MODE", "skip")
+    monkeypatch.setenv(
+        "_TEST_GH_PR_FILES", '{"filename": "src/benign.py", "previous_filename": null}'
+    )
+    monkeypatch.delenv("GENESIS_CC_SESSION", raising=False)
+    # #5000: the head being merged, and a compare that shows the file changed there.
+    monkeypatch.setenv("_TEST_GH_HEAD_SHA", MERGE)
+    monkeypatch.setattr(guard, "_compare_rows", lambda *_a: CHANGED)
+    monkeypatch.setattr(guard, "_blob_oids", lambda *_a: pytest.fail("unexpected blob read"))
+
+
+def _finding(cid=1, body=P1, *, path=PATH, login="chatgpt-codex-connector[bot]", orig=BASE) -> dict:
+    return {
+        "id": cid,
+        "reply_to": None,
+        "login": login,
+        "type": "Bot",
+        "assoc": "NONE",
+        "path": path,
+        "body": body,
+        "created": FOUND_AT,
+        "orig": orig,
+    }
+
+
+def _reply(
+    to=1, body=f"Fixed in {FIX[:9]}.", *, cid=90, login="a-maintainer", utype="User", assoc="OWNER"
+) -> dict:
+    return {"id": cid, "reply_to": to, "login": login, "type": utype, "assoc": assoc, "body": body}
+
+
+def _scan(guard, monkeypatch, comments, *, commits=None, files=None, **kw):
+    """``commits``/``files``: a value, or ``(rows, complete)`` to fake a failed read."""
+    commits = COMMITS if commits is None else commits
+    files = {FIX: [PATH]} if files is None else files
+    reads: list[str] = []
+    if isinstance(commits, list) and commits:
+        # The head being merged: the one commit no other commit lists as a parent.
+        shas = {r.get("sha") for r in commits if isinstance(r.get("sha"), str)}
+        tips = shas - {
+            p for r in commits if isinstance(r.get("parents"), list) for p in r["parents"]
+        }
+        if len(tips) == 1:
+            monkeypatch.setenv("_TEST_GH_HEAD_SHA", tips.pop())
+
+    def fetch(endpoint, _pr, _repo, _jq):
+        reads.append(endpoint)
+        if endpoint.endswith("/comments"):
+            return comments, True
+        if endpoint.endswith("/commits"):
+            return commits if isinstance(commits, tuple) else (commits, True)
+        got = files.get(endpoint.removeprefix("commits/"), [])
+        if isinstance(got, tuple):
+            return got
+        return [{"f": name, "p": None, "s": "modified", "c": 1} for name in got], True
+
+    monkeypatch.setattr(guard, "_fetch_comments_paged", fetch)
+    monkeypatch.setattr(guard, "_pr_lane", lambda *_a, **_k: "standard")
+    block, msg = guard._check_inline_review_findings("100", **kw)
+    return block, msg, reads
+
+
+class TestFixTest:
+    def test_a_later_single_parent_commit_on_the_file_clears(self, guard, monkeypatch):
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply()])
+        assert not block, msg
+
+    @pytest.mark.parametrize(
+        ("reply", "why"),
+        [
+            ("Deferred to #123.", "no reply has a line starting 'Fixed in <sha>'"),
+            ("Not a defect, by design.", "no reply has a line starting 'Fixed in <sha>'"),
+            (f"Documented in {FIX[:9]} as a known limit.", "no reply has a line"),
+            (f"Verified at {FIX[:9]}, no defect.", "no reply has a line"),
+            (f"Partly fixed in {FIX[:9]}; the rest is tracked.", "no reply has a line"),
+            (f"Not fixed in {FIX[:9]}.", "no reply has a line"),
+            (f"Unfixed in {FIX[:9]}.", "no reply has a line"),
+            (f"Fixed in {FIX[:9].upper()}.", "is not a claim"),
+            (f"Not yet fixed in {FIX[:9]}.", "no reply has a line"),
+            (f"This will be fixed in {FIX[:9]}.", "no reply has a line"),
+            (f"Should be fixed in {FIX[:9]}.", "no reply has a line"),
+            (f"It isn\u2019t fixed in {FIX[:9]}.", "no reply has a line"),
+            (f"> Fixed in {FIX[:9]}\n\nThat claim is wrong.", "no reply has a line"),
+            (f"```\nFixed in {FIX[:9]}\n```", "no reply has a line"),
+            (f"````\n```\nFixed in {FIX[:9]}\n````", "no reply has a line"),
+            (f"```\n``` info\nFixed in {FIX[:9]}\n```", "no reply has a line"),
+            (f"<!-- Fixed in {FIX[:9]} --> Deferred.", "no reply has a line"),
+            (f"Deferred.\n\n    Fixed in {FIX[:9]}", "no reply has a line"),
+            (f"I cannot say it is fixed in {FIX[:9]}.", "no reply has a line"),
+            (f"It hasnt been fixed in {FIX[:9]}.", "no reply has a line"),
+            (f"Fixed in {FIX[:9]}? No, the race remains.", "is not a claim"),
+            (f"Fixed in `{FIX[:9]}`? No, the race remains.", "is not a claim"),
+            (f"Fixed in {LATER[:9]}.", "not among the PR's commits"),
+            (f"Fixed in {MERGE[:9]}.", "is a merge commit"),
+            (f"Fixed in {BASE[:9]}.", "does not come after the head"),
+            (f"Confirmed and fixed in `{FIX[:9]}`, with a test.", "no reply has a line"),
+            (f"This was not a race. Fixed in {FIX[:9]}.", "no reply has a line"),
+            # Round-1 class audit: text that states no claim.
+            (f"Reply with `Fixed in {FIX[:9]}` once it lands.", "no reply has a line"),
+            (f"`Fixed in {FIX[:9]}`", "no reply has a line"),
+            (f"~~Fixed in {FIX[:9]}~~", "no reply has a line"),
+            (f"<del>\nFixed in {FIX[:9]}\n</del>", "no reply has a line"),
+            (f"<code>Fixed in {FIX[:9]}</code>", "no reply has a line"),
+            (f"<details>\n\nFixed in {FIX[:9]}\n\n</details>", "no reply has a line"),
+            (f"> The reviewer said\nFixed in {FIX[:9]}", "no reply has a line"),
+            (f"- > Fixed in {FIX[:9]}", "no reply has a line"),
+            (f"Fixed in {FIX[:9]}, pending CI.", "is not a claim"),
+            (f"Fixed in {FIX[:9]} (partially).", "is not a claim"),
+            (f"Fixed in {FIX[:9]} \u2014 reverted.", "is not a claim"),
+            (f"Fixed in {FIX[:9]} if CI passes.", "is not a claim"),
+            (f"Fixed in {FIX[:9]} on #4999.", "is not a claim"),
+            (f"Fixed in {FIX[:9]} ?", "is not a claim"),
+            (f"Fixed in {FIX[:9]}, or not?", "is not a claim"),
+            (f"Fixed in {FIX[:9]}, right?", "is not a claim"),
+            (f"Fixed in {FIX[:9]}, except the retry path.", "is not a claim"),
+            (f"Fixed in {FIX[:9]}, mostly.", "is not a claim"),
+            (f"Fixed in {FIX[:9]}, the race remains.", "is not a claim"),
+            (f"Fixed in {FIX[:9]}, with a follow-up for the rest.", "is not a claim"),
+            (f"Fixed in {FIX[:9]}, but it isn\u2019t complete.", "is not a claim"),
+            (f"The typo is fixed in {FIX[:9]}, the P1 is not.", "no reply has a line"),
+            (f"@codex review: confirm whether this was fixed in {FIX[:9]}.", "no reply has a line"),
+            (f"This will be\nfixed in {FIX[:9]}.", "is not a claim"),
+            (f"[Fixed in {FIX[:9]}](https://example.com)", "no reply has a line"),
+        ],
+    )
+    def test_a_reply_that_is_not_a_fix_blocks(self, guard, monkeypatch, reply, why):
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply(body=reply)])
+        assert block
+        assert "finding 1 (src/benign.py): " in msg and why in msg
+
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            f"Fixed at {FIX}.",
+            f"Fixed in `{FIX[:9]}`, with a test.",
+            f"fixed by commit {FIX[:9]}",
+            f"- Fixed in {FIX[:9]}.",
+            f"Fixed in {FIX[:9]}: the guard now returns early when the file is missing.",
+            f"Fixed in {FIX[:9]}. It now returns early if the file is missing.",
+            f"Thanks!\nFixed in {FIX[:9]}.",
+            f"Fixed in {FIX[:9]} \u2014 the check now runs first.",
+            f"```\r\nlog\r\n```\r\nFixed in {FIX[:9]}.",
+            f'<!-- devin-review-comment {{"role": "builder"}} --> Fixed in {FIX[:9]}.',
+            f"This was not a race.\nFixed in {FIX[:9]}.",
+            f"> The reviewer's text\n\nFixed in {FIX[:9]}.",
+            f"Fixes in {FIX[:9]}",
+            f"Thanks, will check the rest\n\nFixed in {FIX[:9]}.",
+        ],
+    )
+    def test_the_fix_claim_forms(self, guard, monkeypatch, reply):
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply(body=reply)])
+        assert not block, msg
+
+    def test_a_commit_on_another_file_blocks(self, guard, monkeypatch):
+        block, msg, _ = _scan(
+            guard, monkeypatch, [_finding(), _reply()], files={FIX: ["src/other.py"]}
+        )
+        assert block and "does not touch src/benign.py" in msg
+
+    def test_a_rename_source_counts_as_the_file(self, guard, monkeypatch):
+        rows = [{"f": "src/new.py", "p": PATH, "s": "renamed", "c": 3}]
+
+        def fetch(endpoint, _pr, _repo, _jq):
+            if endpoint.endswith("/comments"):
+                return [_finding(), _reply()], True
+            if endpoint.endswith("/commits"):
+                return COMMITS, True
+            return rows, True
+
+        monkeypatch.setattr(guard, "_fetch_comments_paged", fetch)
+        monkeypatch.setattr(guard, "_pr_lane", lambda *_a, **_k: "standard")
+        assert not guard._check_inline_review_findings("100")[0]
+
+    def test_a_pure_rename_is_no_fix(self, guard, monkeypatch):
+        """A commit that only moves the file changes none of its lines."""
+        rows = [{"f": "src/new.py", "p": PATH, "s": "renamed", "c": 0}]
+
+        def fetch(endpoint, _pr, _repo, _jq):
+            if endpoint.endswith("/comments"):
+                return [_finding(), _reply()], True
+            if endpoint.endswith("/commits"):
+                return COMMITS, True
+            return rows, True
+
+        monkeypatch.setattr(guard, "_fetch_comments_paged", fetch)
+        monkeypatch.setattr(guard, "_pr_lane", lambda *_a, **_k: "standard")
+        block, msg = guard._check_inline_review_findings("100")
+        assert block and "does not touch src/benign.py" in msg
+
+    def test_a_fix_after_an_earlier_rename_clears(self, guard, monkeypatch):
+        """Devin 4675231808: the finding names the old path, and the fix touches only the
+        name this PR's rename gave it."""
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES", json.dumps({"filename": "src/new.py", "previous_filename": PATH})
+        )
+        block, msg, _ = _scan(
+            guard, monkeypatch, [_finding(), _reply()], files={FIX: ["src/new.py"]}
+        )
+        assert not block, msg
+
+    def test_a_fix_to_the_old_name_does_not_clear_a_finding_on_the_new_one(
+        self, guard, monkeypatch
+    ):
+        """Only a rename back could make the old name the same file again."""
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES", json.dumps({"filename": "src/new.py", "previous_filename": PATH})
+        )
+        block, msg, _ = _scan(
+            guard, monkeypatch, [_finding(path="src/new.py"), _reply()], files={FIX: [PATH]}
+        )
+        assert block and "does not touch src/new.py" in msg
+
+    def test_a_rename_elsewhere_does_not_widen_the_match(self, guard, monkeypatch):
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            "\n".join(
+                json.dumps(r)
+                for r in (
+                    {"filename": PATH, "previous_filename": None},
+                    {"filename": "src/new.py", "previous_filename": "src/old.py"},
+                )
+            ),
+        )
+        block, msg, _ = _scan(
+            guard, monkeypatch, [_finding(), _reply()], files={FIX: ["src/new.py"]}
+        )
+        assert block and "does not touch" in msg
+
+    def test_an_ambiguous_prefix_is_no_evidence(self, guard, monkeypatch):
+        twin = "abcdef1" + "9" * 33
+        commits = [*COMMITS, _row(twin)]
+        block, msg, _ = _scan(
+            guard, monkeypatch, [_finding(), _reply(body="Fixed in abcdef1.")], commits=commits
+        )
+        assert block and "ambiguous" in msg
+
+    def test_ancestry_decides_whatever_the_list_order(self, guard, monkeypatch):
+        """GitHub lists a PR's commits by date. A fix listed BEFORE the finding's head
+        (an earlier author date) still descends from it, so it is a real fix."""
+        block, msg, _ = _scan(
+            guard,
+            monkeypatch,
+            [_finding(), _reply()],
+            commits=[_row(FIX, [BASE], date="2026-01-01T00:00:00Z"), _row(BASE)],
+        )
+        assert not block, msg
+
+    def test_a_later_listed_ancestor_is_no_fix(self, guard, monkeypatch):
+        """A commit listed after the finding's head (a later or forged date) that the
+        head descends from came before the finding."""
+        block, msg, _ = _scan(
+            guard,
+            monkeypatch,
+            [_finding(orig=FIX), _reply(body=f"Fixed in {BASE[:9]}.")],
+            commits=[_row(FIX, [BASE]), _row(BASE, date="2026-02-01T00:00:00Z")],
+            files={BASE: [PATH]},
+        )
+        assert block and "does not come after the head" in msg
+
+    def test_a_side_branch_commit_is_no_fix(self, guard, monkeypatch):
+        """S was made beside the finding's head and merged in later: it is listed after
+        the head and is still not a fix of what that head showed."""
+        side = "abcdef5" + "5" * 33
+        commits = [
+            _row(BASE),
+            _row(FIX, [BASE]),
+            _row(side, [BASE], date="2026-01-03T00:00:00Z"),
+            _row(MERGE, [FIX, side], date="2026-01-04T00:00:00Z"),
+        ]
+        block, msg, _ = _scan(
+            guard,
+            monkeypatch,
+            [_finding(orig=FIX), _reply(body=f"Fixed in {side[:9]}.")],
+            commits=commits,
+            files={side: [PATH]},
+        )
+        assert block and "does not come after the head" in msg
+
+    def test_unreadable_parents_never_clear(self, guard, monkeypatch):
+        commits = [_row(BASE), {"sha": FIX, "parents": 1}]
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", FIX)
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply()], commits=commits)
+        assert block and "parents of" in msg
+
+    def test_a_parent_cycle_ends(self, guard, monkeypatch):
+        """Real git cannot loop, but the rows are GitHub's data: the walk must end."""
+        commits = [_row(BASE, [FIX]), _row(FIX, [BASE])]
+        _scan(guard, monkeypatch, [_finding(), _reply()], commits=commits)
+
+    def test_a_row_with_no_changed_line_count_is_no_fix(self, guard, monkeypatch):
+        def fetch(endpoint, _pr, _repo, _jq):
+            if endpoint.endswith("/comments"):
+                return [_finding(), _reply()], True
+            if endpoint.endswith("/commits"):
+                return COMMITS, True
+            return [{"f": PATH, "p": None, "s": "modified", "c": None}], True
+
+        monkeypatch.setattr(guard, "_fetch_comments_paged", fetch)
+        monkeypatch.setattr(guard, "_pr_lane", lambda *_a, **_k: "standard")
+        block, msg = guard._check_inline_review_findings("100")
+        assert block and "does not touch src/benign.py" in msg
+
+    def test_a_commit_is_not_its_own_descendant(self, guard, monkeypatch):
+        commits = [_row(BASE), _row(FIX, [FIX])]
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(orig=FIX), _reply()], commits=commits)
+        assert block and "does not come after the head" in msg
+
+    @pytest.mark.parametrize(
+        "row",
+        [
+            {"f": PATH, "p": None, "s": "modified", "c": 0},
+            {"f": "src/copy.py", "p": PATH, "s": "copied", "c": 0},
+            {"f": "src/copy.py", "p": PATH, "s": "copied", "c": 4},
+        ],
+    )
+    def test_a_row_that_changes_no_line_of_the_file_is_no_fix(self, guard, monkeypatch, row):
+        """A mode change touches no line; a copy leaves its source as it was."""
+
+        def fetch(endpoint, _pr, _repo, _jq):
+            if endpoint.endswith("/comments"):
+                return [_finding(), _reply()], True
+            if endpoint.endswith("/commits"):
+                return COMMITS, True
+            return [row], True
+
+        monkeypatch.setattr(guard, "_fetch_comments_paged", fetch)
+        monkeypatch.setattr(guard, "_pr_lane", lambda *_a, **_k: "standard")
+        block, msg = guard._check_inline_review_findings("100")
+        assert block and "does not touch src/benign.py" in msg
+
+    @pytest.mark.parametrize(
+        "tag", ["s", "pre", "kbd", "samp", "sub", "sup", "strike", "blockquote", "del", "details"]
+    )
+    def test_text_inside_an_html_aside_claims_nothing(self, guard, monkeypatch, tag):
+        for body in (
+            f"<{tag}>\nFixed in {FIX[:9]}.\n</{tag}>",
+            f'<{tag} class="x">\nFixed in {FIX[:9]}.',  # never closed: the rest is inside
+        ):
+            block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply(body=body)])
+            assert block and "no reply has a line" in msg, body
+
+    def test_a_hedge_far_back_in_the_sentence_counts(self, guard, monkeypatch):
+        body = "We will land this after the refactor of the parser and its many callers, " * 2
+        body += f"\nfixed in {FIX[:9]}."
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply(body=body)])
+        assert block
+
+    def test_an_open_tag_with_no_end_stays_linear(self, guard):
+        import time
+
+        body = "<s" * 32768
+        started = time.monotonic()
+        assert guard._fix_claims(body) == []
+        assert time.monotonic() - started < 0.5
+
+    def test_a_gone_head_cannot_prove_order(self, guard, monkeypatch):
+        """A rebase refreshes committer dates, so no date stands in for the order."""
+        block, msg, _ = _scan(
+            guard, monkeypatch, [_finding(orig="f" * 40), _reply()], commits=[_row(FIX, [BASE])]
+        )
+        assert block and "is gone" in msg
+
+    def test_a_finding_with_no_head_cannot_prove_order(self, guard, monkeypatch):
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(orig=None), _reply()])
+        assert block and "is gone" in msg
+
+    def test_a_pathless_finding_cannot_pass(self, guard, monkeypatch):
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(path=None), _reply()])
+        assert block and "only the sigil" in msg
+
+    @pytest.mark.parametrize(
+        ("kw", "why"),
+        [
+            ({"commits": (None, False)}, "commit list unreadable"),
+            ({"commits": ([_row(FIX, [BASE])], False)}, "commit list unreadable"),
+            ({"files": {FIX: (None, False)}}, "unreadable"),
+            ({"files": {FIX: ([{"f": "src/other.py", "p": None}], False)}}, "unreadable"),
+        ],
+    )
+    def test_a_failed_read_never_clears(self, guard, monkeypatch, kw, why):
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply()], **kw)
+        assert block and why in msg
+
+    @pytest.mark.parametrize("head_listed", [True, False])
+    def test_a_clipped_commit_list_says_so(self, guard, monkeypatch, head_listed):
+        commits = [_row(f"{i:040x}") for i in range(guard._PR_COMMITS_API_CAP)]
+        if head_listed:
+            commits[0] = _row(BASE)
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply()], commits=commits)
+        assert block and "clipped" in msg
+
+    def test_the_commit_read_cap_holds_across_findings(self, guard, monkeypatch):
+        cap = guard._FIX_CHECK_MAX_COMMITS
+        shas = [f"{i + 1:07x}" + "a" * 33 for i in range(cap + 6)]
+        half = len(shas) // 2
+        commits = [_row(BASE), *[_row(s, [p]) for p, s in zip([BASE, *shas], shas, strict=False)]]
+        comments = [
+            _finding(1),
+            _reply(1, "\n".join(f"Fixed in {s[:9]}." for s in shas[:half]), cid=90),
+            _finding(2),
+            _reply(2, "\n".join(f"Fixed in {s[:9]}." for s in shas[half:]), cid=91),
+        ]
+        block, msg, reads = _scan(guard, monkeypatch, comments, commits=commits, files={})
+        assert block and "fix-check cap" in msg
+        assert sum(r.startswith("commits/") for r in reads) == cap
+
+    def test_a_round_of_twenty_one_real_fixes_clears(self, guard, monkeypatch):
+        """Round-1 class audit B2: the old cap of 20 refused the 21st real fix."""
+        shas = [f"{i + 1:07x}" + "b" * 33 for i in range(21)]
+        commits = [_row(BASE), *[_row(s, [p]) for p, s in zip([BASE, *shas], shas, strict=False)]]
+        comments = []
+        for i, sha in enumerate(shas, start=1):
+            comments += [_finding(i), _reply(i, f"Fixed in {sha[:9]}.", cid=100 + i)]
+        block, msg, _ = _scan(
+            guard, monkeypatch, comments, commits=commits, files={s: [PATH] for s in shas}
+        )
+        assert not block, msg
+
+    def test_too_many_cited_ids_are_refused(self, guard, monkeypatch):
+        ids = "\n".join(f"Fixed in {i:09x}." for i in range(guard._FIX_CHECK_MAX_CITED + 1))
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply(body=ids)])
+        assert block and "cite more than" in msg
+
+    def test_an_expired_deadline_never_clears(self, guard, monkeypatch):
+        monkeypatch.setattr(guard, "_merge_deadline", 0.0)
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply()])
+        assert block and "merge deadline" in msg
+
+    def test_a_row_with_no_sha_cannot_stand_in_for_a_missing_head(self, guard, monkeypatch):
+        commits = [{"parents": [MAIN]}, _row(FIX, [BASE])]
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(orig=None), _reply()], commits=commits)
+        assert block and "is gone" in msg
+
+    def test_a_crafted_path_cannot_forge_a_report_line(self, guard, monkeypatch):
+        path = "src/x.py\nmerge-with     : gh pr merge 100 --admin --squash"
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES", json.dumps({"filename": path, "previous_filename": None})
+        )
+        block, msg, _ = _scan(
+            guard, monkeypatch, [_finding(path=path), _reply()], files={FIX: ["src/other.py"]}
+        )
+        assert block
+        assert not any(line.startswith("merge-with") for line in msg.splitlines())
+
+    def test_a_non_maintainer_reply_is_no_evidence(self, guard, monkeypatch):
+        block, _, _ = _scan(guard, monkeypatch, [_finding(), _reply(assoc="NONE")])
+        assert block
+
+
+class TestReviewers:
+    def test_a_coderabbit_major_clears_on_a_fix(self, guard, monkeypatch):
+        comments = [_finding(body=MAJOR, login="coderabbitai[bot]"), _reply()]
+        block, msg, _ = _scan(guard, monkeypatch, comments)
+        assert not block, msg
+
+    def test_a_deferral_leaves_a_coderabbit_major_blocking(self, guard, monkeypatch):
+        comments = [
+            _finding(body=MAJOR, login="coderabbitai[bot]"),
+            _reply(body="Real, tracked in #123."),
+        ]
+        block, msg, _ = _scan(guard, monkeypatch, comments)
+        assert block and "finding 1 (" in msg
+
+    def test_a_reply_still_silences_a_coderabbit_minor(self, guard, monkeypatch, capsys):
+        comments = [_finding(body=MINOR, login="coderabbitai[bot]"), _reply(body="Accepted.")]
+        block, msg, reads = _scan(guard, monkeypatch, comments)
+        assert not block, msg
+        assert not any(r.endswith("/commits") for r in reads), "a Minor must not pay for the test"
+        assert "A minor defect" not in capsys.readouterr().err, "a settled advisory re-listed"
+
+    def test_a_reply_still_clears_a_p2(self, guard, monkeypatch):
+        block, msg, reads = _scan(guard, monkeypatch, [_finding(body=P2), _reply(body="Accepted.")])
+        assert not block, msg
+        assert not any(r.endswith("/commits") for r in reads)
+
+    def test_devin_resolved_uses_the_sha_from_devins_own_reply(self, guard, monkeypatch):
+        comments = [
+            _finding(body=_devin(), login=DEVIN),
+            _reply(
+                body=f"Fixed in {FIX[:9]}.", cid=90, login=DEVIN, utype="Bot", assoc="CONTRIBUTOR"
+            ),
+            _reply(
+                body="✅ **Resolved**: done.", cid=91, login=DEVIN, utype="Bot", assoc="CONTRIBUTOR"
+            ),
+        ]
+        block, msg, _ = _scan(guard, monkeypatch, comments)
+        assert not block, msg
+
+    def test_a_clear_resting_on_devins_reply_is_listed(self, guard, monkeypatch, capsys):
+        """A maintainer reply that clears nothing must not hide that Devin's reply did."""
+        comments = [
+            _finding(body=_devin(), login=DEVIN),
+            _reply(body="Deferred.", cid=89),
+            _reply(
+                body=f"Fixed in {FIX[:9]}.", cid=90, login=DEVIN, utype="Bot", assoc="CONTRIBUTOR"
+            ),
+            _reply(
+                body="✅ **Resolved**: done.", cid=91, login=DEVIN, utype="Bot", assoc="CONTRIBUTOR"
+            ),
+        ]
+        block, msg, _ = _scan(guard, monkeypatch, comments)
+        assert not block, msg
+        assert "[Devin self-withdrawn]" in capsys.readouterr().err
+
+    def test_a_maintainer_fix_on_a_devin_finding_is_not_listed(self, guard, monkeypatch, capsys):
+        comments = [
+            _finding(body=_devin(), login=DEVIN),
+            _reply(cid=89),
+            _reply(
+                body="✅ **Resolved**: done.", cid=91, login=DEVIN, utype="Bot", assoc="CONTRIBUTOR"
+            ),
+        ]
+        block, msg, _ = _scan(guard, monkeypatch, comments)
+        assert not block, msg
+        assert "[Devin self-withdrawn]" not in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        ("body", "login"), [(P1, "chatgpt-codex-connector[bot]"), (MAJOR, "coderabbitai[bot]")]
+    )
+    def test_only_devin_gets_the_self_withdrawal_route(self, guard, monkeypatch, body, login):
+        comments = [
+            _finding(body=body, login=login),
+            _reply(
+                body=f"✅ **Resolved**\n\nFixed in {FIX[:9]}.",
+                login=login,
+                utype="Bot",
+                assoc="CONTRIBUTOR",
+            ),
+        ]
+        block, _, _ = _scan(guard, monkeypatch, comments)
+        assert block
+
+    def test_a_fix_must_follow_the_head_of_the_copy_on_its_file(self, guard, monkeypatch):
+        """Copy 2 was posted after the cited commit existed, on the same file as copy 1."""
+        comments = [
+            _finding(1, _devin(), login=DEVIN, orig=BASE),
+            _finding(2, _devin(), login=DEVIN, orig=FIX),
+            _reply(1),
+        ]
+        block, msg, _ = _scan(guard, monkeypatch, comments)
+        assert block and "does not come after the head" in msg
+
+    def test_each_files_reason_is_its_own(self, guard, monkeypatch):
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            '{"filename": "src/benign.py", "previous_filename": null}\n'
+            '{"filename": "src/second.py", "previous_filename": null}',
+        )
+        comments = [
+            _finding(1, _devin(), login=DEVIN),
+            _finding(2, _devin(), login=DEVIN, path="src/second.py"),
+            _reply(1),
+        ]
+        block, msg, _ = _scan(guard, monkeypatch, comments)
+        assert block and "(src/second.py): cited commit" in msg
+
+    def test_a_fix_on_one_devin_copy_does_not_clear_another_file(self, guard, monkeypatch):
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            '{"filename": "src/benign.py", "previous_filename": null}\n'
+            '{"filename": "src/second.py", "previous_filename": null}',
+        )
+        comments = [
+            _finding(1, _devin(), login=DEVIN),
+            _finding(2, _devin(), login=DEVIN, path="src/second.py"),
+            _reply(1),
+        ]
+        block, _, _ = _scan(guard, monkeypatch, comments)
+        assert block, "a commit touching only one copy's file cleared both"
+        files = {FIX: [PATH, "src/second.py"]}
+        block, msg, _ = _scan(guard, monkeypatch, comments, files=files)
+        assert not block, msg
+
+    def test_devins_own_sha_without_the_marker_is_no_evidence(self, guard, monkeypatch):
+        comments = [
+            _finding(body=_devin(), login=DEVIN),
+            _reply(body=f"Fixed in {FIX[:9]}.", login=DEVIN, utype="Bot", assoc="CONTRIBUTOR"),
+        ]
+        block, _, _ = _scan(guard, monkeypatch, comments)
+        assert block
+
+    def test_devin_resolved_with_a_bad_sha_blocks(self, guard, monkeypatch):
+        comments = [
+            _finding(body=_devin(), login=DEVIN),
+            _reply(
+                body=f"Fixed in {LATER[:9]}.", cid=90, login=DEVIN, utype="Bot", assoc="CONTRIBUTOR"
+            ),
+            _reply(
+                body="✅ **Resolved**: done.", cid=91, login=DEVIN, utype="Bot", assoc="CONTRIBUTOR"
+            ),
+        ]
+        block, _, _ = _scan(guard, monkeypatch, comments)
+        assert block
+
+    def test_an_answered_off_diff_floor_finding_stays_silent(self, guard, monkeypatch, capsys):
+        comments = [_finding(path="src/elsewhere.py"), _reply(body="Accepted.")]
+        block, msg, _ = _scan(guard, monkeypatch, comments)
+        assert not block, msg
+        assert "src/elsewhere.py" not in capsys.readouterr().err
+
+
+class TestSigil:
+    def test_it_clears_the_named_finding_and_records_it(self, guard, monkeypatch):
+        used: set[int] = set()
+        block, msg, _ = _scan(
+            guard, monkeypatch, [_finding()], floor_accept=frozenset({1}), floor_accept_used=used
+        )
+        assert not block, msg
+        assert used == {1}
+
+    def test_it_clears_only_the_named_finding(self, guard, monkeypatch):
+        block, msg, _ = _scan(
+            guard, monkeypatch, [_finding(1), _finding(2)], floor_accept=frozenset({1})
+        )
+        assert block and "finding 2 (" in msg and "finding 1 (" not in msg
+
+    def test_an_id_on_a_fixed_finding_is_not_spent(self, guard, monkeypatch, capsys):
+        used: set[int] = set()
+        _scan(
+            guard,
+            monkeypatch,
+            [_finding(), _reply()],
+            floor_accept=frozenset({1}),
+            floor_accept_used=used,
+        )
+        assert used == set()
+        assert "already cleared by a fix" in capsys.readouterr().err
+
+    def test_an_unknown_id_is_a_note_not_a_clearance(self, guard, monkeypatch, capsys):
+        block, _, _ = _scan(guard, monkeypatch, [_finding()], floor_accept=frozenset({7}))
+        assert block
+        assert "names no open floor finding" in capsys.readouterr().err
+
+    def test_a_dispatched_session_cannot_use_it(self, guard, monkeypatch, capsys):
+        monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+        used: set[int] = set()
+        block, msg, _ = _scan(
+            guard, monkeypatch, [_finding()], floor_accept=frozenset({1}), floor_accept_used=used
+        )
+        assert block and "dispatched" in msg
+        assert used == set()
+        assert "was refused in a dispatched session" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        ("command", "ids", "bad"),
+        [
+            ("gh pr merge 1  # floor-accept=12", {12}, False),
+            ("gh pr merge 1  # floor-accept=12,34", {12, 34}, False),
+            ("gh pr merge 1  # stale-review-override floor-accept=12", {12}, False),
+            ("gh pr merge 1  # floor-accept", set(), True),
+            ("gh pr merge 1  # floor-accept:", set(), True),
+            ("gh pr merge 1  # floor-accept=12,", set(), True),
+            ("gh pr merge 1  # floor-accept=12, 34", set(), True),
+            ("gh pr merge 1  # floor-accept=abc", set(), True),
+            ("gh pr merge 1  # floor-accept=" + "1" * 21, set(), True),
+            ("gh pr merge 1  # floor-accept=١٢", set(), True),
+            ("gh pr merge 1  # see floor-accept=12", set(), False),
+            ("gh pr merge 1 --body '# floor-accept=12'", set(), False),
+        ],
+    )
+    def test_the_sigil_form(self, guard, command, ids, bad):
+        assert guard.trailing_sigil_ids(command, "floor-accept") == (frozenset(ids), bad)
+
+    def test_check_pr_reads_the_flag(self, guard):
+        assert guard._parse_check_pr_floor_accept(["--floor-accept", "12,34"]) == {12, 34}
+        assert guard._parse_check_pr_floor_accept(["--floor-accept=12"]) == {12}
+        assert guard._parse_check_pr_floor_accept(["--floor-accept", "x"]) is None
+        assert guard._parse_check_pr_floor_accept(["--floor-accept", "1 2"]) is None
+        assert guard._parse_check_pr_floor_accept(["--floor-accept", "1" * 21]) is None
+        assert guard._parse_check_pr_floor_accept(["--floor-accept=1", "--floor-accept=2"]) is None
+        assert guard._parse_check_pr_floor_accept(["--floor-accept"]) is None
+        assert guard._parse_check_pr_floor_accept([]) == frozenset()
+
+
+class TestReviewOverride:
+    def test_a_floor_finding_survives_it(self, guard, monkeypatch):
+        block, msg, _ = _scan(guard, monkeypatch, [_finding()], force=True)
+        assert block and "always-fix floor" in msg
+
+    def test_the_sigil_clears_under_it(self, guard, monkeypatch):
+        block, msg, _ = _scan(
+            guard, monkeypatch, [_finding()], force=True, floor_accept=frozenset({1})
+        )
+        assert not block, msg
+
+    def test_it_still_waives_the_p2_score(self, guard, monkeypatch):
+        comments = [_finding(i, P2) for i in range(1, 9)]
+        assert _scan(guard, monkeypatch, comments)[0], "control: this score must block"
+        assert not _scan(guard, monkeypatch, comments, force=True)[0]
+
+    def test_it_still_waives_an_unreadable_scan(self, guard, monkeypatch, capsys):
+        monkeypatch.setattr(guard, "_fetch_comments_paged", lambda *_a: (None, False))
+        assert guard._check_inline_review_findings("100")[0], "control"
+        assert not guard._check_inline_review_findings("100", force=True)[0]
+        assert "waived an unreadable inline scan" in capsys.readouterr().err
+
+    def test_it_still_waives_an_incomplete_scan(self, guard, monkeypatch, capsys):
+        monkeypatch.setattr(guard, "_fetch_comments_paged", lambda *_a: ([], False))
+        assert guard._check_inline_review_findings("100")[0], "control"
+        assert not guard._check_inline_review_findings("100", force=True)[0]
+        assert "waived an incomplete inline scan" in capsys.readouterr().err
+
+    def test_a_clean_override_says_nothing_about_unread_scans(self, guard, monkeypatch, capsys):
+        assert not _scan(guard, monkeypatch, [], force=True)[0]
+        assert "waived" not in capsys.readouterr().err
+
+
+def _cmp(rows, status="ahead"):
+    return lambda *_a: (status, rows)
+
+
+def _blobs(a, b):
+    return lambda *_a: (a, b)
+
+
+class TestStillInHead:
+    """#5000: the cited fix must still be in the head being merged."""
+
+    def test_a_fix_outside_the_head_blocks(self, guard, monkeypatch):
+        side = "5eed000" + "5" * 33
+        commits = [_row(BASE), _row(FIX, [BASE]), _row(side, [BASE])]
+        monkeypatch.setenv("_TEST_GH_HEAD_SHA", side)
+        block, msg, _ = _scan(
+            guard, monkeypatch, [_finding(), _reply()], commits=commits, files={FIX: [PATH]}
+        )
+        assert block and "is not in the head being merged" in msg
+
+    def test_the_head_itself_can_be_the_fix(self, guard, monkeypatch):
+        commits = [_row(BASE), _row(FIX, [BASE])]
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply()], commits=commits)
+        assert not block, msg
+
+    @pytest.mark.parametrize("head", [None, "9" * 40, MERGE[:12], f"x/../{MERGE}"])
+    def test_an_unknown_or_malformed_head_blocks(self, guard, monkeypatch, head):
+        calls = []
+        monkeypatch.setattr(guard, "_compare_rows", lambda *a: calls.append(a) or CHANGED)
+        if head is None:  # no bound head, and the current head is unreadable
+            monkeypatch.setattr(guard, "_pr_head_sha", lambda *_a, **_k: None)
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply()], head=head)
+        assert block and "not a full sha of this PR" in msg
+        assert not calls, "no compare may run against an unproven head"
+
+    def test_the_head_is_normalized(self, guard, monkeypatch):
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply()], head=f" {MERGE.upper()} ")
+        assert not block, msg
+
+    def test_an_explicit_head_beats_the_current_head(self, guard, monkeypatch):
+        """The merge arm binds a head; the PR's current head is read only when it has none."""
+        commits = [_row(BASE), _row(FIX, [BASE]), _row(MERGE, [FIX, MAIN])]
+        block, msg, _ = _scan(
+            guard, monkeypatch, [_finding(), _reply()], commits=commits, head=BASE
+        )
+        assert block and "is not in the head being merged" in msg
+
+    def test_with_no_bound_head_the_current_head_is_read(self, guard, monkeypatch):
+        """A stale-review-override merge with no --match-head-commit still verifies fixes."""
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply()], head=None)
+        assert not block, msg
+
+    @pytest.mark.parametrize(
+        ("compare", "why"),
+        [
+            (_cmp([{"f": "src/other.py", "p": None, "s": "modified", "c": 4}]), "unchanged since"),
+            (_cmp([], "identical"), "unchanged since"),
+            (_cmp([], "behind"), "compare status 'behind'"),
+            (_cmp([], "diverged"), "compare status 'diverged'"),
+            (lambda *_a: None, "compare with the head being merged unreadable"),
+            (
+                _cmp([{"f": PATH, "p": None, "s": "copied", "c": 1}]),
+                "compare lists src/benign.py as 'copied'",
+            ),
+        ],
+    )
+    def test_a_file_not_changed_in_the_head_blocks(self, guard, monkeypatch, compare, why):
+        monkeypatch.setattr(guard, "_compare_rows", compare)
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply()])
+        assert block and why in msg
+
+    @pytest.mark.parametrize(
+        "row",
+        [
+            {"f": PATH, "p": None, "s": "modified", "c": 0},  # GitHub dropped the counts
+            {"f": PATH, "p": None, "s": "removed", "c": 0},
+            {"f": PATH, "p": None, "s": "added", "c": 2},
+            {"f": PATH, "p": None, "s": "changed", "c": 0},
+            {"f": "src/new.py", "p": PATH, "s": "renamed", "c": 3},
+        ],
+    )
+    def test_a_file_changed_in_the_head_clears(self, guard, monkeypatch, row):
+        monkeypatch.setattr(guard, "_compare_rows", _cmp([row]))
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply()])
+        assert not block, msg
+
+    @pytest.mark.parametrize(
+        ("blobs", "cleared", "why"),
+        [
+            (_blobs("a" * 40, "b" * 40), True, ""),
+            (_blobs("a" * 40, "a" * 40), False, "unchanged since"),
+            (_blobs("a" * 40, None), False, "unreadable or absent"),
+            (_blobs(None, "b" * 40), False, "unreadable or absent"),
+            (lambda *_a: None, False, "unreadable"),
+        ],
+    )
+    def test_a_pure_rename_is_decided_by_the_blobs(self, guard, monkeypatch, blobs, cleared, why):
+        seen = []
+        monkeypatch.setattr(
+            guard, "_compare_rows", _cmp([{"f": "src/new.py", "p": PATH, "s": "renamed", "c": 0}])
+        )
+        monkeypatch.setattr(guard, "_blob_oids", lambda *a: seen.append(a) or blobs())
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply()])
+        assert block is not cleared, msg
+        assert why in msg
+        assert seen == [(None, (BASE, PATH), (MERGE, "src/new.py"))]
+
+    @pytest.mark.parametrize(
+        ("blobs", "cleared"),
+        [(_blobs("a" * 40, "b" * 40), True), (_blobs("a" * 40, "a" * 40), False)],
+    )
+    def test_a_capped_compare_without_the_file_reads_the_blobs(
+        self, guard, monkeypatch, blobs, cleared
+    ):
+        rows = [{"f": f"src/x{i}.py", "p": None, "s": "modified", "c": 1} for i in range(300)]
+        monkeypatch.setattr(guard, "_compare_rows", _cmp(rows))
+        monkeypatch.setattr(guard, "_blob_oids", lambda *_a: blobs())
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply()])
+        assert block is not cleared, msg
+
+    _CAPPED = [{"f": f"src/x{i}.py", "p": None, "s": "modified", "c": 1} for i in range(300)]
+
+    def _capped_scan(self, guard, monkeypatch, pr_files, blobs):
+        """A compare capped at 300 files without the finding's file; ``blobs`` maps the
+        head-side name to its oid (None: absent there)."""
+        monkeypatch.setenv("_TEST_GH_PR_FILES", "\n".join(json.dumps(r) for r in pr_files))
+        monkeypatch.setattr(guard, "_compare_rows", _cmp(self._CAPPED))
+        seen = []
+
+        def read(_repo, at_orig, at_head):
+            seen.append((at_orig, at_head))
+            return blobs.get("orig", "a" * 40), blobs.get(at_head[1])
+
+        monkeypatch.setattr(guard, "_blob_oids", read)
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply()])
+        return block, msg, seen
+
+    def test_a_deletion_past_the_cap_clears(self, guard, monkeypatch):
+        """Round 1 (Devin 4686732027): the fix deleted the file, and the capped
+        compare does not list it; the PR file list confirms the removal."""
+        block, msg, seen = self._capped_scan(
+            guard,
+            monkeypatch,
+            [{"filename": PATH, "previous_filename": None, "status": "removed"}],
+            {PATH: None},
+        )
+        assert not block, msg
+        assert seen == [((BASE, PATH), (MERGE, PATH))]
+
+    def test_a_rename_with_edits_past_the_cap_clears(self, guard, monkeypatch):
+        block, msg, seen = self._capped_scan(
+            guard,
+            monkeypatch,
+            [{"filename": "src/moved.py", "previous_filename": PATH, "status": "renamed"}],
+            {PATH: None, "src/moved.py": "b" * 40},
+        )
+        assert not block, msg
+        assert seen[-1] == ((BASE, PATH), (MERGE, "src/moved.py"))
+
+    def test_a_pure_rename_past_the_cap_blocks(self, guard, monkeypatch):
+        block, msg, _ = self._capped_scan(
+            guard,
+            monkeypatch,
+            [{"filename": "src/moved.py", "previous_filename": PATH, "status": "renamed"}],
+            {PATH: None, "src/moved.py": "a" * 40},
+        )
+        assert block and "unchanged since" in msg
+
+    @pytest.mark.parametrize(
+        ("pr_files", "blobs"),
+        [
+            # Gone at the head, but the PR file list neither removes nor renames it.
+            ([{"filename": PATH, "previous_filename": None, "status": "modified"}], {PATH: None}),
+            # Renamed, but the new name is unreadable or absent too.
+            (
+                [{"filename": "src/moved.py", "previous_filename": PATH, "status": "renamed"}],
+                {PATH: None, "src/moved.py": None},
+            ),
+            # Absent at the finding's head: no deletion can be credited.
+            (
+                [{"filename": PATH, "previous_filename": None, "status": "removed"}],
+                {"orig": None, PATH: None},
+            ),
+        ],
+    )
+    def test_a_capped_absence_it_cannot_confirm_blocks(self, guard, monkeypatch, pr_files, blobs):
+        block, msg, _ = self._capped_scan(guard, monkeypatch, pr_files, blobs)
+        assert block and "could not be verified" in msg
+
+    def test_only_a_capped_compare_consults_the_pr_file_list(self, guard, monkeypatch):
+        """A listed rename row is the compare's own answer: when its new name is absent,
+        the PR file list (base to head) may not overrule it, even if it says removed."""
+        monkeypatch.setenv(
+            "_TEST_GH_PR_FILES",
+            json.dumps({"filename": PATH, "previous_filename": None, "status": "removed"}),
+        )
+        monkeypatch.setattr(
+            guard, "_compare_rows", _cmp([{"f": "src/new.py", "p": PATH, "s": "renamed", "c": 0}])
+        )
+        monkeypatch.setattr(guard, "_blob_oids", _blobs("a" * 40, None))
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply()])
+        assert block and "could not be verified" in msg
+
+    def test_an_unreadable_pr_file_list_keeps_a_capped_absence_open(self, guard, monkeypatch):
+        monkeypatch.setattr(guard, "_pr_changed_files", lambda *_a, **_k: None)
+        block, msg, _ = self._capped_scan(
+            guard,
+            monkeypatch,
+            [{"filename": PATH, "previous_filename": None, "status": "removed"}],
+            {PATH: None},
+        )
+        assert block and "could not be verified" in msg
+
+    def test_the_second_blob_read_counts_against_the_cap(self, guard, monkeypatch):
+        monkeypatch.setattr(guard, "_FIX_CHECK_MAX_BLOB_READS", 1)
+        block, msg, _ = self._capped_scan(
+            guard,
+            monkeypatch,
+            [{"filename": "src/moved.py", "previous_filename": PATH, "status": "renamed"}],
+            {PATH: None, "src/moved.py": "b" * 40},
+        )
+        assert block and "blob-read cap reached (1 reads)" in msg
+
+    def test_a_new_file_reusing_a_renamed_name_cannot_stand_in(self, guard, monkeypatch):
+        rows = [
+            {"f": PATH, "p": None, "s": "added", "c": 5},
+            {"f": "src/new.py", "p": PATH, "s": "renamed", "c": 0},
+        ]
+        monkeypatch.setattr(guard, "_compare_rows", _cmp(rows))
+        monkeypatch.setattr(guard, "_blob_oids", _blobs("a" * 40, "a" * 40))
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply()])
+        assert block and "unchanged since" in msg
+
+    def test_a_file_renamed_onto_the_path_is_not_the_file(self, guard, monkeypatch):
+        """Another file moved onto the finding's name is not the finding's file."""
+        rows = [{"f": PATH, "p": "src/old.py", "s": "renamed", "c": 0}]
+        monkeypatch.setattr(guard, "_compare_rows", _cmp(rows))
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply()])
+        assert block and "unchanged since" in msg
+
+    def test_a_copy_of_the_file_does_not_hide_its_own_row(self, guard, monkeypatch):
+        rows = [
+            {"f": "src/copy.py", "p": PATH, "s": "copied", "c": 0},
+            {"f": PATH, "p": None, "s": "modified", "c": 2},
+        ]
+        monkeypatch.setattr(guard, "_compare_rows", _cmp(rows))
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply()])
+        assert not block, msg
+
+    def test_known_limit_another_change_hides_a_revert(self, guard, monkeypatch):
+        """Stated limit: the fix is reverted, but the file also changed some other way
+        (another fix, a merge of main), so compare lists it and the finding clears."""
+        revert = "7e7e7e7" + "7" * 33
+        commits = [_row(BASE), _row(FIX, [BASE]), _row(revert, [FIX]), _row(MERGE, [revert, MAIN])]
+        block, msg, _ = _scan(
+            guard, monkeypatch, [_finding(), _reply()], commits=commits, files={FIX: [PATH]}
+        )
+        assert not block, msg
+
+    def test_a_revert_then_reapply_clears(self, guard, monkeypatch):
+        """Only the head counts: a fix reverted and re-applied before it is there."""
+        revert = "7e7e7e7" + "7" * 33
+        again = "8a8a8a8" + "8" * 33
+        commits = [_row(BASE), _row(FIX, [BASE]), _row(revert, [FIX]), _row(again, [revert])]
+        block, msg, _ = _scan(
+            guard, monkeypatch, [_finding(), _reply()], commits=commits, files={FIX: [PATH]}
+        )
+        assert not block, msg
+
+    def _chain(self, n, tag):
+        shas = [f"{i + 1:07x}" + tag * 33 for i in range(n)]
+        return shas, [
+            _row(BASE),
+            *[_row(s, [p]) for p, s in zip([BASE, *shas], shas, strict=False)],
+        ]
+
+    def test_every_finding_head_must_see_the_change(self, guard, monkeypatch):
+        """A duplicated finding: changed since one copy's head, not since the other's."""
+        (mid, fix), commits = self._chain(2, "c")
+        monkeypatch.setattr(
+            guard,
+            "_compare_rows",
+            lambda orig, *_a: CHANGED if orig == BASE else ("ahead", []),
+        )
+        comments = [
+            {**_finding(1, _devin()), "login": DEVIN, "orig": BASE},
+            {**_finding(2, _devin()), "login": DEVIN, "orig": mid},
+            _reply(1, f"Fixed in {fix[:9]}.", cid=90),
+            _reply(2, f"Fixed in {fix[:9]}.", cid=91),
+        ]
+        block, msg, _ = _scan(guard, monkeypatch, comments, commits=commits, files={fix: [PATH]})
+        assert block and "unchanged since" in msg
+
+    def test_one_compare_per_finding_head(self, guard, monkeypatch):
+        calls = []
+        monkeypatch.setattr(guard, "_compare_rows", lambda *a: calls.append(a) or CHANGED)
+        comments = [_finding(1), _reply(1, cid=90), _finding(2), _reply(2, cid=91)]
+        block, msg, _ = _scan(guard, monkeypatch, comments)
+        assert not block, msg
+        assert calls == [(BASE, MERGE, None)]
+
+    def test_the_compare_cap_holds(self, guard, monkeypatch):
+        cap = guard._FIX_CHECK_MAX_COMPARES
+        shas, commits = self._chain(cap + 2, "d")
+        fix = shas[-1]
+        calls = []
+        monkeypatch.setattr(guard, "_compare_rows", lambda *a: calls.append(a) or CHANGED)
+        comments = []
+        for i, orig in enumerate(shas[:-1], start=1):
+            comments += [_finding(i, orig=orig), _reply(i, f"Fixed in {fix[:9]}.", cid=100 + i)]
+        block, msg, _ = _scan(guard, monkeypatch, comments, commits=commits, files={fix: [PATH]})
+        assert block and f"compare cap reached ({cap} finding heads)" in msg
+        assert len(calls) == cap
+
+    def test_the_blob_read_cap_holds(self, guard, monkeypatch):
+        (o1, o2, fix), commits = self._chain(3, "e")
+        rename = [{"f": "src/new.py", "p": PATH, "s": "renamed", "c": 0}]
+        monkeypatch.setattr(guard, "_FIX_CHECK_MAX_BLOB_READS", 1)
+        monkeypatch.setattr(guard, "_compare_rows", _cmp(rename))
+        monkeypatch.setattr(guard, "_blob_oids", _blobs("a" * 40, "b" * 40))
+        comments = [
+            _finding(1, orig=o1),
+            _reply(1, f"Fixed in {fix[:9]}.", cid=90),
+            _finding(2, orig=o2),
+            _reply(2, f"Fixed in {fix[:9]}.", cid=91),
+        ]
+        block, msg, _ = _scan(guard, monkeypatch, comments, commits=commits, files={fix: [PATH]})
+        assert block and "blob-read cap reached (1 reads)" in msg
+        assert "finding 1 " not in msg
+
+    def test_the_deadline_stops_the_next_compare(self, guard, monkeypatch):
+        (o1, o2, fix), commits = self._chain(3, "f")
+
+        def compare(*_a):
+            monkeypatch.setattr(guard, "_merge_deadline", 0.0)
+            return CHANGED
+
+        monkeypatch.setattr(guard, "_compare_rows", compare)
+        comments = [
+            _finding(1, orig=o1),
+            _reply(1, f"Fixed in {fix[:9]}.", cid=90),
+            _finding(2, orig=o2),
+            _reply(2, f"Fixed in {fix[:9]}.", cid=91),
+        ]
+        block, msg, _ = _scan(guard, monkeypatch, comments, commits=commits, files={fix: [PATH]})
+        assert block and "merge deadline reached" in msg
+
+    def test_the_deadline_stops_the_next_finding_head(self, guard, monkeypatch):
+        """One finding on two heads (a duplicated Devin finding): the deadline is
+        checked before each compare, not only before each finding."""
+        (mid, fix), commits = self._chain(2, "9")
+
+        def compare(*_a):
+            monkeypatch.setattr(guard, "_merge_deadline", 0.0)
+            return CHANGED
+
+        monkeypatch.setattr(guard, "_compare_rows", compare)
+        comments = [
+            {**_finding(1, _devin()), "login": DEVIN, "orig": BASE},
+            {**_finding(2, _devin()), "login": DEVIN, "orig": mid},
+            _reply(1, f"Fixed in {fix[:9]}.", cid=90),
+            _reply(2, f"Fixed in {fix[:9]}.", cid=91),
+        ]
+        block, msg, _ = _scan(guard, monkeypatch, comments, commits=commits, files={fix: [PATH]})
+        assert block and "merge deadline reached" in msg
+
+    def test_the_deadline_stops_a_blob_read(self, guard, monkeypatch):
+        def compare(*_a):
+            monkeypatch.setattr(guard, "_merge_deadline", 0.0)
+            return "ahead", [{"f": "src/new.py", "p": PATH, "s": "renamed", "c": 0}]
+
+        monkeypatch.setattr(guard, "_compare_rows", compare)
+        block, msg, _ = _scan(guard, monkeypatch, [_finding(), _reply()])
+        assert block and "merge deadline reached" in msg
+
+
+class _Proc:
+    def __init__(self, rc, out):
+        self.returncode, self.stdout, self.stderr = rc, out, ""
+
+
+class TestHeadReaders:
+    """The two readers fail closed: only a well-formed answer is an answer."""
+
+    @pytest.mark.parametrize(
+        ("rc", "out", "want"),
+        [
+            (0, '{"status": "ahead", "files": [{"f": "a"}]}', ("ahead", [{"f": "a"}])),
+            (1, '{"status": "ahead", "files": []}', None),
+            (0, '{"files": []}', None),
+            (0, '{"status": "ahead"}', None),
+            (0, "not json", None),
+        ],
+    )
+    def test_compare_rows(self, guard, monkeypatch, rc, out, want):
+        monkeypatch.undo()
+        monkeypatch.setattr(guard.subprocess, "run", lambda *_a, **_k: _Proc(rc, out))
+        assert guard._compare_rows(BASE, MERGE, "o/r") == want
+
+    @pytest.mark.parametrize(
+        ("rc", "out", "want"),
+        [
+            (
+                0,
+                json.dumps(
+                    {"data": {"repository": {"a": {"__typename": "Blob", "oid": "x"}, "b": None}}}
+                ),
+                ("x", None),
+            ),
+            (
+                0,
+                json.dumps(
+                    {
+                        "data": {
+                            "repository": {
+                                "a": {"__typename": "Blob", "oid": "x"},
+                                "b": {"__typename": "Blob", "oid": "y"},
+                            }
+                        }
+                    }
+                ),
+                ("x", "y"),
+            ),
+            (
+                0,
+                json.dumps(
+                    {"data": {"repository": {"a": {"__typename": "Tree", "oid": "t"}, "b": None}}}
+                ),
+                None,
+            ),
+            (0, json.dumps({"errors": [{"message": "boom"}], "data": None}), None),
+            # A partial answer with errors is no answer, even when the data looks whole.
+            (
+                0,
+                json.dumps(
+                    {
+                        "errors": [{"message": "boom"}],
+                        **json.loads(
+                            json.dumps(
+                                {
+                                    "data": {
+                                        "repository": {
+                                            "a": {"__typename": "Blob", "oid": "x"},
+                                            "b": {"__typename": "Blob", "oid": "y"},
+                                        }
+                                    }
+                                }
+                            )
+                        ),
+                    }
+                ),
+                None,
+            ),
+            (0, json.dumps({"data": {"repository": None}}), None),
+            (
+                1,
+                json.dumps(
+                    {
+                        "data": {
+                            "repository": {
+                                "a": {"__typename": "Blob", "oid": "x"},
+                                "b": {"__typename": "Blob", "oid": "y"},
+                            }
+                        }
+                    }
+                ),
+                None,
+            ),
+        ],
+    )
+    def test_blob_oids(self, guard, monkeypatch, rc, out, want):
+        monkeypatch.undo()
+        monkeypatch.setattr(guard.subprocess, "run", lambda *_a, **_k: _Proc(rc, out))
+        assert guard._blob_oids("o/r", (BASE, PATH), (MERGE, PATH)) == want
+
+    def test_blob_oids_sends_the_expected_request(self, guard, monkeypatch):
+        """Analysis 4686732289: the query, the variables and their -f form are pinned."""
+        monkeypatch.undo()
+        sent = []
+        monkeypatch.setattr(
+            guard.subprocess, "run", lambda argv, **_k: sent.append(argv) or _Proc(1, "")
+        )
+        guard._blob_oids("o/r", (BASE, PATH), (MERGE, "src/moved.py"))
+        (argv,) = sent
+        assert argv[:3] == ["gh", "api", "graphql"]
+        fields = dict(argv[i + 1].split("=", 1) for i in range(3, len(argv), 2) if argv[i] == "-f")
+        assert all(argv[i] == "-f" for i in range(3, len(argv), 2))
+        assert fields["owner"] == "o" and fields["name"] == "r"
+        assert fields["a"] == f"{BASE}:{PATH}" and fields["b"] == f"{MERGE}:src/moved.py"
+        q = " ".join(fields["query"].split())
+        assert "a:object(expression:$a){__typename ... on Blob{oid}}" in q
+        assert "b:object(expression:$b){__typename ... on Blob{oid}}" in q
+        assert "repository(owner:$owner,name:$name)" in q

@@ -284,7 +284,7 @@ async def agent_card():
     settings = await service.registry.settings()
     card = AgentCard(
         name="Genesis",
-        description="Same-owner asynchronous conversations with Genesis",
+        description="Explicitly enrolled asynchronous conversations with Genesis",
         version="1",
         supported_interfaces=[
             AgentInterface(

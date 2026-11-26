@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+
+from genesis.util.proc_kill import reap_bounded
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +45,14 @@ async def run_subprocess(
             except ProcessLookupError:
                 pass
         return -1, "", "timeout"
+    except asyncio.CancelledError:
+        # A SIGTERM'd tick (#5007): the child must not outlive it. A bounded
+        # reap, as diagnosis.py does; the child is not a group leader here.
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            await reap_bounded(proc, timeout_s=5.0)
+        raise
     except OSError as exc:
         logger.warning("Subprocess exec failed for %s: %s", args[0] if args else "?", exc)
         return -1, "", str(exc)

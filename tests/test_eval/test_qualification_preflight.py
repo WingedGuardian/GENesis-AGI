@@ -20,14 +20,27 @@ from tests.test_eval.qualification_fixtures import novelty_case
 from tests.test_eval.qualification_preflight_fixtures import admitted, params
 
 
-async def replay(tmp_path, case=None, content='{"redundant_with":null}'):
+async def replay(
+    tmp_path, case=None, content='{"redundant_with":null}', *, served_model="model",
+):
     case = case or novelty_case("probe", None)
     async with contracts.Sandbox(tmp_path) as sandbox:
         probe = contracts.Probe()
         rendered = await contracts.novelty(case, probe, sandbox)
         mapping = contracts.candidate_mapping(case, probe.calls[0][0], rendered["candidate_ids"])
         return await storage.replay(case, probe.calls[0][0], mapping,
-                                    content, sandbox, "synthetic", "model")
+                                    content, sandbox, "synthetic", "model", served_model=served_model)
+
+
+@pytest.mark.parametrize("served_model", ["another/model", None])
+async def test_replay_keeps_numbered_verdict_without_matching_served_model(
+    tmp_path, monkeypatch, served_model,
+):
+    monkeypatch.setitem(extractor._NOVELTY_VALIDATED_MODELS, "synthetic", "model")
+    case = novelty_case("identity", "candidate-b")
+    result = await replay(tmp_path, case, '{"redundant_with":1}', served_model=served_model)
+    assert all(row["novelty_replayed"] and row["stored"] for row in result.values())
+    assert all(not row["suppression_authorized"] for row in result.values())
 
 
 @pytest.mark.parametrize("field", ["principle", "steps", "version", "confidence", "source",
@@ -193,7 +206,7 @@ async def test_saved_answer_cannot_bind_another_rendered_question(tmp_path, chan
             mapping.reverse()
         with pytest.raises(Incomplete):
             await storage.replay(case, messages, mapping, '{"redundant_with":null}', sandbox,
-                                 "synthetic", "model")
+                                 "synthetic", "model", served_model="model")
 
 
 @pytest.mark.parametrize("variant", ["ids", "candidate_tail", "new_tail", "metadata"])

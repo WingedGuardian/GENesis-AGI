@@ -49,6 +49,7 @@ def _reflection(
         f"Premise: {premise}",
         "Premise-why: the change routes around an existing helper that already exists",
         "Impossible: route every call through one checked helper and delete the rest",
+        "Alternative: none found: searched scripts/ for an existing checked helper",
         *[f"Scope: {s}" for s in scopes],
         f"Decision: {decision}",
         "Decision-why: the same mistake appears twice in two different files",
@@ -2266,6 +2267,133 @@ def test_validate_exit_codes(tmp_path):
     assert rr.main(["validate", str(bad)]) == 1
     assert rr.main(["validate", str(tmp_path / "absent.md")]) == 2
     assert rr.main(["validate", str(binary)]) == 2
+
+
+# -- the Alternative line (spec 5.8) ------------------------------------------
+
+_ALT = "Alternative: none found: searched scripts/ for an existing checked helper\n"
+_CUT = "2026-11-23T00:00:00+00:00"
+_BEFORE = datetime(2026, 11, 22, 23, 59, tzinfo=UTC)
+_AFTER = datetime(2026, 11, 23, 0, 0, tzinfo=UTC)
+
+
+def test_the_shipped_alternative_cutover():
+    assert rr.ALTERNATIVE_CUTOVER_ISO == _CUT
+
+
+@pytest.mark.parametrize(
+    "made_at, lacks_line, fixes_now, owed",
+    [
+        (_BEFORE, True, True, False),  # acceptance 8: committed before, no line, valid
+        (_AFTER, True, True, True),  # at the cutover itself it is owed
+        (_AFTER, False, True, False),
+        (_AFTER, True, False, False),  # no fix-now: nothing to name
+        ("2026-11-24T00:00:00Z", True, True, True),  # the ISO form a commit log gives
+    ],
+)
+def test_alternative_problem(made_at, lacks_line, fixes_now, owed):
+    keys = ("c1", "c2")
+    dispositions = None if fixes_now else [f"Disposition: {k} file issue=#12" for k in keys]
+    text = _reflection(keys, dispositions=dispositions)
+    if lacks_line:
+        text = text.replace(_ALT, "")
+    parsed = rr.parse(text)
+    assert parsed.ok, parsed.problems  # the grammar never requires the line
+    problem = rr.alternative_problem(parsed, made_at, cutover=_CUT)
+    assert (problem == rr.ALTERNATIVE_MISSING) is owed
+
+
+@pytest.mark.parametrize("made_at", [None, "not a time", datetime(2026, 11, 24)])
+def test_an_absent_or_unreadable_time_is_judged_as_now(made_at):
+    """None (a reflection being committed), an unreadable time and a naive one
+    all mean now: owed when the cutover is past, not before it. The cutovers
+    sit far from the wall clock either way, so the test never flips by date."""
+    parsed = rr.parse(_reflection().replace(_ALT, ""))
+    assert rr.alternative_problem(parsed, made_at, cutover="2026-01-01T00:00:00+00:00")
+    assert rr.alternative_problem(parsed, made_at, cutover="2099-01-01T00:00:00+00:00") is None
+
+
+def test_an_unreadable_cutover_owes_the_line():
+    parsed = rr.parse(_reflection().replace(_ALT, ""))
+    assert rr.alternative_problem(parsed, _BEFORE, cutover="garbage") == rr.ALTERNATIVE_MISSING
+
+
+def test_no_cutover_owes_the_line_never():
+    parsed = rr.parse(_reflection().replace(_ALT, ""))
+    assert rr.alternative_problem(parsed, _AFTER, cutover=None) is None
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Alternative: none found",  # names no search
+        "Alternative: None found anywhere at all",  # any case
+        "Alternative: NONE FOUND: searched x y z",
+        "Alternative: nothing found in scripts/",
+        "Alternative: n/a - no helper exists",
+        "Alternative: N/A, nothing like it",
+        "Alternative: none found, searched scripts/",  # the one spelling is ': searched'
+        "Alternative: none found: searched",
+        "Alternative: none found: searched x",  # under the 10-character floor
+        "Alternative: short",
+        "Alternative:  leading space here",
+    ],
+)
+def test_an_alternative_line_out_of_grammar_is_refused(line):
+    parsed = rr.parse(_reflection().replace(_ALT, line + "\n"))
+    assert any(
+        "not a recognised field" in p and "'none found: searched <what>'" in p
+        for p in parsed.problems
+    ), parsed.problems
+
+
+def test_the_none_found_form_reaches_the_300_character_cap():
+    head = "Alternative: "
+    for length, ok in ((300, True), (301, False)):
+        value = "none found: searched " + "x" * (length - 21)
+        assert len(value) == length
+        assert bool(rr.FIELDS["Alternative"][0].match(head + value)) is ok
+
+
+def test_a_named_alternative_that_merely_contains_none_parses():
+    text = _reflection().replace(_ALT, "Alternative: rr._run, which leaves none unchecked\n")
+    assert rr.parse(text).ok
+
+
+def test_every_shared_reflection_builder_carries_the_line():
+    """Each shared fixture builder in the reflection test files passes the rule
+    with the cutover in the past, so no suite turns red on the cutover date."""
+    from tests.test_hooks import test_reflection_gate as gate_t
+    from tests.test_hooks import test_review_late as late_t
+
+    past = "2026-01-01T00:00:00+00:00"
+    for text in (_reflection(), late_t._block(["c9"], HEAD), gate_t._reflection(HEAD)):
+        parsed = rr.parse(text)
+        assert parsed.ok and any(d.kind == "fix-now" for d in parsed.dispositions.values())
+        assert rr.alternative_problem(parsed, None, cutover=past) is None
+
+
+def test_two_alternative_lines_are_refused():
+    parsed = rr.parse(_reflection().replace(_ALT, _ALT + "Alternative: review_late.py's checked helper\n"))
+    assert "'Alternative:' appears 2 times (at most 1)" in parsed.problems
+
+
+def test_a_named_alternative_parses():
+    text = _reflection().replace(_ALT, "Alternative: rr._run already checks every git call's exit\n")
+    parsed = rr.parse(text)
+    assert parsed.ok and parsed.alternative == "rr._run already checks every git call's exit"
+
+
+def test_validate_judges_the_alternative_line_at_its_time(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(rr, "ALTERNATIVE_CUTOVER_ISO", _CUT)
+    lacking = tmp_path / "lacking.md"
+    lacking.write_text(_reflection().replace(_ALT, ""))
+    after = "2099-01-01T00:00:00+00:00"
+    assert rr.main(["validate", str(lacking), "--round", "1", "--at", after]) == 1
+    out = capsys.readouterr().out
+    assert out.splitlines()[0] == f"- {rr.ALTERNATIVE_MISSING}"  # first: the gate keeps five
+    assert rr.main(["validate", str(lacking), "--round", "1", "--at", "2026-01-01T00:00:00Z"]) == 0
+    assert rr.main(["validate", str(lacking), "--at", "not a time"]) == 2
 
 
 def test_an_unexpected_error_in_status_is_cannot_check_not_invalid(monkeypatch):

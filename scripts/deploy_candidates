@@ -4,8 +4,11 @@
 #
 # Usage: scripts/deploy_candidates add <branch> --owner <who> [--pr N] [--wait N]
 #        scripts/deploy_candidates drop <branch> [--no-rebuild] [--wait N]
+#        scripts/deploy_candidates drop <branch> --expect-branch live --expect-head T \
+#            --expect-candidate H [--expect-leaving JSON] [--restart-server] --wait 0
+#            (the Guardian's drop, #4911)
 #        scripts/deploy_candidates rebuild [--wait N]
-#        scripts/deploy_candidates list | status
+#        scripts/deploy_candidates list [--json [--move-refusals]] | status
 #        scripts/deploy_candidates repair-move [--wait N] [--dismiss TS | --restore TS [--check]] [--explain]
 #
 # This shell is thin on purpose. For every command that writes the manifest or
@@ -27,8 +30,20 @@
 # either. That is the repair path for a candidate whose hook blocks
 # every session.
 #
-# Exit codes: the engine's (0 done, 1 refused or failed, 2 usage), plus 200 when
-# update.lock is still held after the wait; 130 and 143 when interrupted.
+# Exit codes: the engine's (0 done, 1 refused or failed, 2 usage, 4 the
+# Guardian's drop done but its restart not queued, 5 done but the restart
+# enqueue got no answer, so it may have been queued), plus 200 when update.lock is
+# still held after the wait; 1 when a live deploy holds the deploy marker (the
+# message carries the phrase "holds the deploy marker": a wait, nothing changed;
+# "cannot write the deploy marker" is a fault, never a wait); 97 when the test
+# fence refuses; 130 and 143 when interrupted. bash runs those traps only once
+# python returns, so a SIGTERM during the Guardian's restart enqueue can exit
+# 143 after the engine finished with 0, 4 or 5: the engine view (list --json
+# --move-refusals) says whether the drop happened, and nothing records whether
+# the restart was queued: scripts/deploy_code_only.sh status says whether the
+# server runs the tree `live` now holds. The engine queues the Guardian's restart
+# from python, never here: the lock fd below is inheritable, and a child of this
+# shell would hold it.
 
 set -euo pipefail
 

@@ -25,6 +25,7 @@ from genesis.outreach.fresh_eyes import FreshEyesReview
 from genesis.outreach.governance import GovernanceGate
 from genesis.outreach.reply_waiter import DEFAULT_REPLY_TIMEOUT_S, ReplyWaiter
 from genesis.outreach.types import (
+    OWNER_RELAY_ALERT_SUBJECT,
     GovernanceVerdict,
     OutreachCategory,
     OutreachRequest,
@@ -68,6 +69,22 @@ def _suppressed_awaited_result() -> OutreachResult:
 
 class OutreachPipeline:
     """Main outreach orchestrator."""
+
+    def _owner_relay_alert(self, request: OutreachRequest, recipient: str) -> bool:
+        """An owner-relay alert addressed to the configured owner, and nothing else.
+
+        The one email that skips the autonomy gate: it tells the owner what a
+        relayed session did, so holding it for the owner's approval defeats it.
+        Only the configured owner address passes; no session can send the
+        reserved subject (outreach_send refuses it). Every other email stays gated.
+        """
+        owner = self._recipients.get("email", "")
+        return bool(
+            owner
+            and recipient == owner
+            and request.category == OutreachCategory.ALERT
+            and request.email_subject == OWNER_RELAY_ALERT_SUBJECT
+        )
 
     def channel_configured(self, channel: str) -> bool:
         """Whether an owner notice has a local adapter and default recipient."""
@@ -643,7 +660,12 @@ class OutreachPipeline:
         # ledger.  Stays None for non-email, the gate_cleared resume path, no
         # gate, or a held send.
         gate_cell: tuple[str, str, str] | None = None
-        if channel == "email" and not gate_cleared and self._autonomy_gate is not None:
+        if (
+            channel == "email"
+            and not gate_cleared
+            and self._autonomy_gate is not None
+            and not self._owner_relay_alert(request, recipient)
+        ):
             decision = await self._autonomy_gate.check(
                 request=request, recipient=recipient, message_text=formatted.text,
             )

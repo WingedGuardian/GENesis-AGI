@@ -730,7 +730,9 @@ _NOT_WIRED = {
     "inbox_review_rulings.py": "a read-only CLI run by hand, not a hook: wired nowhere in .claude/settings.json",
     # Exit 2 is its refusal code (closing-session's delivery read runs it); it posts
     # nothing itself and no hook calls it.
-    "delivery_marker.py": "a CLI a session runs by hand, not a hook: wired nowhere in .claude/settings.json",
+    "delivery_marker.py": "a CLI a session runs by hand, not a hook: wired nowhere in .claude/settings.json;"
+    " git_push_guard imports it inside the --check-pr delivery row's try, where a failed import is a"
+    " 'could not check' row",
 }
 
 

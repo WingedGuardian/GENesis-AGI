@@ -148,6 +148,10 @@ else, that asks a different question.
 
 ## The method
 
+A premise check of a PR built from a spec (its body carries a `Spec:` line)
+reads the spec and its `## Amendments`, not only the PR: the spec is the
+statement of what was asked.
+
 **1. Extract the premises.** State the claims the change DEPENDS ON, as the author
 would state them — from the PR body, the plan file, the commit messages. Usually
 two to four. A premise is load-bearing: if it were false, would the change still be
@@ -193,7 +197,12 @@ nobody enumerated).
 given the premises that hold, is this the BEST available shape? **Start from the
 author's item 7.** Confirm or refute each alternative it names, with evidence, as
 for any premise. Search from scratch only when it says "none found" (or the form is
-absent), and then say what you searched. Either way, look specifically
+absent), and then say what you searched. In a review round that follows a round
+with a `fix-now`, the previous round's reflection carries an `Alternative:` line
+(owed from `review_reflection.ALTERNATIVE_CUTOVER_ISO`; an older one may lack it)
+(what already does or decides the thing its fix builds, or `none found: searched
+<what>`): judge that fix against it the same way, confirming or refuting it, and
+treat a "none found" as a search to repeat, not a finding. Either way, look specifically
 for:
 - an existing **chokepoint** the change re-implements or bypasses (the common one —
   a skipped helper is a call-site defect, not a missing feature, and the fix is to
