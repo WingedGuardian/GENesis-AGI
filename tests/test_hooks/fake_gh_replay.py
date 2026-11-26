@@ -200,6 +200,12 @@ def _normalize(document: str) -> str:
 #: ``delivery_changes`` is ``delivery_marker._CHANGES_Q`` (the delivery row);
 #: ``blob_oids`` is ``git_push_guard._BLOB_OIDS_QUERY`` (the floor fix check).
 GRAPHQL_DOCUMENTS = {
+    "edit_history": (
+        "query($ids:[ID!]!){nodes(ids:$ids){... on PullRequestReviewComment{"
+        "fullDatabaseId author{__typename login} "
+        "userContentEdits(first:100){totalCount nodes{editor{__typename login} "
+        "deletedBy{__typename login}}}}}}"
+    ),
     "blob_oids": (
         "query($owner:String!,$name:String!,$a:String!,$b:String!){"
         "repository(owner:$owner,name:$name){"
@@ -289,6 +295,7 @@ _BY_DOCUMENT = {_normalize(doc): name for name, doc in GRAPHQL_DOCUMENTS.items()
 #: checks cannot change the answer unseen, and a number sent as a string is not
 #: answered as if GitHub had accepted it.
 _GRAPHQL_VARIABLES = {
+    "edit_history": {"ids[]": "-f"},
     "base_ref": {"owner": "-f", "name": "-f", "ref": "-f"},
     "blob_oids": {"owner": "-f", "name": "-f", "a": "-f", "b": "-f"},
     "codex_signal": {"owner": "-F", "name": "-F", "number": "-F"},
@@ -341,9 +348,14 @@ def _graphql(opts: dict[str, list[str]], state: dict) -> tuple[int, str, str]:
         raise _Unrouted("api graphql --paginate: every recorded page is the last")
     fields: dict[str, str] = {}
     sent_by: dict[str, str] = {}
+    id_list: list[str] = []  # a GraphQL list variable: gh repeats `ids[]=`
     for flag in ("-f", "-F"):
         for item in opts.get(flag, []):
             key, sep, value = item.partition("=")
+            if key == "ids[]" and sep and flag == "-f":
+                id_list.append(value)
+                sent_by[key] = flag
+                continue
             if not sep or key in fields:
                 raise _Unrouted(f"graphql field {item!r}")
             fields[key] = value
@@ -358,6 +370,31 @@ def _graphql(opts: dict[str, list[str]], state: dict) -> tuple[int, str, str]:
         raise _Unrouted("graphql asked for a second page; every recorded page is the last")
     if sent_by != _GRAPHQL_VARIABLES[route]:
         raise _Unrouted(f"graphql {route} variables by flag {sorted(sent_by.items())}")
+    if route == "edit_history":
+        # One node per id, each an inline comment of the recorded PR, answered from
+        # the recorded history (no edits when none is recorded); an id no recorded
+        # comment carries is refused.
+        by_node = {
+            c.get("node_id"): c for c in state["api"].get(f"pulls/{state['pr']}/comments", [])
+        }
+        nodes = []
+        for nid in id_list:
+            if nid not in by_node:
+                raise _Unrouted(f"edit_history id {nid!r} is no recorded comment")
+            c = by_node[nid]
+            login = (c.get("user") or {}).get("login", "")
+            kind = (c.get("user") or {}).get("type", "User")
+            nodes.append(
+                state.get("edit_history", {}).get(
+                    nid,
+                    {
+                        "fullDatabaseId": str(c["id"]),
+                        "author": {"__typename": kind, "login": login.removesuffix("[bot]")},
+                        "userContentEdits": {"totalCount": 0, "nodes": []},
+                    },
+                )
+            )
+        return _answer({"data": {"nodes": nodes}}, _one(opts, "--jq"))
     owner, name = state["repo"].split("/")
     owner_var, name_var = _REPO_VARIABLES.get(route, ("owner", "name"))
     if fields.get(owner_var) != owner or fields.get(name_var) != name:

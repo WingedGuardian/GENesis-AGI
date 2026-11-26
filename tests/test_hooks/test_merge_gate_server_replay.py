@@ -106,6 +106,7 @@ GH_CALLERS = {
     "_commit_at_prefix": "api commits/<sha>",
     "_commit_info": "api commits/<sha> (the no-change note)",
     "_commit_touched_files": "api commits/<sha> --paginate",
+    "_edit_histories": "api graphql, stored document edit_history (reviewer comment edits)",
     "_classify_post_review_delta": "api compare/<a>...<b>",
     "_pr_contribution": "api compare/<a>...<b>",
     "_sha_is_ancestor": "api compare/<a>...<b>",
@@ -364,6 +365,7 @@ def _codex_inline(
     """An inline Codex finding on a file the PR changes, in the badge form Codex posts."""
     return {
         "id": comment_id,
+        "node_id": f"PRRC_{comment_id}",
         "in_reply_to_id": None,
         "pull_request_review_id": review_id,
         "user": _user(CODEX, "Bot"),
@@ -600,6 +602,35 @@ def test_a_maintainer_answered_p1_passes(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert rows["inline-findings"].startswith("ok"), rows["inline-findings"]
     assert rows["verdict"] == "MERGEABLE (all gates pass)"
+
+
+@pytest.mark.parametrize("edited", [True, False])
+def test_a_finding_edited_by_the_owner_blocks(tmp_path, edited):
+    """#5001: a Codex P1 the owner edited down to a P2 is read through the real edit
+    history query and blocks as an edited finding; the same P2 left as posted does
+    not block on its own."""
+    state = _green_state()
+    state["api"][f"pulls/{PR}/comments"] = [_codex_inline("P2")]
+    if edited:
+        state["edit_history"] = {
+            "PRRC_9101": {
+                "fullDatabaseId": "9101",
+                "author": {"__typename": "Bot", "login": CODEX.removesuffix("[bot]")},
+                "userContentEdits": {
+                    "totalCount": 1,
+                    "nodes": [
+                        {"editor": {"__typename": "User", "login": OWNER_LOGIN}, "deletedBy": None}
+                    ],
+                },
+            }
+        }
+    proc, rows, calls = _report(tmp_path, state)
+    assert any("ids[]=PRRC_9101" in c["argv"] for c in calls), "the edit history was not read"
+    if edited:
+        assert rows["inline-findings"].startswith("BLOCK"), rows["inline-findings"]
+        assert f"[edited by {OWNER_LOGIN}]" in proc.stdout, proc.stdout
+    else:
+        assert rows["inline-findings"].startswith("ok"), rows["inline-findings"]
 
 
 @pytest.mark.parametrize(("at_head", "clears"), [("d" * 40, True), ("c" * 40, False)])
@@ -1142,6 +1173,7 @@ def _live_graphql_documents() -> dict[str, str]:
     live = {
         "base_ref": base_ref[0],
         "codex_signal": guard["_CODEX_SIGNAL_QUERY"],
+        "edit_history": guard["_EDIT_HISTORY_QUERY"],
         "blob_oids": guard["_BLOB_OIDS_QUERY"],
         "outside_pr": guard["_OUTSIDE_PR_QUERY"],
         "delivery_changes": _module_strings(_DELIVERY_MARKER)[0]["_CHANGES_Q"],
