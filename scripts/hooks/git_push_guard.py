@@ -374,6 +374,7 @@ try:
         commit_skips_hooks,
         gh_api_request,
         gh_command,
+        gh_option_values,
         gh_pr_subcommand,
         gh_requests_help,
         git_subcommand,
@@ -6542,6 +6543,228 @@ def _check_past_terminal(
     )
 
 
+# ── Past-terminal route friction (owner ruling 3f6ad6fb, 2026-11-25) ──────────
+# The guarantee is the merge check above; these denies only make the common
+# routes that move a past-terminal head, or open a round on it, fail early.
+# VERDICT: deny, on a POSITIVE match only (an owner-approved escalation after a
+# measured incident). AUDIENCE: the agent. BACKGROUND: a dispatched session is
+# denied the same way (its pushes were already denied outright). Every lookup
+# that fails returns "no match", so unknown evidence keeps today's behaviour
+# (plan note R-S4); only the merge check blocks on it.
+_CODEX_MENTION_RE = re.compile(r"(?<![\w@])@codex\b", re.IGNORECASE)
+_API_PR_THREAD_RE = re.compile(r"/?repos/([^/\s]+/[^/\s]+)/(?:issues|pulls)/(\d+)/(?:comments|reviews)/?\Z")
+_API_COMMENT_RE = re.compile(r"/?repos/[^/\s]+/[^/\s]+/(?:issues|pulls)/comments/(\d+)/?\Z")
+
+
+def _past_terminal(budget) -> bool:
+    """A READABLE budget (``status: ok``) that is past terminal."""
+    return (
+        isinstance(budget, dict)
+        and budget.get("status") == "ok"
+        and budget.get("terminal_state") == "past"
+    )
+
+
+def _past_terminal_route_text(what: str, pr_num: str, budget: dict, raw: str) -> str:
+    terminal = str(budget.get("terminal_head") or "")[:12]
+    return (
+        f"BLOCKED: {what} on PR #{pr_num}, which is past its terminal review round "
+        f"(terminal head {terminal}). Past terminal there are two choices: merge at the "
+        "terminal head with the remaining issues filed, or send the PR back. Anything "
+        f"else is the owner's call: the owner can run `! {raw.strip()}` (a bang command "
+        "runs no hook)."
+    )
+
+
+def _push_dest_branches(argv: list[str], cur: str | None) -> list[str]:
+    """The branches a ``git push`` writes or deletes on the remote, from argv: the
+    DESTINATION of each refspec (``HEAD``/``@`` read as the current branch), or the
+    current branch for a push with no refspec (R-S1). A ``+`` force refspec is not a
+    positional; a force push to the public repo is blocked before this is asked."""
+    specs = _push_positionals(argv)[1:]
+    if not specs:
+        return [cur] if cur and "--tags" not in argv else []
+    out = []
+    for spec in specs:
+        src, sep, dst = spec.partition(":")
+        name = dst if sep else src
+        name = (cur or "") if name in ("HEAD", "@") else name.removeprefix("refs/heads/")
+        if name and not name.startswith("refs/") and name not in ("main", "master"):
+            out.append(name)
+    return out
+
+
+def _open_prs_for_branch(branch: str, cwd: str | None) -> list[tuple[str, str]]:
+    """``[(number, OWNER/REPO)]`` of the open same-repository PRs headed by
+    ``branch``, in the repo gh resolves at ``cwd``; empty on any failure. Seam
+    ``_TEST_GH_BRANCH_PRS``: a JSON object mapping a branch to ``gh pr list --json
+    number,url,isCrossRepository`` rows."""
+    raw = os.environ.get("_TEST_GH_BRANCH_PRS")
+    try:
+        if raw is not None:
+            rows = json.loads(raw).get(branch, [])
+        else:
+            got = subprocess.run(
+                ["gh", "pr", "list", "--head", branch, "--state", "open", "--json",
+                 "number,url,isCrossRepository", "--limit", str(_PR_LIST_WINDOW)],
+                capture_output=True, text=True, timeout=_gh_timeout(10.0), cwd=cwd or None,
+            )
+            rows = json.loads(got.stdout) if got.returncode == 0 else []
+    except Exception:  # noqa: BLE001 - friction: an unanswerable lookup matches nothing
+        return []
+    out = []
+    for row in rows if isinstance(rows, list) else []:
+        url = _PR_URL_RE.match(str(row.get("url") or "")) if isinstance(row, dict) else None
+        if url and row.get("isCrossRepository") is False:
+            out.append((url.group(2), url.group(1)))
+    return out
+
+
+def _past_terminal_push_deny(seg, cur: str | None, remote: str | None, cwd: str | None) -> str | None:
+    """The refusal for a ``git push`` whose destination is the head branch of a
+    past-terminal PR, or None. One PR lookup per destination branch, and one budget
+    read only when that branch heads an open PR. A destination proven off origin,
+    a branch with no open PR, a failed lookup, an unreadable budget and a dry run
+    (it moves nothing) are None."""
+    if _push_is_dry_run(seg) or not _push_dest_meets_origin(remote, cwd, False):
+        return None
+    for branch in _push_dest_branches(seg.argv, cur):
+        for pr_num, repo in _open_prs_for_branch(branch, cwd):
+            budget = _terminal_budget(pr_num, repo)
+            if _past_terminal(budget):
+                what = f"this push moves the head of '{branch}'"
+                return _past_terminal_route_text(what, pr_num, budget, seg.raw)
+    return None
+
+
+def _pr_is_open(kind: str, ident: str, repo: str | None, cwd: str | None) -> bool:
+    """Whether ``ident`` is an OPEN pull request (``kind`` "pr"; "" is the current
+    branch's), or a comment on one (``kind`` "comment"; ``ident`` is the endpoint
+    as typed). False on any failed read: best effort, by owner ruling. Seam
+    ``_TEST_GH_PR_STATE``: a JSON object mapping ``"pr:<n>"`` or
+    ``"comment:<id>"`` to ``OPEN``/``CLOSED``/``ISSUE``."""
+    raw = os.environ.get("_TEST_GH_PR_STATE")
+    if raw is not None:
+        key = ident if kind == "pr" else (_API_COMMENT_RE.match(ident) or [None, ""])[1]
+        try:
+            return str(json.loads(raw).get(f"{kind}:{key}") or "").upper() == "OPEN"
+        except Exception:  # noqa: BLE001
+            return False
+
+    def gh(*args: str) -> str:
+        got = subprocess.run(
+            ["gh", *args], capture_output=True, text=True, timeout=_gh_timeout(8), cwd=cwd or None
+        )
+        return got.stdout.strip() if got.returncode == 0 else ""
+
+    try:
+        if kind == "pr":
+            target = [ident] if ident else []
+            return gh("pr", "view", *target, *_repo_args(repo), "--json", "state", "--jq", ".state") == "OPEN"
+        parent = gh("api", ident.lstrip("/"), "--jq", ".issue_url // .pull_request_url")
+        parent = parent.removeprefix("https://api.github.com/")
+        if not parent.startswith("repos/"):
+            return False
+        jq = 'if (.pull_request != null or .head != null) then .state else "issue" end'
+        return gh("api", parent, "--jq", jq) == "open"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _route_target(seg, verb: str) -> tuple[str | None, str | None]:
+    """``(pr_number, explicit_repo)`` of a ``gh pr review|update-branch`` segment:
+    its first bare word after ``verb`` (a number, ``#N`` or a PR URL), skipping the
+    values of its value flags."""
+    argv = seg.argv
+    words, skip = [], False
+    for tok in argv[argv.index(verb) + 1:] if verb in argv else []:
+        if skip or tok in ("-b", "--body", "-F", "--body-file", "-R", "--repo"):
+            skip = not skip
+            continue
+        if not tok.startswith("-"):
+            words.append(tok)
+    repo = _comment_repo(argv)
+    if not words:
+        return None, repo
+    num, url = _PR_NUMBER_RE.match(words[0]), _PR_URL_RE.match(words[0])
+    return (num.group(1) if num else url.group(2) if url else None), repo or (url and url.group(1))
+
+
+def _past_terminal_route_deny(segs, cmd: str, payload: dict) -> str | None:
+    """The refusal for a route that opens a round on, moves, or rewrites the record
+    of a pull request, or None:
+
+    - ``gh pr update-branch N`` on a past-terminal PR (it moves the head);
+    - an ``@codex`` mention (``gh pr|issue comment N``, ``gh api …/issues/N/comments``,
+      ``gh pr review N``) on a past-terminal PR whose head is off the terminal head.
+      At the terminal head it opens no round and is unchanged (F-B3). An issue
+      number reads as an unknown budget, so it is never matched (R-S3). A
+      ``gh pr comment`` that ``_check_codex_round_escalation`` treats as a review
+      request is left to it, so it costs one budget read, not two;
+    - F-S2: an agent's delete or edit of a comment on ANY open PR
+      (``--delete-last``/``--edit-last``, ``gh api -X DELETE|PATCH
+      …/{issues,pulls}/comments/<id>``): deleting a reviewer's comment lowers the
+      round count, and a pin lives in a comment. A bare comment id costs two API
+      reads to find its PR; a failed read allows (best effort, owner ruling)."""
+    for seg in segs:
+        inv = gh_command(seg.argv) if seg.exe == "gh" else None
+        if inv is None or gh_requests_help(seg.argv):
+            continue
+        cwd = _effective_cwd(cmd, payload, seg=seg)
+        cwd = cwd if isinstance(cwd, str) else None
+        verb = (inv.group, inv.subcommand)
+        api = gh_api_request(seg.argv) if inv.group == "api" else None
+        num, repo, body = None, None, None
+        if verb in (("pr", "comment"), ("issue", "comment")):
+            num, repo = _comment_target(seg.argv)
+            flags = {name for name, _ in gh_option_values(seg.argv, frozenset({"--delete-last", "--edit-last"}))}
+            if flags and _pr_is_open("pr", num or "", repo, cwd):
+                return _comment_rewrite_text(seg.raw)
+            if verb == ("pr", "comment") and _comment_review_request(seg.argv)[2] is not False:
+                continue  # a review request: _check_codex_round_escalation judges it
+            body = _comment_body(seg.argv)[0]
+        elif api is not None and api.endpoint:
+            if api.method in ("DELETE", "PATCH") and _API_COMMENT_RE.match(api.endpoint):
+                if _pr_is_open("comment", api.endpoint, None, cwd):
+                    return _comment_rewrite_text(seg.raw)
+                continue
+            thread = _API_PR_THREAD_RE.match(api.endpoint)
+            if thread and api.method == "POST":
+                num, repo = thread.group(2), thread.group(1)
+                body = " ".join(v for k, v in api.fields if k == "body")
+        elif verb in (("pr", "review"), ("pr", "update-branch")):
+            num, repo = _route_target(seg, inv.subcommand)
+            if verb == ("pr", "review"):
+                body = _comment_body(["comment", *seg.argv[seg.argv.index("review") + 1:]])[0]
+        update = verb == ("pr", "update-branch")
+        if not update and not (body and _CODEX_MENTION_RE.search(body)):
+            continue
+        if num is None and update:
+            num = _resolve_pr_number("", cwd=cwd) if not repo else None
+        if not num:
+            continue
+        if not repo or "{" in repo or repo.startswith(":"):
+            repo = _derive_repo_from_cwd(cwd or os.getcwd())
+        budget = _terminal_budget(num, repo)
+        if not _past_terminal(budget):
+            continue
+        if update:
+            return _past_terminal_route_text("this update-branch moves the head", num, budget, seg.raw)
+        if _check_past_terminal(num, repo, str(budget.get("current_head") or ""), budget=budget)[0]:
+            return _past_terminal_route_text("this @codex mention opens a round", num, budget, seg.raw)
+    return None
+
+
+def _comment_rewrite_text(raw: str) -> str:
+    return (
+        "BLOCKED: this command deletes or edits a comment on an open pull request. "
+        "Deleting a reviewer's comment lowers the review round count, and a pinned "
+        "head lives in a comment, so an agent does neither on an open PR. Post a new "
+        f"comment instead; the owner can run `! {raw.strip()}` (a bang command runs "
+        "no hook)."
+    )
+
+
 def _no_change_note(
     pr_num: str, repo: str | None, budget: dict, *, clock: Callable[[], float] = time.monotonic
 ) -> str | None:
@@ -6860,6 +7083,18 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
                 )
             except Exception as exc:  # noqa: BLE001 - unknown asks/denies; never crashes open.
                 result = {"status": "unknown", "errors": [f"evaluator_raised:{type(exc).__name__}"]}
+
+        # Past terminal with the head moved off the terminal head, the ask past the
+        # limit becomes a deny (owner ruling 3f6ad6fb), for a positive request only;
+        # at the terminal head it stays the ask below (F-B3).
+        current = str(result.get("current_head") or "")
+        if (
+            body_signal is True
+            and _past_terminal(result)
+            and _check_past_terminal(pr_num, repo, current, budget=result)[0]
+        ):
+            what = "this review request opens a round"
+            return "deny", _past_terminal_route_text(what, pr_num, result, seg.raw)
 
         if result.get("status") == "ok" and result.get("confirmation_exempt"):
             marker = _review_budget.confirmation_marker(
@@ -11419,7 +11654,9 @@ def _stale_base_counts(path: str) -> bool:
     return not _is_doc_path(path)
 
 
-def _stale_base_note(pr_num: str, repo: str | None = None, head: str | None = None) -> str | None:
+def _stale_base_note(
+    pr_num: str, repo: str | None = None, head: str | None = None, past_terminal: bool = False
+) -> str | None:
     """A NOTE when the PR's newest CI run predates base commits touching its code.
 
     WHY: a ``pull_request`` run tests the PR merged onto its base AS IT STOOD when
@@ -11543,14 +11780,23 @@ def _stale_base_note(pr_num: str, repo: str | None = None, head: str | None = No
     if unread and overlaps:
         lines.append(f"{len(unread)} of {len(paths)} code path(s) were not checked.")
     update = " ".join(["gh pr update-branch", pr_num, *_repo_args(repo)])
-    lines += [
+    lines.append(
         "Weigh it before merging: do those changes interact with this PR's? Most "
-        "overlaps merge cleanly.",
-        f"If they may, update the branch ({update}, or a merge or rebase) so CI runs "
-        f"on the current base.",
-        "That moves the head, so the review gate then needs a review of the new head.",
-        "Re-running the old run does not help: a re-run tests the same merge commit.",
-    ]
+        "overlaps merge cleanly."
+    )
+    if past_terminal:
+        # F-S5: past terminal an agent's update is denied (it moves the head).
+        lines.append(
+            "This PR is past its terminal review round, so do not update the branch: "
+            f"if they may, send it back, or the owner runs `! {update}`."
+        )
+    else:
+        lines += [
+            f"If they may, update the branch ({update}, or a merge or rebase) so CI "
+            f"runs on the current base.",
+            "That moves the head, so the review gate then needs a review of the new head.",
+        ]
+    lines.append("Re-running the old run does not help: a re-run tests the same merge commit.")
     return "\n".join(lines)
 
 
@@ -16762,6 +17008,14 @@ def _run_merge_and_push_gates() -> int:
         if _merge_deadline is None:
             _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
 
+        # ── Past-terminal route friction, and comment rewrites on open PRs ──
+        # Before the round gate, so its deny wins over that gate's ask. See
+        # `_past_terminal_route_deny`; dispatched sessions are denied the same way.
+        route_deny = _past_terminal_route_deny(segs, cmd, payload)
+        if route_deny is not None:
+            print(route_deny, file=sys.stderr)
+            return 2
+
         # ── Codex round-authorization gate (`gh pr comment … @codex review`) ──
         # Review rounds (heads that drew findings; before the round-rule cutover,
         # heads Codex reviewed) decide when standing authorization ends. A dispatched session cannot
@@ -16991,6 +17245,15 @@ def _run_merge_and_push_gates() -> int:
                 # this only relaxes RE-approval of an already-approved branch).
                 cur = _current_branch(cwd=pcwd)
                 push_remote = _effective_push_remote(push_segs[0], cur, cwd=pcwd)
+                # Past terminal, a push onto the PR's head branch is denied, in any
+                # spelling (`_past_terminal_push_deny`). Dispatched sessions were
+                # denied above, so they are denied the same way.
+                terminal_deny = None if pcwd_unknown else _past_terminal_push_deny(
+                    push_segs[0], cur, push_remote, pcwd
+                )
+                if terminal_deny is not None:
+                    print(terminal_deny, file=sys.stderr)
+                    return 2
                 if (
                     not pcwd_unknown
                     and cur
@@ -18823,7 +19086,9 @@ def check_pr_report(
     # owner ruling 2026-10-28) — ADVISORY: a stderr NOTE only, never a row in the
     # verdict, and never run by the merge arm.
     try:
-        stale_note = _stale_base_note(pr_num, repo=repo, head=verified_head)
+        stale_note = _stale_base_note(
+            pr_num, repo=repo, head=verified_head, past_terminal=_past_terminal(_term_budget)
+        )
     except Exception:  # noqa: BLE001 - an advisory NOTE never takes the report down.
         stale_note = None
     if stale_note:

@@ -793,7 +793,10 @@ agent's merge is bound to the round-4 head, the 4th round by `opened_at`
 moved off it (a fix, a merge of main, a force-push) blocks at merge unless every
 commit after it is empty, and merging that head is the owner's bang-command merge
 (`! gh pr merge …`) or a send-back. A round-4 head that cannot be placed blocks
-too. A
+too. Past round 4 the push guard also denies an agent's push onto the PR's
+branch (any spelling), `gh pr update-branch`, and an `@codex` mention once the
+head is off the round-4 head; on any open PR it denies deleting or editing a
+comment. Each deny names the owner's bang command. A
 fifth round exists only by explicit user approval, re-asked every round, and
 each of those is terminal in the same way (this replaced "round 6 and later are
 strongly discouraged", which read round 5 as ordinary; the discouragement was never a

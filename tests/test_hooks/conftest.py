@@ -255,6 +255,17 @@ def _hermetic_terminal_budget(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_route_lookups(monkeypatch):
+    """Pin the past-terminal route lookups (a push destination's open PRs, and
+    whether a PR or a comment's PR is open) to "none", for the reason above: the
+    push path and every comment delete or edit would otherwise call gh live.
+    tests/test_hooks/test_past_terminal_routes.py sets them per case."""
+    monkeypatch.setenv("_TEST_GH_BRANCH_PRS", "{}")
+    monkeypatch.setenv("_TEST_GH_PR_STATE", "{}")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_delivery_row(monkeypatch):
     """Pin the ``--check-pr`` ``delivery`` row for EVERY hook test, for the reason
     above: the row reads the PR's comments and a GraphQL timeline, and report tests
