@@ -916,3 +916,24 @@ def test_tagged_command_keeps_slash_prefixed_arguments():
     kept = _prompt_for_matching(tagged)
     assert "/api build" in kept
     assert "claude" not in kept
+
+
+def test_spec_session_is_not_nudged_by_a_prompt_that_only_mentions_a_spec():
+    """A spec session is the default for an unstated foreground type, decided by
+    the router, so a prompt that merely mentions a spec must not fire the nudge;
+    a PRD prompt still does. Real scorer, this repo's own skill catalog."""
+    import generate_skill_catalog as gen
+    import skill_injection_hook as hook
+
+    repo = Path(__file__).resolve().parents[2]
+    found = [
+        s for s in gen._scan_tier(repo / ".claude" / "skills", 1, repo) if s["name"] == "spec-session"
+    ]
+    assert len(found) == 1, "spec-session is missing from the scanned catalog"
+    skill = found[0]
+
+    def score(prompt: str) -> float:
+        return hook._score_skill(skill, hook._extract_keywords(prompt), hook._prompt_for_matching(prompt))
+
+    assert score("see this spec and let's discuss") < hook._MIN_SCORE
+    assert score("draft a PRD for the backup change") >= hook._MIN_SCORE
