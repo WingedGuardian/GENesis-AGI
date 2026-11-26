@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -258,14 +259,36 @@ class TestAddSteeringRule:
         assert loader.add_steering_rule("Never push to main")
 
     def test_a_staging_file_left_by_a_killed_write_is_swept(self, loader: IdentityLoader) -> None:
-        stale = loader._dir / ".abcd1234.STEERING.local.md"
+        stale = loader._dir / ".STEERING.local.md.abcd1234.tmp"
         stale.write_text("half a write\n", encoding="utf-8")
-        mine = loader._dir / ".backup-1.STEERING.local.md"  # not a mkstemp name: kept
+        mine = loader._dir / ".STEERING.local.md.backup-1.tmp"  # not a mkstemp name: kept
         mine.write_text("kept\n", encoding="utf-8")
         loader.add_steering_rule("Fresh rule")
         assert loader.add_steering_rule("Fresh rule") is False  # a duplicate still sweeps
         assert not stale.exists()
         assert mine.exists()
+
+    def test_staging_name_is_never_listed_by_the_identity_backup(
+        self, loader: IdentityLoader, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Backup section 6e lists *.md in the identity dir and reports a gap for a
+        dot-named *.local.md, so a staging file left by a killed write must not be one."""
+        import tempfile
+
+        names: list[str] = []
+        real = tempfile.mkstemp
+
+        def spy(*args, **kwargs):
+            fd, name = real(*args, **kwargs)
+            names.append(Path(name).name)
+            return fd, name
+
+        monkeypatch.setattr(tempfile, "mkstemp", spy)
+        assert loader.add_steering_rule("Staged rule")
+        assert names
+        for name in names:
+            assert not name.endswith(".md"), name
+            assert re.fullmatch(r"\.STEERING\.local\.md\.[a-z0-9_]{8}\.tmp", name), name
 
     def test_cache_cleared_after_add(self, loader: IdentityLoader) -> None:
         # Read steering to populate cache

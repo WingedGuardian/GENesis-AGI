@@ -473,9 +473,10 @@ class IdentityLoader:
             text = _read_regular_file(path)
             # A staging file only outlives a write killed mid-swap; the lock means
             # no other writer is using one, so any left here is garbage. Only
-            # mkstemp's own names (8 of [a-z0-9_]) are removed.
-            for stale in self._dir.glob("." + "?" * 8 + "." + path.name):
-                if re.fullmatch(r"\.[a-z0-9_]{8}\." + re.escape(path.name), stale.name):
+            # mkstemp's own names (8 of [a-z0-9_]) are removed. The .tmp suffix
+            # keeps a leftover out of the identity backup, which lists *.md.
+            for stale in self._dir.glob("." + path.name + "." + "?" * 8 + ".tmp"):
+                if re.fullmatch(r"\." + re.escape(path.name) + r"\.[a-z0-9_]{8}\.tmp", stale.name):
                     stale.unlink(missing_ok=True)
             if _rule_key(safe_rule) in _in_force_keys(read_identity("STEERING.md", self._dir) or ""):
                 logger.debug("Steering rule already in force (key %s)", _rule_tag(safe_rule))
@@ -484,7 +485,7 @@ class IdentityLoader:
             # and _parse_rules read a file's first block as a preamble, never a
             # rule, and a rule can then never become the replace marker line.
             new = text.rstrip() + ("\n\n" if text.strip() else "") + "---\n\n" + safe_rule + "\n"
-            tmp_fd, tmp = tempfile.mkstemp(dir=self._dir, prefix=".", suffix="." + path.name)
+            tmp_fd, tmp = tempfile.mkstemp(dir=self._dir, prefix="." + path.name + ".", suffix=".tmp")
             try:
                 with os.fdopen(tmp_fd, "w", encoding="utf-8") as out:
                     out.write(new)
