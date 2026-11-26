@@ -129,7 +129,7 @@ def test_the_block_is_emitted_by_exactly_ONE_part(tmp_path):
     """
     emitting = [
         part
-        for part in ("charter", "identity-core", "identity-user", "knowledge")
+        for part in ("charter", "soul", "steering", "identity-core", "identity-user", "knowledge")
         if "## This Session" in _run(tmp_path, _SID, dispatched=True, part=part)
     ]
     assert emitting == ["charter"], f"expected exactly the charter part, got {emitting}"

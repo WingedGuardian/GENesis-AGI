@@ -272,7 +272,14 @@ names, so an overlay of a read-only file is editable (#2446).
   files: `USER.md` (user-edited, seeded from `USER.md.example`) and runtime-generated
   `USER_KNOWLEDGE.md` and `TRIAGE_CALIBRATION.md`. `IdentityLoader` caches
   per instance (the runtime's perception loader is built at init, so hand edits need a
-  restart); `src/genesis/cc/system_prompt.py` re-reads per call. The dashboard file editor
+  restart); `src/genesis/cc/system_prompt.py` re-reads per call. Every reader resolves
+  `SOUL.md`/`VOICE.md`/`CONVERSATION.md`/`STEERING.md` through
+  `src/genesis/identity/paths.py`: SOUL and VOICE read `<name>`, else `<name>.example`;
+  CONVERSATION and STEERING read the tracked file with a per-install `<stem>.local.md`
+  appended after a `---` (a local file whose first line is `<!-- genesis: replace -->`
+  replaces the tracked text, and the result opens with a line saying so). The
+  steering writer (`IdentityLoader.add_steering_rule`) appends captured rules to
+  `STEERING.local.md`, never to the tracked file. The dashboard file editor
   may edit these, and may create one only where a `.example` exists.
 - **Claude Code** — `.claude/settings.json` (tracked, hook wiring, ships to every clone);
   `.claude/settings.local.json` (gitignored); `~/.claude/settings.json` (user level;

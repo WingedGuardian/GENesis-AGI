@@ -78,11 +78,48 @@ if _SECRETS_PATH.is_file():
 _FLAG = Path.home() / ".genesis" / "cc_context_enabled"
 _SETUP_COMPLETE = Path.home() / ".genesis" / "setup-complete"
 _IDENTITY_DIR = Path(__file__).resolve().parent.parent / "src" / "genesis" / "identity"
-# Which identity files ride which part. Split across two hook entries because
-# each entry gets its own harness budget (see the cap block below).
+# The resolver's own location, fixed: tests point _IDENTITY_DIR at a scratch dir.
+_IDENTITY_PATHS_PY = _IDENTITY_DIR / "paths.py"
+
+
+def _identity_notice(name: str, ipaths) -> str:
+    """The truncation notice for one identity file, naming every file it was read from."""
+    read = " and ".join(
+        f"src/genesis/identity/{p.name}" for p in ipaths.sources(name, _IDENTITY_DIR)
+    ) or f"src/genesis/identity/{name}"
+    return (
+        f"\n\n_[{name} truncated at {{kept}} chars — the full file exceeds "
+        f"this hook's stdout budget; read {read} directly.]_"
+    )
+
+
+def _identity_paths():
+    """The stdlib-only identity resolver, loaded by path like the secrets one."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_genesis_identity_paths", _IDENTITY_PATHS_PY)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# Which identity files ride which part. Split across hook entries because each
+# entry gets its own harness budget (see the cap block below). STEERING has a
+# part to itself: its captured rules (STEERING.local.md) grow without a cap, and
+# sharing a part with SOUL left room for about five of them.
+# `identity-core` is the LEGACY name for SOUL + STEERING together. It is not
+# wired any more and `all` skips it, but it is still accepted: a session whose
+# hook wiring predates the split keeps invoking it (after a compaction, say),
+# and must still get its steering rules.
+# GROUNDWORK(identity-core-alias): accepted for sessions wired before the
+# split; remove once no install runs pre-split wiring.
+_LEGACY_IDENTITY_PART = "identity-core"
+_SPLIT_FROM_LEGACY = ("soul", "steering")
 _IDENTITY_PARTS = {
-    "identity-core": ["SOUL.md", "STEERING.md"],
+    "soul": ["SOUL.md"],
+    "steering": ["STEERING.md"],
     "identity-user": ["USER.md", "CONVERSATION.md"],
+    _LEGACY_IDENTITY_PART: ["SOUL.md", "STEERING.md"],
 }
 _SESSION_START_FILE = Path.home() / ".genesis" / "session_start"
 _SESSION_CONFIG = Path.home() / ".genesis" / "session_config.json"
@@ -101,8 +138,8 @@ _SKILLS_DIR = Path(__file__).resolve().parent.parent / "src" / "genesis" / "skil
 #     unit is characters, not bytes);
 #   * the budget is PER HOOK ENTRY — two SessionStart hooks emitting 9,000
 #     chars each both arrived inline, in print AND interactive mode. That
-#     per-entry budget is why this script runs as FOUR settings.json entries
-#     (--part charter | identity-core | identity-user | knowledge);
+#     per-entry budget is why this script runs as FIVE settings.json entries
+#     (--part charter | soul | steering | identity-user | knowledge);
 #   * the threshold MOVES ACROSS VERSIONS: on CC 2.1.218 it sat near the high
 #     20 Ks (filings were rare, 28-32 KB); the 2.1.246 update dropped it to
 #     10 K and the filing rate tripled the SAME DAY. Whether it can also change
@@ -119,7 +156,7 @@ _SKILLS_DIR = Path(__file__).resolve().parent.parent / "src" / "genesis" / "skil
 _HOOK_STDOUT_CAP = HOOK_STDOUT_CAP
 _PART_BUDGET = 9_800
 
-_PARTS = ("charter", "identity-core", "identity-user", "knowledge")
+_PARTS = ("charter", "soul", "steering", "identity-user", "knowledge")
 
 
 def _part_budget(part: str) -> int:
@@ -277,8 +314,8 @@ def _miswire_alert(miswired: str) -> str:
         f"The session-context hook was invoked with {miswired}. Only the CHARTER "
         "part was emitted — identity (SOUL/USER/STEERING/CONVERSATION), essential "
         "knowledge, in-flight state and capabilities are MISSING from this window. "
-        "Fix the four `--part` SessionStart entries in `.claude/settings.json` "
-        "(charter, identity-core, identity-user, knowledge), then restart the "
+        "Fix the five `--part` SessionStart entries in `.claude/settings.json` "
+        "(charter, soul, steering, identity-user, knowledge), then restart the "
         "session. Tell the user this happened."
     )
 
@@ -309,7 +346,8 @@ _CONVERSATION_POINTER = (
 )
 
 #: The tail a truncated identity file appends (see the truncation branch). Sized
-#: generously; only its LENGTH is used, as a reserve.
+#: generously; only its LENGTH is used, as the reserve's floor (a notice naming a
+#: local layer as well is longer, and is reserved at its own length).
 _TRUNCATION_NOTICE_TAIL = (
     "\n\n_[CONVERSATION.md truncated at 99999 chars — the full file exceeds this "
     "hook's stdout budget; read src/genesis/identity/CONVERSATION.md directly.]_"
@@ -397,7 +435,7 @@ def _begin_part(part: str, mirror: Path | None, session_id: str = "") -> None:
     The ``all`` mode is a MANUAL/test invocation that deliberately emits every
     part at once; it is never wired as a hook entry, so one entry's cap is the
     wrong bound for it and cutting there would truncate a legitimate full run.
-    It is bounded at the sum of what the four real entries carry — still a
+    It is bounded at the sum of what the real entries carry — still a
     bound, just the honest one — and its audit line reports the true size.
     """
     global _OUT, _CURRENT_PART, _CURRENT_SID
@@ -688,8 +726,8 @@ def _emit_body() -> tuple[str, str, str] | None:
             _n = max(0, min(int(_probe), _PROBE_MAX_CHARS))
         except ValueError:
             # A malformed value must not SILENCE the injection: this env var is
-            # inherited by all four SessionStart entries, so `return` here
-            # turned one shell typo into four empty parts — no charter, no
+            # inherited by every SessionStart entry, so `return` here
+            # turned one shell typo into empty parts — no charter, no
             # identity, no audit line, no miswire record. Warn and fall through
             # to normal injection; probe mode engages only on a valid integer.
             print(
@@ -745,12 +783,12 @@ def _emit_body() -> tuple[str, str, str] | None:
 
     # ── Which PART of the injection this invocation emits ──────────────
     # The harness budget is PER HOOK ENTRY (measured — see the cap comment at
-    # the top), so settings.json wires this script FOUR times with --part
-    # charter | identity-core | identity-user | knowledge, in that order, each
+    # the top), so settings.json wires this script FIVE times with --part
+    # charter | soul | steering | identity-user | knowledge, in that order, each
     # under its own 10,000-char budget. No argument = ALL parts in sequence —
     # the test/manual path ONLY: wired as a single hook it would exceed the
     # per-entry cap, which is precisely the bug this split fixes (a wiring
-    # test pins the four-entry form in settings.json).
+    # test pins the wired form in settings.json).
     # FAIL CLOSED on a mis-wire. `all` emits every part under ONE hook entry,
     # which is guaranteed to exceed the cap — the exact bug this split fixes —
     # so it is reachable ONLY by an explicit `--part all` (tests, manual runs),
@@ -771,17 +809,31 @@ def _emit_body() -> tuple[str, str, str] | None:
             requested = ""
         if requested == "all" and _hook_session_id:
             # `all` is a MANUAL/TEST path and is never wired: it grants one hook
-            # entry the four-part sum, so wiring drifting to `--part all` on a
+            # entry the sum of every part, so wiring drifting to `--part all` on a
             # real session recreates the original whole-payload filing — with
             # `miswired` empty, i.e. the original bug with its alarm disabled.
             # A hook invocation always carries a session_id; that is the
             # discriminator. Degrade exactly like any other mis-wire: loud,
             # charter only, in budget.
             miswired = "--part all with a live session payload (all is manual/test only)"
-        elif requested in (*_PARTS, "all"):
+        elif requested in (*_PARTS, _LEGACY_IDENTITY_PART, "all"):
             part = requested
         else:
-            miswired = f"--part {requested!r} is not one of {(*_PARTS, 'all')}"
+            miswired = (
+                f"--part {requested!r} is not one of {(*_PARTS, _LEGACY_IDENTITY_PART, 'all')}"
+            )
+        # The soul and steering parts are wired as `--part identity-core --only
+        # <part>`, never `--part soul`: a script from before the split ignores
+        # `--only` and emits all of identity-core, so wiring newer than the
+        # script (a worktree's settings.json against the main checkout's script,
+        # or a rollback) duplicates SOUL and STEERING within budget instead of
+        # losing both to a mis-wire.
+        if part == _LEGACY_IDENTITY_PART and "--only" in sys.argv:
+            only = sys.argv[sys.argv.index("--only") + 1 : sys.argv.index("--only") + 2]
+            if only and only[0] in _SPLIT_FROM_LEGACY:
+                part = only[0]
+            else:
+                part, miswired = "charter", f"--only {only[0] if only else ''!r} is not one of {_SPLIT_FROM_LEGACY}"
     else:
         miswired = "no --part argument (settings.json wiring is out of date)"
 
@@ -832,7 +884,7 @@ def _emit_body() -> tuple[str, str, str] | None:
     # Phase 6: self-heal Genesis git hooks before doing anything else.
     # Runs on every session start so community installs auto-pick up hook
     # updates without requiring a bootstrap.sh re-run. Charter part only —
-    # four concurrent invocations must not race four sync subprocesses.
+    # concurrent invocations must not race one sync subprocess each.
     #
     # `not miswired` is part of that guarantee, not belt-and-braces: a mis-wire
     # FALLS BACK to the charter part, so two mis-spelled settings entries mean
@@ -908,22 +960,39 @@ def _emit_body() -> tuple[str, str, str] | None:
             pass  # Charter is advisory — never block session start
 
     # 1. Identity files (disk, always available, no external deps), split
-    # across two PARTS so each rides its own 10 K hook budget:
-    #   identity-core: SOUL + STEERING (tracked; CI ceilings pin their sizes)
+    # across PARTS so each rides its own 10 K hook budget:
+    #   soul: SOUL (tracked; a CI ceiling pins its size)
+    #   steering: STEERING (the tracked file has a CI ceiling; STEERING.local.md,
+    #     the captured rules, is unbounded and truncates loudly)
+    #   identity-core: the legacy SOUL + STEERING part (see _IDENTITY_PARTS)
     #   identity-user: USER + CONVERSATION (USER is install-local — CI cannot
     #     see it, so the guard is runtime: CONVERSATION degrades to a pointer
     #     when USER leaves it no room, and an oversized USER itself truncates
     #     LOUDLY rather than silently taking the part over the cliff).
     if not is_genesis_session:
+        try:
+            _ipaths = _identity_paths()
+        except Exception as exc:
+            _ipaths = None
+            if any(_in(p) for p in _IDENTITY_PARTS):
+                _emit(
+                    "## GENESIS ALERT: the identity resolver could not be loaded\n\n"
+                    f"`{type(exc).__name__}: {exc}` — every identity file is MISSING from "
+                    "this window. Tell the user; src/genesis/identity/paths.py is broken.",
+                    block="identity-error:paths.py",
+                )
+                first = False
         for _pname, _files in _IDENTITY_PARTS.items():
-            if not _in(_pname):
+            if _ipaths is None or not _in(_pname):
                 continue
+            if _pname == _LEGACY_IDENTITY_PART and part != _pname:
+                continue  # `all` emits soul + steering; never both copies
             for _idx, name in enumerate(_files):
-                path = _IDENTITY_DIR / name
-                if not path.exists():
-                    continue
                 try:
-                    content = path.read_text(encoding="utf-8").strip()
+                    content = _ipaths.read_identity(name, _IDENTITY_DIR)
+                    if content is None:
+                        continue
+                    content = content.strip()
                 except (OSError, UnicodeDecodeError) as exc:
                     # One damaged file must not cost the whole part. Say WHICH
                     # file and why, in-band: an identity file that silently
@@ -952,7 +1021,7 @@ def _emit_body() -> tuple[str, str, str] | None:
                 # The still-to-come reserve is the one thing the writer cannot
                 # know — it is about the NEXT file — so it is passed, and it is
                 # that file's own degrade, per part: identity-user can swap
-                # CONVERSATION.md for a pointer, identity-core can only truncate.
+                # CONVERSATION.md for a pointer, the other parts can only truncate.
                 _next = _files[_idx + 1] if _idx + 1 < len(_files) else ""
                 # Charged with the WRITER's own cost function, not a hand
                 # guess: the pointer costs its length plus the newline `emit`
@@ -971,7 +1040,15 @@ def _emit_body() -> tuple[str, str, str] | None:
                 _reserve = (
                     emit_cost(_CONVERSATION_POINTER) + utf16_len("\n\n---\n\n")
                     if _next == "CONVERSATION.md"
-                    else utf16_len(_TRUNCATION_NOTICE_TAIL)
+                    # The next file's own notice at its widest, charged like the
+                    # pointer above (emit cost plus the divider ahead of it), and
+                    # never below the fixed tail: a notice naming a local layer is
+                    # longer than the tail, which only covered the divider by slack.
+                    else max(
+                        utf16_len(_TRUNCATION_NOTICE_TAIL),
+                        emit_cost(_identity_notice(_next, _ipaths).replace("{kept}", "99999"))
+                        + utf16_len("\n\n---\n\n"),
+                    )
                     if _next
                     else 0
                 )
@@ -982,11 +1059,7 @@ def _emit_body() -> tuple[str, str, str] | None:
                     # CONVERSATION.md is the one identity file with a pointer to
                     # fall back to; the rest are never elided, only truncated.
                     pointer=_CONVERSATION_POINTER if name == "CONVERSATION.md" else "",
-                    notice=(
-                        f"\n\n_[{name} truncated at {{kept}} chars — the full file exceeds "
-                        f"this hook's stdout budget; read src/genesis/identity/{name} "
-                        "directly.]_"
-                    ),
+                    notice=_identity_notice(name, _ipaths),
                     reserve=_reserve,
                 )
                 first = False
@@ -1029,7 +1102,7 @@ def _emit_body() -> tuple[str, str, str] | None:
         # session-lifetime constant, and the per-turn tag exists for the clock
         # beside it, not for the id.
         #
-        # GATED ON THE PART, and "once" is why. settings.json wires FOUR
+        # GATED ON THE PART, and "once" is why. settings.json wires FIVE
         # SessionStart invocations of this script, one per --part; an ungated
         # block inside `is_genesis_session` therefore ran in every part that
         # reaches here, which MEASURED as two copies (charter and knowledge) —
@@ -1553,7 +1626,8 @@ def _finish_part(part: str, session_id: str, miswired: str = "") -> None:
             f"[session_context] MIS-WIRED: {miswired}. Emitted the charter part only "
             "so this invocation stays under the harness cap; the rest of the context "
             "is MISSING from this session. Fix the SessionStart wiring in "
-            ".claude/settings.json (four --part entries).",
+            ".claude/settings.json (one --part entry per part in _PARTS), or, if the "
+            "wiring is newer than the main checkout's script, deploy main.",
             file=sys.stderr,
         )
         return

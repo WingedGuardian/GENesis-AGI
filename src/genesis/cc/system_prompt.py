@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from genesis.db.crud import cognitive_state
+from genesis.identity.paths import read_identity
 
 #: First part of an assembled prompt when model/effort/session are given.
 #: Shared with the contingency lane, which strips it: it names the HOME model.
@@ -23,10 +24,8 @@ class SystemPromptAssembler:
         self._dir = identity_dir
 
     def _read(self, name: str) -> str | None:
-        path = self._dir / name
-        if path.exists():
-            return path.read_text().strip()
-        return None
+        text = read_identity(name, self._dir)
+        return None if text is None else text.strip()
 
     def assemble_static(self) -> str:
         """Assemble the static portions (no DB needed)."""

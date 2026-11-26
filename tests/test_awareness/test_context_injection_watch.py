@@ -328,7 +328,7 @@ def test_the_known_part_set_matches_the_emitter(tmp_path):
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    assert {*mod._PARTS, "all"} == ci._KNOWN_PARTS
+    assert {*mod._PARTS, mod._LEGACY_IDENTITY_PART, "all"} == ci._KNOWN_PARTS
 
 
 def test_probe_artifacts_are_excluded_but_counted(tmp_path):
