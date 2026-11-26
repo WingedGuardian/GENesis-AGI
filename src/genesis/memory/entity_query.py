@@ -19,9 +19,11 @@ Measurement-integrity notes (why the numbers are honest):
 - ``novel_candidates`` counts only lane memories that pass the SAME validity
   filter the main pipeline applies at ``retrieval._filter_expired_candidates``
   (bitemporally-expired / deprecated / deleted are excluded via
-  ``hydrate_for_expansion`` — the visibility predicate the sibling graph lane
+  ``graph_expansion.hydrate_neighbours`` — the visibility predicate the sibling graph lane
   already uses). ``memories_mentioning`` has no such filter, so without this
-  the count would over-sell the lane.
+  the count would over-sell the lane. One difference: a memory still
+  ``pending`` embedding has no point yet, so the lane drops it, while the main
+  pipeline can still reach it through FTS.
 - ``topk_delta`` is the lane's marginal effect on pure RRF ordering — an
   UPPER BOUND: it skips rerank / graph-boost / min_activation / diversity /
   scope, which the production path would apply to novel candidates. Read it
@@ -58,13 +60,13 @@ from typing import TYPE_CHECKING
 
 from genesis.db.crud import entities as entities_crud
 from genesis.db.crud import j9_eval
-from genesis.db.crud import memory as memory_crud
 from genesis.db.crud.entities import PROVENANCE_WEIGHTS
 from genesis.memory import graph_expansion
 from genesis.memory.entity_resolution import normalize_content
 
 if TYPE_CHECKING:
     import aiosqlite
+    from qdrant_client import QdrantClient
 
 logger = logging.getLogger(__name__)
 
@@ -217,7 +219,7 @@ async def compute_entity_lane(
     ``path_score = weight × mention_confidence × provenance_weight``. Returns
     ``(memory_ids capped at ENTITY_LANE_LIMIT, entities_reached_count)``. The
     memory_ids are NOT visibility-filtered — the caller applies
-    ``hydrate_for_expansion``. Never raises.
+    ``graph_expansion.hydrate_neighbours``. Never raises.
     """
     if not weights:
         return [], 0
@@ -264,6 +266,7 @@ def _rrf_top(ranked_lists: list[list[str]], limit: int) -> set[str]:
 
 async def maybe_entity_lane_shadow(
     db: aiosqlite.Connection,
+    qdrant: QdrantClient,
     *,
     query: str | None,
     ranked_lists: list[list[str]],
@@ -277,7 +280,8 @@ async def maybe_entity_lane_shadow(
     No-op unless ``entity_lane_mode() == "shadow"``. NEVER changes recall
     output (returns ``None``); on any error logs and returns. Emits one
     ``entity_lane_shadow`` eval_event with the fire/novelty/delta metrics that
-    drive the PR-2 flip decision.
+    drive the PR-2 flip decision. *qdrant* is the vector store client the
+    lane candidates' text is read from.
     """
     if entity_lane_mode() != "shadow":
         return
@@ -290,7 +294,7 @@ async def maybe_entity_lane_shadow(
         # excluded (expired / deprecated / deleted) BEFORE counting novelty.
         valid_ids = lane_ids
         if lane_ids:
-            hydrated = await memory_crud.hydrate_for_expansion(db, lane_ids)
+            hydrated = await graph_expansion.hydrate_neighbours(db, qdrant, lane_ids)
             now_iso = datetime.now(UTC).isoformat()
             valid_ids = []
             for mid in lane_ids:

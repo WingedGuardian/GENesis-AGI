@@ -24,6 +24,7 @@ import pytest
 from genesis.db.crud import entities as entities_crud
 from genesis.db.crud import memory as memory_crud
 from genesis.memory import entity_query, graph_expansion
+from tests.vector_store_fake import FakeVectorStore
 
 TARGET = "9d36f039-0000-0000-0000-000000000000"
 
@@ -78,13 +79,25 @@ async def _seed_spine(db):
     return omi
 
 
-async def _seed_memory(db, memory_id, *, invalid_at=None, deprecated=0):
+@pytest.fixture
+def qdrant() -> FakeVectorStore:
+    return FakeVectorStore()
+
+
+async def _seed_memory(db, qdrant, memory_id, *, invalid_at=None, deprecated=0):
     await memory_crud.create(
         db,
         memory_id=memory_id,
         content=f"content of {memory_id}",
         source_type="memory",
         collection="episodic_memory",
+    )
+    qdrant.put(
+        "episodic_memory",
+        memory_id,
+        content=f"content of {memory_id}",
+        source_type="memory",
+        tags=[],
     )
     await memory_crud.create_metadata(
         db,
@@ -200,12 +213,13 @@ async def test_compute_empty_weights(db):
 
 
 @pytest.mark.asyncio
-async def test_shadow_emits_event_and_returns_none(db, monkeypatch):
+async def test_shadow_emits_event_and_returns_none(db, qdrant, monkeypatch):
     await _seed_spine(db)
-    await _seed_memory(db, TARGET)
+    await _seed_memory(db, qdrant, TARGET)
     monkeypatch.setattr(entity_query, "entity_lane_mode", lambda: "shadow")
     ret = await entity_query.maybe_entity_lane_shadow(
         db,
+        qdrant,
         query="omi",
         ranked_lists=[["some-other-mem"]],
         all_ids={"some-other-mem"},
@@ -223,14 +237,15 @@ async def test_shadow_emits_event_and_returns_none(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_shadow_excludes_expired_from_novel(db, monkeypatch):
+async def test_shadow_excludes_expired_from_novel(db, qdrant, monkeypatch):
     """SHOULD-FIX 1: an entity-reachable but bitemporally-expired memory must
     NOT count as a novel win — the main pipeline drops it at L693."""
     await _seed_spine(db)
-    await _seed_memory(db, TARGET, invalid_at="2020-01-01T00:00:00+00:00")
+    await _seed_memory(db, qdrant, TARGET, invalid_at="2020-01-01T00:00:00+00:00")
     monkeypatch.setattr(entity_query, "entity_lane_mode", lambda: "shadow")
     await entity_query.maybe_entity_lane_shadow(
         db,
+        qdrant,
         query="omi",
         ranked_lists=[["x"]],
         all_ids={"x"},
@@ -243,12 +258,13 @@ async def test_shadow_excludes_expired_from_novel(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_off_mode_emits_nothing(db, monkeypatch):
+async def test_off_mode_emits_nothing(db, qdrant, monkeypatch):
     await _seed_spine(db)
-    await _seed_memory(db, TARGET)
+    await _seed_memory(db, qdrant, TARGET)
     monkeypatch.setattr(entity_query, "entity_lane_mode", lambda: "off")
     ret = await entity_query.maybe_entity_lane_shadow(
         db,
+        qdrant,
         query="omi",
         ranked_lists=[["x"]],
         all_ids={"x"},
@@ -260,11 +276,12 @@ async def test_off_mode_emits_nothing(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_shadow_never_raises_on_bad_input(db, monkeypatch):
+async def test_shadow_never_raises_on_bad_input(db, qdrant, monkeypatch):
     monkeypatch.setattr(entity_query, "entity_lane_mode", lambda: "shadow")
     # query None, empty ranked_lists — must not raise
     ret = await entity_query.maybe_entity_lane_shadow(
         db,
+        qdrant,
         query=None,
         ranked_lists=[],
         all_ids=set(),

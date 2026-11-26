@@ -387,6 +387,7 @@ async def memory_recall(
         # results. Shadow mode only emits metrics; live appends.
         results = await graph_expansion.maybe_expand(
             memory_mod._db,
+            memory_mod._qdrant,
             results,
             surface="compact",
             recall_event_id=recall_event_id,
@@ -599,6 +600,7 @@ async def memory_recall(
     try:
         _expanded = await graph_expansion.maybe_expand(
             memory_mod._db,
+            memory_mod._qdrant,
             results,
             surface="full",
             recall_event_id=recall_event_id,
@@ -1443,6 +1445,7 @@ async def _proactive_impl(
     _graph_seen: list | None = [] if trace is not None else None
     _expanded = await graph_expansion.maybe_expand(
         memory_mod._db,
+        memory_mod._qdrant,
         kept,
         surface="proactive",
         # Joins the graph_expansion_* event to this recall's trace row.
@@ -1454,7 +1457,7 @@ async def _proactive_impl(
         trace["graph_mode"] = graph_expansion.expansion_mode()
         trace["graph_neighbors"] = [(nr.memory_id, nr.score) for nr in _graph_seen or []]
     for nr in _expanded[len(kept) :]:
-        # Neighbor tags come from the FTS row as a STRING — substring check
+        # Neighbor tags arrive as one space-separated STRING — substring check
         # mirrors the organic list-membership filter above.
         if "memory_operation" in (nr.payload.get("tags") or ""):
             _drops[nr.memory_id] = "memory_operation"

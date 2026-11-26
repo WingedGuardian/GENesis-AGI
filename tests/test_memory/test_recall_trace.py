@@ -300,10 +300,12 @@ async def test_proactive_impl_records_drops_and_joins_graph_expansion():
             received["trace"] = trace
             return [_rr("m1"), _rr("junk", content="ok"), _rr("m2"), _rr("m3")]
 
-    fake_mod = SimpleNamespace(_retriever=_Retriever(), _db=MagicMock(), _require_init=lambda: None)
+    fake_mod = SimpleNamespace(
+        _retriever=_Retriever(), _db=MagicMock(), _qdrant=MagicMock(), _require_init=lambda: None
+    )
     seen = {}
 
-    async def _maybe_expand(db, kept, surface, recall_event_id=None, neighbor_sink=None):
+    async def _maybe_expand(db, qdrant, kept, surface, recall_event_id=None, neighbor_sink=None):
         seen["recall_event_id"] = recall_event_id
         nb = _rr("nb1")
         if neighbor_sink is not None:
@@ -345,9 +347,11 @@ async def test_shadow_mode_graph_neighbors_reach_the_trace():
         async def recall(self, *a, trace=None, **k):
             return [_rr("m1"), _rr("m2")]
 
-    fake_mod = SimpleNamespace(_retriever=_Retriever(), _db=MagicMock(), _require_init=lambda: None)
+    fake_mod = SimpleNamespace(
+        _retriever=_Retriever(), _db=MagicMock(), _qdrant=MagicMock(), _require_init=lambda: None
+    )
 
-    async def _shadow_expand(db, kept, surface, recall_event_id=None, neighbor_sink=None):
+    async def _shadow_expand(db, qdrant, kept, surface, recall_event_id=None, neighbor_sink=None):
         if neighbor_sink is not None:
             neighbor_sink.append(_rr("nb-shadow"))
         return list(kept)  # shadow: computed, not injected
@@ -381,17 +385,20 @@ async def test_real_maybe_expand_fills_the_sink_in_shadow_mode():
     """The sink is honoured by the REAL maybe_expand in shadow mode."""
     from genesis.memory import graph_expansion as G
 
-    async def _neighbors(db, seed_ids, **kw):
+    async def _neighbors(db, qdrant, seed_ids, **kw):
         return [_rr("nb")]
 
     db = MagicMock()
+    qdrant = MagicMock()
     sink: list = []
     with (
         patch.object(G, "load_recall_config", return_value={"graph_expansion": {"mode": "shadow"}}),
         patch.object(G, "expand_neighbors", new=_neighbors),
         patch.object(G.j9_eval, "insert_event", new=AsyncMock()),
     ):
-        out = await G.maybe_expand(db, [_rr("seed")], surface="proactive", neighbor_sink=sink)
+        out = await G.maybe_expand(
+            db, qdrant, [_rr("seed")], surface="proactive", neighbor_sink=sink
+        )
     assert [r.memory_id for r in out] == ["seed"]  # shadow: nothing injected
     assert [r.memory_id for r in sink] == ["nb"]
 

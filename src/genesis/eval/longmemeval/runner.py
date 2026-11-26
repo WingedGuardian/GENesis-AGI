@@ -459,7 +459,9 @@ def _coverage(evidence_ids: set[str], ids: set[str]) -> tuple[bool, float | None
     return hit, cov
 
 
-async def _expand_neighbors(db: object, seed_ids: list[str], *, k: int) -> list[tuple[str, str]]:
+async def _expand_neighbors(
+    db: object, qdrant: object, seed_ids: list[str], *, k: int
+) -> list[tuple[str, str]]:
     """1-hop expansion: (memory_id, content) for up to ``k`` linked neighbors.
 
     Thin adapter over the PRODUCTION primitive
@@ -473,7 +475,7 @@ async def _expand_neighbors(db: object, seed_ids: list[str], *, k: int) -> list[
     """
     from genesis.memory.graph_expansion import expand_neighbors
 
-    expanded = await expand_neighbors(db, seed_ids, cap=k)
+    expanded = await expand_neighbors(db, qdrant, seed_ids, cap=k)
     return [(r.memory_id, r.content) for r in expanded]
 
 
@@ -512,7 +514,7 @@ async def _run_arm(
     evidence_recalled_final: bool | None = None
     evidence_coverage_final: float | None = None
     if arm.graph:
-        expanded = await _expand_neighbors(es.db, [h.memory_id for h in hits], k=k)
+        expanded = await _expand_neighbors(es.db, es.qdrant, [h.memory_id for h in hits], k=k)
         expanded_ids = tuple(mid for mid, _ in expanded)
         memories = [*memories, *(content for _, content in expanded)]
         evidence_recalled_final, evidence_coverage_final = _coverage(

@@ -329,45 +329,24 @@ async def origin_class_by_ids(db: aiosqlite.Connection, ids: list[str]) -> dict[
     return out
 
 
-async def hydrate_for_expansion(db: aiosqlite.Connection, ids: list[str]) -> dict[str, dict]:
-    """Batch memory_id → {content, source_type, tags, collection, origin_class,
-    invalid_at, deprecated} for graph-expansion neighbor hydration.
+async def expansion_metadata_by_ids(db: aiosqlite.Connection, ids: list[str]) -> dict[str, dict]:
+    """memory_id → {origin_class, invalid_at, deprecated} (missing ids omitted).
 
-    ONE FTS⋈metadata query replaces the recall-time expansion's former
-    per-neighbor ``get_by_id`` loop plus its separate ``origin_class_by_ids``
-    and visibility-filter passes (the N+1 that dominated expansion latency).
-    Neighbor lists are cap-bounded (≤25 by the settings validator), so a
-    single IN-clause never approaches the 999 bind-variable ceiling — no
-    chunking needed. Missing ids are omitted (dangling links). ``collection``
-    is read from the FTS row (authoritative at retrieval, matching
-    ``get_by_id``); the LEFT JOIN yields NULL metadata fields for a row with
-    no ``memory_metadata`` companion, which the caller treats as
-    visible/unclassified — identical to the prior separate-query behavior.
+    The indexed half of graph-expansion neighbour hydration
+    (``graph_expansion.hydrate_neighbours``): ``memory_metadata`` is keyed by
+    ``memory_id`` and holds the authoritative visibility, which a payload copy
+    can lag. Neighbour lists are capped at 25, so one IN-clause stays far under
+    SQLite's bind-variable limit.
     """
     if not ids:
         return {}
     marks = ",".join("?" * len(ids))
     rows = await db.execute_fetchall(
-        f"SELECT f.memory_id, f.content, f.source_type, f.tags, f.collection, "  # noqa: S608 - placeholders bound
-        f"       m.origin_class, m.invalid_at, "
-        f"       COALESCE(m.deprecated, 0) AS deprecated "
-        f"FROM memory_fts f "
-        f"LEFT JOIN memory_metadata m ON f.memory_id = m.memory_id "
-        f"WHERE f.memory_id IN ({marks})",
+        f"SELECT memory_id, origin_class, invalid_at, deprecated "  # noqa: S608 - placeholders bound
+        f"FROM memory_metadata WHERE memory_id IN ({marks})",
         ids,
     )
-    return {
-        r[0]: {
-            "content": r[1],
-            "source_type": r[2],
-            "tags": r[3],
-            "collection": r[4],
-            "origin_class": r[5],
-            "invalid_at": r[6],
-            "deprecated": r[7],
-        }
-        for r in rows
-    }
+    return {r[0]: {"origin_class": r[1], "invalid_at": r[2], "deprecated": r[3]} for r in rows}
 
 
 async def delete(db: aiosqlite.Connection, *, memory_id: str) -> bool:

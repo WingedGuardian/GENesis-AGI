@@ -772,6 +772,7 @@ class HybridRetriever:
 
             await entity_query.maybe_entity_lane_shadow(
                 self._db,
+                self._qdrant,
                 query=query,
                 ranked_lists=ranked_lists,
                 all_ids=all_ids,
