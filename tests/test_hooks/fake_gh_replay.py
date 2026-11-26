@@ -197,13 +197,20 @@ def _normalize(document: str) -> str:
 #: ``git_push_guard._pr_base_sha``; ``codex_signal`` is ``_CODEX_SIGNAL_QUERY``;
 #: ``outside_pr`` is ``_OUTSIDE_PR_QUERY``; the two ``review_budget`` documents are
 #: ``review_budget._graphql_query`` of the connections in ``_REVIEW_BUDGET_READS``;
-#: ``delivery_changes`` is ``delivery_marker._CHANGES_Q`` (the delivery row).
+#: ``delivery_changes`` is ``delivery_marker._CHANGES_Q`` (the delivery row);
+#: ``blob_oids`` is ``git_push_guard._BLOB_OIDS_QUERY`` (the floor fix check).
 GRAPHQL_DOCUMENTS = {
     "edit_history": (
         "query($ids:[ID!]!){nodes(ids:$ids){... on PullRequestReviewComment{"
         "fullDatabaseId author{__typename login} "
         "userContentEdits(first:100){totalCount nodes{editor{__typename login} "
         "deletedBy{__typename login}}}}}}"
+    ),
+    "blob_oids": (
+        "query($owner:String!,$name:String!,$a:String!,$b:String!){"
+        "repository(owner:$owner,name:$name){"
+        "a:object(expression:$a){__typename ... on Blob{oid}} "
+        "b:object(expression:$b){__typename ... on Blob{oid}}}}"
     ),
     "base_ref": (
         "query($owner:String!,$name:String!,$ref:String!){repository(owner:$owner,nam"
@@ -290,6 +297,7 @@ _BY_DOCUMENT = {_normalize(doc): name for name, doc in GRAPHQL_DOCUMENTS.items()
 _GRAPHQL_VARIABLES = {
     "edit_history": {"ids[]": "-f"},
     "base_ref": {"owner": "-f", "name": "-f", "ref": "-f"},
+    "blob_oids": {"owner": "-f", "name": "-f", "a": "-f", "b": "-f"},
     "codex_signal": {"owner": "-F", "name": "-F", "number": "-F"},
     "outside_pr": {"owner": "-f", "name": "-f", "num": "-F"},
     "review_budget": {"owner": "-f", "name": "-f", "number": "-F"},
@@ -392,6 +400,19 @@ def _graphql(opts: dict[str, list[str]], state: dict) -> tuple[int, str, str]:
     if fields.get(owner_var) != owner or fields.get(name_var) != name:
         raise _Unrouted("graphql owner/name is not the recorded repository")
     number = fields.get("number", fields.get("num", fields.get("pr")))
+    if route == "blob_oids":
+        # Two "<sha>:<path>" expressions, each at a commit of the recorded PR, each
+        # answered from the recorded blobs; an expression with no record is refused.
+        shas = {c["sha"] for c in state["api"].get(f"pulls/{state['pr']}/commits", [])}
+        repo_obj = {}
+        for key in ("a", "b"):
+            sha, sep, path = fields.get(key, "").partition(":")
+            if not sep or not re.fullmatch(r"[0-9a-f]{40}", sha) or not path or sha not in shas:
+                raise _Unrouted(f"blob_oids expression {fields.get(key)!r}")
+            if fields[key] not in state.get("blobs", {}):
+                raise _Unrouted(f"no recorded blob for {fields[key]!r}")
+            repo_obj[key] = state["blobs"][fields[key]]
+        return _answer({"data": {"repository": repo_obj}}, _one(opts, "--jq"))
     if route != "base_ref" and number != state["pr"]:
         raise _Unrouted(f"graphql for PR {number}, not {state['pr']}")
     if route == "base_ref" and fields.get("ref") != f"refs/heads/{state['pr_view']['baseRefName']}":

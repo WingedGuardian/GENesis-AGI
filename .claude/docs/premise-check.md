@@ -148,6 +148,10 @@ else, that asks a different question.
 
 ## The method
 
+A premise check of a PR built from a spec (its body carries a `Spec:` line)
+reads the spec and its `## Amendments`, not only the PR: the spec is the
+statement of what was asked.
+
 **1. Extract the premises.** State the claims the change DEPENDS ON, as the author
 would state them — from the PR body, the plan file, the commit messages. Usually
 two to four. A premise is load-bearing: if it were false, would the change still be

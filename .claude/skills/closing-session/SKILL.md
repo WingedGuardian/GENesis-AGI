@@ -41,9 +41,10 @@ skill_type: workflow
 
 ## Load Gate
 
-This skill is for **closing** work, not building it. If the task is "implement
-X and open a PR", you are a build session — load `build-session` instead.
-If the task is "take the open PRs and get them merged", you are here.
+This skill is for **closing** work, not building it. For a foreground session, a
+task does not decide the type: the core's router (`genesis-development`, "Which session are you?") decides a
+session's type. A closing session takes the open PRs
+and gets them merged.
 
 The two are different SESSION TYPES, not two phases of one session's life.
 
@@ -443,6 +444,15 @@ comment and label moves it.
    this way. **Fast path:** a PR with basis `claim` whose diff only changes
    dependency pins or lockfiles is read by confirming exactly that, and that
    the new versions are the ones the PR names, and recorded DELIVERS, CLEAN. Anything else in the diff ends the fast path.
+
+   **A PR body with a `Spec:` line**, whatever its basis is, also gets the
+   spec read: open the spec and its `## Amendments`, and judge the PR against
+   the items its plan parts name. These are delivery defects, fixed before
+   merge: no `Amended:` line; `Amended: none` while the spec or the plan
+   carries an `AM-n` or `PC-n` for the PR's plan parts; an `AM-n` or `PC-n` id
+   that matches no entry; and a missing or non-`CLEAN` copied `Spec check:`
+   line. The fix for a non-`CLEAN` line is to run the reviewer again after the
+   owner's answers are recorded, and copy the new line.
 2. **Read the basis in full**, thread included. From an issue take: what is
    wrong; where it says the intended behaviour is stated; every sentence that
    says what a fix must do (its `Acceptance:` answer, or on older issues a Fix,
@@ -953,6 +963,11 @@ it** (owner ruling, 2026-10-19):
   its delivery read recorded `intended=not-stated|unsupported` (step 1a);
 - a PR that departs from its issue's named fix (a CHANGED named fix in its
   delivery read), or whose read records a DRIFT that adds a mechanism;
+- a PR whose `Amended:` line names an amendment (`AM-n`) or plan revision
+  (`PC-n`) with no `Confirmed:` line. Ask the owner yourself: a builder's
+  relay is not the confirmation. On a yes, append to that item
+  `Confirmed: <date> "<the owner's words>" (PR #<N>)`, the only edit a closing
+  session makes there; an item with that line asks nothing of a later PR;
 - a design, premise or user-impact question the review raised.
 
 Authorization never carries over from an earlier session, and a peer session's
@@ -990,7 +1005,10 @@ Two triggers, two labels:
      builder": findings by class; what is kept; what is deleted; the prescribed
      mechanism; the SPLIT plan (the `PR-shape:` line, as a list of PRs); every
      decided question; acceptance. The builder is often Codex or Devin on
-     another machine, building cold from this comment alone.
+     another machine, building cold from this comment alone. For a PR built
+     from a spec, what is kept and what is dropped are listed against the
+     spec's ids, and a drop needs the owner's yes recorded on the PR (a cut is
+     a spec amendment).
      - Questions only the owner can answer get asked BEFORE posting.
      - Any question left to the builder says "answer it in the PR body".
      - Never post a bare open-questions list, and never omit the PR-shape
@@ -1375,7 +1393,9 @@ Where a real external backstop exists, name it and cite the query that proved it
 
 **Close every review with a verdict.** End each review with an explicit
 `Ready to merge: Yes | No | With fixes` + a one-line reason, alongside the
-DONE / DONE_WITH_CONCERNS completion status. And the DON'Ts that keep a review
+DONE / DONE_WITH_CONCERNS completion status. A `genesis-architect` review puts
+these above its `Contradicts:`/`Differs:` lines and ends on its `Spec check:`
+line (its Completion Status Protocol). And the DON'Ts that keep a review
 honest: never "looks good" without reading the code; never a finding on code you
 did not read; never vague ("improve error handling") — always `file:line` + why it
 matters. (Deliberately NOT a "praise-first / acknowledge strengths" balance: an
@@ -1402,9 +1422,11 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   says" is SOUND-BUT-INFERIOR with the better shape named. Render a
   better-shape finding on the severity ladder too (normally SHOULD-FIX), or it
   is invisible to every surface that scores findings.
-- **Completion status last**: every review (and every skill workflow that
-  concludes work) ends with exactly one of DONE / DONE_WITH_CONCERNS /
-  BLOCKED / NEEDS_CONTEXT — with concerns listed, or blocker + what was
+- **Completion status, then the architect's verdict line**: every review (and
+  every skill workflow that concludes work) ends with exactly one of DONE /
+  DONE_WITH_CONCERNS / BLOCKED / NEEDS_CONTEXT, placed as the architect's
+  Completion Status Protocol says for a `genesis-architect` review, whose
+  `Spec check:` line is always last — with concerns listed, or blocker + what was
   tried, or exactly what context is missing. Findings use the
   BLOCKER / SHOULD-FIX / NOTE severity ladder with per-finding confidence
   and the pre-emit quote gate (a finding must quote its motivating
@@ -2402,7 +2424,11 @@ The review-findings gate specifically:
      `at`/`by`), where the sha is one of the PR's own single-parent commits, descending
      from the head the finding was posted on (if a force-push removed that head, order
      cannot be proven and only the sigil clears it), and touching the finding's file or
-     the name a rename in the PR gave it. Quoted, coded, struck or hedged text ("will be
+     the name a rename in the PR gave it. The fix must still be in the head being merged
+     (#5000): the cited commit is that head or its ancestor, and the finding's file
+     differs there from the head the finding was posted on, so a fully reverted fix clears
+     nothing (a revert hidden by another change to the same file, such as another fix or
+     a merge of main, still clears). Quoted, coded, struck or hedged text ("will be
      fixed in", "Fixed in X, pending CI"), and a claim in the middle of a line, claim
      nothing. Write the claim as its own line: `Fixed in <sha>.` then any explanation. Cite the commit that made the fix,
      never a merge of main. A reply that defers, accepts, disputes or says "partly

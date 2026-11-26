@@ -22,7 +22,10 @@
    **Clearing a FLOOR finding (#4933):** a reply with a line that starts with
    `Fixed in <sha>` (or `at`/`by`), outside quotes and code and unhedged, whose commit
    is one of the PR's own, single-parent, descending from the head the finding was
-   posted on, and touching its file or its renamed name; or the owner's
+   posted on, and touching its file or its renamed name; the fix must still be in the
+   head being merged (that head or its ancestor, with the file changed there since the
+   finding was posted, so a fully reverted fix does not clear, #5000; a revert hidden by
+   another change to the same file still clears); or the owner's
    `# floor-accept=<id>[,<id>]`. Any other reply clears nothing, and neither does
    `# review-override`. A reviewer's finding comment edited by anyone but that reviewer is a
    floor finding whatever it now says (off-diff and doc exclusions still apply),

@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[2]
 SKILL_DIR = REPO / ".claude" / "skills" / "spec-session"
 SKILL = SKILL_DIR / "SKILL.md"
@@ -69,7 +71,7 @@ def _hash_snippet() -> str:
     blocks = re.findall(r"```python\n(.*?)```", text, re.S)
     assert len(blocks) == 1, "spec-analyze.md must carry exactly one python snippet"
     snippet = blocks[0]
-    assert snippet.count("\n") <= 15, "the hash snippet must stay at most 15 lines"
+    assert snippet.count("\n") <= 20, "the hash snippet must stay at most 20 lines"
     return snippet
 
 
@@ -116,6 +118,63 @@ def test_hash_ignores_frontmatter_and_a_first_amendment(tmp_path):
 def test_hash_changes_when_the_body_changes(tmp_path):
     base = _hash(tmp_path, _SPEC)
     assert _hash(tmp_path, _SPEC.replace("30 days", "31 days")) != base
+
+
+_B3, _B4, _T3 = "`" * 3, "`" * 4, "~" * 3
+
+
+@pytest.mark.parametrize(
+    ("opener", "closer"),
+    [
+        (_B3 + "markdown", _B3),
+        (_B4 + "markdown", _B4),  # a longer run, holding a three-backtick example
+        (_T3 + "markdown", _T3),
+        (_T3 + "a`b", _T3),  # a tilde opener may carry a backtick
+        ("   " + _B3, "   " + _B3),  # indented up to three spaces
+        (_B3, _B4),  # closed by a longer run
+    ],
+)
+def test_a_fenced_delimiter_does_not_end_the_body(tmp_path, opener, closer):
+    """A spec showing `## Amendments` in a code example of any CommonMark fence form
+    still hashes what follows it, and a real amendment section still does not count."""
+    inner = f"{_B3}\n## Amendments\n{_B3}\n" if opener.startswith(_B4) else "## Amendments\n"
+    example = f"{opener}\n{inner}## Spec analysis: x.md\n{closer}\n"
+    spec = _SPEC.replace("## Decided", example + "\n## Decided")
+    base = _hash(tmp_path, spec)
+    assert _hash(tmp_path, spec.replace("30 days", "60 days")) != base
+    assert _hash(tmp_path, spec + "\n## Amendments\n\n- AM-1 ...\n") == base
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["    " + _B3, "``", _B3 + "a`b"],
+    ids=["four-space-indent", "two-backticks", "backtick-in-info"],
+)
+def test_a_line_that_is_not_a_fence_hides_nothing(tmp_path, line):
+    """A line CommonMark does not read as a fence opener leaves a real amendment real."""
+    spec = _SPEC + f"\n{line}\n\n## Amendments\n\n- AM-1 ...\n"
+    assert _hash(tmp_path, spec) == _hash(tmp_path, _SPEC + f"\n{line}\n")
+
+
+def test_a_closer_with_trailing_spaces_closes_and_one_with_info_does_not(tmp_path):
+    closed = _SPEC + f"\n{_B3}\nx\n{_B3}   \n\n## Amendments\n\n- AM-1 ...\n"
+    assert _hash(tmp_path, closed) == _hash(tmp_path, _SPEC + f"\n{_B3}\nx\n{_B3}   \n")
+    still_open = _SPEC.replace("## Decided", f"{_B3}\n{_B3}python\n## Amendments\n{_B3}\n\n## Decided")
+    assert _hash(tmp_path, still_open.replace("30 days", "60 days")) != _hash(tmp_path, still_open)
+
+
+def test_an_unclosed_fence_runs_to_the_end(tmp_path):
+    """As in CommonMark, so an amendment after it is hashed: the change is loud, never silent."""
+    spec = _SPEC + f"\n{_B3}\nunclosed\n"
+    assert _hash(tmp_path, spec + "\n## Amendments\n\n- AM-1 ...\n") != _hash(tmp_path, spec)
+
+
+@pytest.mark.parametrize("inner", [_B3 * 2, _T3], ids=["other-character", "shorter-run"])
+def test_a_shorter_or_other_marker_does_not_close_a_fence(tmp_path, inner):
+    """Inside a long tilde fence, a backtick line or a shorter run closes nothing."""
+    example = f"{_T3 * 2}\n{inner}\n## Amendments\n{_T3 * 2}\n"
+    spec = _SPEC.replace("## Decided", example + "\n## Decided")
+    assert _hash(tmp_path, spec.replace("30 days", "60 days")) != _hash(tmp_path, spec)
 
 
 def test_approval_report_is_saved_for_every_handoff():
