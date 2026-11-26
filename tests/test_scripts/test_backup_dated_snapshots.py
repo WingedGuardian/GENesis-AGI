@@ -1386,6 +1386,12 @@ def test_smb_offsite_refuses_a_name_that_could_leave_its_quotes(backup_env):
     assert not any("COMPLETE" in ln and "put" in ln for ln in cmds.splitlines()), cmds
 
 
+def _skip_unless_unreadable(path: Path) -> None:
+    """The permission cases need a runner that chmod 0 actually stops (not root)."""
+    if os.access(path, os.R_OK):
+        pytest.skip("this runner reads through chmod 0 (root or DAC override)")
+
+
 def _own_identity_dir(backup_env) -> Path:
     """The sandbox's own identity directory (the fixture keeps it empty and apart
     from the repo's)."""
@@ -1461,6 +1467,7 @@ def test_identity_unlistable_dir_keeps_every_copy(backup_env, tmp_path):
     assert (repo_ident / "USER.md.gpg").is_file()
     ident.chmod(0o000)
     try:
+        _skip_unless_unreadable(ident)
         proc = _run_local(backup_env, offsite)
     finally:
         ident.chmod(0o755)
@@ -1609,6 +1616,7 @@ def test_identity_capture_gaps_are_reported(backup_env, tmp_path):
     (ident / "-x.local.md").write_text("dashed\n")
     (ident / "LOCKED.local.md").write_text("secret\n")
     (ident / "LOCKED.local.md").chmod(0)
+    locked = not os.access(ident / "LOCKED.local.md", os.R_OK)  # False as root
     offsite = tmp_path / "offsite"
     offsite.mkdir()
     try:
@@ -1617,9 +1625,10 @@ def test_identity_capture_gaps_are_reported(backup_env, tmp_path):
         (ident / "LOCKED.local.md").chmod(0o600)
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     names = {p.name for p in (_repo(backup_env) / "identity").iterdir()}
-    assert names == {"STEERING.local.md.gpg"}, names
+    assert names == {"STEERING.local.md.gpg"} | (set() if locked else {"LOCKED.local.md.gpg"}), names
     status = _status(backup_env)
-    assert status["extras_complete"] is False and status["extra_dirs_skipped"] == 3, status
+    assert status["extras_complete"] is False, status
+    assert status["extra_dirs_skipped"] == (3 if locked else 2), status
     assert (
         "not captured" in proc.stdout + proc.stderr
         or "failed to encrypt" in proc.stdout + proc.stderr
@@ -1770,3 +1779,646 @@ def test_identity_restore_refuses_a_symlinked_target_dir(backup_env, tmp_path):
     _fident, out = _identity_only_restore(backup_env, tmp_path, prepare)
     assert not (elsewhere / "SOUL.md").exists(), out[-3000:]
     assert "is a symlink; not restored through it" in out, out[-3000:]
+
+
+def _seed_user_config(home: Path) -> Path:
+    cfg = home / ".genesis" / "config"
+    (cfg / "modules").mkdir(parents=True)
+    (cfg / "ego.local.yaml").write_text("cadence: 2\n")
+    (cfg / "modules" / "tool.yaml").write_text("enabled: true\n")
+    (cfg / "genesis.yaml").write_text("left: to-creds\n")  # §8 owns it
+    (cfg / "ego.local.yaml.bak-20260101").write_text("old\n")
+    return cfg
+
+
+def _fresh_restore_env(backup_env, fresh: Path) -> dict:
+    return {
+        **{k: v for k, v in os.environ.items() if k not in (*_SESSION_BUS_VARS, "SECRETS_PATH")},
+        "HOME": str(fresh),
+        "GENESIS_DIR": str(fresh / "genesis"),
+        "GENESIS_BACKUP_TMPDIR": str(fresh / "tmp"),
+        "GENESIS_BACKUP_TIER2_BACKEND": "none",
+        "QDRANT_URL": "http://127.0.0.1:1",
+        "GENESIS_BACKUP_PASSPHRASE": "testpass",
+        "GENESIS_RESTORE_HOLDER_SCAN": "none",
+        "GNUPGHOME": str(fresh / ".gnupg"),
+        "PATH": f"{backup_env['bind']}:{os.environ['PATH']}",
+    }
+
+
+def test_user_config_backed_up_flat_encrypted_and_kept(backup_env, tmp_path):
+    """Backup section 6g: every file in ~/.genesis/config is encrypted into Tier 1
+    and the off-site snapshot as a FLAT copy (`/` written `__`), except genesis.yaml
+    (section 8 owns it) and `*.bak-*`. A symlink and a name already holding `__` are
+    refused with a warning. A deleted file keeps its copy (no section prunes): a
+    restore brings it back."""
+    cfg = _seed_user_config(backup_env["home"])
+    target = tmp_path / "outside.yaml"
+    target.write_text("not mine\n")
+    (cfg / "linked.yaml").symlink_to(target)
+    (cfg / "odd__name.yaml").write_text("x\n")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+
+    copies = _repo(backup_env) / "user_config"
+    want = {"ego.local.yaml.gpg", "modules__tool.yaml.gpg"}
+    assert {p.name for p in copies.iterdir()} == want, sorted(p.name for p in copies.iterdir())
+    assert _gpg(backup_env["home"], "-d", str(copies / "modules__tool.yaml.gpg")) == b"enabled: true\n"
+    assert "user config linked.yaml is a symlink" in proc.stdout, proc.stdout[-2000:]
+    assert "user config odd__name.yaml has '__' or a '_' beside a '/'" in proc.stdout, proc.stdout[-2000:]
+    host = next((offsite / "Genesis").iterdir())
+    snap = next(d for d in host.iterdir() if _STAMP_RE.fullmatch(d.name))
+    assert {p.name for p in (snap / "user_config").iterdir()} == want
+    assert _status(backup_env)["user_config_files"] == 2
+
+    (cfg / "ego.local.yaml").unlink()
+    proc = _run_local(backup_env, offsite)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert {p.name for p in copies.iterdir()} == want
+    assert not list(cfg.glob(".backup-seen*"))
+
+
+def test_user_config_skips_per_box_transient_and_section8_files(backup_env, tmp_path):
+    """Files that hold this box's paths, writers' files in flight, and copies of
+    genesis.yaml (section 8 owns it) are never backed up."""
+    cfg = _seed_user_config(backup_env["home"])
+    for name in ("codebase-managed.json", "codebase-managed.json.0a1b2c", "tmpab12.yaml.tmp",
+                 "genesis.malformed-20260101T000000.yaml"):
+        (cfg / name).write_text("x\n")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    names = {p.name for p in (_repo(backup_env) / "user_config").iterdir()}
+    assert names == {"ego.local.yaml.gpg", "modules__tool.yaml.gpg"}, names
+    assert _status(backup_env)["extras_complete"] is True
+
+
+def test_user_config_subdir_extra_entry_is_covered_not_a_gap(backup_env, tmp_path):
+    """An extra entry naming a directory INSIDE ~/.genesis/config is covered by
+    section 6g too, so it is neither archived again nor a gap."""
+    _seed_user_config(backup_env["home"])
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/.genesis/config/modules"})
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert "which §6g backs up — not archived again" in proc.stdout, proc.stdout[-2000:]
+    status = _status(backup_env)
+    assert status["extra_dirs_skipped"] == 0 and status["extras_complete"] is True, status
+
+
+def test_user_config_unlistable_dir_keeps_every_copy(backup_env, tmp_path):
+    """A failed listing prunes nothing."""
+    cfg = _seed_user_config(backup_env["home"])
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    assert _run_local(backup_env, offsite).returncode == 0
+    copy = _repo(backup_env) / "user_config" / "ego.local.yaml.gpg"
+    assert copy.is_file()
+    (cfg / "modules").chmod(0o000)
+    try:
+        _skip_unless_unreadable(cfg / "modules")
+        proc = _run_local(backup_env, offsite)
+    finally:
+        (cfg / "modules").chmod(0o755)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert "could not list" in proc.stdout, proc.stdout[-2000:]
+    assert copy.is_file()
+    assert (_repo(backup_env) / "user_config" / "modules__tool.yaml.gpg").is_file()
+    status = _status(backup_env)
+    assert status["extras_complete"] is False and status["extra_dirs_skipped"] >= 1, status
+
+
+def test_user_config_round_trip_restores_nested_and_keeps_local_edits(backup_env, tmp_path):
+    """Producer to consumer for backup 6g and restore 4e: nested files come back in
+    their directory, a local file is kept without --force whatever its mtime (a
+    downloaded copy carries its transfer time), --force replaces it and keeps a
+    copy, and payload names
+    that decode outside the directory, to genesis.yaml, or through a symlinked
+    parent are refused."""
+    _seed_user_config(backup_env["home"])
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    assert _run_local(backup_env, offsite).returncode == 0
+    repo = _repo(backup_env)
+    shutil.rmtree(repo / "data")  # see the identity round trip: no SQLite confirmation
+    for bad in ("..__escape.yaml", "genesis.yaml", "linkdir__x.yaml"):
+        _gpg(
+            backup_env["home"],
+            "--symmetric",
+            "-o",
+            str(repo / "user_config" / f"{bad}.gpg"),
+            "-",
+            data=b"bad\n",
+        )
+
+    fresh = tmp_path / "fresh"
+    fcfg = fresh / ".genesis" / "config"
+    fcfg.mkdir(parents=True)
+    (fresh / "genesis").mkdir()
+    (fresh / "tmp").mkdir()
+    (fresh / ".gnupg").mkdir(mode=0o700)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (fcfg / "linkdir").symlink_to(elsewhere, target_is_directory=True)
+    (fcfg / "ego.local.yaml").write_text("cadence: 9\n")
+    past = time.time() - 86400
+    os.utime(fcfg / "ego.local.yaml", (past, past))
+    r = subprocess.run(
+        ["bash", str(_RESTORE), "--from", str(repo)],
+        env=_fresh_restore_env(backup_env, fresh),
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    assert (fcfg / "modules" / "tool.yaml").read_text() == "enabled: true\n", r.stdout[-3000:]
+    assert (fcfg / "ego.local.yaml").read_text() == "cadence: 9\n"
+    assert not (fresh / ".genesis" / "escape.yaml").exists()
+    assert not (fcfg / "genesis.yaml").exists()
+    assert not (elsewhere / "x.yaml").exists()
+    assert "unexpected payload ..__escape.yaml.gpg" in r.stdout, r.stdout[-3000:]
+    # Caught by the resolved-path containment check before the parent walk.
+    assert "unexpected payload linkdir__x.yaml.gpg" in r.stdout, r.stdout[-3000:]
+    status = json.loads((fresh / ".genesis" / "restore_status.json").read_text())
+    assert status["user_config_restored"] == 1, status
+    assert status["user_config_kept"] == 1, status
+
+    r = subprocess.run(
+        ["bash", str(_RESTORE), "--from", str(repo), "--force"],
+        env=_fresh_restore_env(backup_env, fresh),
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    assert (fcfg / "ego.local.yaml").read_text() == "cadence: 2\n", r.stdout[-3000:]
+    kept = list((fresh / ".genesis" / "restore-displaced").glob("*/config/ego.local.yaml"))
+    assert [p.read_text() for p in kept] == ["cadence: 9\n"], kept
+
+
+def test_user_config_only_backup_is_a_restorable_payload(backup_env, tmp_path):
+    """A backup whose only payload is user_config/ still restores."""
+    src = tmp_path / "only-config"
+    (src / "user_config").mkdir(parents=True)
+    _gpg(
+        backup_env["home"],
+        "--symmetric",
+        "-o",
+        str(src / "user_config" / "ego.local.yaml.gpg"),
+        "-",
+        data=b"cadence: 2\n",
+    )
+    fresh = tmp_path / "fresh"
+    (fresh / ".genesis").mkdir(parents=True)
+    (fresh / "genesis").mkdir()
+    (fresh / "tmp").mkdir()
+    (fresh / ".gnupg").mkdir(mode=0o700)
+    r = subprocess.run(
+        ["bash", str(_RESTORE), "--from", str(src)],
+        env=_fresh_restore_env(backup_env, fresh),
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    assert "no restorable payloads" not in r.stdout + r.stderr, r.stdout[-2000:]
+    cfg = fresh / ".genesis" / "config" / "ego.local.yaml"
+    assert cfg.read_text() == "cadence: 2\n", r.stdout[-3000:]
+
+
+@pytest.mark.parametrize(("file_already_here", "dry_run"), [(False, False), (True, False), (False, True)])
+def test_user_config_both_layouts_of_a_path_restore_without_failing(
+    backup_env, tmp_path, file_already_here, dry_run
+):
+    """Nothing is pruned, so a path that turned from a file into a directory leaves
+    copies of both. A clean restore lands the directory layout (deepest first) and
+    skips the stale file; a box that already holds the file keeps it and skips
+    the copies under it. Either way it is a layout conflict, not a failure."""
+    src = tmp_path / "both-layouts"
+    (src / "user_config").mkdir(parents=True)
+    for name, data in (("modules.gpg", b"old file\n"), ("modules__tool.yaml.gpg", b"enabled: true\n")):
+        _gpg(backup_env["home"], "--symmetric", "-o", str(src / "user_config" / name), "-", data=data)
+    fresh = tmp_path / "fresh"
+    cfg = fresh / ".genesis" / "config"
+    cfg.mkdir(parents=True)
+    (fresh / "genesis").mkdir()
+    (fresh / "tmp").mkdir()
+    (fresh / ".gnupg").mkdir(mode=0o700)
+    if file_already_here:
+        (cfg / "modules").write_text("mine\n")
+    r = subprocess.run(
+        ["bash", str(_RESTORE), "--from", str(src), *(["--dry-run"] if dry_run else [])],
+        env=_fresh_restore_env(backup_env, fresh),
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    status = json.loads((fresh / ".genesis" / "restore_status.json").read_text())
+    assert not [f for f in status["failures"] if "user config" in f.lower()], status
+    # Already here: the stale copies under it conflict, and the file itself is kept.
+    assert status["user_config_kept"] == (2 if file_already_here else 1), status
+    if file_already_here:
+        assert (cfg / "modules").read_text() == "mine\n", r.stdout[-3000:]
+    elif dry_run:  # the preview meets the same conflict the real run does
+        assert status["user_config_restored"] == 1, status
+        assert not (cfg / "modules").exists()
+    else:
+        assert (cfg / "modules" / "tool.yaml").read_text() == "enabled: true\n", r.stdout[-3000:]
+    assert "conflicts with the file or directory already at its path" in r.stdout, r.stdout[-3000:]
+
+
+def test_a_kept_copy_the_new_passphrase_cannot_open_is_a_gap(backup_env, tmp_path):
+    """A copy kept after its source was deleted is never re-encrypted. After a
+    passphrase change restore cannot open it, so that run reports it once and sets
+    it aside (kept, out of what restore and the off-site upload read); the next run
+    is clean. Identity copies are handled the same way."""
+    cfg = _seed_user_config(backup_env["home"])
+    ident = _own_identity_dir(backup_env)
+    (ident / "STEERING.local.md").write_text("rule\n")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    assert _run_local(backup_env, offsite).returncode == 0
+    assert _status(backup_env)["extras_complete"] is True
+    (cfg / "ego.local.yaml").unlink()
+    (ident / "STEERING.local.md").unlink()
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_PASSPHRASE": "newpass"})
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    status = _status(backup_env)
+    assert status["extras_complete"] is False and status["extra_dirs_skipped"] == 2, status
+    repo = _repo(backup_env)
+    assert not (repo / "user_config" / "ego.local.yaml.gpg").exists()
+    assert not (repo / "identity" / "STEERING.local.md.gpg").exists()
+    assert [p.name.rsplit(".", 2)[0] for p in (repo / "user_config" / "unopenable").iterdir()] == ["ego.local.yaml"]
+    assert [p.name.rsplit(".", 2)[0] for p in (repo / "identity" / "unopenable").iterdir()] == ["STEERING.local.md"]
+    assert proc.stdout.count("set aside in") == 2, proc.stdout[-3000:]
+    host = next((offsite / "Genesis").iterdir())
+    newest = sorted(d for d in host.iterdir() if _STAMP_RE.fullmatch(d.name))[-1]
+    assert not (newest / "user_config" / "unopenable").exists()
+
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_PASSPHRASE": "newpass"})
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert _status(backup_env)["extras_complete"] is True, _status(backup_env)
+    # The set-aside copies survive the next run's plaintext purge (they end in .gpg).
+    assert len(list((repo / "user_config" / "unopenable").iterdir())) == 1
+    assert len(list((repo / "identity" / "unopenable").iterdir())) == 1
+
+
+def test_a_kept_copy_that_fails_for_another_reason_stays_in_place(backup_env, tmp_path):
+    """Only gpg's own wrong-passphrase verdict sets a copy aside. A damaged copy
+    (or any other failure) is reported and left where restore can still try it."""
+    cfg = _seed_user_config(backup_env["home"])
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    assert _run_local(backup_env, offsite).returncode == 0
+    (cfg / "ego.local.yaml").unlink()
+    copy = _repo(backup_env) / "user_config" / "ego.local.yaml.gpg"
+    data = bytearray(copy.read_bytes())
+    data[len(data) // 2] ^= 0xFF  # damaged data (zlib error), not a passphrase verdict
+    copy.write_bytes(bytes(data))
+    proc = _run_local(backup_env, offsite)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert copy.is_file(), "a copy that failed for another reason must stay in place"
+    assert not (_repo(backup_env) / "user_config" / "unopenable").exists()
+    assert "could not be verified with the current passphrase; left in place" in proc.stdout, proc.stdout[-3000:]
+    assert _status(backup_env)["extras_complete"] is False
+
+
+def test_no_backup_passphrase_is_a_gap_for_identity_and_config(backup_env, tmp_path):
+    """Without a passphrase nothing per-install is captured (plaintext is refused),
+    and the run says so instead of reading complete."""
+    _seed_user_config(backup_env["home"])
+    ident = _own_identity_dir(backup_env)
+    (ident / "STEERING.local.md").write_text("rule\n")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_PASSPHRASE": ""})
+    out = proc.stdout + proc.stderr
+    assert "skipping identity files (refusing plaintext)" in out, out[-3000:]
+    assert "skipping user config (refusing plaintext)" in out, out[-3000:]
+    status = _status(backup_env)
+    assert status["extras_complete"] is False and status["extra_dirs_skipped"] >= 2, status
+
+
+def test_a_missing_config_subdir_extra_entry_is_a_skip_not_covered(backup_env, tmp_path):
+    """An extra entry naming a config subdirectory that does not exist is reported,
+    not waved through as covered."""
+    _seed_user_config(backup_env["home"])
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/.genesis/config/gone"})
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert "which §6g backs up — not archived again" not in proc.stdout, proc.stdout[-2000:]
+    status = _status(backup_env)
+    assert status["extra_dirs_skipped"] == 1 and status["extras_complete"] is False, status
+
+
+def test_user_config_extra_entry_is_covered_not_a_gap(backup_env, tmp_path):
+    """An install that still lists ~/.genesis/config as an extra dir (from before
+    section 6g) is told it is covered; it is not a skip, so no extras-gap alert."""
+    _seed_user_config(backup_env["home"])
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/.genesis/config"})
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert "which §6g backs up — not archived again" in proc.stdout, proc.stdout[-2000:]
+    status = _status(backup_env)
+    assert status["extra_dirs_skipped"] == 0, status
+    assert status["user_config_files"] == 2, status
+
+
+def test_user_config_backup_refuses_ambiguous_and_generated_names(backup_env, tmp_path):
+    """A '_' beside a '/' would decode to another path, so it is refused; files
+    bootstrap regenerates per box are never backed up."""
+    cfg = _seed_user_config(backup_env["home"])
+    (cfg / "x_").mkdir()
+    (cfg / "x_" / "y.yaml").write_text("a\n")
+    (cfg / "watchgod.conf").write_text("CC_TMP_DIR=/old/box\n")
+    (cfg / "serena-shared.json").write_text("{}\n")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    names = {p.name for p in (_repo(backup_env) / "user_config").iterdir()}
+    assert names == {"ego.local.yaml.gpg", "modules__tool.yaml.gpg"}, names
+    assert "user config x_/y.yaml has '__' or a '_' beside a '/'" in proc.stdout, proc.stdout[-2000:]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "x\n..__..__evil.yaml",  # a newline must not end the check early
+        "x___y.yaml",  # decodes to x/_y, which the backup never writes
+        "",  # an empty name
+    ],
+)
+def test_user_config_restore_refuses_names_the_backup_never_writes(backup_env, tmp_path, payload):
+    src = tmp_path / "only-config"
+    (src / "user_config").mkdir(parents=True)
+    _gpg(
+        backup_env["home"],
+        "--symmetric",
+        "-o",
+        str(src / "user_config" / f"{payload}.gpg"),
+        "-",
+        data=b"bad\n",
+    )
+    fresh = tmp_path / "fresh"
+    (fresh / ".genesis" / "config").mkdir(parents=True)
+    (fresh / "genesis").mkdir()
+    (fresh / "tmp").mkdir()
+    (fresh / ".gnupg").mkdir(mode=0o700)
+    before = {p for p in fresh.rglob("*")}
+    r = subprocess.run(
+        ["bash", str(_RESTORE), "--from", str(src)],
+        env=_fresh_restore_env(backup_env, fresh),
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    assert "user config: unexpected payload" in r.stdout, r.stdout[-3000:]
+    written = {p for p in fresh.rglob("*") if p.is_file()} - before
+    assert not [p for p in written if p.read_bytes() == b"bad\n"], written
+
+
+def test_old_layout_config_extra_archive_still_restores(backup_env, tmp_path):
+    """A snapshot from before backup section 6g holds ~/.genesis/config only as an
+    extra-dirs archive. With no user_config payload to restore it from, restore must
+    let that archive through rather than refuse it as a core path."""
+    old_home = tmp_path / "oldhome"
+    (old_home / ".genesis" / "config").mkdir(parents=True)
+    (old_home / ".genesis" / "config" / "ego.local.yaml").write_text("cadence: 2\n")
+    tar = subprocess.run(
+        ["tar", "-C", str(old_home), "-cf", "-", ".genesis/config"],
+        capture_output=True,
+        check=True,
+    ).stdout
+    rel = ".genesis/config"
+    digest = subprocess.run(
+        ["sha1sum"], input=rel.encode(), capture_output=True, check=True
+    ).stdout.decode()[:8]
+    name = f".genesis_config-{digest}.tar.gpg"
+    src = tmp_path / "old-snapshot"
+    (src / "extra").mkdir(parents=True)
+    _gpg(backup_env["home"], "--symmetric", "-o", str(src / "extra" / name), "-", data=tar)
+    (src / ".extra-manifest").write_text(f"genesis-snapshot 1\nextra {name}\n")
+    fresh = tmp_path / "fresh"
+    (fresh / ".genesis").mkdir(parents=True)
+    (fresh / "genesis").mkdir()
+    (fresh / "tmp").mkdir()
+    (fresh / ".gnupg").mkdir(mode=0o700)
+    r = subprocess.run(
+        ["bash", str(_RESTORE), "--from", str(src)],
+        env=_fresh_restore_env(backup_env, fresh),
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    assert "which the core restore owns" not in r.stdout, r.stdout[-3000:]
+    assert (fresh / ".genesis" / "config" / "ego.local.yaml").read_text() == "cadence: 2\n", r.stdout[-3000:]
+
+
+def test_old_layout_config_subdir_extra_archive_still_restores(backup_env, tmp_path):
+    """An opted-in directory UNDER ~/.genesis/config (e.g. research-profiles) was an
+    extra archive before section 6g; with no user_config payload it is the only copy."""
+    old_home = tmp_path / "oldhome"
+    sub_dir = old_home / ".genesis" / "config" / "research-profiles"
+    sub_dir.mkdir(parents=True)
+    (sub_dir / "a.yaml").write_text("x: 1\n")
+    tar = subprocess.run(
+        ["tar", "-C", str(old_home), "-cf", "-", ".genesis/config/research-profiles"],
+        capture_output=True,
+        check=True,
+    ).stdout
+    rel = ".genesis/config/research-profiles"
+    digest = subprocess.run(
+        ["sha1sum"], input=rel.encode(), capture_output=True, check=True
+    ).stdout.decode()[:8]
+    name = f".genesis_config_research-profiles-{digest}.tar.gpg"
+    src = tmp_path / "old-snapshot"
+    (src / "extra").mkdir(parents=True)
+    _gpg(backup_env["home"], "--symmetric", "-o", str(src / "extra" / name), "-", data=tar)
+    (src / ".extra-manifest").write_text(f"genesis-snapshot 1\nextra {name}\n")
+    fresh = tmp_path / "fresh"
+    (fresh / ".genesis").mkdir(parents=True)
+    (fresh / "genesis").mkdir()
+    (fresh / "tmp").mkdir()
+    (fresh / ".gnupg").mkdir(mode=0o700)
+    r = subprocess.run(
+        ["bash", str(_RESTORE), "--from", str(src)],
+        env=_fresh_restore_env(backup_env, fresh),
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    assert "which the core restore owns" not in r.stdout, r.stdout[-3000:]
+    got = fresh / ".genesis" / "config" / "research-profiles" / "a.yaml"
+    assert got.read_text() == "x: 1\n", r.stdout[-3000:]
+
+
+def test_user_config_symlinked_subdir_keeps_its_childrens_copies(backup_env, tmp_path):
+    """A subdirectory replaced by a symlink is not followed, and the copies of the
+    files that were under it stay: its kept name is a prefix, not one file."""
+    cfg = _seed_user_config(backup_env["home"])
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    assert _run_local(backup_env, offsite).returncode == 0
+    copy = _repo(backup_env) / "user_config" / "modules__tool.yaml.gpg"
+    assert copy.is_file()
+    moved = tmp_path / "modules-real"
+    (cfg / "modules").rename(moved)
+    (cfg / "modules").symlink_to(moved, target_is_directory=True)
+    proc = _run_local(backup_env, offsite)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert "user config modules is a symlink" in proc.stdout, proc.stdout[-2000:]
+    assert copy.is_file()
+
+
+def test_symlinked_user_config_dir_listed_as_extra_is_not_called_covered(backup_env, tmp_path):
+    """Section 6g refuses a symlinked config dir, so an extra entry naming its real
+    target is not 'covered': it must not be waved through as if backed up."""
+    home = backup_env["home"]
+    real = home / "cfg-real"
+    real.mkdir()
+    (real / "ego.local.yaml").write_text("cadence: 2\n")
+    (home / ".genesis" / "config").symlink_to(real, target_is_directory=True)
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/cfg-real"})
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert "which §6g backs up — not archived again" not in proc.stdout, proc.stdout[-2000:]
+    status = _status(backup_env)
+    assert status["extra_dirs"] == 1 and status["extra_dirs_skipped"] == 0, status
+    assert status["extras_complete"] is True, status
+
+
+def test_symlinked_user_config_dir_with_no_extra_is_a_gap(backup_env, tmp_path):
+    """Section 6g never follows a symlinked config dir; with no extra entry for its
+    real directory, nothing backs it up, and the run says so."""
+    home = backup_env["home"]
+    real = home / "cfg-real"
+    real.mkdir()
+    (real / "ego.local.yaml").write_text("cadence: 2\n")
+    (home / ".genesis" / "config").symlink_to(real, target_is_directory=True)
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    status = _status(backup_env)
+    assert status["extras_complete"] is False and status["extra_dirs_skipped"] == 1, status
+
+
+def test_user_config_copy_from_before_a_passphrase_rotation_is_reencrypted(backup_env, tmp_path):
+    """A kept copy is compared by decrypted content: one the current passphrase
+    cannot open (made before a rotation) is re-encrypted, even with a newer mtime,
+    so every copy in a snapshot opens with the passphrase restore will use."""
+    _seed_user_config(backup_env["home"])
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    assert _run_local(backup_env, offsite).returncode == 0
+    copy = _repo(backup_env) / "user_config" / "ego.local.yaml.gpg"
+    copy.unlink()
+    subprocess.run(
+        ["gpg", "--batch", "--yes", "--quiet", "--passphrase", "oldpass", "--symmetric", "-o", str(copy), "-"],
+        input=b"cadence: 3\n",
+        env={**os.environ, "GNUPGHOME": str(backup_env["home"] / ".gnupg")},
+        capture_output=True,
+        check=True,
+    )
+    future = time.time() + 3600
+    os.utime(copy, (future, future))
+    assert _run_local(backup_env, offsite).returncode == 0
+    assert _gpg(backup_env["home"], "-d", str(copy)) == b"cadence: 2\n"
+
+
+def test_user_config_names_restore_cannot_read_are_gaps(backup_env, tmp_path):
+    """A name outside the off-site restore rule is reported as a gap and never
+    uploaded, rather than uploaded and then silently skipped on recovery."""
+    cfg = _seed_user_config(backup_env["home"])
+    (cfg / "network+dns.yaml").write_text("a\n")
+    (cfg / "-dash.yaml").write_text("b\n")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    names = {p.name for p in (_repo(backup_env) / "user_config").iterdir()}
+    assert names == {"ego.local.yaml.gpg", "modules__tool.yaml.gpg"}, names
+    status = _status(backup_env)
+    assert status["extras_complete"] is False and status["extra_dirs_skipped"] == 2, status
+
+
+def test_user_config_restore_refuses_a_bak_payload(backup_env, tmp_path):
+    """Backup never writes *.bak-* copies, so restore refuses one."""
+    src = tmp_path / "only-config"
+    (src / "user_config").mkdir(parents=True)
+    for name in ("ego.local.yaml.bak-20260101.gpg", "ego.local.yaml.gpg"):
+        _gpg(backup_env["home"], "--symmetric", "-o", str(src / "user_config" / name), "-", data=b"c\n")
+    fresh = tmp_path / "fresh"
+    (fresh / ".genesis").mkdir(parents=True)
+    (fresh / "genesis").mkdir()
+    (fresh / "tmp").mkdir()
+    (fresh / ".gnupg").mkdir(mode=0o700)
+    r = subprocess.run(
+        ["bash", str(_RESTORE), "--from", str(src)],
+        env=_fresh_restore_env(backup_env, fresh),
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    cfg = fresh / ".genesis" / "config"
+    assert (cfg / "ego.local.yaml").read_text() == "c\n", r.stdout[-3000:]
+    assert not (cfg / "ego.local.yaml.bak-20260101").exists()
+    assert "unexpected payload ego.local.yaml.bak-20260101.gpg" in r.stdout, r.stdout[-3000:]
+
+
+def test_a_user_config_dir_holding_no_ciphertext_is_not_a_payload(backup_env, tmp_path):
+    """A user_config/ with only a README is nothing restore can apply."""
+    src = tmp_path / "readme-only"
+    (src / "user_config").mkdir(parents=True)
+    (src / "user_config" / "README").write_text("notes\n")
+    fresh = tmp_path / "fresh"
+    (fresh / ".genesis").mkdir(parents=True)
+    (fresh / "genesis").mkdir()
+    (fresh / "tmp").mkdir()
+    (fresh / ".gnupg").mkdir(mode=0o700)
+    r = subprocess.run(
+        ["bash", str(_RESTORE), "--from", str(src)],
+        env=_fresh_restore_env(backup_env, fresh),
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    assert r.returncode != 0 and "no restorable payloads" in r.stdout + r.stderr, r.stdout[-2000:]
+
+
+def test_core_overlap_leaves_out_only_the_named_entry(tmp_path):
+    """The legacy-archive exception sets aside the config entry alone: a config dir
+    inside the checkout (GENESIS_DIR=~/.genesis) still overlaps the checkout."""
+    home = tmp_path / "home"
+    (home / ".genesis" / "config").mkdir(parents=True)
+    core = _BACKUP.parent / "lib" / "backup_core_paths.sh"
+    cfg = str(home / ".genesis" / "config")
+    # The checkout at the config path itself: its own entry still protects it.
+    for gdir, want_rc in ((home / "genesis", 1), (home / ".genesis", 0), (home / ".genesis" / "config", 0)):
+        env = {
+            **os.environ,
+            "HOME": str(home),
+            "GENESIS_DIR": str(gdir),
+            "TRANSCRIPT_DIR": str(home / "t"),
+            "_SCRIPT_DIR": str(_BACKUP.parent),
+        }
+        env.pop("GENESIS_HOME", None)
+        proc = subprocess.run(
+            ["bash", "-c", f'source "{core}"; backup_core_overlap "$1" config', "x", cfg],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == want_rc, (gdir, proc.stdout, proc.stderr)
+    # Without the argument, the config dir is itself a core path.
+    proc = subprocess.run(
+        ["bash", "-c", f'source "{core}"; backup_core_overlap "$1"', "x", cfg],
+        env={**env, "GENESIS_DIR": str(home / "genesis")},
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)

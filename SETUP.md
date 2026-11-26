@@ -227,7 +227,8 @@ watchdogs have their own off switch; see `docs/reference/network-resilience.md`.
 Backups run every 6 hours via the `genesis-backup.timer` systemd user unit
 and split into two tiers:
 
-- **Tier 1** (git → GitHub): Memory files, configs, secrets and your per-install
+- **Tier 1** (git → GitHub): Memory files, configs (including every setting you
+  change, which lives in `~/.genesis/config/`), secrets and your per-install
   identity files (`USER.md`, and any identity file you customise locally) (~1MB).
   Automatic; everything that can hold personal data is encrypted. Resetting an
   identity file to its template keeps the last backed-up copy; delete the file to
