@@ -80,8 +80,8 @@ def _qdrant(contents: dict[str, str]):
 async def test_breadcrumbs_keep_prefixes_and_remember_full_ids(db):
     dicts = [{"memory_id": SEED}]
     await P._breadcrumbs(db, dicts)
-    assert dicts[0]["related_ids"] == ["aaaaaaaa", "bbbbbbbb"]
-    assert dicts[0]["_related_full"] == [LIVE, HIDDEN]
+    assert dicts[0]["related_ids"] == ["aaaaaaaa"]  # HIDDEN is never offered
+    assert dicts[0]["_related_full"] == [LIVE]
 
 
 async def test_breadcrumb_labels_never_label_a_hidden_or_credential_id(db):
@@ -99,7 +99,7 @@ async def test_breadcrumb_labels_never_label_a_hidden_or_credential_id(db):
         }
     )
     await P._breadcrumb_labels(db, dicts, q)
-    # Top 2 by strength: LIVE (0.9) and CRED (0.85); HIDDEN (0.8) is the third.
+    # Top 2 visible by strength: LIVE (0.9) and CRED (0.85); HIDDEN is dropped.
     assert dicts[0]["related_ids"] == ["aaaaaaaa", "cccccccc"]
     assert dicts[0]["related_labels"] == {"aaaaaaaa": "Hook budget is anchored to process…"}
     assert FAKE_SECRET not in repr(dicts)
@@ -113,7 +113,7 @@ async def test_breadcrumb_label_failure_keeps_the_hint_ids(db):
         raise RuntimeError("qdrant down")
 
     await P._breadcrumb_labels(db, dicts, SimpleNamespace(retrieve=boom))
-    assert dicts[0]["related_ids"] == ["aaaaaaaa", "bbbbbbbb"]
+    assert dicts[0]["related_ids"] == ["aaaaaaaa"]
     assert "related_labels" not in dicts[0]
 
 
@@ -140,9 +140,14 @@ def test_trace_record_persists_the_shown_hints():
 
 
 async def test_breadcrumb_labels_skip_a_hidden_hint(db):
-    dicts = [{"memory_id": SEED}]
-    await P._breadcrumbs(db, dicts)
-    assert dicts[0]["related_ids"] == ["aaaaaaaa", "bbbbbbbb"]  # the id itself stays (#5051)
+    # A hint that turned hidden after _breadcrumbs read it (the reads are separate).
+    dicts = [
+        {
+            "memory_id": SEED,
+            "related_ids": ["aaaaaaaa", "bbbbbbbb"],
+            "_related_full": [LIVE, HIDDEN],
+        }
+    ]
     await P._breadcrumb_labels(db, dicts, _qdrant({LIVE: "live note", HIDDEN: "a superseded rule"}))
     assert dicts[0]["related_labels"] == {"aaaaaaaa": "live note"}
 
