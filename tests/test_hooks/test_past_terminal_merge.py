@@ -181,6 +181,72 @@ def test_an_unreviewed_marker_never_becomes_the_terminal_head():
     assert got["terminal_head"] == H2
 
 
+@pytest.mark.parametrize("review_hour", [2, 3], ids=["review-before-marker", "same-instant"])
+def test_a_review_from_before_the_marker_confirms_nothing(review_hour):
+    # H3 was reviewed (clean) before, or at the instant, its confirmation marker
+    # was posted. That review answers no confirmation request, so the terminal
+    # head stays the round-2 head.
+    reviews = (_finding(H1, _at(0)), _finding(H2, _at(1)), _clean(H3, _at(review_hour)))
+    comments = (_marker(H3, _at(3)),)
+    got = _ev(head=H3, reviews=reviews, comments=comments, files=(GATE_FILE,))
+    assert got["terminal_state"] == "past"
+    assert got["terminal_head"] == H2
+
+
+def test_a_marker_for_an_earlier_reviewed_head_cannot_outrank_the_real_one():
+    # Someone posts a marker naming H2, which Codex reviewed BEFORE that comment.
+    # Then the real confirmation for H3 is posted and reviewed. H3 is terminal.
+    reviews = (_finding(H1, _at(1)), _finding(H2, _at(2)), _clean(H3, _at(6)))
+    comments = (_marker(H2, _at(4)), _marker(H3, _at(5)))
+    got = _ev(head=H3, reviews=reviews, comments=comments, files=(GATE_FILE,))
+    assert got["terminal_head"] == H3
+
+
+def test_a_thread_reply_after_the_marker_answers_nothing():
+    # H3 was approved before its marker. Afterwards Codex only replies inside a
+    # thread, which GitHub records as an empty COMMENTED review on H3. That wrapper
+    # is no review, so it must not answer the marker: the round-2 head stays terminal.
+    reply = {
+        "login": rf.CODEX_LOGIN,
+        "commit_id": H3,
+        "state": "COMMENTED",
+        "submitted_at": _at(5),
+        "body": "",
+        "top_level": [],
+    }
+    reviews = (_finding(H1, _at(0)), _finding(H2, _at(1)), _clean(H3, _at(2)), reply)
+    comments = (_marker(H3, _at(3)),)
+    got = _ev(head=H3, reviews=reviews, comments=comments, files=(GATE_FILE,))
+    assert got["terminal_head"] == H2
+
+
+def test_a_real_commented_review_after_the_marker_still_answers_it():
+    # The positive twin of the thread-reply case: a COMMENTED review with text is a
+    # review, so it answers the marker and H3 becomes terminal.
+    review = {
+        "login": rf.CODEX_LOGIN,
+        "commit_id": H3,
+        "state": "COMMENTED",
+        "submitted_at": _at(5),
+        "body": "Reviewed; no further findings.",
+        "top_level": [],
+    }
+    reviews = (_finding(H1, _at(0)), _finding(H2, _at(1)), _clean(H3, _at(2)), review)
+    comments = (_marker(H3, _at(3)),)
+    got = _ev(head=H3, reviews=reviews, comments=comments, files=(GATE_FILE,))
+    assert got["terminal_head"] == H3
+
+
+def test_an_edited_comment_dates_its_marker_by_the_edit():
+    # A comment created at hour 1 is edited at hour 5 to carry a marker for H3,
+    # which Codex reviewed at hour 4. Dated by creation the marker would look
+    # answered; dated by the edit it is not, so the round-2 head stays terminal.
+    reviews = (_finding(H1, _at(0)), _finding(H2, _at(2)), _clean(H3, _at(4)))
+    edited = {**_marker(H3, _at(1)), "updated_at": _at(5)}
+    got = _ev(head=H3, reviews=reviews, comments=(edited,), files=(GATE_FILE,))
+    assert got["terminal_head"] == H2
+
+
 def test_the_gate_lane_before_its_confirmation_is_below_terminal():
     reviews = (_finding(H1, _at(1)), _finding(H2, _at(2)))
     got = _ev(head=H3, reviews=reviews, files=(GATE_FILE,))
@@ -378,6 +444,27 @@ def test_the_report_row_blocks_and_counts_in_the_verdict(monkeypatch, capsys):
     row = next(ln for ln in out.splitlines() if ln.startswith("terminal-head"))
     assert row.startswith("terminal-head  : BLOCK — past round 4 the PR moved off"), row
     assert "merge-with" not in out
+    assert rc == 1
+
+
+def test_the_report_row_judges_the_rounds_rows_own_read(monkeypatch, capsys):
+    # The rounds row's read comes back unreadable. The terminal-head row must block
+    # on that same read, never pass on a second one (the seam would say below).
+    calls = []
+
+    def fake(*_a, **_k):
+        calls.append(1)
+        return {"status": "unknown", "errors": ["graphql_unreadable"]}
+
+    ch._report_env(monkeypatch, scheduled=ch._scheduled_marker(ch.HEAD))
+    monkeypatch.delenv("_TEST_ROUNDS_ROW")
+    monkeypatch.setattr(G._review_budget, "evaluate_pr", fake)
+    rc = G.check_pr_report("100", repo=ch.REPO)
+    out = capsys.readouterr().out
+    assert "rounds         : unreadable" in out
+    row = next(ln for ln in out.splitlines() if ln.startswith("terminal-head"))
+    assert row.startswith("terminal-head  : BLOCK — the review budget is unreadable"), row
+    assert len(calls) == 1
     assert rc == 1
 
 

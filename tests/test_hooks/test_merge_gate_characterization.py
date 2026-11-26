@@ -1552,9 +1552,10 @@ def test_the_no_change_note_is_wired_and_never_moves_the_verdict(
     budget = {"status": "ok", "current_head": HEAD, "terminal_state": "below"}
     seen = {}
 
-    def fake_rounds(pr_num, repo=None, budget_out=None):
-        if budget_out is not None:
-            budget_out.append(budget)
+    def fake_rounds(pr_num, repo=None, budget_out=None, read_out=None):
+        for out in (budget_out, read_out):
+            if out is not None:
+                out.append(budget)
         return "x"
 
     def fake_note(pr_num, repo, got):

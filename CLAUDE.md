@@ -166,6 +166,15 @@ components — invoke the `genesis-development` skill via the Skill tool
 immediately. Do NOT load it for Genesis-as-tool work (using
 Genesis to research, summarize, write content, or do non-Genesis tasks).
 
+A foreground development session whose type the owner has not stated is a
+**spec session**: load `spec-session` and write no code unless the change is on
+the spec skill's skip list; otherwise the build happens in a
+build session once a spec and an approved plan exist. The owner names the other
+three (build, closing, validating) when opening the session, or hands over a
+handoff file whose `For:` line names the type, or a spec whose status is
+`approved`. A dispatched session takes its type from its dispatcher's prompt; a
+subagent and a channel conversation have none.
+
 ## Vision
 
 - **Philosophical foundation**: `docs/architecture/genesis-v3-vision.md` —
