@@ -168,6 +168,7 @@ def test_next_open_is_a_real_in_window_instant(zone, spec, now, expected):
 
 def test_failed_timezone_lookup_is_fallback_even_with_valid_user_config(tmp_path):
     with (
+        patch("genesis.guardian.deletion_window._system_zone_name", return_value=None),
         patch("genesis.env._local_config", return_value={"timezone": "Europe/Berlin"}),
         patch("genesis.env.user_timezone", side_effect=RuntimeError("lookup failed")),
     ):

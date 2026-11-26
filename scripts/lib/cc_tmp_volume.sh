@@ -74,7 +74,8 @@ _cctmpvol_container() {
     fi
     local name=""
     if [[ -f "$CCTMPVOL_GUARDIAN_YAML" ]]; then
-        name="$(awk -F':' '/^container_name:/ {sub(/^[^:]*:/,""); gsub(/[" '"'"']/,""); print; exit}' \
+        # A trailing "# comment" is YAML, not part of the name: drop it first.
+        name="$(awk -F':' '/^container_name:/ {sub(/^[^:]*:/,""); sub(/[ \t]+#.*$/,""); gsub(/[" '"'"']/,""); print; exit}' \
             "$CCTMPVOL_GUARDIAN_YAML" 2>/dev/null)" || name=""
     fi
     echo "${name:-genesis}"

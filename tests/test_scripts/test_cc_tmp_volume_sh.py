@@ -422,6 +422,18 @@ def test_result_token_live_cc_at_recheck(tmp_path):
 # ── container resolution honors the authoritative guardian.yaml default ──────
 
 
+def test_container_name_ignores_a_trailing_yaml_comment(tmp_path):
+    env = _sandbox(tmp_path)
+    cfgdir = tmp_path / ".local" / "share" / "genesis-guardian" / "config"
+    cfgdir.mkdir(parents=True)
+    (cfgdir / "guardian.yaml").write_text("container_name: mybox  # production container\n")
+    res = _run(env)
+    assert res.returncode == 0 and "__DONE__" in res.stdout
+    # Exact token: the comment must not ride along as "mybox#productioncontainer".
+    targets = {line.split()[1] for line in _log(tmp_path).splitlines() if line.startswith("info ")}
+    assert targets == {"mybox"}
+
+
 def test_guardian_yaml_default_resolves_container_name(tmp_path):
     # The lib's CCTMPVOL_GUARDIAN_YAML default must point at the authoritative
     # path install_guardian.sh writes ($HOME/.local/share/genesis-guardian/config/
