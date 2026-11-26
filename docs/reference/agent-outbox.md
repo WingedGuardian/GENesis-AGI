@@ -22,6 +22,10 @@ owned context; a supplied context must already belong to this peer and epoch,
 or match the deterministic context for an exact retry of that message_id.
 Pass a stable UUID message_id when retrying the same logical send. Reusing an
 identity with changed content conflicts. Otherwise use a new message_id.
+A refusal carries a `reason` naming the rule that failed (the closed list is in
+the tool's docstring and `peers/outbox.py` `REFUSAL_REASONS`). It never quotes
+the text, and peers never see it: the peer-facing API still answers with the
+code and status only.
 
 Every `agent_send` caller writes a typed envelope to `pending_outreach`, with a
 stable queue identity, and reports queued_for_governance. The normal scheduler
