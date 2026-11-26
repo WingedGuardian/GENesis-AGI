@@ -10,10 +10,12 @@ import logging
 import os
 import re
 import stat
+import subprocess
 from pathlib import Path
 
 from flask import jsonify, request, send_file
 
+from genesis.dashboard import _identity_layer as identity_layer
 from genesis.dashboard._blueprint import blueprint
 from genesis.dashboard.auth import (
     api_mutation_auth_disabled,
@@ -566,6 +568,71 @@ def _sanitize_path(raw: str | None) -> tuple[Path | None, tuple | None]:
     return resolved, None
 
 
+def _identity_dir() -> Path:
+    """The identity directory of the checkout this server runs (the config editor's)."""
+    from genesis.dashboard.routes import config as config_routes
+
+    return config_routes._IDENTITY_DIR.resolve()
+
+
+def _layer_of(target: Path) -> str | None:
+    """CONVERSATION.md or STEERING.md in the server's identity directory, else None."""
+    if target.parent == _identity_dir() and identity_layer.is_layer(target.name):
+        return target.name
+    return None
+
+
+def _holds_identity_dir(path: Path) -> bool:
+    """*path* is the server's identity directory or a directory above it.
+
+    Renaming one would take the layer files out from under the guards above and
+    let them be edited in place, then renamed back.
+    """
+    return _identity_dir().is_relative_to(path)
+
+
+def _is_local_layer(target: Path) -> bool:
+    """A ``<stem>.local.md`` in the server's identity directory: written only via its layer."""
+    return target.parent == _identity_dir() and target.name.endswith(".local.md")
+
+
+def _dirties_server_checkout(target: Path) -> bool:
+    """Whether *target* is now a changed tracked file of the checkout this server runs.
+
+    That is the tree the next deploy checks, and it refuses a dirty one. Other
+    clones and worktrees are where tracked files are meant to be edited.
+    Unreadable reads as False: this only decides whether a warning is shown,
+    so git gets 10 s (a wedged index lock must not hold the request thread).
+    """
+    from genesis.dashboard.routes import config as config_routes
+
+    repo = config_routes._REPO_ROOT.resolve()
+    if not target.is_relative_to(repo):
+        return False
+    from genesis.session_awareness.zero_drop_git import scrubbed_git_env
+
+    try:
+        # Hardened like every other read of the deployed tree (zero_drop_git.py):
+        # no index write or lock, the path read literally, no fsmonitor command
+        # from a config the browser itself can edit, no inherited GIT_DIR.
+        status = subprocess.run(
+            ["git", "--no-optional-locks", "--literal-pathspecs", "-c", "core.fsmonitor=false",
+             "-C", str(repo), "status", "--porcelain", "--untracked-files=no", "--",
+             str(target.relative_to(repo))],
+            capture_output=True, text=True, timeout=10,
+            env={**scrubbed_git_env(), "GIT_OPTIONAL_LOCKS": "0"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return status.returncode == 0 and bool(status.stdout.strip())
+
+
+_TRACKED_WARNING = (
+    "Saved, but this file is tracked in the checkout Genesis runs from: it is now "
+    "changed there, and the next deploy refuses until it is committed or reverted."
+)
+
+
 def _file_info(p: Path) -> dict:
     """Return metadata dict for a single path."""
     try:
@@ -654,6 +721,13 @@ def file_read():
     target, err = _sanitize_path(request.args.get("path"))
     if err:
         return jsonify(err[0]), err[1]
+    if (layer := _layer_of(target)) is not None:
+        # CONVERSATION/STEERING: the text sessions read, saved into the local layer.
+        body, status = identity_layer.read_layer(target.parent, layer)
+        if status == 200:
+            body.update(path=str(target), size=len(body["content"]), mode="markdown",
+                        writable=True, layered=True)
+        return jsonify(body), status
     if not target.is_file():
         return jsonify({"error": "Not a file"}), 404
     if target.stat().st_size > _MAX_FILE_SIZE:
@@ -709,19 +783,29 @@ def file_write():
     target, err = _sanitize_path(data.get("path"))
     if err:
         return jsonify(err[0]), err[1]
-    if content is None:
+    if not isinstance(content, str):
         return jsonify({"error": "content required"}), 400
+    if _is_local_layer(target):
+        return jsonify({"error": "edit the shipped file; its local layer is written for you"}), 403
     if not target.exists():
         return jsonify({"error": "File not found — use create endpoint"}), 404
     if len(content.encode("utf-8")) > _MAX_FILE_SIZE:
         return jsonify({"error": "Content too large"}), 413
+    if (layer := _layer_of(target)) is not None:
+        body, status = identity_layer.save_layer(target.parent, layer, content, data.get("version"))
+        if status == 200:
+            body["size"] = len(content)
+        return jsonify(body), status
 
     try:
         target.write_text(content, encoding="utf-8")
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
-    return jsonify({"status": "ok", "path": str(target), "size": len(content)})
+    result = {"status": "ok", "path": str(target), "size": len(content)}
+    if _dirties_server_checkout(target):
+        result["warning"] = _TRACKED_WARNING
+    return jsonify(result)
 
 
 @blueprint.route("/api/genesis/files/create", methods=["POST"])
@@ -740,6 +824,8 @@ def file_create():
         return jsonify(err[0]), err[1]
     if target.exists():
         return jsonify({"error": "Already exists"}), 409
+    if _is_local_layer(target) or _layer_of(target) is not None:
+        return jsonify({"error": "this identity file is edited in place only through its layer"}), 403
 
     # Parent must exist and be allowed
     if not target.parent.is_dir():
@@ -789,6 +875,10 @@ def file_rename():
         return jsonify({"error": "Directory contains a live database"}), 403
 
     dest = source.parent / new_name
+    if _holds_identity_dir(source) or any(
+        _is_local_layer(p) or _layer_of(p) is not None for p in (source, dest)
+    ):
+        return jsonify({"error": "a local identity layer is not renamed via the browser"}), 403
     if not _is_allowed(dest):
         return jsonify({"error": "Destination path not allowed"}), 403
     if dest.exists():
@@ -818,6 +908,10 @@ def file_delete():
         return jsonify({"error": "Not found"}), 404
     if target.is_dir():
         return jsonify({"error": "Cannot delete directories via browser — use terminal"}), 400
+    if _is_local_layer(target) or _layer_of(target) is not None:
+        # The shipped file is tracked; its local layer is written under the
+        # identity lock. Edit the shipped file's text instead.
+        return jsonify({"error": "this identity file is edited, not deleted, via the browser"}), 403
 
     from genesis.trash import TrashRefused, trash
 

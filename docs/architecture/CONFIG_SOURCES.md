@@ -272,8 +272,23 @@ names, so an overlay of a read-only file is editable (#2446).
   files: `USER.md` (user-edited, seeded from `USER.md.example`) and runtime-generated
   `USER_KNOWLEDGE.md` and `TRIAGE_CALIBRATION.md`. `IdentityLoader` caches
   per instance (the runtime's perception loader is built at init, so hand edits need a
-  restart); `src/genesis/cc/system_prompt.py` re-reads per call. The dashboard file editor
-  may edit these, and may create one only where a `.example` exists.
+  restart); `src/genesis/cc/system_prompt.py` re-reads per call. Every reader resolves
+  `SOUL.md`/`VOICE.md`/`CONVERSATION.md`/`STEERING.md` through
+  `src/genesis/identity/paths.py`: SOUL and VOICE read `<name>`, else `<name>.example`;
+  CONVERSATION and STEERING read the tracked file with a per-install `<stem>.local.md`
+  appended after a `---` (a local file whose first line is `<!-- genesis: replace -->`
+  replaces the tracked text, and the result opens with a line saying so). The
+  steering writer (`IdentityLoader.add_steering_rule`) appends captured rules to
+  `STEERING.local.md`, never to the tracked file. The dashboard file editor
+  may edit these, and may create one only where a `.example` exists. For
+  CONVERSATION.md and STEERING.md it shows the resolved text and saves an edit
+  into `<stem>.local.md` (an append layer when the edit only adds after the
+  shipped text, otherwise a replace layer), under the same directory lock as the
+  steering writer; a save made against an older version of the text is refused.
+  The generic file browser (`dashboard/routes/files.py`) does the same for those
+  two files in the server's own identity directory, refuses a direct write,
+  create or rename of a `.local.md` there, and saves any other tracked file of a
+  main checkout with a warning that the deploy will refuse the dirty tree.
 - **Claude Code** — `.claude/settings.json` (tracked, hook wiring, ships to every clone);
   `.claude/settings.local.json` (gitignored); `~/.claude/settings.json` (user level;
   `scripts/setup_claude_config.py --global` applies `config/cc-global-settings.yaml`, and

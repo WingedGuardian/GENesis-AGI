@@ -14,6 +14,7 @@ from pathlib import Path
 import yaml
 from flask import jsonify, request
 
+from genesis.dashboard import _identity_layer as identity_layer
 from genesis.dashboard._blueprint import blueprint
 from genesis.env import cc_project_dir
 from genesis.util.resolve import resolve_refusing_loops
@@ -180,9 +181,36 @@ def config_files():
     return jsonify(results)
 
 
+def _layer_name(name: str) -> str | None:
+    """*name* when it is a LAYER identity file (CONVERSATION.md, STEERING.md)."""
+    return name if identity_layer.is_layer(name) else None
+
+
+def _misspelled_layer(name: str) -> bool:
+    """A LAYER or local-layer file asked for under a path prefix.
+
+    The identity resolvers key on the last path segment, so ``x/STEERING.md``
+    would otherwise reach the tracked file and skip the layer path entirely.
+    """
+    base = name.rsplit("/", 1)[-1]
+    return name != base and (bool(_layer_name(base)) or base.endswith(".local.md"))
+
+
 @blueprint.route("/api/genesis/config-files/<path:name>")
 def config_file_content(name: str):
-    """Return the content of a config, identity, or memory file."""
+    """Return the content of a config, identity, or memory file.
+
+    A LAYER identity file (CONVERSATION.md, STEERING.md) returns the text the
+    model reads (the shipped file plus this install's ``<stem>.local.md``),
+    with a ``version`` a save must send back.
+    """
+    if _misspelled_layer(name):
+        return jsonify({"error": "name the identity file without a path prefix"}), 403
+    if _layer_name(name):
+        body, status = identity_layer.read_layer(_IDENTITY_DIR, name)
+        if status == 200:
+            body["syntax"] = "markdown"
+        return jsonify(body), status
     target, syntax = _resolve_file(name)
     if target is None:
         return jsonify({"error": "not found"}), 404
@@ -210,8 +238,18 @@ def config_file_update(name: str):
         return jsonify({"error": "missing 'content' in request body"}), 400
 
     content = data["content"]
+    if not isinstance(content, str):
+        return jsonify({"error": "'content' must be a string"}), 400
     if len(content) > 1_000_000:
         return jsonify({"error": "content too large (max 1MB)"}), 413
+
+    if _misspelled_layer(name):
+        return jsonify({"error": "name the identity file without a path prefix"}), 403
+    if name.endswith(".local.md"):
+        return jsonify({"error": "edit the shipped file's name; its local layer is written for you"}), 403
+    if _layer_name(name):
+        body, status = identity_layer.save_layer(_IDENTITY_DIR, name, content, data.get("version"))
+        return jsonify(body), status
 
     target, allowed_dir = _resolve_file_for_write(name)
 

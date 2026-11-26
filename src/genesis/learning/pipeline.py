@@ -435,7 +435,8 @@ def build_triage_pipeline(
         summary: Any,
         loader: Any,
     ) -> str | None:
-        """Extract a steering rule from a user correction and add to STEERING.md.
+        """Extract a steering rule from a user correction and add it to the
+        per-install STEERING.local.md layer.
 
         Fires only on approach_failure (gated upstream). Two further layers, both
         fail-CLOSED, both applied HERE so the write is gated at its own function
@@ -454,8 +455,11 @@ def build_triage_pipeline(
            too late" was captured verbatim as a rule).
 
         Note: add_steering_rule() does synchronous file I/O (read + write
-        STEERING.md). Acceptable because the file is tiny (<2KB) and local, and
-        this runs in a fire-and-forget background task.
+        STEERING.local.md). Acceptable because the file is small and local, and
+        this runs in a fire-and-forget background task. The rule is stored
+        whole. `_looks_like_directive` bounds it to two sentences and
+        _MAX_DIRECTIVE_WORDS words, not characters; what bounds the injected
+        steering text is the session-start hook's part budget.
         """
         if summary.channel not in _STEERING_CHANNELS:
             # Log the REFUSAL: it is the only signal this attempt produces. The
@@ -484,8 +488,9 @@ def build_triage_pipeline(
         if not _looks_like_directive(user_text):
             return None
 
-        rule = user_text if len(user_text) <= 200 else user_text[:200] + "..."
-        loader.add_steering_rule(rule)
+        rule = user_text
+        if not loader.add_steering_rule(rule):
+            return None  # already in force: nothing written, nothing to emit
         logger.info("Auto-added steering rule from user correction: %.80s...", rule)
         # Return the written rule so the caller can distinguish a REAL write
         # from a directive-filter reject (the WS-3 gate-2 emit fires only on

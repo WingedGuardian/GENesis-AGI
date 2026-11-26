@@ -232,7 +232,9 @@ _PART_STAMP = re.compile(rb"\[genesis-ctx:([\w-]+)")
 #: captured group is bytes from a file this process does not own: an unknown
 #: name means the file is NOT ours, whatever it claims. Kept in parity with
 #: ``_PARTS`` in scripts/genesis_session_context.py by a test.
-_KNOWN_PARTS = frozenset({"charter", "identity-core", "identity-user", "knowledge", "all"})
+_KNOWN_PARTS = frozenset(
+    {"charter", "soul", "steering", "identity-user", "knowledge", "all", "identity-core"}
+)
 
 #: The pre-stamp session-context injection always began with this heading.
 #: Kept ONLY so filings from sessions started before the fix are attributed
@@ -1012,8 +1014,10 @@ def derive_findings(health: InjectionHealth, *, max_listed: int = 5) -> list[str
         findings.append(
             f"the SessionStart hook was MIS-WIRED {len(health.miswires)} time(s) "
             f"({health.miswires[-1]}) — those sessions got the charter part ONLY, so "
-            "identity and essential knowledge were missing from them. Fix the four "
-            "`--part` entries in .claude/settings.json and restart those sessions."
+            "identity and essential knowledge were missing from them. Fix the "
+            "SessionStart `--part` entries in .claude/settings.json (or, if the wiring "
+            "is newer than the main checkout's script, deploy main), then restart "
+            "those sessions."
         )
     if not health.fresh_filings:
         return findings

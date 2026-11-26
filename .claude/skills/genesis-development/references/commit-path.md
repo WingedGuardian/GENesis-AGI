@@ -306,7 +306,7 @@ Verify before any commit:
   block.
 - **Anything a hook prints to CC's context has a hard, measured ceiling**
   (CLAUDE.md "Hook Output Persistence"). The SessionStart injection is therefore
-  four `--part` entries with per-part budgets, CI ceilings on every tracked
+  five `--part` entries with per-part budgets, CI ceilings on every tracked
   identity file (`tests/test_scripts/test_context_injection_budget.py`), and a
   watcher over the harness's own filings. Adding protocol text to an identity
   file is a budget decision: put DETAIL in a reference doc and a pointer in the

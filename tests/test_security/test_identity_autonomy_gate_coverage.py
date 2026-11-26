@@ -92,7 +92,7 @@ _LOADER_WRITE_METHODS = {
     "write_user_md",
     "write_user_knowledge_md",
     "_write_narrative_knowledge",
-    "_write_steering",
+    "add_steering_rule",  # writes STEERING.local.md (#2862)
 }
 
 # Public writer entry points whose CALLERS must be classified.
@@ -122,6 +122,19 @@ IDENTITY_GATE_SITES: dict[str, tuple[str, str | None, str]] = {
 # Identity-file writers OUTSIDE loader.py that a loader-scoped sweep cannot
 # see — pinned manually (the gate-4 _EXTRA_WRAPPED_SITES pattern).
 IDENTITY_EXTRA_SITES: dict[str, tuple[str, str | None, str]] = {
+    "dashboard/_identity_layer.py::save_layer": (
+        "exempt-with-reason",
+        None,
+        "owner-direct edit surface (HTTP-auth'd dashboard PUT of CONVERSATION/"
+        "STEERING into their <stem>.local.md, from either editor) — owner origin "
+        "by construction",
+    ),
+    "dashboard/routes/files.py::file_write": (
+        "exempt-with-reason",
+        None,
+        "owner-direct edit surface (HTTP-auth'd dashboard file editor); its "
+        "CONVERSATION/STEERING saves route through save_layer",
+    ),
     "dashboard/routes/config.py::config_file_update": (
         "exempt-with-reason",
         None,
@@ -132,8 +145,9 @@ IDENTITY_EXTRA_SITES: dict[str, tuple[str, str | None, str]] = {
 
 
 def test_loader_write_surface_is_pinned():
-    """SET-EQUALITY on identity/loader.py's write_text enclosers — a new or
-    moved raw write method fails CI and must be classified here."""
+    """SET-EQUALITY on identity/loader.py's raw-write enclosers (write_text, an
+    os.replace swapping a file in, or identity/paths.py's write_atomic) — a new
+    or moved raw write method fails CI and must be classified here."""
     tree = _parse(_SRC / "identity" / "loader.py")
     assert tree is not None
     funcs = _funcs(tree)
@@ -141,8 +155,21 @@ def test_loader_write_surface_is_pinned():
         _enclosing(funcs, node.lineno)
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "write_text"
+        and (
+            (
+                isinstance(node.func, ast.Attribute)
+                and (
+                    node.func.attr == "write_text"
+                    or (
+                        node.func.attr == "replace"
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "os"
+                    )
+                )
+            )
+            # identity/paths.py's atomic writer, which every local-layer write uses
+            or (isinstance(node.func, ast.Name) and node.func.id == "write_atomic")
+        )
     }
     assert writers == _LOADER_WRITE_METHODS, (
         f"identity/loader.py raw-write surface changed: {sorted(writers)} != "
@@ -189,15 +216,17 @@ def test_identity_gated_sites_actually_emit():
 
 
 def test_dashboard_identity_writer_still_exists():
-    """The manual pin must track reality: the dashboard PUT writer's enclosing
-    function must still exist (rename/removal updates the registry)."""
-    tree = _parse(_SRC / "dashboard" / "routes" / "config.py")
-    assert tree is not None
-    names = {name for _, _, name in _funcs(tree)}
-    assert "config_file_update" in names, (
-        "dashboard/routes/config.py::config_file_update not found — update "
-        "IDENTITY_EXTRA_SITES to the new identity-file write surface"
-    )
+    """The manual pin must track reality: every pinned writer's function must
+    still exist (a rename or removal updates the registry)."""
+    for key in IDENTITY_EXTRA_SITES:
+        rel, func = key.split("::")
+        tree = _parse(_SRC / rel)
+        assert tree is not None, f"{rel} missing or unparseable"
+        names = {name for _, _, name in _funcs(tree)}
+        assert func in names, (
+            f"{key} not found — update IDENTITY_EXTRA_SITES to the new "
+            "identity-file write surface"
+        )
 
 
 # ═══════════════════════════════ GATE 3 — autonomy ══════════════════════════

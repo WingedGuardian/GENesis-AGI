@@ -106,7 +106,7 @@ class TestLoadIdentityBlock:
         assert "---" in result  # separator between SOUL and VOICE
 
     def test_fallback_when_missing(self, builder):
-        with patch("pathlib.Path.exists", return_value=False):
+        with patch("genesis.identity.paths.read_identity", return_value=None):
             result = builder._load_identity_block()
         assert result == "You are Genesis, an autonomous AI agent."
 

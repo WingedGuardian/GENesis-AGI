@@ -25,7 +25,16 @@
                 "hooks": [
                     {
                         "type": "command",
-                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook genesis_session_context.py --part identity-core",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook genesis_session_context.py --part identity-core --only soul",
+                        "timeout": 30
+                    }
+                ]
+            },
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook genesis_session_context.py --part identity-core --only steering",
                         "timeout": 30
                     }
                 ]
