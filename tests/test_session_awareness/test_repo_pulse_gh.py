@@ -221,3 +221,212 @@ async def test_list_open_prs_limit_hit_is_loud():
     run = _fake_runner({"pr": (0, json.dumps(prs), "")})
     out = await gh.list_open_prs(repo="o/r", limit=3, runner=run)
     assert out["limit_hit"] is True
+
+
+def _queue_page(total, nodes, *, more=False, cursor=None, default="main"):
+    return json.dumps({"data": {"repository": {
+        "url": "https://github.com/o/r",
+        "defaultBranchRef": {"name": default},
+        "pullRequests": {
+            "totalCount": total,
+            "pageInfo": {"hasNextPage": more, "endCursor": cursor},
+            "nodes": nodes,
+        },
+    }}})
+
+
+def _queue_pr(number, title, *, draft=False, labels=None):
+    labels = labels or []
+    return {
+        "number": number,
+        "title": title,
+        "isDraft": draft,
+        "labels": {
+            "totalCount": len(labels),
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": labels,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_queue_listing_paginates_graphql_and_keeps_required_fields():
+    first = _queue_pr(1, "one")
+    second = _queue_pr(2, "two", draft=True)
+    calls = []
+    responses = [
+        (0, _queue_page(2, [first], more=True, cursor="cursor-1"), ""),
+        (0, _queue_page(2, [second]), ""),
+    ]
+
+    async def run(argv):
+        calls.append(argv)
+        return responses.pop(0)
+
+    out = await gh.list_queue_prs(repo="o/r", runner=run)
+
+    assert out["repo"] == "o/r"
+    assert out["default_branch"] == "main"
+    assert out["open_total"] == out["read"] == 2
+    assert out["limit_hit"] is False
+    assert out["prs"] == [first, second]
+    assert all(argv[:3] == ["gh", "api", "graphql"] for argv in calls)
+    assert not any("--search" in argv for argv in calls)
+    assert any("after=cursor-1" in argv for argv in calls[1])
+
+
+@pytest.mark.asyncio
+async def test_queue_listing_reports_cursor_failure_without_claiming_complete():
+    first = {"number": 1, "title": "one"}
+    responses = [
+        (0, _queue_page(2, [first], more=True, cursor="cursor-1"), ""),
+        (1, "", "cursor request failed"),
+    ]
+
+    async def run(argv):
+        return responses.pop(0)
+
+    out = await gh.list_queue_prs(repo="o/r", runner=run)
+
+    assert out["limit_hit"] is True
+    assert out["read"] == 1
+    assert out["open_total"] == 2
+    assert "cursor request failed" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_queue_listing_preserves_malformed_numbered_rows():
+    malformed = _queue_pr(7, None)
+    run = _fake_runner({"api": (0, _queue_page(1, [malformed]), "")})
+
+    out = await gh.list_queue_prs(repo="o/r", runner=run)
+
+    assert out["prs"] == [malformed]
+    assert out["read"] == 1
+
+
+@pytest.mark.asyncio
+async def test_queue_listing_marks_total_count_mismatch():
+    one = _queue_pr(1, "one")
+    run = _fake_runner({"api": (0, _queue_page(3, [one]), "")})
+
+    out = await gh.list_queue_prs(repo="o/r", runner=run)
+
+    assert out["limit_hit"] is True
+    assert out["open_total"] == 3
+    assert out["read"] == 1
+
+
+@pytest.mark.asyncio
+async def test_queue_listing_paginates_labels_when_the_connection_is_saturated():
+    first = _queue_pr(4, "labels", labels=[{"name": "first"}])
+    first["labels"].update(
+        totalCount=2, pageInfo={"hasNextPage": True, "endCursor": "label-cursor"}
+    )
+    second_page = json.dumps({"data": {"repository": {"pullRequest": {
+        "labels": {
+            "totalCount": 2,
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [{"name": "second"}],
+        },
+    }}}})
+    responses = [(0, _queue_page(1, [first]), ""), (0, second_page, "")]
+
+    async def run(argv):
+        return responses.pop(0)
+
+    out = await gh.list_queue_prs(repo="o/r", runner=run)
+
+    assert [label["name"] for label in out["prs"][0]["labels"]["nodes"]] == [
+        "first", "second",
+    ]
+    assert out["prs"][0].get("_queue_error") is None
+
+
+def _comment_page(total, nodes, *, more=False, cursor=None):
+    return json.dumps({"data": {"repository": {"pullRequest": {
+        "comments": {
+            "totalCount": total,
+            "pageInfo": {"hasNextPage": more, "endCursor": cursor},
+            "nodes": nodes,
+        },
+    }}}})
+
+
+@pytest.mark.asyncio
+async def test_queue_comments_read_all_pages_and_surface_cursor_failure():
+    comments = [{"body": "one", "authorAssociation": "OWNER", "createdAt": "now"}]
+    responses = [
+        (0, _comment_page(2, comments, more=True, cursor="comment-cursor"), ""),
+        (0, _comment_page(2, comments), ""),
+    ]
+
+    async def run(argv):
+        return responses.pop(0)
+
+    out = await gh.list_queue_pr_comments("o/r", 8, runner=run)
+
+    assert out["total"] == out["read"] == 2
+    assert out["limit_hit"] is False
+
+    responses = [
+        (0, _comment_page(2, comments, more=True, cursor="comment-cursor"), ""),
+        (1, "", "comment page failed"),
+    ]
+
+    async def failing(argv):
+        return responses.pop(0)
+
+    failed = await gh.list_queue_pr_comments("o/r", 8, runner=failing)
+    assert failed["limit_hit"] is True
+    assert failed["read"] == 1
+    assert "comment page failed" in failed["error"]
+
+
+@pytest.mark.asyncio
+async def test_queue_mergeability_reread_uses_shared_runner():
+    run = _fake_runner({"pr": (0, "CONFLICTING\n", "")})
+
+    out = await gh.read_queue_pr_mergeability("o/r", 9, runner=run)
+
+    assert out == {"mergeable": "CONFLICTING"}
+    assert run.calls[0][:3] == ["gh", "pr", "view"]
+
+
+@pytest.mark.asyncio
+async def test_queue_pr_identity_reads_head_and_update_time_with_shared_runner():
+    calls = []
+
+    async def run(argv):
+        calls.append(argv)
+        return 0, json.dumps({
+            "headRefOid": "a" * 40,
+            "updatedAt": "2026-11-13T12:00:00Z",
+        }), ""
+
+    out = await gh.read_queue_pr_identity("o/r", 9, runner=run)
+
+    assert out == {"head_sha": "a" * 40, "updated_at": "2026-11-13T12:00:00Z"}
+    assert calls[0] == [
+        "gh", "pr", "view", "9", "--repo", "o/r", "--json", "headRefOid,updatedAt",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_queue_pr_identity_reports_malformed_api_facts():
+    async def run(argv):
+        return 0, json.dumps({"headRefOid": "short", "updatedAt": "2026-11-13T12:00:00Z"}), ""
+
+    out = await gh.read_queue_pr_identity("o/r", 9, runner=run)
+
+    assert "error" in out and "head SHA" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_queue_pr_identity_runner_exception_is_a_read_error():
+    async def run(argv):
+        raise TimeoutError("identity command timed out")
+
+    out = await gh.read_queue_pr_identity("o/r", 9, runner=run)
+
+    assert out == {"error": "PR identity read failed: identity command timed out"}
