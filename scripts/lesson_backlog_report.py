@@ -30,6 +30,7 @@ import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
@@ -40,6 +41,9 @@ _HOOKS = str(Path(__file__).resolve().parent / "hooks")
 if _HOOKS not in sys.path:
     sys.path.insert(0, _HOOKS)
 
+from genesis.learning.procedural.extractor import (  # noqa: E402
+    CROSS_TYPE_PREFILTER,
+)
 from genesis.learning.procedural.extractor import (  # noqa: E402
     NOVELTY_THRESHOLD as TOPIC_COSINE,
 )
@@ -82,7 +86,7 @@ def load(db_path: Path) -> Lessons:
         rows = conn.execute(
             "SELECT id, task_type, principle, created_at, draft, principle_embedding"
             " FROM procedural_memory WHERE deprecated = 0"
-            " ORDER BY julianday(created_at), id"
+            " ORDER BY julianday(created_at), created_at, id"
         ).fetchall()
     finally:
         conn.close()
@@ -116,19 +120,22 @@ def load(db_path: Path) -> Lessons:
 
 def block_rows(n: int) -> int:
     """Rows per similarity block: one block's (rows x n) float32 product, plus
-    working copies, within a share of MemAvailable. The x3 charges each row
-    for copies that exist once per row, so it over-reserves; that is safe."""
+    working copies, within a share of the memory this process can use. That is
+    the cgroup-capped figure (``hostmetrics.read_memory``), not procfs
+    MemAvailable, which inside a container can be the host's. The x3 charges
+    each row for copies that exist once per row, so it over-reserves; that is
+    safe."""
+    from genesis.hostmetrics.readings import read_memory
+
     if n == 0:
         return 1
     try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
-            if line.startswith("MemAvailable:"):
-                available = int(line.split()[1]) * 1024
-                break
-        else:
-            return min(n, _FALLBACK_BLOCK)
+        memory = read_memory()
     except (OSError, ValueError):
+        memory = None
+    if memory is None:
         return min(n, _FALLBACK_BLOCK)
+    available = memory.available
     per_row = n * 4 * 3
     return max(1, min(n, int(available * _MEMORY_SHARE) // per_row))
 
@@ -260,9 +267,13 @@ def render(lessons: Lessons, result: dict, *, generated_at: str, csv_name: str) 
             "",
             f"Of the {len(near)} drafts whose nearest earlier lesson is at or above "
             f"{TOPIC_COSINE}, {same} share its task type and {len(near) - same} do not. "
-            "The store-time novelty gate compares a new lesson against same-type "
-            "lessons at this threshold, so cross-type paraphrases are the duplicates "
-            "it lets through.",
+            "The extractor's store path dedups in three layers: a same-type novelty "
+            "check at this threshold, a cross-type LLM duplicate check over candidates "
+            f"from cosine {CROSS_TYPE_PREFILTER}, and a context-overlap check against "
+            "trusted lessons only. Other write paths, such as the executor's "
+            "retrospective, store drafts with none of them. A cross-type pair here may "
+            "be one those layers judged distinct, missed, or never saw; the split alone "
+            "does not show which.",
             "",
         ]
     topics = result["topics"]
@@ -374,10 +385,12 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--db", default=None, help="genesis.db path (default: the install's)")
     ap.add_argument("--out", default=None, help="output .md path (default: ~/.genesis/output/)")
-    ap.add_argument("--block", type=_positive, default=None, help="rows per block (default: from memory)")
+    ap.add_argument(
+        "--block", type=_positive, default=None, help="rows per block (default: from memory)"
+    )
     args = ap.parse_args(argv)
 
-    from genesis.env import genesis_db_path, output_dir
+    from genesis.env import genesis_db_path, output_dir, user_timezone
 
     db_path = Path(args.db) if args.db else genesis_db_path()
     if not db_path.exists():
@@ -388,10 +401,19 @@ def main(argv: list[str] | None = None) -> int:
     except FencedDatabase:
         print(f"lesson_backlog_report: {db_path} is fenced; not reading it", file=sys.stderr)
         return 2
+    out = Path(args.out) if args.out else None
+    if out is not None and out.with_suffix(".csv") == out:
+        print(
+            "lesson_backlog_report: --out must not end in .csv (that is the CSV's name)",
+            file=sys.stderr,
+        )
+        return 2
     block = args.block or block_rows(len(lessons.ids))
     result = analyse(lessons, block=block)
-    now = datetime.now(UTC)
-    out = Path(args.out) if args.out else output_dir() / f"lesson-backlog-report-{now.date()}.md"
+    # Shown to the user, so dated in the configured zone (stored and computed in UTC).
+    now = datetime.now(UTC).astimezone(ZoneInfo(user_timezone()))
+    if out is None:
+        out = output_dir() / f"lesson-backlog-report-{now.date()}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     csv_path = out.with_suffix(".csv")
     write_csv(csv_path, lessons, result)

@@ -219,3 +219,76 @@ def test_nan_and_zero_vectors_are_left_out_not_poisoning_the_rest(rep, tmp_path)
 def test_block_must_be_a_positive_integer(rep, db_path, tmp_path, value):
     with pytest.raises(SystemExit):
         rep.main(["--db", str(db_path), "--out", str(tmp_path / "r.md"), "--block", value])
+
+
+# ── Round-1 review fixes on #4721 ────────────────────────────────────────────
+
+
+def test_block_rows_uses_the_cgroup_capped_memory(rep, monkeypatch):
+    """Codex: procfs MemAvailable can be the host's inside a container, so blocks
+    are sized from hostmetrics.read_memory, which caps by the cgroup limit."""
+    from genesis.hostmetrics import readings
+
+    n = 1000
+    per_row = n * 4 * 3
+    monkeypatch.setattr(
+        readings, "read_memory", lambda: readings.Memory(10**12, per_row * 50 * 10, "cgroup")
+    )
+    assert rep.block_rows(n) == 50  # 10% of available, divided by the per-row cost
+    monkeypatch.setattr(readings, "read_memory", lambda: None)
+    assert rep.block_rows(n) == 256  # unknown memory: the fixed fallback
+
+
+def test_an_out_path_ending_in_csv_is_refused(rep, db_path, tmp_path):
+    """Devin: --out report.csv would write the markdown over the per-draft CSV."""
+    out = tmp_path / "report.csv"
+    assert rep.main(["--db", str(db_path), "--out", str(out)]) == 2
+    assert not out.exists()
+
+
+def test_lessons_sharing_a_julianday_keep_their_stored_order(rep, tmp_path):
+    """Devin: julianday drops sub-millisecond precision, so two lessons 100
+    microseconds apart tied and fell back to id order, reversing them."""
+    path = tmp_path / "tie.db"
+
+    async def _make():
+        import aiosqlite
+
+        async with aiosqlite.connect(path) as db:
+            await create_all_tables(db)
+            for pid, created in (
+                ("A-later", "2026-01-01T00:00:00.000200+00:00"),
+                ("B-earlier", "2026-01-01T00:00:00.000100+00:00"),
+            ):
+                await db.execute(
+                    "INSERT INTO procedural_memory (id, task_type, principle, steps, tools_used,"
+                    " context_tags, created_at, draft, principle_embedding)"
+                    " VALUES (?, 't', 'p', '[]', '[]', '[]', ?, 1, ?)",
+                    (pid, created, _e((0, 1.0))),
+                )
+            await db.commit()
+
+    asyncio.run(_make())
+    assert rep.load(path).ids == ["B-earlier", "A-later"]
+
+
+def test_the_report_is_dated_in_the_user_zone(rep, db_path, tmp_path, monkeypatch):
+    """Devin: the generated time is shown to the user, so it uses user_timezone()."""
+    import genesis.env
+
+    monkeypatch.setattr(genesis.env, "user_timezone", lambda: "Pacific/Kiritimati")
+    out = tmp_path / "r.md"
+    assert rep.main(["--db", str(db_path), "--out", str(out)]) == 0
+    assert "+14:00. Read-only" in out.read_text()
+
+
+def test_the_dedup_paragraph_names_every_store_time_layer(rep, db_path, tmp_path):
+    """Codex: store time also runs a cross-type LLM check and a context-overlap
+    check, so a cross-type pair is not proof of an unchecked duplicate."""
+    out = tmp_path / "r.md"
+    assert rep.main(["--db", str(db_path), "--out", str(out)]) == 0
+    md = out.read_text()
+    assert "cross-type LLM duplicate check" in md
+    assert "context-overlap check against trusted lessons only" in md
+    assert "store drafts with none of them" in md  # e.g. the executor retrospective
+    assert "duplicates it lets through" not in md
