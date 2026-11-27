@@ -16,7 +16,9 @@ All paths use the cgroup v2 layout: /sys/fs/cgroup/lxc.payload.{container}/
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 import re
 import signal
 from pathlib import Path
@@ -203,6 +205,76 @@ def list_container_pids(container: str) -> list[int]:
     except (OSError, ValueError) as exc:
         logger.warning("Failed to list PIDs for %s: %s", container, exc)
         return []
+
+
+#: Read by lock_holders; a module value so a test can point it at a fake tree.
+_PROC = Path("/proc")
+#: Without update.lock's inode (a guest that cannot answer), processes whose
+#: command line names one of these are the hint.
+_DEPLOY_NAMES = ("update.sh", "deploy_code_only", "deploy_candidates", "update.lock")
+
+
+def lock_holders(container: str, inode: str = "") -> list[tuple[int, str]]:
+    """(pid, process name) of the container's processes the host sees holding
+    update.lock: the FLOCK rows of /proc/locks whose inode is ``inode`` and
+    whose pid is a live process in the container's cgroup SUBTREE (its top
+    level lists none); else (no inode, or no live row: a deploy's `flock FD`
+    helper exits and the kernel then hides its row) the processes whose open
+    fds point at update.lock, where the host can read them; else the
+    processes whose command line names a deploy script. Only the name (comm,
+    or "name unknown" where it cannot be read) is returned, never argv, which
+    can carry anything a holder was given. Measured readable by the Guardian's
+    host user (B2). A hint for alert text, never a rule; raises OSError when
+    the host cannot read."""
+    pids: set[int] = set()
+    for procs in _cgroup_path(container).rglob("cgroup.procs"):
+        with contextlib.suppress(OSError):
+            pids.update(int(p) for p in procs.read_text().split() if p.isdigit())
+    if not pids:  # nothing read: the host could not look ("cannot tell", not "none seen")
+        raise OSError(f"no process of {container} could be read from the host")
+    # Inode only, not maj:min too: the measurement (B2) showed the holder's row
+    # and pid from the host, not that the container's stat reports the same
+    # device number (storage drivers and overlays can differ), and a device
+    # mismatch would hide the real holder. Pids outside the subtree are dropped.
+    by_lock: set[int] = set()
+    if inode:
+        rows = [ln.split() for ln in (_PROC / "locks").read_text().splitlines()]
+        by_lock = {
+            int(r[4]) for r in rows
+            if len(r) > 5 and r[1] == "FLOCK" and r[4].isdigit() and r[5].split(":")[-1] == inode
+        } & pids
+        by_lock = {pid for pid in by_lock if (_PROC / str(pid)).exists()}
+    by_fd = set()
+    for pid in () if by_lock else pids:
+        with contextlib.suppress(OSError):
+            fds = (_PROC / str(pid) / "fd").iterdir()
+            if any(_target(fd).endswith("/locks/update.lock") for fd in fds):
+                by_fd.add(pid)
+    by_lock = by_lock or by_fd
+    out = []
+    for pid in sorted(by_lock or pids):
+        # A pid the lock row or an fd confirmed is kept whatever else cannot be
+        # read; argv is read only for the name match.
+        try:
+            name = (_PROC / str(pid) / "comm").read_text().strip() or "name unknown"
+        except OSError:
+            name = "name unknown"
+        if not by_lock:
+            try:
+                argv = (_PROC / str(pid) / "cmdline").read_bytes().decode(errors="replace")
+            except OSError:
+                continue
+            if not any(d in argv for d in _DEPLOY_NAMES):
+                continue
+        out.append((pid, name))
+    return out
+
+
+def _target(fd: Path) -> str:
+    try:
+        return os.readlink(fd)
+    except OSError:
+        return ""
 
 
 # Shared with the container watchdog; one sampler for both callers.

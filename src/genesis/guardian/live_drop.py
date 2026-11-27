@@ -16,12 +16,16 @@ in full.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+import shlex
 from dataclasses import replace
+from html import escape
 
 from genesis.guardian._subprocess import run_subprocess as _run_subprocess
+from genesis.guardian.alert.base import Alert, AlertSeverity
 from genesis.guardian.alert.telegram import _utf16_units
 from genesis.guardian.diagnosis import DiagnosisResult, RecoveryAction
 
@@ -80,6 +84,194 @@ _IDENTITY_CAP = 3000
 
 #: DiagnosisResult.escalation: a drop saved the manifest and did not move `live`.
 HALF_DONE_DROP = "half_done_drop"
+
+# ── update.lock (B2, #4841 rework) ────────────────────────────────────────────
+
+#: Every update.lock a deploy on this checkout can take. Each deploy script
+#: takes `${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock` from its OWN
+#: environment (update.sh, deploy_code_only.sh, deploy_marker.sh; no shared
+#: resolver), so this program, run in the container as `python3 -I -S -c`
+#: (nothing is read from the checkout), reads every source: the login shell,
+#: genesis-server's Environment= and the GENESIS_HOME line of each of its
+#: EnvironmentFile= files (plain key=value, never evaluated). One rule for
+#: every read: verified absence (ENOENT) is skipped, any other failure, or a
+#: value it cannot parse safely (a quote, a space, a non-absolute path), exits
+#: 74, unreadable. A user manager that does not answer, or a unit systemd does
+#: not report loaded, is best effort (owner rulings 14abd7df, b5dff1b1): the
+#: default and login-shell homes only, marked `unchecked=1` for the wait text.
+#: An fd scan backs the resolver: every */locks/update.lock an open fd in
+#: /proc/[0-9]*/fd points at is flock-tested too, whatever path it is at
+#: (best effort: unreadable entries skipped, at most 20000 fds or 2 s).
+#: /proc/locks and lslocks do NOT do this job: a deploy takes the lock with a
+#: `flock FD` helper that exits, and the kernel hides a lock whose owner pid
+#: is gone (MEASURED on a real deploy); the shell's open fd still shows it.
+#: GENESIS_LOCK_SCAN_UNDER (unset in production) limits the scan to a path
+#: prefix (and GENESIS_LOCK_SCAN_MAX its bound), so tests never see a real
+#: deploy's lock; a scan cut short prints `partial=1`, said like an unread
+#: unit. One file named twice (a trailing slash, a symlinked home) is locked
+#: once, by (st_dev, st_ino). Time budget inside the 30 s exec it shares with
+#: the queued restart: one `systemctl show` (3 s) plus the scan (2 s), so the
+#: restart keeps more than 20 s. Exit 0
+#: free (then the arguments, if any, run holding every lock it found: never
+#: inherited by what they start), 75 held (its inode and the deploy marker's
+#: pid printed), 74 unreadable. Residual: a deploy whose GENESIS_HOME comes
+#: from none of these sources, with its lock not yet taken, is not seen.
+_RESOLVER = r"""
+import fcntl, os, re, subprocess, sys, time
+failed = []
+def absent(path):
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        return True
+    except OSError as e:
+        failed.append(f"{path}: {e.strerror}")
+        return None
+    return False
+def clean(v, where):
+    v = v.strip()
+    if len(v) > 1 and v[0] == v[-1] and v[0] in "\"'":
+        v = v[1:-1]
+    if not v.startswith("/") or re.search(r"[\s\"'\\$`]", v):
+        failed.append("cannot parse GENESIS_HOME in " + where)
+        return None
+    return v
+home = os.environ["HOME"]
+login = os.environ.get("GENESIS_HOME")
+homes = [clean(login, "the login shell") if login else home + "/.genesis", home + "/.genesis"]
+props = {}
+try:
+    r = subprocess.run(["systemctl", "--user", "show", "genesis-server", "-p", "LoadState",
+                        "-p", "Environment", "-p", "EnvironmentFiles"],
+                       capture_output=True, text=True, timeout=3)
+    if r.returncode == 0:
+        for ln in r.stdout.splitlines():
+            k, _, v = ln.partition("=")
+            props.setdefault(k, []).append(v.strip())
+except (OSError, subprocess.SubprocessError):
+    pass
+if props.get("LoadState") != ["loaded"]:
+    print("unchecked=1")
+    props = {}
+hits = [t for t in " ".join(props.get("Environment", [])).split()
+        if t.lstrip("\"'").startswith("GENESIS_HOME=")]
+if hits and not hits[-1].startswith("GENESIS_HOME="):
+    failed.append("cannot parse GENESIS_HOME in the unit Environment")
+elif hits:
+    homes.append(clean(hits[-1][13:], "the unit Environment"))
+files = " ".join(props.get("EnvironmentFiles", []))
+if not re.fullmatch(r"(?:\S+ \(ignore_errors=(?:yes|no)\)\s*)*", files):
+    failed.append("cannot parse the unit EnvironmentFiles")
+    files = ""
+for path in re.findall(r"(\S+) \(ignore_errors=(?:yes|no)\)", files):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        continue
+    except (OSError, ValueError) as e:
+        failed.append(f"{path}: {e}")
+        continue
+    vals = []
+    for ln in text.splitlines():
+        k, sep, v = ln.strip().partition("=")
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[7:].strip()
+        if sep and k == "GENESIS_HOME":
+            vals.append(v)
+    if vals:
+        homes.append(clean(vals[-1], path))
+def scanned():
+    under = os.environ.get("GENESIS_LOCK_SCAN_UNDER", "/")
+    most = int(os.environ.get("GENESIS_LOCK_SCAN_MAX", "20000"))
+    out, n, end = [], 0, time.monotonic() + 2
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            fds = os.listdir(f"/proc/{pid}/fd")
+        except OSError:
+            continue
+        for fd in fds:
+            n += 1
+            if n > most or time.monotonic() > end:
+                print("partial=1")
+                return out
+            try:
+                t = os.readlink(f"/proc/{pid}/fd/{fd}")
+            except OSError:
+                continue
+            if t.startswith(under) and t.endswith("/locks/update.lock"):
+                out.append(t[: -len("/locks/update.lock")])
+    return out
+homes += scanned()
+def held(path):
+    try:
+        print(f"inode={os.stat(path).st_ino}")
+        with open(path.rsplit("/locks/", 1)[0] + "/update_in_progress.pid", "rb") as fh:
+            print("pid=" + fh.read(64).decode(errors="replace").strip())
+    except OSError:
+        pass
+    sys.exit(75)
+fds, seen = [], set()
+for g in dict.fromkeys(h for h in homes if h):
+    if absent(g + "/locks") is not False:
+        continue
+    path = g + "/locks/update.lock"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CREAT, 0o644)
+    except OSError as e:
+        failed.append(f"{path}: {e.strerror}")
+        continue
+    st = os.fstat(fd)
+    if (st.st_dev, st.st_ino) in seen:  # one file named twice: locked already
+        os.close(fd)
+        continue
+    seen.add((st.st_dev, st.st_ino))
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        held(path)
+    except OSError as e:
+        failed.append(f"{path}: {e.strerror}")
+        os.close(fd)
+        continue
+    fds.append(fd)
+if failed:
+    print("unreadable=" + "; ".join(failed).replace("\n", " "))
+    sys.exit(74)
+sys.exit(subprocess.run(sys.argv[1:]).returncode if sys.argv[1:] else 0)
+"""
+
+
+def under_lock(cmd: str) -> str:
+    """``cmd`` (shell words) run holding every update.lock _RESOLVER finds;
+    exit 75 when one is held, 74 when a lookup failed: never without its lock."""
+    return f"exec python3 -I -S -c {shlex.quote(_RESOLVER)} {cmd}"
+
+
+#: The lock probe: exit 0 free, 75 held, anything else (74: a failed lookup;
+#: -1: no answer) unreadable.
+_LOCK_PROBE = under_lock("")
+_LOCK_HELD = 75
+#: What the probe says when genesis-server's unit could not be read.
+_UNCHECKED = (
+    "the relocated update.lock path could not be checked (genesis-server's unit "
+    "could not be read); the default and login-shell paths were"
+)
+_PARTIAL = (
+    "some update.lock paths could not be checked (the open-file scan that "
+    "finds them was cut short)"
+)
+FREE, HELD, UNREADABLE = "free", "held", "unreadable"
+#: Re-alert this often while waiting: the deploy scripts' own lock-wait ceiling
+#: (GENESIS_DEPLOY_LOCK_WAIT, 7200 s), past which the holder is likely hung.
+WAIT_REALERT_S = 7200
+WAITING_ON_LOCK = "update_lock_held"
+WAITING_ON_UNREADABLE_LOCK = "update_lock_unreadable"
+WAITS = (WAITING_ON_LOCK, WAITING_ON_UNREADABLE_LOCK)
+_HINT_TIMEOUT_S = 2.0
 
 
 def shown(value: object, cap: int = _SHOWN_CAP) -> str:
@@ -277,6 +469,144 @@ def attempt_line(attempt: dict | None) -> str:
         f"{attempt['pinned_head'][:12]}), attempted at {shown(attempt['at'], 40)}, when `live` "
         f"was at {attempt['tip'][:12]}"
     )
+
+
+async def lock_state(container: str) -> tuple[str, str, str]:
+    """(FREE | HELD | UNREADABLE, who holds it, update.lock's inode), read
+    fresh in ONE exec: the holder is the one at the path the probe resolved.
+    ``who`` also says when genesis-server's unit could not be read."""
+    rc, lines = await _in_container(container, _LOCK_PROBE)
+    vals = dict(ln.split("=", 1) for ln in lines if "=" in ln)
+    note = "; ".join(
+        text for key, text in (("unchecked", _UNCHECKED), ("partial", _PARTIAL))
+        if vals.get(key) == "1"
+    )
+    if rc != _LOCK_HELD:
+        if rc == 0 and note:
+            logger.warning("update.lock read free, best effort: %s", note)
+        elif rc != 0:
+            logger.warning("update.lock unreadable: %s", shown(vals.get("unreadable", rc)))
+        return (FREE if rc == 0 else UNREADABLE), note, ""
+    pid, inode = vals.get("pid", "").strip(), vals.get("inode", "").strip()
+    who = f"the deploy marker names pid {pid}" if pid.isascii() and pid.isdigit() else ""
+    who = "; ".join(t for t in (who, note) if t)
+    return HELD, who, (inode if inode.isascii() and inode.isdigit() else "")
+
+
+async def container_status(container: str) -> str:
+    """What incus reports (lower case: "stopped", "frozen", "running"), or ""
+    when `incus info` fails or times out. Read fresh, never cached: only
+    "stopped" means nothing in the container can hold update.lock."""
+    rc, stdout, _ = await _run_subprocess("incus", "info", container, timeout=30.0)
+    found = re.search(r"(?mi)^status:\s*(\w+)\s*$", stdout) if rc == 0 else None
+    return found.group(1).lower() if found else ""
+
+
+async def lock_blocks(config, *, owner_approved_unreadable: bool = False) -> tuple[str, str]:
+    """(WAITING_ON_LOCK | WAITING_ON_UNREADABLE_LOCK, why) when no recovery may
+    run now, else ("", ""): update.lock held on `live`, or unreadable there
+    while incus does not report the container stopped (unless the owner
+    approved the frozen gate). Only with recovery.live_engine on; the branch
+    is read only when the lock blocks."""
+    if not config.recovery.live_engine:
+        return "", ""
+    from genesis.guardian.recovery import container_on_live
+
+    container = config.container_name
+    state, who, _inode = await lock_state(container)
+    if state == FREE or (
+        state == UNREADABLE
+        and (owner_approved_unreadable or await container_status(container) == "stopped")
+    ):
+        return "", ""
+    if not await container_on_live(container):
+        return "", ""
+    if state == HELD:
+        return WAITING_ON_LOCK, "update.lock is held" + (f" ({who})" if who else "") + (
+            ": a deploy, rebuild, drop or validation hold is running"
+        )
+    return WAITING_ON_UNREADABLE_LOCK, (
+        "update.lock cannot be read and incus does not report the container stopped: "
+        "a deploy, rebuild, drop or validation hold may be running" + (f" ({who})" if who else "")
+    )
+
+
+async def hold_for_lock(config, diagnosis: DiagnosisResult) -> DiagnosisResult:
+    """C1/C2: any proposal (ESCALATE included) becomes the ESCALATE that waits
+    while lock_blocks says so; unchanged otherwise."""
+    kind, why = await lock_blocks(config)
+    if not kind:
+        return diagnosis
+    logger.warning("update.lock blocks on `live`: ESCALATE instead of %s", diagnosis.recommended_action)
+    return _escalation(
+        diagnosis, kind, f"the checkout is on `live` and {why}, and any recovery now would cut "
+        "into it. Nothing was touched; the Guardian diagnoses again once the lock is free",
+    )
+
+
+def wait_alert(why: str, ran: str = "") -> tuple[str, str]:
+    """The first alert of a wait on a HELD lock (an unreadable one's is the
+    frozen gate): its title and body. ``ran``: the approved step that already
+    ran before its restart was held (SF1)."""
+    done = (
+        f"{ran} ran; only the genesis-server restart is held."
+        if ran
+        else "Nothing was restarted or dropped."
+    )
+    return "Genesis down — waiting for a deploy to finish", (
+        f"{why}\n{done} The Guardian reads update.lock every tick and diagnoses again once "
+        "it is free (or incus reports the container stopped), asking your approval for what "
+        "it then proposes. While it waits you hear again every 2 h."
+    )
+
+
+async def send_wait_alert(
+    sm, dispatcher, title: str, body: str, *, gate=None, plain="", frozen=False
+):
+    """The ONE writer of a wait alert: send it, then stamp and save. With
+    ``plain`` it is an APPROVE prompt to the Telegram channel ``gate``
+    (returning its message id); with no channel, or a failed send, ``plain``
+    (asking nothing) goes through send_or_queue instead. ``frozen``: it stands
+    for this wait's frozen gate. A gate or stand-in sent or durably queued is
+    stamped as the gate (the next in 2 h); one neither sent nor queued is
+    stamped as a failed gate attempt, so it retries after
+    StateMachine.gate_due's bound, never every tick; any other alert is
+    stamped only once delivered."""
+    frozen = frozen or bool(plain)
+    if plain and gate is not None:
+        sent = await gate.send_text(f"<b>{escape(title)}</b>\n{escape(body)}")
+        if sent is not None:
+            sm.stamp_alert(gate=True)
+            sm.persist()
+            return sent
+    alert = Alert(severity=AlertSeverity.EMERGENCY, title=title, body=plain or body)
+    delivered = await dispatcher.send_or_queue(alert)
+    if delivered:
+        sm.stamp_alert(gate=frozen)
+    elif frozen:
+        sm.stamp_gate_attempt()
+    else:
+        return None
+    sm.persist()
+    return None
+
+
+async def host_hint(container: str, inode: str = "") -> str:
+    """What the host sees of update.lock's holder (cgroup_ops.lock_holders), as
+    alert text; "cannot tell" when the host could not look, never "none seen".
+    A hint only: never a rule."""
+    from genesis.guardian import cgroup_ops
+
+    try:
+        found = await asyncio.wait_for(
+            asyncio.to_thread(cgroup_ops.lock_holders, container, inode), _HINT_TIMEOUT_S
+        )
+    except (OSError, ValueError, TimeoutError):
+        return "Seen from the host: cannot tell (it could not read the container's processes)."
+    if not found:
+        return "Seen from the host: none seen (a hint, not proof)."
+    named = "; ".join(f"pid {pid} ({shown(cmd, 120)})" for pid, cmd in found[:3])
+    return f"Seen from the host: {named} (a hint, not proof)."
 
 
 # ── what the owner approves at Gate 2 ────────────────────────────────────────
