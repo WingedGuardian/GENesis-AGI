@@ -9,7 +9,10 @@ Once per ``cc.canary_interval_h``, on a tick whose probe found Genesis healthy,
 this makes one minimal real ``claude -p`` call through the diagnosis's OWN
 credential path (``DiagnosisEngine._resolve_cc_env``) and error reader
 (``diagnosis._cc_error_reason``). A failure pages once per episode with Claude
-Code's own reason; the first success after that pages an all-clear.
+Code's own reason; the first success after that pages an all-clear. A run
+that exits 0 without a recognized successful result (empty, not JSON, or some
+other shape) proves nothing: it is recorded as ``unconfirmed`` with a short
+fixed reason, pages like a failure and never clears one.
 
 State lives in ``<state_dir>/cc_canary.json``. Before a run it records the
 attempt, and after the run its result. A run that never finishes (the tick was
@@ -80,8 +83,30 @@ def _due(state: dict, interval_h: int, now: datetime) -> bool:
     return age is None or age < timedelta(0) or age >= timedelta(hours=max(1, interval_h))
 
 
-async def _run_once(config: GuardianConfig, engine: DiagnosisEngine) -> tuple[bool, str]:
-    """(ok, reason) for one minimal real call through the diagnosis's credentials."""
+def _unconfirmed_reason(out: str, envelope: object) -> str | None:
+    """Why a zero-exit run's stdout does not confirm success, or None when it does.
+
+    A fixed phrase, never the output itself, so a page cannot carry whatever
+    the CLI printed.
+    """
+    if not out.strip():
+        return "empty output"
+    if envelope is None:
+        return "invalid JSON"
+    if (
+        not isinstance(envelope, dict)
+        or envelope.get("type") != "result"
+        or envelope.get("is_error") is not False
+    ):
+        return "unrecognized result"
+    return None
+
+
+async def _run_once(config: GuardianConfig, engine: DiagnosisEngine) -> tuple[str, str]:
+    """(status, reason) for one minimal real call through the diagnosis's credentials.
+
+    status is "ok", "failed" or "unconfirmed".
+    """
     cc_path = str(Path(config.cc.path).expanduser())
     work_dir = _ensure_work_dir(Path(config.cc.work_dir).expanduser())
     # The configured model, as the diagnosis runs: an entitlement that covers the
@@ -106,7 +131,7 @@ async def _run_once(config: GuardianConfig, engine: DiagnosisEngine) -> tuple[bo
     except TimeoutError:
         kill_process_group(proc)
         await reap_bounded(proc)
-        return False, f"timed out after {_CANARY_TIMEOUT_S}s"
+        return "failed", f"timed out after {_CANARY_TIMEOUT_S}s"
     except asyncio.CancelledError:
         kill_process_group(proc)
         await reap_bounded(proc)
@@ -118,11 +143,14 @@ async def _run_once(config: GuardianConfig, engine: DiagnosisEngine) -> tuple[bo
         envelope = None
     failed = proc.returncode != 0 or (isinstance(envelope, dict) and envelope.get("is_error"))
     if failed:
-        return False, f"exit {proc.returncode}: " + _cc_error_reason(
+        return "failed", f"exit {proc.returncode}: " + _cc_error_reason(
             out,
             stderr.decode("utf-8", errors="replace"),
         )
-    return True, "ok"
+    unconfirmed = _unconfirmed_reason(out, envelope)
+    if unconfirmed:
+        return "unconfirmed", f"exit 0 with {unconfirmed}"
+    return "ok", "ok"
 
 
 async def maybe_run_cc_canary(
@@ -148,16 +176,18 @@ async def maybe_run_cc_canary(
         logger.warning("cannot write %s; skipping the auth canary this tick", path, exc_info=True)
         return
     try:
-        ok, reason = await _run_once(config, engine)
+        status, reason = await _run_once(config, engine)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # spawn failure, missing binary, unwritable work dir
-        ok, reason = False, f"{type(exc).__name__}: {exc}"[:300]
+        status, reason = "failed", f"{type(exc).__name__}: {exc}"[:300]
 
+    ok = status == "ok"
     was_alerted = bool(state.get("alerted"))
     new_state = {
         "last_run_at": now.isoformat(),
         "ok": ok,
+        "status": status,
         "reason": reason,
         "alerted": was_alerted,
     }
@@ -173,17 +203,25 @@ async def maybe_run_cc_canary(
             )
             new_state["alerted"] = not sent
     else:
-        logger.error("Guardian recovery-brain auth canary FAILED: %s", reason)
+        logger.error("Guardian recovery-brain auth canary %s: %s", status.upper(), reason)
+        if status == "unconfirmed":
+            detail = (
+                "The daily auth canary could not confirm that the Guardian can diagnose "
+                "or repair Genesis if it goes down.\n"
+                f"No usable result from Claude Code: {reason}"
+            )
+        else:
+            detail = (
+                "The daily auth canary failed, so if Genesis goes down the Guardian "
+                "cannot diagnose or repair it, only page.\n"
+                f"Claude Code said: {reason}"
+            )
         if not was_alerted:
             sent = await dispatcher.send_or_queue(
                 Alert(
                     severity=AlertSeverity.WARNING,
                     title="Guardian recovery brain cannot authenticate",
-                    body=(
-                        "The daily auth canary failed, so if Genesis goes down the Guardian "
-                        "cannot diagnose or repair it, only page.\n"
-                        f"Claude Code said: {reason}"
-                    ),
+                    body=detail,
                 )
             )
             new_state["alerted"] = bool(sent)
