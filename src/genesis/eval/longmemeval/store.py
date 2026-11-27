@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
     import aiosqlite
+    from qdrant_client import QdrantClient
 
     from genesis.memory.retrieval import HybridRetriever
     from genesis.memory.store import MemoryStore
@@ -38,14 +39,16 @@ if TYPE_CHECKING:
 class EphemeralStore:
     """A throwaway store + retriever pair sharing one in-memory Qdrant + temp DB.
 
-    ``db`` is the ephemeral SQLite connection — exposed so the graph arm can
-    run link queries (``memory_links.neighbors_of``) against this store.
+    ``db`` is the ephemeral SQLite connection and ``qdrant`` the in-memory
+    vector store, exposed so the graph arm can run link queries
+    (``memory_links.neighbors_of``) and read neighbours against this store.
     """
 
     store: MemoryStore
     retriever: HybridRetriever
     workdir: Path
     db: aiosqlite.Connection | None = None
+    qdrant: QdrantClient | None = None
 
 
 def _default_tmp_root() -> Path:
@@ -122,7 +125,9 @@ async def ephemeral_store(
     )
 
     try:
-        yield EphemeralStore(store=store, retriever=retriever, workdir=workdir, db=db)
+        yield EphemeralStore(
+            store=store, retriever=retriever, workdir=workdir, db=db, qdrant=qdrant
+        )
     finally:
         with contextlib.suppress(Exception):
             await db.close()

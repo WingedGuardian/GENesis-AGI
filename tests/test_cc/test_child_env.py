@@ -125,6 +125,7 @@ _ADMISSION_EXEMPT: dict[str, str] = {
         "would deadlock the deploy"
     ),
     "guardian/diagnosis.py": "Claude Code runs on the host VM, not this container checkout",
+    "guardian/cc_canary.py": "Claude Code runs on the host VM, not this container checkout",
     "modules/external/ipc.py": (
         "SSH Claude reads remote files, and the stdio adapter runs a configured external command"
     ),
@@ -156,6 +157,7 @@ def test_the_enumeration_finds_the_known_spawn_sites():
         "experimentation/cc_router.py",
         "dashboard/routes/updates.py",
         "guardian/diagnosis.py",
+        "guardian/cc_canary.py",
         "modules/external/ipc.py",
     } <= names, names
 

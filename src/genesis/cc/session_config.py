@@ -179,6 +179,11 @@ _MCP_PROFILES: dict[str, list[str]] = {
 }
 
 
+def _generated_mcp_dir(config_dir: Path) -> Path:
+    """Resolve generated output separately from the source template and root."""
+    return config_dir / ".generated"
+
+
 class SessionConfigBuilder:
     """Builds CC session configurations per type."""
 
@@ -289,14 +294,14 @@ class SessionConfigBuilder:
         """Load SOUL.md + VOICE.md identity content."""
         from pathlib import Path
 
+        from genesis.identity.paths import read_identity
+
         identity_dir = Path(__file__).resolve().parent.parent / "identity"
-        soul_path = identity_dir / "SOUL.md"
-        voice_path = identity_dir / "VOICE.md"
-        parts: list[str] = []
-        if soul_path.exists():
-            parts.append(soul_path.read_text(encoding="utf-8"))
-        if voice_path.exists():
-            parts.append(voice_path.read_text(encoding="utf-8"))
+        parts = [
+            text
+            for text in (read_identity(n, identity_dir) for n in ("SOUL.md", "VOICE.md"))
+            if text is not None
+        ]
         if parts:
             return "\n\n---\n\n".join(parts)
         logger.warning("SOUL.md not found, using minimal identity")
@@ -337,7 +342,7 @@ class SessionConfigBuilder:
             logger.warning("Unknown MCP profile %r, using full", profile)
             return None
 
-        generated_dir = config_dir / ".generated"
+        generated_dir = _generated_mcp_dir(config_dir)
         generated_path = generated_dir / f"{profile}_mcp.json"
         template_path = config_dir / "mcp.json.template"
 

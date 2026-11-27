@@ -590,7 +590,8 @@ def test_a_pending_conflict_refuses_with_the_conflict_remedy(dc, dc_ready):
 
 def test_a_harmless_leftover_is_removed_before_a_move_and_kept_by_status(dc, dc_ready):
     """SF-C: rebuild and drop pass _move_preflight under update.lock, then move
-    HEAD off the leftover's rollback tag; status only reports."""
+    HEAD off the leftover's rollback tag; status only reports. Preflight keeps
+    it: the move's before_write retires it, past the lock's refusals (#5007)."""
     w = dc_ready
     content = {
         "phase": "fetching",
@@ -603,6 +604,8 @@ def test_a_harmless_leftover_is_removed_before_a_move_and_kept_by_status(dc, dc_
     assert state.exists(), "status (_move_refusals) only reports"
     engine = dc.Engine(w.root, w.env)
     engine._move_preflight(need_manifest=False, source=dc.plan.read_source(engine))
+    assert state.exists()
+    engine._retire_harmless_update_state()
     assert not state.exists()
 
 

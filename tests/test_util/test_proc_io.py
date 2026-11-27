@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
 from pathlib import Path
 
 import pytest
@@ -324,3 +326,137 @@ def test_read_starttime_handles_a_comm_with_spaces_and_parens(fake_proc: Path) -
     (fake_proc / "30" / "stat").write_text("30 (short) S 1 2\n")
     assert proc_io.read_starttime(30) is None  # truncated stat
     assert proc_io.read_starttime(31) is None  # gone
+
+
+# --- tri-state reads, against the real kernel --------------------------------
+
+_ZOMBIE_LEADER = r"""
+import ctypes, sys, threading, time
+buf = bytearray(24 * 1024 * 1024)
+for i in range(0, len(buf), 4096):
+    buf[i] = 1
+threading.Thread(target=lambda: time.sleep(60)).start()
+ctypes.CDLL(None).pthread_exit(None)
+"""
+
+
+@pytest.fixture
+def zombie_leader():
+    """A real process whose main thread exited while a worker thread still
+    holds its memory: the kernel shows its leader as Z with two threads."""
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    if not sys.platform.startswith("linux"):
+        pytest.skip("needs the Linux /proc")
+    import ctypes
+
+    if not hasattr(ctypes.CDLL(None), "pthread_exit"):
+        pytest.skip("no pthread_exit in this libc")
+    child = subprocess.Popen([sys.executable, "-c", _ZOMBIE_LEADER], start_new_session=True)
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            st = proc_io.probe_stat(child.pid)
+            if isinstance(st, proc_io.Stat) and st.state == "Z" and st.threads >= 2:
+                break
+            if child.poll() is not None:
+                pytest.fail(f"the child exited early (rc {child.returncode})")
+            time.sleep(0.05)
+        else:
+            pytest.fail("the child never showed a zombie leader with a live thread")
+        yield child.pid
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(child.pid, signal.SIGKILL)
+        child.wait(timeout=20)
+
+
+def test_a_real_zombie_leader_reads_as_alive_and_holding_memory(zombie_leader):
+    from genesis.sentinel import codex_mcp_stop, process_stop
+
+    st = proc_io.probe_stat(zombie_leader)
+    assert isinstance(st, proc_io.Stat)
+    assert st.state == "Z" and not st.exited and not st.kernel_thread
+    # Its own status has no Vm lines; the figure comes from the live task.
+    assert proc_io.held_kb(zombie_leader) >= 20 * 1024
+    assert process_stop._alive(zombie_leader, st.starttime) is True
+    assert codex_mcp_stop._group_alive(zombie_leader) is True
+
+
+def test_a_real_group_reads_gone_once_killed_and_reaped(zombie_leader):
+    """Control for the test above: the same group, killed and reaped, is gone,
+    so 'alive' there is the reader's answer, not an always-True."""
+    import signal
+    import time
+
+    from genesis.sentinel import codex_mcp_stop
+
+    os.killpg(zombie_leader, signal.SIGKILL)
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(zombie_leader, os.WNOHANG)
+        if proc_io.probe_stat(zombie_leader) == proc_io.GONE:
+            break
+        time.sleep(0.05)
+    assert proc_io.probe_stat(zombie_leader) == proc_io.GONE
+    assert codex_mcp_stop._group_alive(zombie_leader) is False
+
+
+def test_a_reaped_process_reads_as_gone(tmp_path):
+    import subprocess
+    import sys
+
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(timeout=20)
+    assert proc_io.probe_stat(child.pid) == proc_io.GONE
+    assert proc_io.held_kb(child.pid) == proc_io.GONE
+
+
+# --- tri-state reads, fake tree ------------------------------------------------
+
+
+def test_probe_stat_tells_gone_from_unreadable(fake_proc: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert proc_io.probe_stat(4242) == proc_io.GONE
+    (fake_proc / "4243").mkdir()
+    (fake_proc / "4243" / "stat").mkdir()  # reading it raises IsADirectoryError
+    assert proc_io.probe_stat(4243) == proc_io.UNREADABLE
+    (fake_proc / "4244").mkdir()
+    (fake_proc / "4244" / "stat").write_text("4244 (x) S 1\n")  # truncated
+    assert proc_io.probe_stat(4244) == proc_io.UNREADABLE
+
+
+def test_held_kb_reads_an_unreadable_status_as_unreadable(fake_proc: Path) -> None:
+    (fake_proc / "4245").mkdir()
+    (fake_proc / "4245" / "status").mkdir()
+    assert proc_io.held_kb(4245) == proc_io.UNREADABLE
+
+
+def test_held_kb_with_no_live_task_is_zero(fake_proc: Path) -> None:
+    d = fake_proc / "4246"
+    (d / "task" / "4246").mkdir(parents=True)
+    (d / "status").write_text("Name:\tx\n")
+    (d / "task" / "4246" / "status").write_text("Name:\tx\n")
+    assert proc_io.held_kb(4246) == 0
+
+
+def test_probe_stat_reads_the_kernel_thread_flag_and_exit_state(fake_proc: Path) -> None:
+    def write(pid, state, flags, threads):
+        fields = [state, "2", str(pid)] + ["0"] * 16 + [str(pid * 10)]
+        fields[6] = str(flags)
+        fields[17] = str(threads)
+        (fake_proc / str(pid)).mkdir()
+        (fake_proc / str(pid) / "stat").write_text(f"{pid} (k w) " + " ".join(fields) + "\n")
+
+    write(4250, "S", 0x00200000, 1)
+    write(4251, "S", 0, 1)
+    write(4252, "Z", 0, 2)
+    write(4253, "Z", 0, 1)
+    k, u, leader, dead = (proc_io.probe_stat(p) for p in (4250, 4251, 4252, 4253))
+    assert k.kernel_thread and not u.kernel_thread
+    assert k.comm == "k w" and k.pgid == 4250 and k.starttime == 42500
+    assert not leader.exited and dead.exited
+

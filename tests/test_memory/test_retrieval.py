@@ -1190,6 +1190,8 @@ async def test_recall_invokes_entity_lane_shadow(mock_qdrant, mock_crud, mock_li
 
     assert len(results) > 0
     spy.assert_awaited_once()
+    # The lane reads candidate text from the retriever's own vector store.
+    assert spy.await_args.args == (retriever._db, retriever._qdrant)
     kw = spy.await_args.kwargs
     assert kw["query"] == "test query"
     assert isinstance(kw["ranked_lists"], list)

@@ -69,6 +69,8 @@ _backup_core_home() {
 }
 _BACKUP_CORE_VAULT="$(_backup_core_home)/payment_vault"
 
+# `config` as $1 leaves the user config directory's own entry out (restore's
+# legacy-archive exception): by role, so an entry with the same value stays.
 _backup_core_path_array() {
     # The merge-gate override store can be relocated (GENESIS_MERGE_OVERRIDE_DIR);
     # resolve it the way backup.sh §6d and restore.sh's audit section do. On a fresh
@@ -90,6 +92,12 @@ _backup_core_path_array() {
         "$HOME/.genesis/restore_status.json" "$HOME/.ssh"
         "$HOME/.config/gh" "$HOME/.local/state/genesis-guardian"
     )
+    # The user config directory: backup.sh §6g copies it file by file, so an extra
+    # archive of it would swap it out on restore. A SYMLINKED one is not backed up
+    # by §6g (it never follows a link), so its real directory may be an extra.
+    if [ "${1:-}" != config ] && [ ! -L "$HOME/.genesis/config" ]; then
+        _backup_core_paths+=("$HOME/.genesis/config")
+    fi
 }
 
 backup_core_paths() {
@@ -113,10 +121,10 @@ backup_paths_overlap() {
 }
 
 backup_core_overlap() {
-    local abs="$1" core core_real
+    local abs="$1" skip="${2:-}" core core_real
     local -a _backup_core_paths=()
     [ -n "$abs" ] || return 2
-    _backup_core_path_array || return 2
+    _backup_core_path_array "$skip" || return 2
     for core in "${_backup_core_paths[@]}"; do
         [ -n "$core" ] || continue
         backup_capture_path core_real realpath -m -- "$core" || return 2

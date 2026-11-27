@@ -20,6 +20,22 @@ def _deletion_window_any(monkeypatch):
     monkeypatch.setenv("GUARDIAN_DELETION_WINDOW", "any")
 
 
+@pytest.fixture(autouse=True)
+def _cc_canary_stubbed(request, monkeypatch):
+    """run_check runs the recovery-brain auth canary on a healthy tick, and the
+    canary makes one real `claude -p` call. Suites that drive run_check are not
+    about the canary, so its one real call is stubbed to success here.
+    test_cc_canary.py exercises the real call path against a stub binary and
+    opts out."""
+    if request.module.__name__.endswith("test_cc_canary"):
+        return
+
+    async def _ok(_config, _engine):
+        return True, "ok (stubbed by tests/test_guardian/conftest.py)"
+
+    monkeypatch.setattr("genesis.guardian.cc_canary._run_once", _ok)
+
+
 @pytest.fixture
 def guardian_config() -> GuardianConfig:
     """Default Guardian config for testing."""

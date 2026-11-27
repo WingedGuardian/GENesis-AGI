@@ -1,0 +1,17 @@
+[Unit]
+Description=Genesis shared memory MCP service
+After=network.target qdrant.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+WorkingDirectory=/
+ExecStart=:/bin/sh -c 'exec "$@"' -- "__VENV_EXEC__/bin/python" "__REPO_EXEC__/scripts/genesis_mcp_server.py" --shared-service memory --transport streamable-http
+Environment="GENESIS_HOME=__HOME_EXEC__/.genesis"
+Environment="GENESIS_REPO_ROOT=__REPO_EXEC__"
+Restart=on-failure
+RestartSec=10
+LimitCORE=0
+
+[Install]
+WantedBy=default.target

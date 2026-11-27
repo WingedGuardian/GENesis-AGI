@@ -18,6 +18,7 @@ from genesis.db.schema import create_all_tables
 from genesis.db.schema._tables import TABLES
 
 MIG = importlib.import_module("genesis.db.migrations.20261105043443_reference_secrets")
+META = importlib.import_module("genesis.db.migrations.20261111230000_reference_secrets_meta")
 
 _OBJECTS = (
     "reference_secrets",
@@ -35,7 +36,9 @@ _LEGACY_UNITS = TABLES["knowledge_units"].replace("secret_ref       TEXT,\n", ""
 
 
 def _normalise(sql: str) -> str:
-    return " ".join(sql.split())
+    # ALTER TABLE ADD COLUMN splices ", col TYPE" in before the closing paren,
+    # so spacing around "," and ")" is not part of the shape.
+    return " ".join(sql.split()).replace(" ,", ",").replace(" )", ")")
 
 
 async def _schema(db) -> dict[str, str]:
@@ -66,6 +69,7 @@ async def test_the_migration_alone_matches_a_fresh_install():
         await legacy.execute(_LEGACY_UNITS)
         await MIG.up(legacy)
         await MIG.up(legacy)  # idempotent
+        await META.up(legacy)
         migrated = await _schema(legacy)
         migrated_columns = await _columns(legacy)
     assert set(fresh_schema) == set(_OBJECTS)
@@ -145,10 +149,18 @@ async def test_both_build_paths_carry_the_detail_column():
     the value, on a fresh install and after the migration alone."""
     async with aiosqlite.connect(":memory:") as fresh:
         await create_all_tables(fresh)
-        assert await _secret_columns(fresh) == ["id", "value", "detail", "created_at"]
+        assert await _secret_columns(fresh) == ["id", "value", "detail", "created_at", "meta"]
     async with aiosqlite.connect(":memory:") as migrated:
         await MIG.up(migrated)
-        assert await _secret_columns(migrated) == ["id", "value", "detail", "created_at"]
+        await META.up(migrated)
+        await META.up(migrated)  # idempotent
+        assert await _secret_columns(migrated) == ["id", "value", "detail", "created_at", "meta"]
+
+
+async def test_the_meta_migration_without_the_secrets_table_is_a_no_op():
+    async with aiosqlite.connect(":memory:") as db:
+        await META.up(db)
+        assert await db.execute_fetchall("SELECT name FROM sqlite_master") == []
 
 
 async def test_a_secrets_table_from_before_the_detail_column_gains_it():

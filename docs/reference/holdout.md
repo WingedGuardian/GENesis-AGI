@@ -239,15 +239,21 @@ itself. `--overlay DIR` copies every file under `DIR` over the worktree at the
 same relative path first. The copy is contents only: an existing file keeps
 its mode, a new file takes the overlay file's, and an overlay cannot delete a
 file. A link in the overlay, a path under `.git`, and a path that is or passes
-through a link in the worktree are refused. A run ended by SIGTERM or SIGHUP
-still removes its worktree and scratch, and a tree it could not remove is named
+through a link in the worktree are refused. A run ended by SIGTERM, SIGHUP or
+SIGINT (Ctrl-C) still removes its worktree and scratch, and a tree it could not remove is named
 in the output. That includes a signal that arrives while `git worktree add` is
 still running: git registers the worktree locked ("initializing") until its
 checkout is done, and `git worktree prune` never drops a locked entry. The
 runner runs the add in its own process group, so it stops git together with
 the child process that does the checkout, then removes the half-made worktree
-with `git worktree remove --force --force`. A runner killed with SIGKILL runs
-no cleanup, so it can still leave one.
+with `git worktree remove --force --force`. It stops the group with SIGTERM,
+on which git removes its own half-made worktree, and sends SIGKILL only to a
+git still running 10 seconds later: SIGKILL alone can land after git registered
+the worktree and before it wrote the tree's `.git` file, a state that
+`git worktree remove` refuses to clean. A second signal during this cleanup is
+held until it is done, and if the stop is cut short anyway, the group is killed
+before the tree is removed. A runner killed with SIGKILL runs no cleanup, so it can
+still leave one.
 
 The writer uses it to check a new scenario on the current tree, and
 then on a deliberately changed copy, without creating a worktree of its own: an

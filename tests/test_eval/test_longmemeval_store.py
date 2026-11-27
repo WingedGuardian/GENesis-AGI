@@ -154,7 +154,7 @@ async def test_expand_neighbors_skips_dangling_links():
             strength=0.99,
             created_at="2026-01-01",
         )
-        expanded = await _expand_neighbors(es.db, [seed_id], k=5)
+        expanded = await _expand_neighbors(es.db, es.qdrant, [seed_id], k=5)
         expanded_ids = {mid for mid, _ in expanded}
         assert "ghost-no-such-memory" not in expanded_ids
         # the real linked sibling still expands

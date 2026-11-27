@@ -3,7 +3,7 @@
 Fail-closed gate for community contributions. Scans a commit diff
 against multiple detectors; ANY finding blocks the contribution.
 
-Scanners (all run when inputs are available):
+Scanners (all run when inputs are available and the diff fits the size cap):
 
 1. Forbidden paths — diff touches files on the CONTRIBUTION_FORBIDDEN
    list (USER.md, secrets.env, research-profiles/**, docs/plans/**,
@@ -122,9 +122,13 @@ _PORTABILITY_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"\b[fF][cdCD][0-9a-fA-F]{2}:", "IPv6 ULA prefix (RFC 4193)"),
 )
 
-# Email regex — loosely based on the release script's pattern.
+# Try an email first; otherwise consume the whole failed local-part token.
+# Retrying its suffixes cannot repair the same invalid @/domain, and is quadratic
+# on long non-email tokens. Unlike a left-boundary assertion, this also preserves
+# finditer's restart after a successful match (e.g. adjacent email addresses).
 _EMAIL_RE = re.compile(
-    r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
+    r"(?P<address>[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})"
+    r"|[A-Za-z0-9._%+\-]+"
 )
 
 # Allowlist of email patterns that are safe to include. Aligned with
@@ -475,9 +479,8 @@ def parse_diff(diff_text: str, *, strict: bool = False) -> _ParsedDiff:
             line_no += 1
             if current_file is not None:
                 added.append((current_file, line_no, raw[1:]))
-        elif raw.startswith(" ") or raw.startswith("-"):
-            if raw.startswith(" "):
-                line_no += 1
+        elif raw.startswith(" "):
+            line_no += 1
 
     _finish_file()
     return _ParsedDiff(
@@ -613,8 +616,8 @@ def _check_emails(parsed: _ParsedDiff) -> list[Finding]:
     hits: list[Finding] = []
     for file, line_no, text in parsed.added_lines:
         for match in _EMAIL_RE.finditer(text):
-            addr = match.group(0)
-            if _EMAIL_ALLOWLIST_RE.search(addr):
+            addr = match.group("address")
+            if addr is None or _EMAIL_ALLOWLIST_RE.search(addr):
                 continue
             hits.append(
                 Finding(
@@ -1077,25 +1080,28 @@ def scan_diff(
         else:
             fingerprint_file = Path.home() / ".genesis" / "release-fingerprints.txt"
 
-    parsed = parse_diff(diff_text)
+    size_bytes = len(diff_text.encode("utf-8"))
     findings: list[Finding] = []
-    scanners_run: list[str] = []
+    scanners_run: list[str] = ["size_cap"]
 
-    # 1. Size cap (before any expensive work)
-    if parsed.size_bytes > MAX_DIFF_BYTES:
+    # 1. Reject before parsing or scanning. This finding alone blocks egress;
+    # scanners_run must not claim any of the skipped detectors executed.
+    if size_bytes > MAX_DIFF_BYTES:
         findings.append(
             Finding(
                 kind=FindingKind.SIZE,
                 severity=Severity.BLOCK,
                 message=(
-                    f"Diff is {parsed.size_bytes} bytes, exceeds "
+                    f"Diff is {size_bytes} bytes, exceeds "
                     f"MVP cap of {MAX_DIFF_BYTES} bytes. Large diffs "
                     "are out of scope for community contributions in Phase 6.1."
                 ),
                 scanner="size_cap",
             )
         )
-    scanners_run.append("size_cap")
+        return SanitizerResult(ok=False, findings=findings, scanners_run=scanners_run)
+
+    parsed = parse_diff(diff_text)
 
     # 2. Binary files
     if parsed.is_binary:

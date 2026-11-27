@@ -312,12 +312,15 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
             from datetime import timedelta
 
             from genesis.db.crud import events as _ev
+            from genesis.sentinel.codex_mcp_inventory import EVENT_TYPE, EVIDENCE_HOURS
 
             cutoff = (datetime.now(UTC) - timedelta(days=90)).isoformat()
             removed = await _ev.prune(rt._db, older_than=cutoff)
+            inventory_cutoff = (datetime.now(UTC) - timedelta(hours=EVIDENCE_HOURS)).isoformat()
+            removed += await _ev.prune(rt._db, older_than=inventory_cutoff, event_type=EVENT_TYPE)
             rt.record_job_success("events_prune")
             if removed:
-                logger.info("events prune: removed %d rows (>90d)", removed)
+                logger.info("events prune: removed %d expired rows", removed)
         except Exception as exc:
             rt.record_job_failure("events_prune", exc=exc)
             logger.exception("events prune failed")
@@ -373,6 +376,33 @@ def _wire_drip_retention_jobs(scheduler, rt) -> None:
         _voice_hygiene,
         CronTrigger(hour=5, minute=50, timezone=user_timezone()),
         id="voice_hygiene",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
+    async def _prune_tool_call_outcomes() -> None:
+        # Every main-session tool call gets a row (#4712), so the table grows
+        # with all work; retention values live beside the CRUD.
+        if rt._db is None:
+            return
+        try:
+            from genesis.db.crud import tool_call_outcomes as _tco
+
+            removed, cleared = await _tco.prune(rt._db)
+            rt.record_job_success("tool_call_outcomes_prune")
+            if removed or cleared:
+                logger.info(
+                    "tool_call_outcomes prune: removed %d rows (>%dd), cleared %d snippets (>%dd)",
+                    removed, _tco.ROW_RETENTION_DAYS, cleared, _tco.SNIPPET_RETENTION_DAYS,
+                )
+        except Exception as exc:
+            rt.record_job_failure("tool_call_outcomes_prune", exc=exc)
+            logger.exception("tool_call_outcomes prune failed")
+
+    scheduler.add_job(
+        _prune_tool_call_outcomes,
+        CronTrigger(hour=5, minute=55, timezone=user_timezone()),
+        id="tool_call_outcomes_prune",
         max_instances=1,
         misfire_grace_time=3600,
     )
@@ -586,6 +616,15 @@ async def init(rt: GenesisRuntime) -> None:
         )
 
         rt._learning_scheduler = AsyncIOScheduler()
+
+        if rt._event_bus is not None:
+            from genesis.sentinel import codex_mcp_inventory
+
+            rt._learning_scheduler.add_job(
+                codex_mcp_inventory.sample,
+                IntervalTrigger(seconds=codex_mcp_inventory.SAMPLE_INTERVAL_S),
+                args=[rt._event_bus], id="codex_mcp_inventory", max_instances=1, coalesce=True,
+            )
 
         _original_calibration = calibrator.run_daily_calibration
 

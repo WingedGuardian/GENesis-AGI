@@ -28,11 +28,20 @@ it holds the review-chain, evidence and private-data rules every session uses.
 review_state sequence, the sigils, the Pre-Commit Gate, the depth gate and
 verify-RED. Read it; it is not on-demand reference.
 
+**Mandatory read before your first code edit of an item:**
+`.claude/skills/build-session/references/ponytail-house-delta.md` (where
+Genesis differs from the ruleset below; it wins), then
+`.claude/skills/build-session/references/ponytail.md` (a vendored ruleset for
+the smallest complete change: reuse what exists before writing anything new).
+Read both, in that order; they are not on-demand reference.
+
 ### Where your session ENDS — build sessions and closing sessions
 
 **A session that writes code and a session that drives a PR to merge are
 different SESSION TYPES, not two phases of one session's life** (user decision,
-2026-09-02). Loading this skill makes you a **build session**.
+2026-09-02). Loading this skill does not make a session a build session:
+the core's router (`genesis-development`, "Which session are you?") decides a
+session's type, and this skill is for a session the router made one.
 
 - **A build session owns an item from Ready through opening its PR.** It runs
   the review the change EARNS — `/deep-review` for a substantial one, because
@@ -47,8 +56,8 @@ different SESSION TYPES, not two phases of one session's life** (user decision,
   pass to the closing session along with the PR; they do not lapse.
 - **A closing session owns the open-PR queue**, whichever session built each
   PR. Its unit of work is the queue, not the card. That is the
-  **`closing-session`** skill; load it instead when the job is "get the open PRs
-  merged".
+  **`closing-session`** skill, for a session the router (`genesis-development`,
+  "Which session are you?") makes a closing session.
 - **A cloud coding agent (Devin) is a third kind of builder.** It works from the
   public repo in its own VM, with no access to an install: no running Genesis, no
   `~/.genesis/`, none of an install's hooks or local reviewers. Hand it only
@@ -242,6 +251,133 @@ ENUMERABLE, which makes the check mechanical rather than a mood.
 `.claude/skills/genesis-development/references/high-stakes-verification.md` §11 carries the canonical surface list
 and the walk; do not keep a second copy of that list here.
 
+### Building from a spec: the departure rules
+
+The spec is the contract a build is checked against, and it is not the
+builder's to edit. These rules say what a builder does before the first edit,
+and what it does when a spec line or an approved plan step cannot be built as
+written. (Adapted from spec-kit's `intent` extension, cc-sdd, BMAD-METHOD and
+OpenSpec; the notices are in `.claude/skills/spec-session/references/`.)
+
+**Before the first edit.**
+- In a foreground session, no file in the repo is edited before the session
+  holds an approved spec and a plan the owner approved in this session, or a
+  skip-list entry it has named, or the owner's words in conversation skipping
+  the spec stage, which the session records (either needs neither).
+- A dispatched session builds only from an owner-approved contract (an approved
+  spec, a nine-item issue, a greenlit build-lane spec, or a completed `/task`
+  intake; the core's router has the detail), with a plan the owner approved. A dispatched builder
+  session, other than a task executor step, whose prompt names neither an
+  approved spec nor a nine-item issue, and whose change is not on the skip list,
+  stops before its first edit and names what is missing in its returned output.
+  One whose change is on the skip list names the entry and re-checks its diff
+  against it before committing.
+- For the task executor the contract already exists: a build-lane task's is the
+  build spec its greenlight card showed the owner (`autonomy/build_lane.py`
+  fails closed on an empty one), and a `/task` submission's is its intake. Its
+  third path, `source="observation"`, has neither and is inert today; whoever
+  wires it owes it a contract.
+- A builder working from a handoff reads the spec and its
+  `<spec stem>.approved.analysis.md`, checks every premise in the spec's
+  `Premise checks` and `Decided` sections that a read or a probe changing
+  nothing can settle, and writes its own plan in plan mode.
+- Each plan part names the spec ids it delivers (ids only, never their text)
+  and one line saying what will be observably true when it is done. Each part
+  ends in a commit whose required review names the spec and the plan in its
+  dispatch.
+
+**Classing a departure.** Every departure goes in exactly one class:
+- `implementation-defect`: the code does not do what the spec and plan say;
+- `design-decision`: a choice the spec and the approved plan left open;
+- `plan-change`: replacing a decision the approved plan made;
+- `contract-discovery`: a spec requirement or acceptance item is wrong or
+  missing while the spec's purpose still holds, including replacing a mechanism
+  the spec holds in `Decided`;
+- `intent-change`: the spec's purpose, a `Ruled out` item, or a success measure
+  must change.
+
+An `implementation-defect` or a `design-decision` is the builder's to make:
+fixed or decided, built, and listed in the PR body under `Departures:`, one
+line each with its class. A `plan-change` or a `contract-discovery` is approved
+only by the owner's answer to a question prompt, asked before it is built; a
+departure the builder did not raise, which the reviewer found in code already
+built, is asked before the PR opens. An `intent-change` ends the build of the
+affected part and goes back to a spec session. When the builder cannot tell
+which class applies, or a spec line has two readings that lead to different
+results, it asks the owner; it never defaults to the class that needs no
+approval. **A builder never infers the owner's approval from silence, a passing
+test, the code as built, or an approval given for something else.**
+
+**When a step cannot be built as written.**
+1. Stop editing and class it.
+2. For a candidate `plan-change` or `contract-discovery` caused by a failed
+   step, first dispatch a fresh `genesis-investigator` with the failure output
+   and the step. Do not ask the owner until its root cause is in the revision
+   entry; if it finds none, the entry says so with what it tried, and you ask
+   anyway.
+3. Return to plan mode and write, under "Changed in this revision": an id
+   `PC-<n>` (from 1 in that plan, never reused); the class; the plan part and
+   spec ids it affects; what failed, with evidence; the root cause; the
+   replacement; each premise of the replacement with how it was checked; the
+   consequences; `Kept:` naming the work that survives; `Failed approach:`
+   naming what must not be tried again; and `Owner answer: pending`. Ask the
+   owner through a question prompt (at least two questions), and on the answer
+   replace `pending` with the owner's words. An entry still reading
+   `Owner answer: pending` approves nothing.
+4. For an `intent-change`, stop building the part, write the same entry, and
+   tell the owner the part needs a spec session.
+5. After an approved `plan-change` or `contract-discovery`, undo the failed part
+   and rebuild it from the revised plan, never patch it forward: save its diff
+   as a patch under `~/.genesis/output/` (`git diff --binary <source> > <patch>`),
+   restore the tracked files with
+   `git restore --source=<source> --staged --worktree :/`, and send new
+   untracked files through `genesis.trash`. The source is the commit that
+   ended the previous part; for the first part it is where the branch started:
+   `git merge-base HEAD origin/<parent branch>` when it is stacked on another
+   PR, otherwise `git merge-base HEAD origin/main`. Never pass the parent
+   branch's name itself, since its head moves. After the parent merges, merge
+   main in first (a pushed branch is never rebased), then use
+   `git merge-base HEAD origin/main`; before that merge it is the old fork
+   point, which would also undo the parent's work.
+
+**Amending a spec.** A spec line changes only by amendment: one list item under
+`## Amendments`, at the spec's end before any report section, holding an id `AM-<n>` (from 1, never
+reused); the date; the class; the spec item's id; its old text quoted in full
+(matching the text above the heading word for word once runs of whitespace are
+read as one space), or `Old: none (new item)`; the new text, or
+`New: none (removed)`; a `Drops:` line quoting each clause the new text no
+longer carries, separated by `; `, or `Drops: none`; and the owner's words,
+verbatim. The builder never edits a spec above that heading, and never writes a
+`Confirmed:` line: only the closing session does, on the owner's words to it. A second amendment
+to an item quotes the first one's `New:` as its `Old:` and names that `AM-n`;
+the newest is the one judged. When one item has needed two amendments in one
+build, any further departure on it is an `intent-change`.
+
+**The PR body** of a build from a spec carries `Spec: <spec file name>`,
+`Amended: <AM and PC ids, with the plan's slug when a PC is named> | none`,
+`Departures:` (the builder's detail changes, the last reviewer's `Differs:`
+lines, scrubbed like any public text since they quote a private spec, and how
+many `Contradicts:` lines the owner called not worth asking),
+and the last reviewer's `Spec check:` line copied verbatim.
+
+**When the reviewer reports a material contradiction** (genesis-architect, Step
+0.5), ask the owner one question per `Contradicts:` line, at most four to a
+question prompt (at least two questions; add a filler when only one is real),
+each naming the line and its consequence in one sentence, with three options: keep it, and it was worth asking; keep it, and it was not worth
+asking; build it back to the plan. Record a kept answer as an `AM-n` when it
+changes a spec line, or a `PC-n` when it changes the plan; record a build-back
+answer only as a `PC-n` whose `Owner answer:` says to build it back, never as an
+`AM-n`, since the spec does not change. Build back what the owner rejects, and run the reviewer again: an
+entry whose answer keeps the change covers its line, and a line the owner
+rejected stays reported until the code matches the plan. A reviewer dispatch that names a spec sets no
+other final-line format, since the verdict line must come last.
+
+**A dispatched session**, which has no owner to ask, stops the affected part at
+any departure that needs the owner, saves its uncommitted attempt as a patch
+under `~/.genesis/output/`, undoes the part as in step 5, names the patch and
+the entry in its returned output, and goes on only with parts that do not
+depend on it.
+
 ### Verify BEFORE the PR, when this install can show it (standing user rule, 2026-09-24)
 
 You build on a long-lived install, so **when the change's effect can
@@ -250,7 +386,50 @@ PR.** Review then looks at a change that works, not at its first attempt to run.
 Put what you ran and what you saw under the PR's `## Testing` section. The `E2E:`
 line keeps its meaning: the check to run AFTER the merge. For a hook that is still
 needed, because a pre-PR run tests the worktree copy, not the merged copy the
-harness fires.
+harness fires. When the build has a spec, the `E2E:` line cites the spec's `V-n`
+items (its `Definition of Verified`) that the PR delivers.
+
+**Work built from a spec converges against it before the PR.** Run the pass in
+`.claude/skills/spec-session/references/spec-converge.md`:
+- the spec, its plan and its tickets are the only statement of intent;
+- a checked box, a closed row or a "done" bullet is not evidence that the work
+  was done;
+- each gap is missing, partial, contradicts or unrequested;
+- its only write is appending items to your plan file, each traced to the spec
+  line it comes from;
+- when nothing remains it changes nothing.
+
+Do the items and run it again until it converges. Something the spec asked
+for may be left unbuilt only on the owner's recorded decision (a change to the
+spec, never your own call), and a standing-rule contradiction only under the
+owner's recorded exception; the contract's "carried" rules say how. Put the report's `Outcome:` line in the PR
+body under `## Testing`. This applies to any build from a spec, whether or not
+its effect can be shown on this install. The review-time check is different: the
+architect's Step 0.5 compares the diff with the spec and the plan; its scope
+lines stay informational, its `Spec check:` line is for the PR-open gate,
+and it does not replace this pass.
+
+**Record that outcome as the PR's first delivery read.** Once the PR is open,
+`python3 scripts/delivery_marker.py compose --pr <N> --checker author-review
+--outcome <converged|converged-with-carried|open> ...` writes the marker, and you
+run the one `gh` command it prints: `converged` records DELIVERS,
+`converged-with-carried` DELIVERS (each carried item is listed as a point the
+owner's recorded decision accepted, which closing-session's verdict rule also
+counts as accepted), `open` PARTIAL. A PR not built from a spec records the verdict your pre-PR
+review's scope check (the architect's Step 0.5) supports. This is the weakest
+form of the read, the builder's own, and it is labelled so: a closing session
+does its own read (closing-session, step 1a) and overwrites it, and on a PR
+that changes code, tests or config only that independent read makes it ready.
+
+**Copy the plan's Change block into the PR body.** The PR template's premise
+section takes the Problem block as a pointer (`1. Problem: as #<issue>`) when
+the linked issue answers items 1 to 5; otherwise write 1 to 5 out too. Items 6
+to 9 (Mechanism, Alternatives, Evidence, Shape) go in full, copied from the
+plan's premise answers and scrubbed like any public text: a plan's Evidence
+often cites local paths and private measurements. Item 9 is not the PR-shape
+`Shape:` reason line; when one is owed it goes on its own line. Nothing blocks
+on the Change block, but the delivery read records whether it is there
+(`change=stated|absent`).
 
 **Which copy actually ran is the whole question. Check it; never assume it.**
 - A hook guard run as `python3 <worktree>/scripts/hooks/<guard>.py`, with a real
@@ -2018,7 +2197,9 @@ A blocked call, `secrets.env` and ask keys:
 `cc-pin-receipts` are **Advisory BY DESIGN** (they always exit 0); a red result
 from another job blocks the local gate. `dependency-audit` has a narrower
 exception: the audit command reports vulnerability findings without making the
-job red, while setup or installation failures can still fail the job. (An
+job red, while setup or installation failures, and its last step (the real
+Scrapling fetch cases, which run only where `[browser]` is installed), still
+fail the job. (An
 earlier version said "ten of eleven … only `review-depth-check`", wrong on both
 halves; count the `jobs:` keys and inspect the steps rather than trusting any
 prose figure, including this one.) Only THREE checks — `test`, `leak-detector`,
@@ -2069,11 +2250,10 @@ python interpreter with an adjacent `-m pytest`.
   through is a convention with better documentation.
 
 Before any "X is absent" or "nothing adoptable exists" claim, follow
-"Auditing Existing Capabilities" in `.claude/skills/spec-session/SKILL.md`.
+`.claude/skills/spec-session/references/existing-capabilities.md`.
 
 Before writing repo-local code that decides something about a pull request, read
-"Never reinvent what GitHub already does natively" in
-`.claude/skills/spec-session/SKILL.md`.
+`.claude/skills/spec-session/references/github-native.md`.
 
 ## Generalizability Gate — build for ANY install, not this one
 
@@ -2282,6 +2462,10 @@ that takes up the rework is the reviving session (closing-session, "Never RETIRE
    Questions answered: <each delegated or missing question: the answer and why>
    ```
 
+   For a rework, split or fix round of a build from a spec, the Kept / deleted
+   line names the spec ids each part keeps or drops, and a drop needs the
+   owner's yes recorded on the PR: a cut is a spec amendment.
+
 The closing session reads this section before it spends a review round. A
 deviation with a stated reason goes to the owner as a design question. A missing
 section, an unexplained deviation, or an unsplit PR the spec split goes back to
@@ -2304,7 +2488,15 @@ Standard open-source workflow: PRs go directly to the public repo.
   banned, so a rebased pushed branch diverges from its remote with no way to
   publish the rewrite. A merge commit on a *branch* is fine — the squash erases
   it at PR merge; "squash only" above governs merging into main, not
-  reconciling a branch.
+  reconciling a branch. The same holds for a **stacked PR's base**: bring a
+  fixed base branch in with a merge (`--no-ff`), never `rebase --onto`. A
+  rebase also strands an open round's reflection: the commit gate credits it
+  only behind the reviewed head, which the rebase rewrites away, so every fix
+  commit is then refused.
+- **A gate that says "ask the owner" means ask.** Do it even when you caused
+  the block yourself and judge the block correct. Never rewrite history (reset,
+  re-merge, sigils) to get past the gate: that judgment is the one the message
+  reserves for the owner.
 - **In a reconciliation merge, the base wins on policy.** The merge commit may
   DELETE from your branch (a rule main superseded, a test that pinned your
   now-dead behavior); it may never re-litigate main. Scope, precisely: base

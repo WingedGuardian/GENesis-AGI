@@ -145,7 +145,7 @@ def _lock(directory: Path, wait_s: float, *, shared: bool = False):
                     raise
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError(
+                    raise QueueBusy(
                         "legacy index-request queue busy; request not changed"
                     ) from exc
                 time.sleep(min(0.01, remaining))
@@ -370,24 +370,32 @@ def migrate(
         retire(directory, imported, sync)
 
 
-def import_status(database: Path, *, limit: int, protocol_only=False, observe=None, schema_check=None) -> dict:
-    """Observe this rollback-journal queue without initialization or migration."""
-    if limit < 0:
-        raise ValueError("limit must be nonnegative")
+class QueueBusy(TimeoutError):
+    """A queue acquisition refused due to confirmed contention."""
+
+
+def rollback_queue_present(database: Path) -> bool:
     try:
         with database.open("rb") as stream:
             header = stream.read(100)
     except FileNotFoundError:
-        return {"state": "absent", "receipts_available": False}
+        return False
     if not header:
-        # An empty file is a queue no writer has initialized yet (for example a
-        # creation deferred during an update); it holds no state.
-        return {"state": "absent", "receipts_available": False}
+        return False
     # WAL readers can create sidecars even with mode=ro. This queue is pinned
     # to DELETE; reject other headers before SQLite opens them. This is an
     # operational snapshot, not protection against manual concurrent mode flips.
     if len(header) != 100 or header[:16] != b"SQLite format 3\0" or header[18:20] != b"\1\1":
         raise RuntimeError("unsupported queue header or journal mode")
+    return True
+
+
+def import_status(database: Path, *, limit: int, protocol_only=False, observe=None, schema_check=None) -> dict:
+    """Observe this rollback-journal queue without initialization or migration."""
+    if limit < 0:
+        raise ValueError("limit must be nonnegative")
+    if not rollback_queue_present(database):
+        return {"state": "absent", "receipts_available": False}
     db = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=0.5)
     try:
         db.execute("PRAGMA query_only=ON")

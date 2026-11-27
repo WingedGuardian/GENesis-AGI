@@ -1,0 +1,1 @@
+- **Procedure deduplication keeps new lessons when the serving model cannot be verified.** A cross-task duplicate judgment can skip a new lesson only when the response identifies the qualified model and the configured route matches.

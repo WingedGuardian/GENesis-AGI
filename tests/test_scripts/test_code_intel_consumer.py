@@ -5,6 +5,7 @@ shipped readiness stays off. Real typed transitions exercise explicit transport
 faults; owner source/registration/intent, manager/kernel and waits are synthetic.
 """
 
+import fcntl
 import json
 import os
 import sqlite3
@@ -18,6 +19,7 @@ import pytest
 
 from tests.test_scripts.code_intel_consumer_fixture import build_consumer, install_provider
 from tests.test_scripts.managed_code_intel_fixture import configured_sentinel
+from tests.test_scripts.test_code_intel_orphan_cli import reserve_dead_owner
 from tests.test_scripts.test_code_intel_source import isolated_modules as isolated_modules
 from tests.test_scripts.test_index_marker_legs import queue as queue  # noqa: F401
 
@@ -545,6 +547,34 @@ def test_native_unreserved_claim_restores_then_sends_once(consumer):
     assert [row["typed_applied_state"] for row in history] == ["pending", "consumed"]
     assert [row["typed_charged_attempts"] for row in history] == [0, 0]
     assert consumer.run().returncode == 0 and len(consumer.events()) == 1
+
+
+def test_runner_reconciles_ended_owner_before_claiming_and_respects_repo_lock(consumer):
+    q = consumer.queue
+    q.write_marker(consumer.repo, "both", "fast")
+    claimed = q.claim_native(consumer.hash, provider="cbm")
+    reserve_dead_owner(q, q._proof, claimed)
+    lock_dir = consumer.directory / ".genesis/locks"
+    lock_dir.mkdir(exist_ok=True)
+    with (lock_dir / f"code-intel-{consumer.hash}.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        blocked = consumer.run()
+        assert blocked.returncode == 0, blocked.stderr
+        assert "queue busy at owner-loss reconciliation" in (
+            consumer.directory / ".genesis/code-intelligence-runner.log"
+        ).read_text()
+        assert not consumer.events()
+        assert q.execution_status(claimed["context"])["control_closure"] is None
+
+    recovered = consumer.run()
+    assert recovered.returncode == 0, recovered.stderr
+    closed = q.execution_status(claimed["context"])
+    assert closed["control_closure"]["data"]["state"] == "orphaned"
+    assert closed["typed_charged_attempts"] == 0 and closed["safety_kind"] == "uncertainty"
+    assert consumer.events() == [{"repo": consumer.repo, "provider": "gitnexus", "mode": "fast"}]
+    assert consumer.run().returncode == 0
+    assert q.execution_status(claimed["context"]) == closed
+    assert len(consumer.events()) == 1
 
 
 def test_legacy_possible_native_claim_is_not_reconciled_or_dispatched(consumer):

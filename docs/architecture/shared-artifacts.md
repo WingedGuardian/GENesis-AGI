@@ -30,9 +30,11 @@ enrolled artifacts by their consumer set — it is not a general prose↔code ch
 
 A `claude setup-token` credential (`~/.genesis/cc_oauth_token.env`, synced to the
 host shared mount) injected as `CLAUDE_CODE_OAUTH_TOKEN` when a primary
-`claude login` is confirmed dead — with ONE documented exception: the
+`claude login` is confirmed dead — with TWO documented exceptions: the
 interactive-slot `GENESIS_CC_SLOT_OAUTH=always` lever (see `cc-slot.sh` below)
-deliberately injects over a live login too. Written by `scripts/store_cc_token.sh`;
+deliberately injects over a live login too, and the host Guardian's recovery
+brain (`guardian/diagnosis.py`) injects it whenever its login is not CONFIRMED
+working (logged out, unknown, or a pre-flight that timed out). Written by `scripts/store_cc_token.sh`;
 accessed directly by filename *and* transitively via
 `credential_bridge.load_cc_oauth_token()` / `login_health.read_fallback_token()`.
 

@@ -7,6 +7,7 @@ Python fixture seam only; production callers use the actual /proc.
 from __future__ import annotations
 
 import math
+import os
 import re
 import sys
 import time
@@ -19,7 +20,32 @@ def _boot(proc: Path) -> str:
     return str(uuid.UUID((proc / "sys/kernel/random/boot_id").read_text().strip()))
 
 
-def owner_ended(owner, proof, *, proc=Path('/proc')):
+class OwnerObservationUnavailable(ValueError):
+    """The automatic caller cannot establish a stable original lifetime view."""
+
+
+def automatic_owner_boot(proc: Path) -> str:
+    """Check the observer side of the installed runner's shared proc view."""
+    try:
+        pid = str(os.getpid())
+        namespace_ids = [line.split()[1:] for line in (proc / "self/status").read_text().splitlines()
+                         if line.startswith("NSpid:")]
+        mounts = []
+        for line in (proc / "self/mountinfo").read_text().splitlines():
+            mount, _, filesystem = line.partition(" - ")
+            if mount.split()[4:5] == [str(proc)]:
+                mounts.append(filesystem.split())
+        if (str((proc / "self").readlink()) != pid or namespace_ids != [[pid]]
+                or len(mounts) != 1 or len(mounts[0]) != 3 or mounts[0][0] != "proc"
+                or any(option.startswith(("hidepid=", "subset=")) and option not in ("hidepid=0", "hidepid=off")
+                       for option in mounts[0][2].split(","))):
+            raise ValueError("not a full local PID view")
+        return _boot(proc)
+    except (OSError, ValueError) as error:
+        raise OwnerObservationUnavailable("automatic owner proc view unavailable") from error
+
+
+def owner_ended(owner, proof, *, proc=Path('/proc'), automatic_boot=None):
     """Positive old-lifetime end, never an arbitrary process-read exception.
 
     proc_pid_stat(5): state3, starttime22. A terminal leader can retain live
@@ -32,8 +58,21 @@ def owner_ended(owner, proof, *, proc=Path('/proc')):
             or not isinstance(owner['boot_id'], str)
             or str(uuid.UUID(owner['boot_id'])) != owner['boot_id']):
         raise ValueError('invalid original process identity')
+    if automatic_boot is None:
+        return _owner_ended_in_view(owner, proof, proc, automatic_boot)
+    try:
+        return _owner_ended_in_view(owner, proof, proc, automatic_boot)
+    except (OSError, ValueError) as error:
+        raise OwnerObservationUnavailable("automatic owner identity unavailable") from error
+
+
+def _owner_ended_in_view(owner, proof, proc, automatic_boot):
     boot = _boot(proc)
+    if automatic_boot is not None and boot != automatic_boot:
+        raise ValueError("boot changed before owner-lifetime observation")
     if boot != owner['boot_id']:
+        if automatic_boot is not None and _boot(proc) != boot:
+            raise ValueError("boot changed during owner-lifetime observation")
         return True
     directory = proc / str(owner['pid'])
     try:
@@ -48,7 +87,7 @@ def owner_ended(owner, proof, *, proc=Path('/proc')):
     else:
         if identity[1] <= 0 or identity[3] not in ('R', 'S', 'D', 'Z', 'T', 't', 'X', 'x', 'K', 'W', 'P', 'I'):
             raise ValueError('original process state or start unavailable')
-        ended = identity[1] != owner['start_ticks']
+        ended = automatic_boot is None and identity[1] != owner['start_ticks']
     if _boot(proc) != boot:
         raise ValueError('boot changed during owner-lifetime observation')
     return ended

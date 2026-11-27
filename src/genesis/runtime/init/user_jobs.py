@@ -24,6 +24,10 @@ async def init(rt: GenesisRuntime) -> None:
         scheduler = UserJobScheduler(db=rt._db, event_bus=rt._event_bus)
         rt._user_job_scheduler = scheduler
 
+        session_manager = getattr(rt, "_session_manager", None)
+        if session_manager is not None:
+            session_manager.add_on_end(scheduler.on_session_end)
+
         await scheduler.start()
 
         init_user_job_tools(db=rt._db, scheduler=scheduler)

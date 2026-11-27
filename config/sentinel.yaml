@@ -23,5 +23,29 @@ autonomy:
 #     (exit 4), so a session that only runs the dry-run sees it is off.
 # Any other value reads as off. GENESIS_CODEX_MCP_STOP_DISABLED=1 also turns
 # it off. Set per install in config/sentinel.local.yaml.
+# codex_mcp_stop.propose_at_mb: the health alarm infra:codex_mcp_held fires
+#   once the tool's own scan finds this many MB held in MCP groups, so the
+#   Sentinel proposes the stop before container memory is high (#4302). The
+#   owner still approves every stop. 4096 is about three piled-up thread sets
+#   (one set is ~1.2 GB), so one active thread never trips it. A value that is
+#   not a positive integer turns the alarm off; mode: off turns it off too.
 codex_mcp_stop:
   mode: propose_only
+  propose_at_mb: 4096
+
+# process_stop: the Sentinel's stop tool for ONE runaway process
+# (python -m genesis.sentinel.process_stop). The health alarm
+# infra:process_memory_high fires when any of this user's processes outside a
+# systemd .service unit holds propose_at_mb MB of RSS+swap, so the Sentinel
+# proposes the stop early. The owner approves every stop, and an approved stop
+# signals only the processes its dry-run named (--only PID:STARTTIME). A
+# legitimately large job keeps the alarm firing: decline it (24 h quiet) or
+# raise the threshold in sentinel.local.yaml. 6144 is about three
+# times the largest ordinary process on a live install (a Claude Code session
+# tree at about 1.8 GB), and well under the 11.7 GB a runaway Codex CLI reached.
+#   mode: propose_only (default) or off (any other value reads as off).
+#   GENESIS_PROCESS_STOP_DISABLED=1 also turns it off. Per install in
+#   config/sentinel.local.yaml.
+process_stop:
+  mode: propose_only
+  propose_at_mb: 6144

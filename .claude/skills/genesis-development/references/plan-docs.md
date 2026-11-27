@@ -49,7 +49,7 @@ YAML frontmatter, the first thing in the file:
 ```yaml
 ---
 plan: tidy-orbiting-haven        # stable slug; matches the filename
-status: active                   # active | stalled | superseded | done
+status: active                   # active | approved | stalled | superseded | done
 updated: 2026-09-15              # last revision of the LIVE section
 pinned:
   main: 71e91e148ab3             # origin/main as of the `updated` date above
@@ -64,6 +64,11 @@ prevents: "a second findings store — adjudication writes to the existing one."
 
 Required: `plan`, `status`, `updated`, `pinned.main`, `binds`, `prevents`. The
 three id lists are optional.
+
+`status: approved` means the owner approved the plan, in plan mode or by a yes
+in conversation; write it with the date and the owner's words
+(`approved (2026-11-24, "go ahead")`). A status counts by its first word, so
+what follows the word is a note.
 
 **Quote `binds` and `prevents`.** They are prose, and unquoted YAML punishes
 prose in two different ways — MEASURED with this repo's PyYAML:
@@ -132,10 +137,11 @@ a tool-appended status block at end-of-file is not plan content and is current
 by construction. That is a real rough edge, not a clean exception, and it will
 read as archaeology to anyone scrolling.
 
-A plan doc's body answers the six plan-time premise questions in
+A plan doc's body answers the nine-item premise form in
 `.claude/docs/premise-check.md`, "At plan and issue time", in its
-`## Premise checks` section format. A plan that names repo paths cannot leave plan
-mode without that section and six non-empty answers.
+`## Premise checks` section format (`1. Problem: as #<N>` may stand for items 1
+to 5 when that issue answers them). A plan that names repo paths cannot leave plan
+mode without that section and its answers.
 
 ## What each field is for
 

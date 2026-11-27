@@ -370,7 +370,7 @@ def _report_env(monkeypatch) -> None:
     monkeypatch.setattr(
         gpg,
         "_check_inline_review_findings",
-        lambda n, repo=None, force=False, uncounted_out=None: (False, ""),
+        lambda n, repo=None, force=False, uncounted_out=None, head=None: (False, ""),
     )
     monkeypatch.setattr(gpg, "_substitute_available_note", lambda n, repo=None: "")
     monkeypatch.setenv("_TEST_GH_HEAD_SHA", HEAD)

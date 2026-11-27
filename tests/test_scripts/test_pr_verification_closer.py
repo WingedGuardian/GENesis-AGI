@@ -52,6 +52,17 @@ NOW = "2026-09-20T11:00:00+00:00"
 MERGE_SHA = "deadbeef1234" + "0" * 28
 
 
+#: The date every close in these tests is judged on: before EVENT_GAP's trigger, so a
+#: close may still store it as a recheck. The refusal of a due trigger is tested
+#: with its own dates below.
+CLOSE_DAY = datetime(2026, 11, 1, tzinfo=UTC).date()
+
+
+@pytest.fixture(autouse=True)
+def _close_before_the_fixture_dates(monkeypatch):
+    monkeypatch.setattr(_prv, "_today", lambda: CLOSE_DAY)
+
+
 @pytest.fixture(autouse=True)
 def _no_real_github(monkeypatch):
     """``close`` resolves the PR's merge commit through gh. No test calls gh for real:
@@ -216,6 +227,34 @@ def _run(tmp_path: Path, doc: dict, *extra: str, pr: int = 7, route: bool = True
             *extra,
         ]
     )
+
+
+@pytest.mark.parametrize("review_complete", [False, True])
+def test_p2_receipt_is_stored_without_claiming_close_enforcement(tmp_path, monkeypatch, review_complete):
+    from dataclasses import replace
+
+    from genesis.session_awareness.pr_completeness import source_binding
+    from tests.test_session_awareness.test_pr_completeness import refresh, reviewed
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    doc, source = reviewed(source_dir)
+    source = replace(source, merge_commit=MERGE_SHA)
+    doc["merge_commit"] = MERGE_SHA
+    doc["completeness"]["inventory"]["source"] = source_binding(source).model_dump(mode="json")
+    doc["completeness"]["complete"] = review_complete
+    refresh(doc)
+    monkeypatch.setattr(_prv, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, source.body))
+    _seed(tmp_path / "genesis.db")
+    assert _run(tmp_path, doc, route=False) == 0
+    stored = _row(tmp_path / "genesis.db")
+    assert stored["status"] == "closed"
+    receipt = json.loads(stored["evidence"])["completeness"]
+    assert receipt["complete"] is review_complete
+    assert receipt["evidence_sha256"] == doc["completeness"]["evidence_sha256"]
+    assert receipt["review_execution_ref"] == "fixture-only:no-model-ran"
+    # P3 replaces this intermediate expectation with the shared close refusal;
+    # these owned writes are not permission to release an installed HOLD.
 
 
 # ── print-schema ─────────────────────────────────────────────────────────
@@ -1606,3 +1645,47 @@ def test_gh_merge_commit_without_gh_installed_names_it(monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda name: None)
     with pytest.raises(LookupError, match="not installed"):
         _REAL_GH(REPO, 7)
+
+
+def test_a_dry_run_prints_the_completeness_prompts_before_its_record(tmp_path, capsys):
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    doc = _doc(gaps=[_gap("only CI ran it")])
+    assert _run(tmp_path, doc, "--dry-run") == 0
+    out = capsys.readouterr().out
+    assert "pr_verification: check: gaps/0 is a method gap" in out
+    assert out.index("check:") < out.index("DRY RUN")
+
+
+def test_an_open_record_prints_the_prompts_too(tmp_path, capsys):
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    doc = _doc_for("not-yet-done", gaps=[UNDONE_GAP, _gap("only CI ran it")])
+    assert _run(tmp_path, doc, "--note", "the test file is owed") == 0
+    assert "pr_verification: check: gaps/1 is a method gap" in capsys.readouterr().out
+    assert _row(db)["status"] == "open"
+
+
+@pytest.mark.parametrize("day", ["2026-11-02", "2026-11-03"])
+def test_a_close_with_a_date_gate_already_come_is_refused_and_writes_nothing(
+    tmp_path, capsys, monkeypatch, day
+):
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    monkeypatch.setattr(_prv, "_today", lambda: datetime.fromisoformat(day).date())
+    assert _run(tmp_path, _doc(gaps=[EVENT_GAP])) == 2
+    err = capsys.readouterr().err
+    assert "gaps/0 (trigger 2026-11-02)" in err
+    assert _row(db)["status"] == "open", "nothing written"
+
+
+def test_a_passing_document_with_tracking_pending_is_recorded_not_refused(tmp_path, capsys, monkeypatch):
+    """The date refusal gates the effective close, as E2E coverage does: an attempt
+    that stays open because routing is pending records its measurement (exit 4)."""
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    monkeypatch.setattr(_prv, "_today", lambda: datetime(2026, 11, 3, tzinfo=UTC).date())
+    doc = _doc(gaps=[EVENT_GAP], findings=[{"summary": "reachable defect", "disposition": "reported in chat"}])
+    assert _run(tmp_path, doc, route=False) == 4
+    assert "date has already come" not in capsys.readouterr().err
+    assert _row(db)["status"] == "open"

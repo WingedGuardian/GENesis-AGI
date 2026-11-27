@@ -196,8 +196,22 @@ def _normalize(document: str) -> str:
 #: re-record. Sources: ``base_ref`` is the local ``query`` in
 #: ``git_push_guard._pr_base_sha``; ``codex_signal`` is ``_CODEX_SIGNAL_QUERY``;
 #: ``outside_pr`` is ``_OUTSIDE_PR_QUERY``; the two ``review_budget`` documents are
-#: ``review_budget._graphql_query`` of the connections in ``_REVIEW_BUDGET_READS``.
+#: ``review_budget._graphql_query`` of the connections in ``_REVIEW_BUDGET_READS``;
+#: ``delivery_changes`` is ``delivery_marker._CHANGES_Q`` (the delivery row);
+#: ``blob_oids`` is ``git_push_guard._BLOB_OIDS_QUERY`` (the floor fix check).
 GRAPHQL_DOCUMENTS = {
+    "edit_history": (
+        "query($ids:[ID!]!){nodes(ids:$ids){... on PullRequestReviewComment{"
+        "fullDatabaseId author{__typename login} "
+        "userContentEdits(first:100){totalCount nodes{editor{__typename login} "
+        "deletedBy{__typename login}}}}}}"
+    ),
+    "blob_oids": (
+        "query($owner:String!,$name:String!,$a:String!,$b:String!){"
+        "repository(owner:$owner,name:$name){"
+        "a:object(expression:$a){__typename ... on Blob{oid}} "
+        "b:object(expression:$b){__typename ... on Blob{oid}}}}"
+    ),
     "base_ref": (
         "query($owner:String!,$name:String!,$ref:String!){repository(owner:$owner,nam"
         "e:$name){ref(qualifiedName:$ref){target{oid}}}}"
@@ -251,6 +265,18 @@ GRAPHQL_DOCUMENTS = {
         " hasNextPage endCursor } nodes { commit { oid committedDate tree { oid }"
         " parents(first: 100) { totalCount nodes { oid } } } } } } } }"
     ),
+    "delivery_changes": (
+        "query($o:String!,$r:String!,$pr:Int!,$issue:Int!,$has:Boolean!,$head:GitObjectID!)"
+        "{repository(owner:$o,name:$r){object(oid:$head){... on Commit{committedDate}}"
+        " pullRequest(number:$pr){lastEditedAt timelineItems(itemTypes:[BASE_REF_CHANGED_EVENT,"
+        "RENAMED_TITLE_EVENT],last:100){filteredCount nodes{__typename"
+        " ... on BaseRefChangedEvent{createdAt} ... on RenamedTitleEvent{createdAt}}}}"
+        " issueOrPullRequest(number:$issue) @include(if:$has){__typename ... on Issue{"
+        "lastEditedAt comments(last:100){totalCount nodes{createdAt lastEditedAt}}"
+        " timelineItems(itemTypes:[RENAMED_TITLE_EVENT,CLOSED_EVENT,REOPENED_EVENT],last:100)"
+        "{filteredCount nodes{__typename ... on RenamedTitleEvent{createdAt}"
+        " ... on ClosedEvent{createdAt stateReason} ... on ReopenedEvent{createdAt}}}}}}}"
+    ),
 }
 
 #: The connections each review_budget document selects, in its order: the first
@@ -269,12 +295,29 @@ _BY_DOCUMENT = {_normalize(doc): name for name, doc in GRAPHQL_DOCUMENTS.items()
 #: checks cannot change the answer unseen, and a number sent as a string is not
 #: answered as if GitHub had accepted it.
 _GRAPHQL_VARIABLES = {
+    "edit_history": {"ids[]": "-f"},
     "base_ref": {"owner": "-f", "name": "-f", "ref": "-f"},
+    "blob_oids": {"owner": "-f", "name": "-f", "a": "-f", "b": "-f"},
     "codex_signal": {"owner": "-F", "name": "-F", "number": "-F"},
     "outside_pr": {"owner": "-f", "name": "-f", "num": "-F"},
     "review_budget": {"owner": "-f", "name": "-f", "number": "-F"},
     "review_budget_reread": {"owner": "-f", "name": "-f", "number": "-F"},
+    "delivery_changes": {
+        "o": "-F",
+        "r": "-F",
+        "pr": "-F",
+        "issue": "-F",
+        "has": "-F",
+        "head": "-f",
+    },
 }
+
+#: The delivery row's REST pull read (``delivery_marker._pr``), the one ``pulls/N``
+#: selection answered from the ``pr view`` record.
+_DELIVERY_PR_JQ = "{head: .head.sha, body: .body}"
+
+#: The variables naming the repository, where a query does not call them owner/name.
+_REPO_VARIABLES = {"delivery_changes": ("o", "r")}
 
 
 #: The REST ``files[].status`` values and the GraphQL ``PatchStatus`` GitHub reports
@@ -305,9 +348,14 @@ def _graphql(opts: dict[str, list[str]], state: dict) -> tuple[int, str, str]:
         raise _Unrouted("api graphql --paginate: every recorded page is the last")
     fields: dict[str, str] = {}
     sent_by: dict[str, str] = {}
+    id_list: list[str] = []  # a GraphQL list variable: gh repeats `ids[]=`
     for flag in ("-f", "-F"):
         for item in opts.get(flag, []):
             key, sep, value = item.partition("=")
+            if key == "ids[]" and sep and flag == "-f":
+                id_list.append(value)
+                sent_by[key] = flag
+                continue
             if not sep or key in fields:
                 raise _Unrouted(f"graphql field {item!r}")
             fields[key] = value
@@ -322,14 +370,60 @@ def _graphql(opts: dict[str, list[str]], state: dict) -> tuple[int, str, str]:
         raise _Unrouted("graphql asked for a second page; every recorded page is the last")
     if sent_by != _GRAPHQL_VARIABLES[route]:
         raise _Unrouted(f"graphql {route} variables by flag {sorted(sent_by.items())}")
+    if route == "edit_history":
+        # One node per id, each an inline comment of the recorded PR, answered from
+        # the recorded history (no edits when none is recorded); an id no recorded
+        # comment carries is refused.
+        by_node = {
+            c.get("node_id"): c for c in state["api"].get(f"pulls/{state['pr']}/comments", [])
+        }
+        nodes = []
+        for nid in id_list:
+            if nid not in by_node:
+                raise _Unrouted(f"edit_history id {nid!r} is no recorded comment")
+            c = by_node[nid]
+            login = (c.get("user") or {}).get("login", "")
+            kind = (c.get("user") or {}).get("type", "User")
+            nodes.append(
+                state.get("edit_history", {}).get(
+                    nid,
+                    {
+                        "fullDatabaseId": str(c["id"]),
+                        "author": {"__typename": kind, "login": login.removesuffix("[bot]")},
+                        "userContentEdits": {"totalCount": 0, "nodes": []},
+                    },
+                )
+            )
+        return _answer({"data": {"nodes": nodes}}, _one(opts, "--jq"))
     owner, name = state["repo"].split("/")
-    if fields.get("owner") != owner or fields.get("name") != name:
+    owner_var, name_var = _REPO_VARIABLES.get(route, ("owner", "name"))
+    if fields.get(owner_var) != owner or fields.get(name_var) != name:
         raise _Unrouted("graphql owner/name is not the recorded repository")
-    number = fields.get("number", fields.get("num"))
+    number = fields.get("number", fields.get("num", fields.get("pr")))
+    if route == "blob_oids":
+        # Two "<sha>:<path>" expressions, each at a commit of the recorded PR, each
+        # answered from the recorded blobs; an expression with no record is refused.
+        shas = {c["sha"] for c in state["api"].get(f"pulls/{state['pr']}/commits", [])}
+        repo_obj = {}
+        for key in ("a", "b"):
+            sha, sep, path = fields.get(key, "").partition(":")
+            if not sep or not re.fullmatch(r"[0-9a-f]{40}", sha) or not path or sha not in shas:
+                raise _Unrouted(f"blob_oids expression {fields.get(key)!r}")
+            if fields[key] not in state.get("blobs", {}):
+                raise _Unrouted(f"no recorded blob for {fields[key]!r}")
+            repo_obj[key] = state["blobs"][fields[key]]
+        return _answer({"data": {"repository": repo_obj}}, _one(opts, "--jq"))
     if route != "base_ref" and number != state["pr"]:
         raise _Unrouted(f"graphql for PR {number}, not {state['pr']}")
     if route == "base_ref" and fields.get("ref") != f"refs/heads/{state['pr_view']['baseRefName']}":
         raise _Unrouted(f"graphql ref {fields.get('ref')!r}")
+    if route == "delivery_changes":
+        # Only the at-head, non-issue read is recorded: the answer is for this head,
+        # and an issue basis would select an issue no fixture holds.
+        if fields.get("head") != state["pr_view"]["headRefOid"]:
+            raise _Unrouted(f"delivery_changes for head {fields.get('head')!r}")
+        if (fields.get("issue"), fields.get("has")) != ("0", "false"):
+            raise _Unrouted(f"delivery_changes for issue {fields.get('issue')!r}")
     if route in REVIEW_BUDGET_READS:
         answer = _review_budget_answer(state, REVIEW_BUDGET_READS[route])
         return _answer(answer, _one(opts, "--jq"))
@@ -443,6 +537,18 @@ def _api(args: list[str], state: dict) -> tuple[int, str, str]:
     page = int(params.pop("page", "1"))
     per_page = int(params.pop("per_page", "30"))
     key = rel + ("?" + "&".join(f"{k}={v}" for k, v in sorted(params.items())) if params else "")
+    if (
+        key == f"pulls/{state['pr']}"
+        and key not in state["api"]
+        and _one(opts, "--jq") == _DELIVERY_PR_JQ
+        and "--paginate" not in opts
+        and page == 1
+    ):
+        # The REST pull read (the delivery row's head and body): the same facts the
+        # ``pr view`` record states, so a fixture states each one once. Only that exact
+        # read: any other selection of this path is a read no record answers.
+        view = state["pr_view"]
+        state["api"][key] = {"head": {"sha": view["headRefOid"]}, "body": view["body"]}
     if key not in state["api"]:
         raise _Unrouted(f"api {key!r}")
     value = state["api"][key]

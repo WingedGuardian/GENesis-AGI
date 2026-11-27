@@ -132,6 +132,7 @@ import json
 import sqlite3
 import sys
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from datetime import UTC
 from pathlib import Path
 
@@ -150,11 +151,14 @@ from genesis.session_awareness.pr_evidence import (  # noqa: E402
     EvidenceError,
     Refusal,
     check_e2e_coverage,
+    check_event_dates,
+    completeness_prompts,
     decide,
     parse_evidence,
     parse_recheck_result,
     reason_for,
     rechecks_for,
+    stored_evidence_json,
 )
 from genesis.session_awareness.pr_recording import (  # noqa: E402
     PrMetadata,
@@ -180,6 +184,16 @@ __all__ = [
     "resolve_repo",
     "validate_evidence",
 ]
+
+
+@asynccontextmanager
+async def _ledger_connection(path: Path, *, dry_run: bool):
+    """Read committed WAL data in previews without opening a writer."""
+    from genesis.db.connection import connect_aiosqlite_ro, connect_aiosqlite_rw
+
+    connect = connect_aiosqlite_ro if dry_run else connect_aiosqlite_rw
+    async with connect(path, timeout=10) as db:
+        yield db
 
 
 def validate_evidence(doc: object) -> EvidenceDocument:
@@ -310,14 +324,6 @@ async def _write(
         )
         return 1
 
-    # The admission seam every real connection path in this repo uses, NOT the
-    # advisory predicate: admission.py says that one is for callers where
-    # continuing would not open the database, and this one opens it read-write to
-    # mutate a permanent ledger. It raises in TWO places — synchronously at
-    # construction and again inside the post-open re-check — so the try must cover
-    # the context manager, not just the call.
-    from genesis.db.connection import connect_aiosqlite_rw
-
     pr_number = doc.pr
     rechecks = []
     # Set the moment a writer COMMITS. Anything that fails after that (the success
@@ -326,7 +332,7 @@ async def _write(
     committed: str | None = None
     committed_code = 0
     try:
-        async with connect_aiosqlite_rw(resolved, timeout=10) as db:
+        async with _ledger_connection(resolved, dry_run=dry_run) as db:
             await db.execute("PRAGMA busy_timeout=5000")
             db.row_factory = aiosqlite.Row
 
@@ -364,6 +370,9 @@ async def _write(
             coverage = check_e2e_coverage(doc, actual.body) if closing else None
             if coverage:
                 return _refuse(coverage.message, coverage.code)
+            dated = check_event_dates(doc, closing, _today())
+            if dated:
+                return _refuse(dated.message, dated.code)
             rechecks = rechecks_for(doc) if closing else []
             if rechecks:
                 schema_error = await _close_schema_refusal(db, rechecks)
@@ -515,6 +524,13 @@ async def _write(
         return 1
 
 
+def _today():
+    """The UTC date a close is judged on; the backlog's "Rechecks due" read uses the same."""
+    from datetime import datetime
+
+    return datetime.now(UTC).date()
+
+
 def _refuse(message: str, code: int) -> int:
     print(f"pr_verification: {message}", file=sys.stderr)
     return code
@@ -566,7 +582,6 @@ async def _recheck(
 
     import aiosqlite
 
-    from genesis.db.connection import connect_aiosqlite_rw
     from genesis.db.crud import pr_verifications as crud
     from genesis.db.integrity import DatabaseIntegrityError
 
@@ -581,7 +596,7 @@ async def _recheck(
     key = f"{repo}#{pr_number}"
     state = None
     try:
-        async with connect_aiosqlite_rw(resolved, timeout=10) as db:
+        async with _ledger_connection(resolved, dry_run=dry_run) as db:
             await db.execute("PRAGMA busy_timeout=5000")
             db.row_factory = aiosqlite.Row
             if dry_run:
@@ -773,14 +788,18 @@ def main(
     result = decide(doc, park=args.park, asserted=args.verdict, note=args.note)
     if isinstance(result, Refusal):
         return _refuse(result.message, result.code)
+    # Questions to answer before a close, which is permanent: printed on every run
+    # (a dry run, an open record, a close), never stored, never a verdict.
+    for prompt in completeness_prompts(doc):
+        print(f"pr_verification: check: {prompt}")
 
     # The cap is enforced on the bytes that get STORED, not the bytes that were read:
     # the canonical re-serialisation can be larger than the file, and checking only
     # the file would let an over-cap record into the column the cap exists to bound.
     # The CRUD enforces the same cap again, because it owns the column.
-    # ensure_ascii=False: the escaped form spends up to 12 bytes on one non-ASCII
-    # character, which would refuse an honest document for its alphabet.
-    payload = json.dumps(doc.model_dump(mode="json"), indent=2, sort_keys=True, ensure_ascii=False)
+    # stored_evidence_json is the one serialization the cap, the writers and the
+    # offline completeness check all measure.
+    payload = stored_evidence_json(doc)
     size = len(payload.encode("utf-8"))
     if size > MAX_EVIDENCE_BYTES:
         return _refuse(

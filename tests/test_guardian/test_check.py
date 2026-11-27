@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -211,6 +212,182 @@ class TestStoragePoolAlert:
         with patch("genesis.guardian.check.measure_storage_pool", called):
             await _check_storage_pool_and_alert(config, dispatcher)
         called.assert_not_called()
+
+
+def _btrfs_pool(pct: float) -> StoragePoolStatus:
+    return StoragePoolStatus(detected=True, pool_used_pct=pct)
+
+
+def _lvm(data: float | None, meta: float | None) -> StoragePoolStatus:
+    return StoragePoolStatus(detected=True, data_pct=data, metadata_pct=meta)
+
+
+class TestStoragePoolExitMargin:
+    """A pool hovering at a line pages once: a tier is left only once the
+    reading is ``exit_margin_pct`` points below its line (default 5)."""
+
+    @staticmethod
+    def _dispatcher() -> MagicMock:
+        d = MagicMock()
+        d.send = AsyncMock(return_value=True)
+        return d
+
+    async def _tick(self, config, dispatcher, status, **kw) -> None:
+        with patch("genesis.guardian.check.measure_storage_pool", AsyncMock(return_value=status)):
+            await _check_storage_pool_and_alert(config, dispatcher, **kw)
+
+    @pytest.mark.asyncio
+    async def test_reading_hovering_at_the_line_pages_once(self, config: GuardianConfig) -> None:
+        dispatcher = self._dispatcher()
+        for pct in (75.2, 74.8, 75.1, 74.6, 75.3, 74.9, 75.0, 74.7):
+            await self._tick(config, dispatcher, _btrfs_pool(pct))
+        titles = [c.args[0].title for c in dispatcher.send.call_args_list]
+        assert titles == ["Storage pool WARN"], titles
+
+    @pytest.mark.asyncio
+    async def test_a_tick_with_no_readable_percentage_is_no_signal(
+        self, config: GuardianConfig
+    ) -> None:
+        """A detected pool whose report has no readable percentage neither clears
+        nor re-arms the held tier: it is skipped like an undetected one."""
+        dispatcher = self._dispatcher()
+        state = config.state_path / "pool_alert_state.json"
+        await self._tick(config, dispatcher, _lvm(76.0, 10.0))  # data warn: pages
+        before = state.read_text()
+        await self._tick(config, dispatcher, _lvm(None, None))  # nothing readable
+        assert state.read_text() == before
+        await self._tick(config, dispatcher, _lvm(73.0, 10.0))  # held at warn
+        titles = [c.args[0].title for c in dispatcher.send.call_args_list]
+        assert titles == ["Storage pool WARN"], titles
+
+    @pytest.mark.asyncio
+    async def test_recovers_once_below_the_margin(self, config: GuardianConfig) -> None:
+        dispatcher = self._dispatcher()
+        for pct in (76.0, 71.0, 69.9):
+            await self._tick(config, dispatcher, _btrfs_pool(pct))
+        alerts = [c.args[0] for c in dispatcher.send.call_args_list]
+        assert [a.title for a in alerts] == ["Storage pool WARN", "Storage pool recovered"]
+        assert "pool recovered" not in alerts[1].body  # the title names what recovered
+        assert alerts[1].body.startswith("recovered (warn→ok)")
+
+    @pytest.mark.asyncio
+    async def test_zero_margin_restores_crossing_behaviour(self, config: GuardianConfig) -> None:
+        config.storage_pool.exit_margin_pct = 0
+        dispatcher = self._dispatcher()
+        for pct in (76.0, 74.0, 76.0):
+            await self._tick(config, dispatcher, _btrfs_pool(pct))
+        assert dispatcher.send.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_held_tier_reminder_says_what_was_measured(self, config: GuardianConfig) -> None:
+        """A sustained reminder while the margin holds the tier names the measured
+        tier, and its severity follows the measurement, not the hold."""
+        dispatcher = self._dispatcher()
+        await self._tick(config, dispatcher, _btrfs_pool(93.0))  # crit
+        state = config.state_path / "pool_alert_state.json"
+        data = json.loads(state.read_text())
+        data["last_alert_at"] = "2000-01-01T00:00:00+00:00"  # reminder due
+        state.write_text(json.dumps(data))
+        await self._tick(config, dispatcher, _btrfs_pool(90.0))  # held at crit by the margin
+        reminder = dispatcher.send.call_args_list[-1].args[0]
+        assert reminder.title == "Storage pool CRIT"
+        assert reminder.severity.value == "warning"
+        assert "measured high; held at crit" in reminder.body
+        assert "near exhaustion" not in reminder.body
+
+    @pytest.mark.asyncio
+    async def test_held_crit_does_not_propose_provisioning(self, config: GuardianConfig) -> None:
+        dispatcher = self._dispatcher()
+        with patch("genesis.guardian.check._maybe_propose_provisioning", AsyncMock()) as propose:
+            await self._tick(config, dispatcher, _btrfs_pool(93.0), genesis_down=True)
+            await self._tick(config, dispatcher, _btrfs_pool(90.0), genesis_down=True)
+        assert propose.call_count == 1  # only the measured-crit tick
+
+    @pytest.mark.asyncio
+    async def test_state_file_without_axes_neither_pages_nor_clears(
+        self, config: GuardianConfig
+    ) -> None:
+        """A state file written before per-axis tiers: every axis starts at the
+        recorded tier, so the upgrade tick is silent at a reading within the margin."""
+        state = config.state_path / "pool_alert_state.json"
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({"tier": "warn", "last_alert_at": _now_iso()}))
+        dispatcher = self._dispatcher()
+        await self._tick(config, dispatcher, _btrfs_pool(73.0))
+        dispatcher.send.assert_not_called()
+        assert json.loads(state.read_text())["axes"] == {"pool_used": "warn"}
+
+    @pytest.mark.asyncio
+    async def test_rise_on_another_axis_pages_while_one_is_held(
+        self, config: GuardianConfig
+    ) -> None:
+        dispatcher = self._dispatcher()
+        await self._tick(config, dispatcher, _lvm(76.0, 10.0))  # data warn: pages
+        await self._tick(config, dispatcher, _lvm(72.0, 10.0))  # data held at warn
+        await self._tick(config, dispatcher, _lvm(72.0, 61.0))  # metadata rises to warn
+        alerts = [c.args[0] for c in dispatcher.send.call_args_list]
+        assert len(alerts) == 2, [a.body for a in alerts]
+        assert alerts[1].body.startswith("metadata rose ok→warn")
+
+    @pytest.mark.asyncio
+    async def test_blind_axis_does_not_hold_a_tier(self, config: GuardianConfig) -> None:
+        """Unlike RAM, the pool watch has no bound on a blind hold, so an axis with
+        no reading reads ok, as it always did."""
+        dispatcher = self._dispatcher()
+        await self._tick(config, dispatcher, _lvm(10.0, 85.0))  # metadata crit
+        await self._tick(config, dispatcher, _lvm(10.0, None))  # metadata unreadable
+        alerts = [c.args[0] for c in dispatcher.send.call_args_list]
+        assert [a.title for a in alerts] == ["Storage pool CRIT", "Storage pool recovered"]
+
+    @pytest.mark.asyncio
+    async def test_unusable_tier_and_timestamp_in_state(self, config: GuardianConfig) -> None:
+        state = config.state_path / "pool_alert_state.json"
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({"tier": ["warn"], "last_alert_at": 12}))
+        dispatcher = self._dispatcher()
+        await self._tick(config, dispatcher, _btrfs_pool(76.0))
+        assert [c.args[0].title for c in dispatcher.send.call_args_list] == ["Storage pool WARN"]
+
+    @pytest.mark.asyncio
+    async def test_failed_lvs_tick_at_a_steady_tier_is_silent(self, config: GuardianConfig) -> None:
+        """A failed ``lvs`` leaves only ``pool_used`` for a tick; the LVM axes
+        coming back at the same tier are not a rise."""
+        dispatcher = self._dispatcher()
+        await self._tick(config, dispatcher, _lvm(76.0, 10.0))
+        await self._tick(config, dispatcher, _btrfs_pool(76.0))
+        await self._tick(config, dispatcher, _lvm(76.0, 10.0))
+        assert [c.args[0].title for c in dispatcher.send.call_args_list] == ["Storage pool WARN"]
+
+    @pytest.mark.asyncio
+    async def test_held_axis_survives_a_tick_on_the_other_axis_set(
+        self, config: GuardianConfig
+    ) -> None:
+        dispatcher = self._dispatcher()
+        await self._tick(config, dispatcher, _lvm(76.0, 10.0))  # data warn
+        await self._tick(config, dispatcher, _lvm(73.0, 10.0))  # held
+        await self._tick(config, dispatcher, _btrfs_pool(76.0))  # lvs failed: still warn
+        await self._tick(config, dispatcher, _lvm(73.0, 10.0))  # still held, no page
+        assert dispatcher.send.call_count == 1
+        axes = json.loads((config.state_path / "pool_alert_state.json").read_text())["axes"]
+        assert axes["data"] == "warn"
+
+    @pytest.mark.asyncio
+    async def test_all_invalid_axes_seed_from_the_tier(self, config: GuardianConfig) -> None:
+        state = config.state_path / "pool_alert_state.json"
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({"tier": "warn", "axes": {"pool_used": 3}, "last_alert_at": _now_iso()}))
+        dispatcher = self._dispatcher()
+        await self._tick(config, dispatcher, _btrfs_pool(73.0))  # within the margin: held
+        dispatcher.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_corrupt_axes_in_state_are_ignored(self, config: GuardianConfig) -> None:
+        state = config.state_path / "pool_alert_state.json"
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({"tier": "ok", "axes": {"pool_used": "bogus"}}))
+        dispatcher = self._dispatcher()
+        await self._tick(config, dispatcher, _btrfs_pool(76.0))
+        assert [c.args[0].title for c in dispatcher.send.call_args_list] == ["Storage pool WARN"]
 
 
 def _prov_cfg(config: GuardianConfig) -> GuardianConfig:
@@ -1894,3 +2071,71 @@ class TestProbeConfirmedHealthy:
         assert _probe_confirmed_healthy(sm, now) is False
         sm.state.signal_history = []
         assert _probe_confirmed_healthy(sm, now) is False
+
+
+def test_guardian_log_stamps_carry_their_utc_offset():
+    import logging
+    import re
+    import time
+
+    from genesis.guardian.check import _setup_logging
+
+    # The datefmt _setup_logging actually configures (the file handler uses the
+    # same value), not the constant, so a reverted call site fails here.
+    with patch("logging.basicConfig") as basic:
+        _setup_logging()
+    datefmt = basic.call_args.kwargs["datefmt"]
+    record = logging.LogRecord("guardian", logging.INFO, __file__, 1, "x", None, None)
+    stamp = logging.Formatter("%(asctime)s", datefmt=datefmt).format(record)
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4}", stamp)
+    assert stamp.endswith(time.strftime("%z", time.localtime(record.created)))
+
+
+class TestCCCanaryWiring:
+    """run_check runs the recovery-brain auth canary only on a tick whose probe
+    found Genesis healthy (during an outage the diagnosis takes that path)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("healthy", [True, False])
+    async def test_canary_runs_only_on_a_healthy_probe(self, config: GuardianConfig, healthy: bool) -> None:
+        config.cc.enabled = False  # no real diagnosis run; the canary itself is mocked below
+        _seed_state(config, current_state="confirmed_dead", first_failure_at="2020-01-01T00:00:00+00:00")
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.send = AsyncMock()
+        canary = AsyncMock()
+        with (
+            patch("genesis.guardian.check.collect_all_signals", AsyncMock(return_value=_dead_snapshot())),
+            patch("genesis.guardian.check._build_dispatcher", return_value=mock_dispatcher),
+            patch("genesis.guardian.check._write_guardian_heartbeat", AsyncMock()),
+            patch("genesis.guardian.check.load_secrets", return_value={}),
+            patch("genesis.guardian.check._probe_confirmed_healthy", return_value=healthy),
+            patch("genesis.guardian.cc_canary.maybe_run_cc_canary", canary),
+        ):
+            await run_check(config)
+        assert canary.await_count == (1 if healthy else 0)
+
+    @pytest.mark.asyncio
+    async def test_canary_runs_after_the_snapshot_and_every_check(self, config: GuardianConfig) -> None:
+        # Its call can take minutes: it must not delay a check, nor widen the gap
+        # between the probe and the healthy snapshot that probe authorises.
+        config.cc.enabled = False
+        _seed_state(config, current_state="confirmed_dead", first_failure_at="2020-01-01T00:00:00+00:00")
+        mock_dispatcher = MagicMock()
+        mock_dispatcher.send = AsyncMock()
+        order: list[str] = []
+
+        def _rec(name):
+            return AsyncMock(side_effect=lambda *a, **k: order.append(name))
+
+        with (
+            patch("genesis.guardian.check.collect_all_signals", AsyncMock(return_value=_dead_snapshot())),
+            patch("genesis.guardian.check._build_dispatcher", return_value=mock_dispatcher),
+            patch("genesis.guardian.check._write_guardian_heartbeat", AsyncMock()),
+            patch("genesis.guardian.check.load_secrets", return_value={}),
+            patch("genesis.guardian.check._probe_confirmed_healthy", return_value=True),
+            patch("genesis.guardian.check._maintain_snapshots", _rec("snapshots")),
+            patch("genesis.guardian.check._check_repo_bundle_and_alert", _rec("last_check")),
+            patch("genesis.guardian.cc_canary.maybe_run_cc_canary", _rec("canary")),
+        ):
+            await run_check(config)
+        assert order == ["snapshots", "last_check", "canary"]

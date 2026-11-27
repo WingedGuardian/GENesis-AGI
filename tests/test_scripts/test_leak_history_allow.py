@@ -112,9 +112,15 @@ def _finding(**over) -> dict:
     return f
 
 
+def _prefix_map(*entries: dict) -> dict[str, str]:
+    """Build the prefix-to-full-commit mapping that ``main`` resolves via git."""
+    return {e["commit"][:lha._COMMIT_PREFIX]: e["commit"] for e in entries}
+
+
 def test_an_exact_match_is_dropped_and_reported():
+    entry = _entry()
     results = _results((f"{_C40[:12]}/src/n.py", _finding()))
-    dropped = lha.apply(results, [_entry()])
+    dropped = lha.apply(results, [entry], _prefix_map(entry))
     assert results["results"] == {}
     assert [(f, r) for f, _, r in dropped] == [(f"{_C40[:12]}/src/n.py", "synthetic")]
 
@@ -130,15 +136,68 @@ def test_an_exact_match_is_dropped_and_reported():
     ids=["other-commit", "other-path", "other-detector", "other-value"],
 )
 def test_anything_short_of_an_exact_match_is_kept(filename, finding):
+    entry = _entry()
+    prefix = filename.partition("/")[0]
+    mapping = {prefix: entry["commit"]} if prefix == _C40[:12] else {prefix: "b" * 40}
     results = _results((filename, finding))
-    assert lha.apply(results, [_entry()]) == []
+    assert lha.apply(results, [entry], mapping) == []
     assert results["results"] == {filename: [finding]}
 
 
+def test_a_different_commit_sharing_the_prefix_is_not_suppressed():
+    """Two commits with the same 12-char prefix are distinct full SHAs."""
+    other_full = _C40[:12] + "f" * 28
+    entry = _entry()
+    results = _results((f"{_C40[:12]}/src/n.py", _finding()))
+    mapping = {_C40[:12]: other_full}
+    assert lha.apply(results, [entry], mapping) == []
+    assert f"{_C40[:12]}/src/n.py" in results["results"]
+
+
+@pytest.mark.parametrize(
+    ("objects", "object_type", "resolved"),
+    [
+        (_C40 + "\n", (0, "commit\n"), True),
+        ("", None, False),
+        (_C40 + "\n" + _C40[:12] + "b" * 28 + "\n", None, False),
+        ("b" * 40 + "\n", None, False),
+        (_C40 + "\n", (0, "blob\n"), False),
+        (_C40 + "\n", (1, ""), False),
+    ],
+    ids=["commit", "missing", "ambiguous", "different-prefix", "non-commit", "unreadable"],
+)
+def test_resolver_requires_a_unique_commit_object(monkeypatch, objects, object_type, resolved):
+    prefix = _C40[:12]
+    replies = {("rev-parse", f"--disambiguate={prefix}"): (0, objects)}
+    if object_type is not None:
+        replies[("--no-replace-objects", "cat-file", "-t", _C40)] = object_type
+    calls = []
+
+    def fake_git(*args):
+        calls.append(args)
+        rc, output = replies[args]
+        return subprocess.CompletedProcess(args, rc, output, "")
+
+    monkeypatch.setattr(lha, "_git", fake_git)
+    results = _results((f"{prefix}/src/n.py", _finding()))
+    assert lha._resolve_prefixes(results) == ({prefix: _C40} if resolved else {})
+    assert calls == list(replies)
+
+
+def test_resolver_ignores_noncanonical_result_paths(monkeypatch):
+    def unexpected_git(*args):
+        pytest.fail(f"looked up an invalid commit prefix: {args!r}")
+
+    monkeypatch.setattr(lha, "_git", unexpected_git)
+    results = _results(("src/n.py", _finding()), (f"{_C40[:11]}/src/n.py", _finding()))
+    assert lha._resolve_prefixes(results) == {}
+
+
 def test_a_dropped_finding_leaves_its_neighbours():
+    entry = _entry()
     keep = _finding(hashed_secret="d" * 40, line_number=2)
     results = _results((f"{_C40[:12]}/src/n.py", _finding()), (f"{_C40[:12]}/src/n.py", keep))
-    lha.apply(results, [_entry()])
+    lha.apply(results, [entry], _prefix_map(entry))
     assert results["results"] == {f"{_C40[:12]}/src/n.py": [keep]}
 
 

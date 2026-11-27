@@ -42,6 +42,7 @@ loads in place from the checkout, so a later deploy updates it at the next sessi
 | The message content of every row the session stores (incl. errored tool calls and hook context) | `session.append` |
 | A large output Claude Code saves to a session's `tool-results/` folder | the saved file is rewritten in place (up to the 4 MiB the engine's file read accepts; a larger one is logged as possibly raw) |
 | The typed prompt (transcript and `~/.claude/history.jsonl`) | `prompt.submit` |
+| Monitor events and background Bash output, including the records Claude Code keeps of them itself (queued notifications, task output files), in a session running in bypass permission mode | the plugin's stream wrap redacts the command's output as it is written (below) |
 
 Which values: those of at least 16 characters whose variable NAME marks them as secret (`KEY`, `TOKEN`,
 `SECRET`, `PASS`, `PWD`, `CRED`, `AUTH`, `PRIVATE`, `COOKIE`, `SESSION`, `WEBHOOK`, `DSN`, `SALT`, `SIGNING`,
@@ -79,6 +80,42 @@ multi-line value is `[secrets.env:VAR#2]`. A value the session held earlier and 
 keeps the name it was shown under, or `[secrets.env:VAR~earlier]` when the new value took that name. Two
 variables holding the same text show one placeholder, named after the first of them. A placeholder is
 redacted once: text that already holds one passes through the next hook unchanged.
+
+## Stream wrap: Monitor and background Bash
+
+Claude Code keeps its own record of what a Monitor or background Bash command writes (queued task notifications,
+the task output file), which the mod cannot rewrite after the fact. So `bin/stream_wrap.py`, a PreToolUse hook,
+rewrites such a command to run through `bin/redact_run.sh`, and that runner passes stdout and stderr each through
+`bin/stream_filter.py`, which replaces known values before anything is recorded.
+
+- Only in a session running in bypass permission mode (`--dangerously-skip-permissions`, the mode Genesis's own
+  sessions run in). Claude Code's permission check runs on the rewritten command and treats its `source` as code
+  to evaluate, so in any other mode a wrapped command would be refused or put to a person as unreadable base64,
+  and allow and deny rules would be matched against the wrapper (measured on 2.1.299). Elsewhere the command is
+  left alone.
+- The rewrite is an `updatedInput` with no `permissionDecision`: the other PreToolUse hooks (the publishing guard
+  below, the repository's guards) judge the original command, and nothing is approved that would otherwise be
+  asked (measured on Claude Code 2.1.299). Claude Code's own `permissions.deny` rules, and any later hook or
+  record that reads the call's input, see the wrapper instead: a Bash deny rule does not match a wrapped Monitor
+  or background command. Foreground Bash is left alone: the mod already covers its
+  result.
+- The command arrives base64-encoded and runs, via `eval`, in a subshell of the shell Claude Code built for it, so
+  its functions, options, exported variables, heredocs and quoting are unchanged. Its exit status is kept; it
+  ends when the command exits, and a child the command left behind keeps writing (redacted) and is never killed.
+  Two differences from the command run unwrapped: stdout and stderr pass through separate filters, so in a task
+  file their lines can be ordered differently than they were written, and job control is off inside the wrap.
+- The filter writes everything except the longest tail that could still become a known value, so a value split
+  across reads, lines or the command's exit is replaced whole. The held tail is written as it is when the output
+  ends, so output that stops partway through a value shows that part (the same exact-match rule as everywhere
+  else in the plugin). The tail is found in the output as written, before anything is replaced, so a shorter
+  value at the start of a longer one waits for the rest. Replacement is one pass with the mod's rules: a value
+  equal to another variable's name is replaced once, and a placeholder already in the output passes unchanged.
+  It re-reads the values when the secrets file, or any location the resolver would prefer, changes; a reload
+  that fails is tried again about once a second until one succeeds. It keeps a value it has read after that
+  value leaves the file, under `[secrets.env:VAR~earlier]` when the new value took its name.
+- Any failure (a shell that is not bash, a filter that cannot start, no temp folder for the pipes, a loader
+  error) runs the command with its output passed through, and says so on stderr: the wrap is a privacy measure,
+  never a reason to stop work.
 
 ## Publishing guard
 
@@ -148,7 +185,8 @@ Not covered:
   file outright (measured); a hard link is a different path to the same file and is not recognised.
 - **One refusal.** An Edit or Write of the secrets file whose written text holds placeholder text is refused,
   with a message naming the placeholders. So is any Edit or Write carrying placeholder text while no values
-  have loaded (the file's path is not known yet), and one the plugin failed to check. This is the only call the plugin blocks. In practice: a Write of
+  have loaded (the file's path is not known yet) or since a reload failed (the file may have moved), until a
+  load succeeds, and one the plugin failed to check. This is the only call the plugin blocks. In practice: a Write of
   the whole file as read is refused, and adding a line next to a line holding a secret means anchoring the
   Edit on a line without one. Onboarding (filling in an empty value) needs no placeholder at all.
 - **A shell write to the secrets file** (`sed -i`, a heredoc) does not go through Edit/Write, so a placeholder
@@ -183,7 +221,8 @@ Claude Code's debug log (`claude --debug`) and the session's report, which `scri
 
 - The values cannot be loaded: the session runs unredacted. A reload that fails later keeps the values that
   loaded earlier. After a failed load the next attempt waits 30 seconds, so a loader that keeps failing does
-  not run on every event.
+  not run on every event; once that wait passes it is retried at the next event even if no watched file has
+  changed since, so the refusal that a failed reload brings ends as soon as a load succeeds.
 - Redacting one tool result fails: a text-level replacement is tried, then the result goes through unchanged.
   The message content of its stored row is still redacted; the structured record of that result is not.
 - Redacting a stored row fails twice: that row's text is withheld with a notice naming the plugin.
@@ -206,9 +245,12 @@ Claude Code's debug log (`claude --debug`) and the session's report, which `scri
   the markers above, and a credential URL whose password contains a `/`.
 - Tool-call inputs and thinking blocks in stored rows: the engine keeps those as the model made them. They hold
   a value only if the model already had it, which is what the rest of this plugin prevents.
-- Monitor events and background Bash output. Claude Code keeps its own record of those (queued notifications,
-  task output files), which the mod cannot rewrite; what the model reads of them through a later tool call is
-  still redacted. Redacting them at the source is tracked in #4445.
+- Monitor and background Bash output in a session not running in bypass permission mode, and a foreground
+  command Claude Code moves to the background (after its timeout, or Ctrl+B): Claude Code keeps its own record
+  of that output. Tracked in #4624.
+- Monitor or background Bash output written in the command's first instant, before the filter has read the
+  values, if that same instant also rotates the value out of the file (the old value was never read, so it is not
+  kept).
 - What a settings-level PostToolUse hook stores: those hooks receive the tool's output before the mod rewrites it
   (measured). Genesis's `session_observer_hook` stores pattern-scrubbed summaries, which do not yet match known
   values; a third-party plugin's store (for example a tool-output archive) can hold a raw copy on local disk.
@@ -224,9 +266,14 @@ Claude Code's debug log (`claude --debug`) and the session's report, which `scri
   python-dotenv and redact-then-restore round trips over quoted values and over files whose texts collide.
 - `tests/test_plugins/test_secret_redact_mod.py`: the mod (CI), run under node against a fake of Claude Code's
   engine with the real loader behind it.
+- `tests/test_plugins/test_secret_redact_stream.py`: the stream wrap (CI): the hook's rewrite, the runner (exit
+  status, shell state, heredocs, a lingering or late-writing child, `set -e`, failure paths) and the filter
+  (values split across reads and lines, a key rotated or a file created while the command runs).
 - `scripts/e2e_secret_redact.py`: a real Claude Code session with canary values, run with the plugin loaded
   through `--plugin-dir`. It checks, step by step, that each scripted call ran and came back holding the
-  placeholder, then the model's answer, the transcript, subagent transcripts and persisted output, and the
+  placeholder, then the model's answer, the transcript, subagent transcripts, persisted output and background
+  task output files (including a late writer's line), that sibling PreToolUse hooks saw the original
+  commands, that in default permission mode an allow-listed background command still runs, and the
   secrets file after a refused Write of the whole file and two Edits. Needs a logged-in `claude` and spends one short
   session. The typed prompt is not part of it (a `-p` run keeps the engine's own record of its prompt); that
   path was measured in an interactive session.

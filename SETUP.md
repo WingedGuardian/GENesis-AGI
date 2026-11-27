@@ -227,7 +227,14 @@ watchdogs have their own off switch; see `docs/reference/network-resilience.md`.
 Backups run every 6 hours via the `genesis-backup.timer` systemd user unit
 and split into two tiers:
 
-- **Tier 1** (git → GitHub): Memory files, configs, secrets (~1MB). Automatic.
+- **Tier 1** (git → GitHub): Memory files, configs (including every setting you
+  change, which lives in `~/.genesis/config/`), secrets and your per-install
+  identity files (`USER.md`, and any identity file you customise locally) (~1MB).
+  Automatic; everything that can hold personal data is encrypted. Resetting an
+  identity file to its template keeps the last backed-up copy; delete the file to
+  drop it from later backups (git history in the private backups repo still holds it).
+  A restore keeps an identity file you have edited unless you pass `--force`, which
+  first copies it to `~/.genesis/restore-displaced/`.
 - **Tier 2** (smbclient → NAS/remote): Qdrant snapshots, SQL dumps (~200MB+). Opt-in.
 
 Tier 2 keeps large binary files off GitHub (which has a 100MB file limit).
@@ -333,6 +340,14 @@ systemctl --user enable --now genesis-backup.timer
 systemctl --user start genesis-backup.service   # fire one run now
 cat ~/.genesis/backup_status.json               # expect "success":true
 ```
+
+Every run proves its SQLite copy restores by rebuilding the database from it, in
+memory when there is room and on disk otherwise. An on-disk rebuild writes a full
+copy of the database in a few minutes, which can stall a shared or spinning disk.
+So when memory is short, the scheduled unit (and the dashboard's Run-Now) first
+waits for it, re-checking every 10 minutes for up to an hour, and the log says so;
+the backup then runs either way. The pre-update backup `update.sh` runs never
+waits. The knobs are under "Restore check" in `secrets.env.example`.
 
 The service runs backup.sh at the lowest best-effort I/O priority
 (`IOSchedulingClass=best-effort`, `IOSchedulingPriority=7`). The priority is
