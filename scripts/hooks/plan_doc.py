@@ -194,7 +194,7 @@ def _blocks(text: str):
     md = _parser()
     if md is None:
         return None
-    lines = text.replace("\r\n", "\n").split("\n")
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     offset = _frontmatter_end(lines)
     source = "\n".join(lines[offset:])
     reused = _REUSED

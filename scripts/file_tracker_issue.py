@@ -47,6 +47,7 @@ a useful redacted description necessarily enables concrete disclosure harm.
 Usage:
     file_tracker_issue.py --title-file T --body-file B --area area:memory \\
         --difficulty "help wanted" [--dry-run]
+        [--validation-pr N --validation-client codex|claude-code]
     file_tracker_issue.py --comment-on 123 --body-file B [--dry-run]
 
 The certainty history above describes issue creation. Comment mode performs one
@@ -76,8 +77,12 @@ import sys
 import unicodedata
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
+
+VALIDATION_LABEL = "source:validation"
+VALIDATION_CLIENTS = {"codex": "Codex", "claude-code": "Claude Code"}
 
 # Mirrors of the fail-closed sets enforced server-side by
 # ``src/genesis/mcp/health/contributor_issue.py``. Duplicated deliberately —
@@ -416,6 +421,47 @@ def validate_labels(area: str, difficulty: str) -> list[str]:
             f"{', '.join(sorted(DIFFICULTY_LABELS))}."
         )
     return [area, difficulty]
+
+
+def _summary_end(body: str, parser) -> int | None:
+    """End line of the opening prose, optionally under a Summary heading."""
+    tokens = [
+        token
+        for token in parser.parse(body)
+        if not (token.type == "html_block" and token.content.lstrip().startswith("<!--"))
+    ]
+    if tokens and tokens[0].type == "heading_open" and tokens[1].content.casefold() == "summary":
+        tokens = tokens[3:]
+    if (
+        len(tokens) >= 2
+        and tokens[0].type == "paragraph_open"
+        and any(
+            child.type in {"text", "code_inline"} and child.content.strip()
+            for child in tokens[1].children or []
+        )
+    ):
+        return tokens[0].map[1]
+    return None
+
+
+def _check_premises(body: str, labels: list[str]) -> None:
+    # Keep the issue-open Action and the terminal publisher on one parser.
+    scripts = str(Path(__file__).resolve().parent)
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import premise_gate
+    from plan_doc import reuse_parses
+
+    with reuse_parses():
+        message = premise_gate.owed_message(
+            {
+                "body": body,
+                "labels": [{"name": label} for label in labels],
+                "created_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        )
+    if message:
+        raise Refused(message)
 
 
 def _lock_path(slug: str) -> Path:
@@ -1007,14 +1053,23 @@ def _run_main(argv: Sequence[str] | None, run: Runner) -> int:
         "--difficulty", help=f"one of: {', '.join(sorted(DIFFICULTY_LABELS))}"
     )
     ap.add_argument("--comment-on", type=int, help="positive issue or PR number for a scanned timeline comment")
+    ap.add_argument("--validation-pr", type=int, help="merged PR that the filing verifies")
+    ap.add_argument("--validation-client", choices=VALIDATION_CLIENTS, help="client that measured the finding")
     ap.add_argument("--dry-run", action="store_true", help="run every check, post nothing")
     args = ap.parse_args(argv)
+    validation = (args.validation_pr, args.validation_client)
     if args.comment_on is not None:
-        if args.comment_on <= 0 or any(value is not None for value in (args.title_file, args.area, args.difficulty)):
-            ap.error("--comment-on requires a positive number and cannot use --title-file, --area or --difficulty")
+        if args.comment_on <= 0 or any(
+            value is not None for value in (args.title_file, args.area, args.difficulty, *validation)
+        ):
+            ap.error("--comment-on requires a positive number and accepts only comment options")
         return _comment_main(args, run)
     if any(value is None for value in (args.title_file, args.area, args.difficulty)):
         ap.error("issue creation requires --title-file, --area and --difficulty")
+    if (None in validation and validation != (None, None)) or (
+        args.validation_pr is not None and args.validation_pr <= 0
+    ):
+        ap.error("validator filing requires a positive --validation-pr and --validation-client")
 
     posted: str | None = None
     snapshot_dir: str | None = None
@@ -1030,7 +1085,7 @@ def _run_main(argv: Sequence[str] | None, run: Runner) -> int:
             # ONE read of the body, kept as bytes. These exact bytes are what
             # gets scanned AND what gets posted — see the snapshot below.
             body_bytes = Path(args.body_file).read_bytes()
-            body = body_bytes.decode("utf-8").strip()
+            body = body_bytes.decode("utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             # Unreadable or non-UTF-8 drafts are a "nothing was posted" outcome,
             # so they belong on exit 2 with everything else that refused — not on
@@ -1048,7 +1103,7 @@ def _run_main(argv: Sequence[str] | None, run: Runner) -> int:
             ) from exc
         if not title:
             raise Refused("title file is empty")
-        if not body:
+        if not body.strip():
             raise Refused("body file is empty")
         if len(title) > 256:
             raise Refused(
@@ -1058,11 +1113,29 @@ def _run_main(argv: Sequence[str] | None, run: Runner) -> int:
         if "\n" in title or "\r" in title:
             raise Refused("title contains a newline — GitHub's handling of that is unverified")
 
+        try:
+            from markdown_it import MarkdownIt
+        except ImportError:
+            raise Refused("issue premise parser unavailable; run with the repository venv") from None
+        labels = validate_labels(args.area, args.difficulty)
+        if args.validation_pr is not None:
+            summary_end = _summary_end(body, MarkdownIt())
+            if summary_end is None:
+                raise Refused("start a validator issue with a plain-language summary before the premise checks")
+            client = VALIDATION_CLIENTS[args.validation_client]
+            source = f"Found by {client} during post-merge validation of #{args.validation_pr}."
+            lines = re.split(r"(?<=\n)|(?<=\r)(?!\n)", body)
+            # A trailing fence or HTML block could swallow a footer.
+            body = "".join(lines[:summary_end]) + f"\n\n{source}\n\n" + "".join(lines[summary_end:])
+            body_bytes = body.encode("utf-8")
+            labels.append(VALIDATION_LABEL)
+
         # BEFORE the lock and before any network call. A refusal here must cost
         # nothing and leave no trace on the tracker; running it after
         # resolve_tracker would spend API calls to learn where not to post.
         for warning in privacy_scan(title, body):
             _warn(f"privacy scan: {warning}")
+        _check_premises(body, labels)
         # Only now, once the bytes have PASSED, are they snapshotted for gh.
         # Taking it before the scan would leave a scanned-clean snapshot on disk
         # for a draft that was then refused.
@@ -1084,7 +1157,6 @@ def _run_main(argv: Sequence[str] | None, run: Runner) -> int:
                 "Check that ~/tmp is writable."
             ) from exc
 
-        labels = validate_labels(args.area, args.difficulty)
         slug = resolve_tracker(run)
         perm = check_permission(slug, run)
 

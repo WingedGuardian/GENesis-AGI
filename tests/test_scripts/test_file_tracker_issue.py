@@ -277,7 +277,7 @@ def _drafts(tmp_path: Path, title: str = "A real title") -> tuple[str, str]:
     t = tmp_path / "title.txt"
     b = tmp_path / "body.md"
     t.write_text(title, encoding="utf-8")
-    b.write_text("body text", encoding="utf-8")
+    b.write_text("body text\n\n" + _ISSUE_PREMISES, encoding="utf-8")
     return str(t), str(b)
 
 
@@ -878,7 +878,7 @@ def test_confirmed_post_does_not_exit_120_when_stdout_is_full(tmp_path):
     title = tmp_path / "title.txt"
     title.write_text("A real title", encoding="utf-8")
     body = tmp_path / "body.md"
-    body.write_text("body", encoding="utf-8")
+    body.write_text("body\n\n" + _ISSUE_PREMISES, encoding="utf-8")
     home = tmp_path / "home"
     home.mkdir()
 
@@ -1213,14 +1213,14 @@ def _scan_runner(calls: list):
     )
 
 
-def _file(tmp_path, title: str, body: str) -> tuple[str, str]:
+def _file(tmp_path, title: str, body: str, *, premises=True) -> tuple[str, str]:
     t, b = tmp_path / "title.txt", tmp_path / "body.md"
     t.write_text(title, encoding="utf-8")
-    b.write_text(body, encoding="utf-8")
+    b.write_text(body + ("\n\n" + _ISSUE_PREMISES if premises else ""), encoding="utf-8")
     return str(t), str(b)
 
 
-def _main(t, b, run):
+def _main(t, b, run, *extra):
     return fti.main(
         [
             "--title-file",
@@ -1231,9 +1231,59 @@ def _main(t, b, run):
             "area:other",
             "--difficulty",
             "help wanted",
+            *extra,
         ],
         run,
     )
+
+
+_ISSUE_PREMISES = """## Premise checks
+
+1. Observed: The fixture failed.
+2. Intended: The fixture passes. Stated: the test.
+3. Cost: One result is missing.
+4. Searched: No matching issue.
+5. Acceptance: The result is present. Wrong fix: Skip the check.
+"""
+
+
+@pytest.mark.parametrize("mode", [(), ("--dry-run",)])
+def test_missing_premise_answer_refuses_before_tracker_access(tmp_path, capsys, mode):
+    calls = []
+    body = "One result is missing.\n\n" + _ISSUE_PREMISES.replace("Stated:", "Stated in")
+    t, b = _file(tmp_path, "A real title", body, premises=False)
+    assert _main(t, b, _scan_runner(calls), *mode) == 2
+    assert calls == []
+    assert "has no `Stated:` answer" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+def test_validator_filing_marks_source_in_published_bytes_and_labels(tmp_path, newline):
+    draft = "## Summary\n\nOne result is missing.\n\n" + _ISSUE_PREMISES + "\n```text\nNotes"
+    t, b = _file(tmp_path, "A real title", draft.replace("\n", newline), premises=False)
+    inner = _scan_runner([])
+    created = {}
+
+    def run(argv):
+        if argv[1:3] == ["issue", "create"]:
+            created["body"] = Path(argv[argv.index("--body-file") + 1]).read_text()
+            created["labels"] = [argv[i + 1] for i, arg in enumerate(argv) if arg == "--label"]
+        return inner(argv)
+
+    assert _main(t, b, run, "--validation-pr", "123", "--validation-client", "codex") == 0
+    assert created["body"].splitlines()[:3] == ["## Summary", "", "One result is missing."]
+    assert created["body"].index("Found by Codex during post-merge validation of #123.") < created["body"].index(
+        "## Premise checks"
+    )
+    assert created["labels"] == ["area:other", "help wanted", "source:validation"]
+
+
+def test_validator_filing_requires_summary_above_premises(tmp_path, capsys):
+    t, b = _file(tmp_path, "A real title", _ISSUE_PREMISES, premises=False)
+    calls = []
+    assert _main(t, b, _scan_runner(calls), "--validation-pr", "123", "--validation-client", "codex") == 2
+    assert calls == []
+    assert "summary" in capsys.readouterr().err
 
 
 def test_acceptance_a_home_path_in_the_body_is_refused_with_no_network_call(tmp_path, capsys):
