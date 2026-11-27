@@ -1361,9 +1361,9 @@ def test_every_fragment_appended_after_the_control_block_opens_a_section():
 
     Found by mutation: narrowing the delimiter to `\\n## ` left all tests green.
     """
-    from genesis.cc.conversation import _BG_RESEARCH_ROUTING
+    from genesis.cc.conversation import _BG_RESEARCH_ROUTING, _REPLY_HEADER_BLOCK
 
-    for fragment in (_BG_RESEARCH_ROUTING,):
+    for fragment in (_BG_RESEARCH_ROUTING, _REPLY_HEADER_BLOCK):
         assert fragment.startswith("\n\n## "), (
             f"{fragment[:48]!r} is appended after the session-control block but "
             "does not open a new top-level section — the strip would consume it"
@@ -1643,3 +1643,91 @@ async def test_a_tool_call_after_thinking_in_one_line_still_counts(loop, invoker
     fi.assert_not_called()
     assert calls["n"] == 1
     assert [n for n, _ in park.await_args.kwargs["ran"]] == ["outreach_send"]
+
+
+# ── The Telegram relay header across resume and failover (#3846) ──────────
+
+
+def _telegram_streamer():
+    from genesis.channels.telegram.transport.streaming import DraftStreamer
+
+    bot = MagicMock()
+    bot.send_message_draft = AsyncMock()
+    return DraftStreamer(bot=bot, chat_id=1, draft_id=3)
+
+
+def _relay_on_event(streamer, seen):
+    import asyncio
+
+    from genesis.channels.telegram._handler_context import HandlerContext
+
+    ctx = HandlerContext.__new__(HandlerContext)
+    relay = HandlerContext.make_on_event(ctx, asyncio.Event(), streamer)
+
+    async def _on_event(ev):
+        seen.append(ev.event_type)
+        await relay(ev)
+
+    return _on_event
+
+
+async def _first_turn(loop, invoker):
+    invoker.run_streaming = AsyncMock(return_value=_output(
+        text="hi", session_id="cc-1", roster_model="claude",
+    ))
+    await loop.handle_message_streaming(
+        "hello", user_id="tg-1", channel=ChannelType.TELEGRAM, on_event=AsyncMock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_peer_answering_a_resumed_turn_gets_its_own_header(loop, invoker):
+    """Resumed home turn, rate limit, the peer answers: the home turn opened no
+    session, so before the peer announced itself the reply had no header at all."""
+    from genesis.channels.telegram._handler_messages import _with_model_prefix
+
+    await _first_turn(loop, invoker)
+    calls = {"n": 0}
+
+    async def _stream(inv, on_event=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            assert inv.resume_session_id == "cc-1"
+            await on_event(StreamEvent(event_type="init", raw={"model": "claude-opus-5-5"}))
+            raise CCRateLimitError("limit")
+        await on_event(StreamEvent(event_type="init", raw={"model": "glm-5.2"}))
+        return _output(text="peer reply", session_id="glm-1")
+
+    invoker.run_streaming = AsyncMock(side_effect=_stream)
+    streamer, seen = _telegram_streamer(), []
+    result = await loop.handle_message_streaming(
+        "again", user_id="tg-1", channel=ChannelType.TELEGRAM,
+        on_event=_relay_on_event(streamer, seen),
+    )
+    assert seen.count("session_opened") == 1  # the peer's, not the resumed home's
+    assert _with_model_prefix(streamer, result) == "[glm-5.2 / Medium]\npeer reply"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drop_resume", [True, False])
+async def test_a_resume_the_loop_drops_announces_a_session_opened(
+    loop, invoker, monkeypatch, drop_resume,
+):
+    """The row has a cc_session_id but `_reconstruct_resume` drops it (a routed
+    session that must not resume on native Claude), so the turn opens a session.
+    The event reaches the caller through `_failover_tracked`."""
+    await _first_turn(loop, invoker)
+    if drop_resume:
+        monkeypatch.setattr(loop, "_reconstruct_resume", lambda session, cc_sid: ({}, None))
+    invoker.run_streaming = AsyncMock(return_value=_output(text="ok", session_id="cc-2"))
+    seen: list[str] = []
+
+    async def _on_event(ev):
+        seen.append(ev.event_type)
+
+    await loop.handle_message_streaming(
+        "again", user_id="tg-1", channel=ChannelType.TELEGRAM, on_event=_on_event,
+    )
+    inv = invoker.run_streaming.await_args.args[0]
+    assert (inv.resume_session_id is None) is drop_resume
+    assert ("session_opened" in seen) is drop_resume

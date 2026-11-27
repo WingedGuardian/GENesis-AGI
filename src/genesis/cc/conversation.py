@@ -154,6 +154,43 @@ def _replay_notice(exc: CCReplayUnsafeError) -> str:
 #: which must not stack the home model's `[Model / Effort]` prefix above it.
 CONTINGENCY_HEADER_PREFIX = "[Contingency mode"
 
+#: Replies the loop writes itself rather than a model: the Telegram relay header
+#: names a model, so these carry none. Prefixes, because some interpolate an error.
+#: The settings confirmation is matched whole instead (``is_non_model_reply``).
+NON_MODEL_REPLY_PREFIXES = (
+    CONTINGENCY_HEADER_PREFIX,  # carries its own [Contingency mode via ...] label
+    "[Genesis ",  # timeout and error replies
+    "[MCP error",
+    "[Rate limit reached",  # rate_limit_park.resume_copy
+    "\u26a0\ufe0f Genesis ",  # _TRUNCATION_NOTICE, _CAPPED_AFTER_TOOLS_NOTICE
+    "\u26a0\ufe0f This attempt ",  # _replay_notice, incl. the memory-pressure kill
+)
+_MODEL_WORDS = "|".join(re.escape(m.value.title()) for m in CCModel)
+_EFFORT_WORDS = "|".join(re.escape(e.value) for e in EffortLevel)
+#: Exactly what ``_settings_confirmation`` writes, so a model answer that only
+#: starts with "Model: " or "Effort: " keeps its header.
+_SETTINGS_CONFIRMATION = re.compile(
+    rf"Model: (?:{_MODEL_WORDS})(?: \| Effort: (?:{_EFFORT_WORDS}))?"
+    rf"|Effort: (?:{_EFFORT_WORDS})|Settings unchanged\."
+)
+
+
+def _settings_confirmation(model: CCModel | None, effort: EffortLevel | None) -> str:
+    """The reply to an intent-only message (no CC run): what changed."""
+    parts = []
+    if model is not None:
+        parts.append(f"Model: {model.value.title()}")
+    if effort is not None:
+        parts.append(f"Effort: {effort.value}")
+    return " | ".join(parts) if parts else "Settings unchanged."
+
+
+def is_non_model_reply(text: str) -> bool:
+    """True for a reply the loop wrote itself, which carries no model header."""
+    return text.startswith(NON_MODEL_REPLY_PREFIXES) or bool(
+        _SETTINGS_CONFIRMATION.fullmatch(text)
+    )
+
 # Delimiters of the recap a FRESH turn carries in its system prompt. The home
 # CC session reads it there; `_try_contingency` lifts it OUT, because for the
 # tool-less backup model chat text belongs in the fenced user turn, never at
@@ -304,6 +341,13 @@ _BG_RESEARCH_ROUTING = (
 # describes the HOME model and effort, and the peer runs a different one — so
 # something has to be able to find it again after composition.
 _SESSION_CONTROL_HEADING = "\n\n## Changing your own model / effort\n"
+# Its own section so the strip below keeps it: it is true for whichever model
+# answers, a failover peer included (#3846).
+_REPLY_HEADER_BLOCK = (
+    "\n\n## Reply header\n"
+    "This channel prints the model/effort header itself: do not begin a reply "
+    "with a [model / effort] line."
+)
 
 
 def _strip_session_control_block(prompt: str | None) -> str | None:
@@ -319,7 +363,8 @@ def _strip_session_control_block(prompt: str | None) -> str | None:
     Bounded by the NEXT top-level section, or the end of the prompt. Verified
     against the builder's output: the block is exactly one `## ` heading plus
     one paragraph and contains no nested section, so the next `\\n\\n## ` is
-    always the start of a different fragment.
+    always the start of a different fragment. The builder appends
+    ``_REPLY_HEADER_BLOCK`` as that next fragment, so it survives on purpose.
     """
     if not prompt or _SESSION_CONTROL_HEADING not in prompt:
         return prompt
@@ -421,7 +466,26 @@ def _session_control_block(
         "the belief that you cannot. If it is absent from this session, or "
         "returns an error, report that verbatim rather than a change that did "
         "not happen."
+        + _REPLY_HEADER_BLOCK
     )
+
+
+async def _announce_session_opened(
+    on_event: Callable[[StreamEvent], Awaitable[None]] | None,
+    model: CCModel | str,
+    effort: EffortLevel,
+) -> None:
+    """Tell the caller this run OPENS a CC session rather than resuming one,
+    or hands the turn to a failover peer.
+
+    Telegram prints its own model/effort header on such a reply, because the
+    session is told not to write one. Callers that do not know the event ignore it.
+    """
+    if on_event:
+        await on_event(StreamEvent(
+            event_type="session_opened",
+            raw={"model": str(model), "effort": str(effort)},
+        ))
 
 
 def _apply_research_routing(system_prompt: str | None, channel) -> str | None:
@@ -950,12 +1014,10 @@ class ConversationLoop:
             # no remaining text) — persist overrides and return confirmation
             # without invoking CC subprocess.
             if intent.intent_only:
-                parts = []
-                if str(model) != old_model:
-                    parts.append(f"Model: {model.value.title()}")
-                if str(effort) != old_effort:
-                    parts.append(f"Effort: {effort.value}")
-                return " | ".join(parts) if parts else "Settings unchanged."
+                return _settings_confirmation(
+                    model if str(model) != old_model else None,
+                    effort if str(effort) != old_effort else None,
+                )
 
             # Session recovery detection: if session was reset or this is
             # a fresh session (no cc_session_id) with recent message history,
@@ -1396,6 +1458,8 @@ class ConversationLoop:
         on_event: Callable[[StreamEvent], Awaitable[None]] | None,
     ) -> tuple[Any, dict]:
         """Streaming variant of _try_invoke with resume-failure recovery."""
+        if not was_resume:
+            await _announce_session_opened(on_event, model, effort)
         try:
             output = await self._invoker.run_streaming(invocation, on_event=on_event)
             return output, session
@@ -1431,6 +1495,7 @@ class ConversationLoop:
                 session_id=session["id"], session_key=invocation.session_key,
                 channel=channel,
             )
+            await _announce_session_opened(on_event, model, effort)
             output = await self._invoker.run_streaming(fresh_inv, on_event=on_event)
             return output, session
 
@@ -1586,6 +1651,13 @@ class ConversationLoop:
         next three lines, and predicting it before the loop got it wrong for a
         non-matching peer and for the retry (both measured)."""
         inv = peer_inv  # fresh by default (failover_invocations set resume=None)
+        # A different model answers from here, even on a sticky resume, so the
+        # reply gets a header naming it (the peer is told not to write one); the
+        # peer's init event then names the exact model.
+        if on_event is not None:
+            await _announce_session_opened(
+                on_event, peer_inv.model_id_override or peer_name, peer_inv.effort,
+            )
         if (
             sticky
             and sticky.get("roster_model") == peer_name
