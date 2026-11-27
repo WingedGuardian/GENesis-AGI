@@ -636,8 +636,10 @@ async def _breadcrumbs(db: Any, dicts: list[dict]) -> None:
     delivered memories (``related_ids``), for memory_expand follow-up.
 
     Never offers a memory normal recall hides (deprecated or expired, the
-    predicate ``memory_expand`` and graph traversal use): those are dropped
-    before the cap, so a visible neighbour takes the freed slot.
+    predicate ``memory_recall``'s graph traversal uses by default; stricter than
+    ``memory_expand``, which shows deprecated neighbours): those are dropped
+    before the cap, so a visible neighbour takes the freed slot. A target linked
+    by several relationship types takes one slot.
 
     Lets a DB read error PROPAGATE (see :func:`_enrich`): the caller's ``_ro_read``
     fallback + best-effort guard handle it, and the writes are idempotent. A
@@ -666,9 +668,9 @@ async def _breadcrumbs(db: Any, dicts: list[dict]) -> None:
         return
     hidden = await invalid_memory_ids_among(db, {i for _, ids in candidates for i in ids})
     for d, ids in candidates:
-        # Cap the visible links, then drop delivered ones (as before hidden ids
-        # were filtered), so a hint set with no hidden id is unchanged.
-        visible = [i for i in ids if i not in hidden][:2]
+        # Cap the distinct visible links, then drop delivered ones (as before
+        # hidden ids were filtered), so a delivered neighbour still uses a slot.
+        visible = list(dict.fromkeys(i for i in ids if i not in hidden))[:2]
         full = [i for i in visible if i not in seen]
         if full:
             d["related_ids"] = [mid[:8] for mid in full]

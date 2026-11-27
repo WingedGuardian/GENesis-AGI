@@ -1,7 +1,7 @@
 """The proactive hook's breadcrumbs never offer a memory normal recall hides.
 
-A hint is an invitation to ``memory_expand``, so it follows the same visibility
-predicate (``graphstore.invalid_memory_ids_among``): deprecated and expired
+A hint follows normal recall's visibility predicate
+(``graphstore.invalid_memory_ids_among``): deprecated and expired
 (``invalid_at`` passed) memories are dropped before the 2-per-memory cap, so a
 visible neighbour takes the freed slot, and the hidden id reaches neither
 ``related_ids`` nor the recall trace's ``hints``.
@@ -109,3 +109,15 @@ async def test_a_failed_visibility_read_offers_nothing(db, monkeypatch):
         await P._breadcrumbs(db, dicts)
     assert "related_ids" not in dicts[0]
     assert P._shown_hints(dicts) == []
+
+
+async def test_a_neighbour_linked_twice_takes_one_slot(db):
+    # Two relationship types to LIVE_A: the freed slot goes to LIVE_B, not LIVE_A again.
+    await _links(
+        db,
+        [(SEED, DEPRECATED, 0.96), (SEED, LIVE_A, 0.92), (SEED, LIVE_A, 0.88), (SEED, LIVE_B, 0.8)],
+    )
+    dicts = [{"memory_id": SEED}]
+    await P._breadcrumbs(db, dicts)
+    assert dicts[0]["related_ids"] == ["aaaaaaaa", "bbbbbbbb"]
+    assert P._shown_hints(dicts) == [LIVE_A, LIVE_B]
