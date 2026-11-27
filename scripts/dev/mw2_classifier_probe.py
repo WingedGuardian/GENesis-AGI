@@ -65,12 +65,29 @@ def snapshot_live_db() -> None:
         dst.close()
 
 
+async def _hydrate_from_snapshot(db, ids: list[str]) -> dict[str, dict]:
+    """memory_id → {content, invalid_at, deprecated} from the snapshot's SQLite.
+
+    The snapshot has no vector store, so content comes from ``memory_fts``.
+    ``memory_id`` is UNINDEXED there, so each call scans the index: fine for a
+    one-off probe, which is why recall reads points instead
+    (``graph_expansion.hydrate_neighbours``).
+    """
+    marks = ",".join("?" * len(ids))
+    rows = await db.execute_fetchall(
+        f"SELECT f.memory_id, f.content, m.invalid_at, COALESCE(m.deprecated, 0) "  # noqa: S608 - placeholders bound
+        f"FROM memory_fts f LEFT JOIN memory_metadata m ON f.memory_id = m.memory_id "
+        f"WHERE f.memory_id IN ({marks})",
+        ids,
+    )
+    return {r[0]: {"content": r[1], "invalid_at": r[2], "deprecated": r[3]} for r in rows}
+
+
 async def run(n: int, batch: int, seed: int) -> int:
     snapshot_live_db()
 
     import aiosqlite
 
-    from genesis.db.crud import memory as memory_crud
     from genesis.memory.relationship_classifier import (
         COARSE_RELATIONSHIPS,
         classify_relationships,
@@ -84,7 +101,7 @@ async def run(n: int, batch: int, seed: int) -> int:
 
     db = await aiosqlite.connect(str(SNAP))
     # The runtime sets this; the router's cost-tracker (budgets.list_active does
-    # dict(row)) requires it, and hydrate_for_expansion's index access still works.
+    # dict(row)) requires it, and _hydrate_from_snapshot's index access still works.
     db.row_factory = aiosqlite.Row
     try:
         # FULL eligible population (Codex r2: a pre-LIMIT on a lexicographic
@@ -133,11 +150,10 @@ async def run(n: int, batch: int, seed: int) -> int:
             return 2
 
         ids = sorted({r[0] for r in rows} | {r[1] for r in rows})
-        # Chunk to stay under SQLite's 999-bind ceiling at large --n (Codex P2);
-        # hydrate_for_expansion itself builds ONE IN-clause.
+        # Chunk to stay under SQLite's 999-bind ceiling at large --n (Codex P2).
         hydrated: dict[str, dict] = {}
         for off in range(0, len(ids), 400):
-            hydrated.update(await memory_crud.hydrate_for_expansion(db, ids[off : off + 400]))
+            hydrated.update(await _hydrate_from_snapshot(db, ids[off : off + 400]))
 
         # created_at per endpoint → per-pair chronology hint (Codex r2: the
         # batch API accepts newers; the probe must actually supply them).

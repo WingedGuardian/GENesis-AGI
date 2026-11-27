@@ -36,9 +36,11 @@ warning, never silently ``live``.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import logging
 import time
+import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -48,6 +50,7 @@ from genesis._config_overlay import merge_local_overlay
 from genesis.db.crud import j9_eval
 from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import memory_links as memory_links_crud
+from genesis.db.request_database import run_resource_thread
 from genesis.env import repo_root
 from genesis.memory.types import RetrievalResult
 
@@ -55,6 +58,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
     import aiosqlite
+    from qdrant_client import QdrantClient
 
 logger = logging.getLogger(__name__)
 
@@ -227,8 +231,131 @@ def reranker_enabled() -> bool:
     return _reranker_mode_from(load_recall_config()) == "live"
 
 
+# The metadata ``collection`` column is unreliable, so a neighbour's collection
+# is the one that holds its point. Results are merged in this order, so a point
+# in both reports ``knowledge_base``: the external collection, which the
+# injection gate's fallback treats as external.
+_POINT_COLLECTIONS = ("episodic_memory", "knowledge_base")
+# ``memory_metadata.embedding_status`` values of a memory that has no vector
+# point yet or ever, so its text is read from FTS instead.
+_NO_VECTOR_STATUSES = frozenset({"fts5_only", "pending", "failed"})
+
+
+def _is_point_id(memory_id: str) -> bool:
+    """Whether Qdrant accepts *memory_id* as a point id: a UUID string.
+
+    A server rejects the whole ``retrieve`` (400) when any id is not one, so a
+    single malformed link would cost every neighbour of that recall.
+    """
+    try:
+        uuid.UUID(memory_id)
+    except (ValueError, TypeError, AttributeError):
+        return False
+    return True
+
+
+async def _neighbour_points(
+    db: aiosqlite.Connection, qdrant: QdrantClient, ids: list[str]
+) -> dict[str, tuple[str, dict]]:
+    """memory_id → (collection, payload) for the asked-for ids that have a point.
+
+    The client is synchronous, so each collection's ``retrieve`` runs in a
+    worker thread, and the two run at once: hydration costs one round trip.
+    """
+    batches = await asyncio.gather(
+        *(
+            run_resource_thread(
+                db,
+                qdrant.retrieve,
+                collection_name=collection,
+                ids=ids,
+                with_payload=["content", "source_type", "tags"],
+                with_vectors=False,
+            )
+            for collection in _POINT_COLLECTIONS
+        )
+    )
+    wanted = set(ids)
+    found: dict[str, tuple[str, dict]] = {}
+    for collection, points in zip(_POINT_COLLECTIONS, batches, strict=True):
+        for point in points:
+            if str(point.id) in wanted:
+                found[str(point.id)] = (collection, point.payload or {})
+    return found
+
+
+async def hydrate_neighbours(
+    db: aiosqlite.Connection, qdrant: QdrantClient, ids: list[str]
+) -> dict[str, dict]:
+    """memory_id → {content, source_type, tags, collection, origin_class,
+    invalid_at, deprecated} for graph-expansion and entity-lane neighbours.
+
+    Every read is keyed by id (#5052): one point ``retrieve`` per collection,
+    concurrent and off the event loop, then the ``memory_metadata`` primary
+    key. ``memory_fts``, whose ``memory_id`` column is UNINDEXED (a lookup by it
+    scans the whole index), is read only for a memory that has no point.
+
+    ``content``, ``source_type`` and ``tags`` come from the point payload
+    (``tags`` as the space-separated string ``store()`` also writes to FTS);
+    ``collection`` is the collection that holds the point. ``origin_class``,
+    ``invalid_at`` and ``deprecated`` come from ``memory_metadata``, the
+    authoritative copy.
+
+    A memory that was never embedded (``memory_metadata`` says ``fts5_only``,
+    ``pending`` or ``failed``) has no point, and its text exists only in FTS, so
+    it is hydrated from there, as before #5052, with the visibility still from
+    ``memory_metadata``. That read is the one scan left, and it runs only when
+    such a neighbour is asked for.
+
+    Any other id with no point is a dangling link and is omitted: no metadata
+    row, or an embedded memory whose point is gone, even when a stale FTS row
+    survives it (an id that is not a UUID is dropped before any read). So is a point
+    with no ``memory_metadata`` row: that is a deleted memory's leftover vector,
+    whose payload still holds the deleted text, and recall drops it as a ghost
+    too (``retrieval.metadata_missing_ids``). A failed point read raises; both
+    callers already log it and skip expansion.
+    """
+    # An id that is not a UUID cannot have a point, so it is dangling too.
+    ids = [i for i in ids if _is_point_id(i)]
+    if not ids:
+        return {}
+    points = await _neighbour_points(db, qdrant, ids)
+    meta = await memory_crud.expansion_metadata_by_ids(db, ids)
+    no_vector = [
+        i
+        for i in ids
+        if i not in points and i in meta and meta[i].get("embedding_status") in _NO_VECTOR_STATUSES
+    ]
+    fts_rows = await memory_crud.expansion_fts_rows_by_ids(db, no_vector) if no_vector else {}
+    out: dict[str, dict] = {}
+    for mid, fts in fts_rows.items():
+        row = meta[mid]
+        out[mid] = {
+            **fts,
+            "origin_class": row.get("origin_class"),
+            "invalid_at": row.get("invalid_at"),
+            "deprecated": row["deprecated"],
+        }
+    for mid, (collection, payload) in points.items():
+        row = meta.get(mid)
+        if row is None:
+            continue  # a ghost: the memory was deleted, its point was not
+        tags = payload.get("tags")
+        out[mid] = {
+            "content": payload.get("content"),
+            "source_type": payload.get("source_type"),
+            "tags": " ".join(map(str, tags)) if isinstance(tags, list) else tags or "",
+            "collection": collection,
+            "origin_class": row.get("origin_class"),
+            "invalid_at": row.get("invalid_at"),
+            "deprecated": row["deprecated"],
+        }
+    return out
+
+
 async def expand_neighbors(
     db: aiosqlite.Connection,
+    qdrant: QdrantClient,
     seed_ids: Sequence[str],
     *,
     cap: int,
@@ -240,17 +367,22 @@ async def expand_neighbors(
     Mode-independent primitive — reads NO config (the LongMemEval graph arm
     calls it directly; :func:`maybe_expand` passes prod config values).
 
-    Provenance is STORED-FIRST and never synthetic: ``collection`` comes from
-    the FTS row, ``origin_class`` from the batched ``memory_metadata`` lookup
+    *qdrant* is the vector store client the neighbours' text is read from
+    (see :func:`hydrate_neighbours`).
+
+    Provenance is STORED-FIRST and never synthetic: ``collection`` is the
+    collection that holds the point, ``origin_class`` comes from the batched
+    ``memory_metadata`` lookup
     (0054-backfilled; ``None`` for a hypothetical unbackfilled row keeps the
     gate's fail-closed normalization honest), and ``source_pipeline`` stays
-    ``None`` — it has no SQLite column and must not be fabricated, because
+    ``None`` — hydration does not read it (it has no SQLite column, and this
+    change keeps the gate inputs as they were), and it must not be fabricated, because
     ``item_is_blockable`` re-derives from these exact fields when the stored
     class is absent.
 
     Neighbors score ``0.01 * strength`` (sorts after any organic result) and
     carry ``payload["graph_expansion"] = {"linked_from": [...], "strength": s}``
-    plus the FTS ``tags`` string (surfaces apply their own tag filters).
+    plus the space-separated ``tags`` string (surfaces apply their own tag filters).
     Dangling links (edge rows whose neighbor no longer resolves) are skipped,
     as are neighbors normal recall would hide (bitemporally expired or
     deprecated/superseded rows) — expansion widens recall, it never
@@ -269,11 +401,10 @@ async def expand_neighbors(
         return []
 
     neighbor_ids = [n["memory_id"] for n in neighbors]
-    # ONE batched FTS⋈metadata fetch hydrates content + provenance + the
-    # visibility fields (was an N+1 get_by_id loop + a separate
-    # origin_class_by_ids + a separate visibility query — the latency the flip
-    # surfaced). Neighbor lists are cap-bounded (≤25), so no chunking needed.
-    hydrated = await memory_crud.hydrate_for_expansion(db, neighbor_ids)
+    # One batched, id-keyed read hydrates content + provenance + the
+    # visibility fields: point payloads for the text, memory_metadata for the
+    # rest. Neighbor lists are cap-bounded (≤25), so no chunking needed.
+    hydrated = await hydrate_neighbours(db, qdrant, neighbor_ids)
 
     # Which seed(s) reach each neighbor — one bounded query over the
     # seed∪neighbor id set (direction-agnostic pair list).
@@ -330,6 +461,7 @@ async def expand_neighbors(
 
 async def maybe_expand(
     db: aiosqlite.Connection,
+    qdrant: QdrantClient,
     results: list[RetrievalResult],
     *,
     surface: str,
@@ -374,6 +506,7 @@ async def maybe_expand(
         seed_ids = [r.memory_id for r in results]
         neighbors = await expand_neighbors(
             db,
+            qdrant,
             seed_ids,
             cap=cap,
             exclude_ids=seed_ids,

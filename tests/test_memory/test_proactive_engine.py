@@ -638,10 +638,11 @@ async def _run_impl(candidates, *, capture=None, **kwargs):
     fake_mod = SimpleNamespace(
         _retriever=_Retriever(),
         _db=MagicMock(),
+        _qdrant=MagicMock(),
         _require_init=lambda: None,
     )
 
-    async def _maybe_expand(db, kept, surface, recall_event_id=None, neighbor_sink=None):
+    async def _maybe_expand(db, qdrant, kept, surface, recall_event_id=None, neighbor_sink=None):
         return list(kept)  # no graph neighbors
 
     async def _record(*a, **k):

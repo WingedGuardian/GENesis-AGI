@@ -26,6 +26,7 @@ from genesis.mcp.memory_mcp import mcp
 from genesis.memory import graph_expansion
 from genesis.memory.types import RetrievalResult
 from genesis.security import immunity_shadow
+from tests.vector_store_fake import FakeVectorStore, point_id
 
 
 async def _get_tools():
@@ -81,30 +82,39 @@ def _rr(
     )
 
 
+@pytest.fixture
+def qdrant() -> FakeVectorStore:
+    return FakeVectorStore()
+
+
 async def _seed_neighbor(
     db,
+    qdrant,
     seed_id: str,
     nbr_id: str,
     *,
     strength: float = 0.8,
     collection: str = "episodic_memory",
     origin_class: str | None = "owner",
-    tags: str = "",
+    tags: tuple[str, ...] = (),
 ) -> None:
-    """DB rows for the SEED (links only resolve via memory_links) + neighbor."""
+    """Stored rows and points for the SEED (links only resolve via
+    memory_links) + neighbor."""
     for mid, coll, oc in (
         (seed_id, "episodic_memory", "owner"),
         (nbr_id, collection, origin_class),
     ):
         exists = await memory_crud.get_by_id(db, mid)
         if not exists:
+            mid_tags = list(tags) if mid == nbr_id else []
             await memory_crud.create(
                 db,
                 memory_id=mid,
                 content=f"content of {mid}",
-                tags=tags if mid == nbr_id else "",
+                tags=" ".join(mid_tags),
                 collection=coll,
             )
+            qdrant.put(coll, mid, content=f"content of {mid}", source_type="memory", tags=mid_tags)
             await memory_crud.create_metadata(
                 db,
                 memory_id=mid,
@@ -125,11 +135,12 @@ async def _seed_neighbor(
 class _SwappedState:
     """Context manager swapping memory_mcp module state (store/db/retriever)."""
 
-    def __init__(self, db, results: list[RetrievalResult]):
+    def __init__(self, db, qdrant, results: list[RetrievalResult]):
         import genesis.mcp.memory_mcp as mod
 
         self.mod = mod
         self.db = db
+        self.qdrant = qdrant
         self.results = results
 
     def __enter__(self):
@@ -145,7 +156,7 @@ class _SwappedState:
         mod._store = MagicMock()
         mod._db = self.db
         mod._retriever = retriever
-        mod._qdrant = MagicMock()
+        mod._qdrant = self.qdrant
         return mod
 
     def __exit__(self, *exc):
@@ -158,35 +169,38 @@ class _SwappedState:
 
 async def test_compact_live_appends_neighbor_preview_with_via_graph(
     db,
+    qdrant,
     expansion_config,
     record_spy,
 ):
     expansion_config("live")
-    await _seed_neighbor(db, "seed-1", "nbr-1")
-    with _SwappedState(db, [_rr("seed-1")]):
+    await _seed_neighbor(db, qdrant, point_id("seed-1"), point_id("nbr-1"))
+    with _SwappedState(db, qdrant, [_rr(point_id("seed-1"))]):
         tools = await _get_tools()
         out = await tools["memory_recall"].fn(query="q", compact=True)
 
-    assert [d["memory_id"] for d in out] == ["seed-1", "nbr-1"]
+    assert [d["memory_id"] for d in out] == [point_id("seed-1"), point_id("nbr-1")]
     assert out[1]["via_graph"] is True
     assert "via_graph" not in out[0]
-    assert out[1]["preview"].startswith("content of nbr-1")
+    assert out[1]["preview"].startswith(f"content of {point_id('nbr-1')}")
 
 
 async def test_compact_live_counts_external_neighbor_blockable(
     db,
+    qdrant,
     expansion_config,
     record_spy,
 ):
     expansion_config("live")
     await _seed_neighbor(
         db,
-        "seed-1",
-        "nbr-ext",
+        qdrant,
+        point_id("seed-1"),
+        point_id("nbr-ext"),
         collection="knowledge_base",
         origin_class="external_untrusted",
     )
-    with _SwappedState(db, [_rr("seed-1")]):
+    with _SwappedState(db, qdrant, [_rr(point_id("seed-1"))]):
         tools = await _get_tools()
         await tools["memory_recall"].fn(query="q", compact=True)
 
@@ -195,14 +209,14 @@ async def test_compact_live_counts_external_neighbor_blockable(
     assert compact_calls[0]["blockable_count"] == 1  # the neighbor, not the seed
 
 
-async def test_compact_shadow_output_unchanged(db, expansion_config, record_spy):
+async def test_compact_shadow_output_unchanged(db, qdrant, expansion_config, record_spy):
     expansion_config("shadow")
-    await _seed_neighbor(db, "seed-1", "nbr-1")
-    with _SwappedState(db, [_rr("seed-1")]):
+    await _seed_neighbor(db, qdrant, point_id("seed-1"), point_id("nbr-1"))
+    with _SwappedState(db, qdrant, [_rr(point_id("seed-1"))]):
         tools = await _get_tools()
         out = await tools["memory_recall"].fn(query="q", compact=True)
 
-    assert [d["memory_id"] for d in out] == ["seed-1"]
+    assert [d["memory_id"] for d in out] == [point_id("seed-1")]
     rows = await db.execute_fetchall(
         "SELECT event_type FROM eval_events WHERE event_type LIKE 'graph_expansion_%'",
     )
@@ -214,18 +228,20 @@ async def test_compact_shadow_output_unchanged(db, expansion_config, record_spy)
 
 async def test_full_live_merges_neighbor_dict_wrapped_and_counted(
     db,
+    qdrant,
     expansion_config,
     record_spy,
 ):
     expansion_config("live")
     await _seed_neighbor(
         db,
-        "seed-1",
-        "nbr-ext",
+        qdrant,
+        point_id("seed-1"),
+        point_id("nbr-ext"),
         collection="knowledge_base",
         origin_class="external_untrusted",
     )
-    with _SwappedState(db, [_rr("seed-1")]):
+    with _SwappedState(db, qdrant, [_rr(point_id("seed-1"))]):
         tools = await _get_tools()
         out = await tools["memory_recall"].fn(
             query="q",
@@ -235,22 +251,22 @@ async def test_full_live_merges_neighbor_dict_wrapped_and_counted(
         )
 
     by_id = {d["memory_id"]: d for d in out}
-    assert set(by_id) == {"seed-1", "nbr-ext"}
-    nbr = by_id["nbr-ext"]
+    assert set(by_id) == {point_id("seed-1"), point_id("nbr-ext")}
+    nbr = by_id[point_id("nbr-ext")]
     assert nbr["via_graph"] is True
     # went through label_result_dicts (provenance) AND the wrap loop
     assert nbr.get("provenance")
-    assert nbr["content"] != "content of nbr-ext"  # wrapped external
-    assert "content of nbr-ext" in nbr["content"]
+    assert nbr["content"] != f"content of {point_id('nbr-ext')}"  # wrapped external
+    assert f"content of {point_id('nbr-ext')}" in nbr["content"]
     full_calls = [c for c in record_spy if c.get("detail") is None]
     assert len(full_calls) == 1
     assert full_calls[0]["blockable_count"] == 1
 
 
-async def test_full_shadow_output_unchanged_and_emits(db, expansion_config, record_spy):
+async def test_full_shadow_output_unchanged_and_emits(db, qdrant, expansion_config, record_spy):
     expansion_config("shadow")
-    await _seed_neighbor(db, "seed-1", "nbr-1")
-    with _SwappedState(db, [_rr("seed-1")]):
+    await _seed_neighbor(db, qdrant, point_id("seed-1"), point_id("nbr-1"))
+    with _SwappedState(db, qdrant, [_rr(point_id("seed-1"))]):
         tools = await _get_tools()
         out = await tools["memory_recall"].fn(
             query="q",
@@ -259,17 +275,17 @@ async def test_full_shadow_output_unchanged_and_emits(db, expansion_config, reco
             corrective=False,
         )
 
-    assert [d["memory_id"] for d in out] == ["seed-1"]
+    assert [d["memory_id"] for d in out] == [point_id("seed-1")]
     rows = await db.execute_fetchall(
         "SELECT event_type FROM eval_events WHERE event_type LIKE 'graph_expansion_%'",
     )
     assert [r[0] for r in rows] == ["graph_expansion_shadow"]
 
 
-async def test_full_off_no_expansion_no_event(db, expansion_config, record_spy):
+async def test_full_off_no_expansion_no_event(db, qdrant, expansion_config, record_spy):
     expansion_config("off")
-    await _seed_neighbor(db, "seed-1", "nbr-1")
-    with _SwappedState(db, [_rr("seed-1")]):
+    await _seed_neighbor(db, qdrant, point_id("seed-1"), point_id("nbr-1"))
+    with _SwappedState(db, qdrant, [_rr(point_id("seed-1"))]):
         tools = await _get_tools()
         out = await tools["memory_recall"].fn(
             query="q",
@@ -278,7 +294,7 @@ async def test_full_off_no_expansion_no_event(db, expansion_config, record_spy):
             corrective=False,
         )
 
-    assert [d["memory_id"] for d in out] == ["seed-1"]
+    assert [d["memory_id"] for d in out] == [point_id("seed-1")]
     rows = await db.execute_fetchall(
         "SELECT event_type FROM eval_events WHERE event_type LIKE 'graph_expansion_%'",
     )
@@ -290,59 +306,63 @@ async def test_full_off_no_expansion_no_event(db, expansion_config, record_spy):
 
 async def test_proactive_live_appends_defended_neighbor(
     db,
+    qdrant,
     expansion_config,
     record_spy,
 ):
     expansion_config("live")
     await _seed_neighbor(
         db,
-        "seed-1",
-        "nbr-ext",
+        qdrant,
+        point_id("seed-1"),
+        point_id("nbr-ext"),
         collection="knowledge_base",
         origin_class="external_untrusted",
     )
-    with _SwappedState(db, [_rr("seed-1")]):
+    with _SwappedState(db, qdrant, [_rr(point_id("seed-1"))]):
         tools = await _get_tools()
         out = await tools["memory_proactive"].fn(current_message="hello")
 
-    assert [d["memory_id"] for d in out] == ["seed-1", "nbr-ext"]
+    assert [d["memory_id"] for d in out] == [point_id("seed-1"), point_id("nbr-ext")]
     nbr = out[1]
     assert nbr["via_graph"] is True
-    assert nbr["content"] != "content of nbr-ext"  # wrapped external
-    assert "content of nbr-ext" in nbr["content"]
+    assert nbr["content"] != f"content of {point_id('nbr-ext')}"  # wrapped external
+    assert f"content of {point_id('nbr-ext')}" in nbr["content"]
     assert len(record_spy) == 1
     assert record_spy[0]["blockable_count"] == 1  # neighbor counted
 
 
-async def test_proactive_live_respects_proactive_cap(db, expansion_config, record_spy):
+async def test_proactive_live_respects_proactive_cap(db, qdrant, expansion_config, record_spy):
     expansion_config("live", proactive_max_neighbors=2)
     for i, s in enumerate((0.9, 0.8, 0.7)):
-        await _seed_neighbor(db, "seed-1", f"nbr-{i}", strength=s)
-    with _SwappedState(db, [_rr("seed-1")]):
+        await _seed_neighbor(db, qdrant, point_id("seed-1"), point_id(f"nbr-{i}"), strength=s)
+    with _SwappedState(db, qdrant, [_rr(point_id("seed-1"))]):
         tools = await _get_tools()
         out = await tools["memory_proactive"].fn(current_message="hello")
 
-    assert [d["memory_id"] for d in out] == ["seed-1", "nbr-0", "nbr-1"]
+    assert [d["memory_id"] for d in out] == [point_id("seed-1"), point_id("nbr-0"), point_id("nbr-1")]
 
 
 async def test_proactive_neighbor_memory_operation_tag_filtered(
     db,
+    qdrant,
     expansion_config,
     record_spy,
 ):
     """The organic pool filters memory_operation-tagged items — a neighbor
-    carrying that tag (string form, from the FTS row) must be filtered too."""
+    carrying that tag (one space-separated string) must be filtered too."""
     expansion_config("live")
-    await _seed_neighbor(db, "seed-1", "nbr-memop", tags="memory_operation,foo")
-    with _SwappedState(db, [_rr("seed-1")]):
+    await _seed_neighbor(db, qdrant, point_id("seed-1"), point_id("nbr-memop"), tags=("memory_operation", "foo"))
+    with _SwappedState(db, qdrant, [_rr(point_id("seed-1"))]):
         tools = await _get_tools()
         out = await tools["memory_proactive"].fn(current_message="hello")
 
-    assert [d["memory_id"] for d in out] == ["seed-1"]
+    assert [d["memory_id"] for d in out] == [point_id("seed-1")]
 
 
 async def test_proactive_neighbor_runs_enforce_drop(
     db,
+    qdrant,
     expansion_config,
     record_spy,
     monkeypatch,
@@ -353,8 +373,9 @@ async def test_proactive_neighbor_runs_enforce_drop(
     expansion_config("live")
     await _seed_neighbor(
         db,
-        "seed-1",
-        "nbr-ext",
+        qdrant,
+        point_id("seed-1"),
+        point_id("nbr-ext"),
         collection="knowledge_base",
         origin_class="external_untrusted",
     )
@@ -363,22 +384,24 @@ async def test_proactive_neighbor_runs_enforce_drop(
         return kwargs.get("origin_class") == "external_untrusted"
 
     monkeypatch.setattr(immunity_shadow, "should_enforce_drop", _drop_external)
-    with _SwappedState(db, [_rr("seed-1")]):
+    with _SwappedState(db, qdrant, [_rr(point_id("seed-1"))]):
         tools = await _get_tools()
         out = await tools["memory_proactive"].fn(current_message="hello")
 
-    assert [d["memory_id"] for d in out] == ["seed-1"]
+    assert [d["memory_id"] for d in out] == [point_id("seed-1")]
     assert record_spy[0]["detail"] == {"enforced_drops": 1}
 
 
-async def test_proactive_shadow_output_unchanged_and_emits(db, expansion_config, record_spy):
+async def test_proactive_shadow_output_unchanged_and_emits(
+    db, qdrant, expansion_config, record_spy
+):
     expansion_config("shadow")
-    await _seed_neighbor(db, "seed-1", "nbr-1")
-    with _SwappedState(db, [_rr("seed-1")]):
+    await _seed_neighbor(db, qdrant, point_id("seed-1"), point_id("nbr-1"))
+    with _SwappedState(db, qdrant, [_rr(point_id("seed-1"))]):
         tools = await _get_tools()
         out = await tools["memory_proactive"].fn(current_message="hello")
 
-    assert [d["memory_id"] for d in out] == ["seed-1"]
+    assert [d["memory_id"] for d in out] == [point_id("seed-1")]
     rows = await db.execute_fetchall(
         "SELECT event_type FROM eval_events WHERE event_type LIKE 'graph_expansion_%'",
     )
@@ -386,7 +409,7 @@ async def test_proactive_shadow_output_unchanged_and_emits(db, expansion_config,
 
 
 async def test_full_live_dedups_neighbor_crag_already_added(
-    db, expansion_config, record_spy, monkeypatch,
+    db, qdrant, expansion_config, record_spy, monkeypatch,
 ):
     """CRAG's corrective augmentation can independently re-add an item that
     is also a 1-hop neighbor — the expansion merge must not duplicate it in
@@ -394,19 +417,19 @@ async def test_full_live_dedups_neighbor_crag_already_added(
     import genesis.memory.corrective as corrective_mod
 
     expansion_config("live")
-    await _seed_neighbor(db, "seed-1", "nbr-1")
+    await _seed_neighbor(db, qdrant, point_id("seed-1"), point_id("nbr-1"))
 
     async def _fake_correct(*, results, **_k):
         # CRAG re-adds the neighbor as its own augmentation
-        return [*results, {"memory_id": "nbr-1", "content": "crag copy of nbr-1"}]
+        return [*results, {"memory_id": point_id("nbr-1"), "content": "crag copy of nbr-1"}]
 
     monkeypatch.setattr(corrective_mod, "maybe_correct_recall", _fake_correct)
-    with _SwappedState(db, [_rr("seed-1")]):
+    with _SwappedState(db, qdrant, [_rr(point_id("seed-1"))]):
         tools = await _get_tools()
         out = await tools["memory_recall"].fn(
             query="q", compact=False, include_graph=False, corrective=True,
         )
 
     ids = [d["memory_id"] for d in out]
-    assert ids.count("nbr-1") == 1  # CRAG's copy kept, expansion did not duplicate
-    assert set(ids) == {"seed-1", "nbr-1"}
+    assert ids.count(point_id("nbr-1")) == 1  # CRAG's copy kept, expansion did not duplicate
+    assert set(ids) == {point_id("seed-1"), point_id("nbr-1")}
