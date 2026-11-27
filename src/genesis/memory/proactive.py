@@ -624,16 +624,34 @@ async def _enrich(db: Any, dicts: list[dict]) -> None:
         d["_wing"] = payload_wing or wing
 
 
+# Strong links read per delivered memory before hidden neighbours are dropped,
+# so visible ones can fill the 2 hint slots. A bound, not a scan: if all 10
+# strongest links are hidden, the memory gets no breadcrumb even when a weaker
+# visible link exists past them.
+_BREADCRUMB_CANDIDATES = 10
+
+
 async def _breadcrumbs(db: Any, dicts: list[dict]) -> None:
     """Attach up to 2 strongly-linked neighbor id-prefixes to the top 3
     delivered memories (``related_ids``), for memory_expand follow-up.
 
+    Never offers a memory normal recall hides (deprecated or expired, the
+    predicate ``memory_recall``'s graph traversal uses by default; stricter than
+    ``memory_expand``, which shows deprecated neighbours): those are dropped
+    before the cap, so a visible neighbour takes the freed slot. A target linked
+    by several relationship types takes one slot.
+
     Lets a DB read error PROPAGATE (see :func:`_enrich`): the caller's ``_ro_read``
-    fallback + best-effort guard handle it, and the writes are idempotent.
+    fallback + best-effort guard handle it, and the writes are idempotent. A
+    failed visibility read therefore costs the breadcrumbs, never shows a
+    hidden id. Nothing is written until every read has succeeded.
     """
     if not dicts:
         return
+    from genesis.memory.graphstore import invalid_memory_ids_among
+
     seen = {d.get("memory_id") for d in dicts}
+    candidates: list[tuple[dict, list[str]]] = []
     for d in dicts[:3]:
         mid = d.get("memory_id")
         if not mid:
@@ -641,10 +659,19 @@ async def _breadcrumbs(db: Any, dicts: list[dict]) -> None:
         rows = await db.execute_fetchall(
             "SELECT target_id FROM memory_links "
             "WHERE source_id = ? AND strength >= 0.5 "
-            "ORDER BY strength DESC LIMIT 2",
-            (mid,),
+            "ORDER BY strength DESC LIMIT ?",
+            (mid, _BREADCRUMB_CANDIDATES),
         )
-        full = [row[0] for row in rows if row[0] not in seen]
+        if rows:
+            candidates.append((d, [row[0] for row in rows]))
+    if not candidates:
+        return
+    hidden = await invalid_memory_ids_among(db, {i for _, ids in candidates for i in ids})
+    for d, ids in candidates:
+        # Cap the distinct visible links, then drop delivered ones (as before
+        # hidden ids were filtered), so a delivered neighbour still uses a slot.
+        visible = list(dict.fromkeys(i for i in ids if i not in hidden))[:2]
+        full = [i for i in visible if i not in seen]
         if full:
             d["related_ids"] = [mid[:8] for mid in full]
             # Full ids for the label step and the recall trace; never rendered.
@@ -656,9 +683,9 @@ async def _breadcrumb_label_plan(db: Any, dicts: list[dict]) -> Any:
 
     Runs on a pooled read connection (``_ro_read``); the vector-store read in
     :func:`_attach_breadcrumb_labels` runs after that connection is released, so
-    a slow label read never holds a pool slot. Never labels a hidden memory:
-    these hints bypass the visibility predicate today (#5051). ``None`` means
-    every label is withheld.
+    a slow label read never holds a pool slot. Never labels a hidden memory
+    (:func:`_breadcrumbs` already drops them; a hint can expire between the two
+    reads). ``None`` means every label is withheld.
     """
     from genesis.memory.neighbour_labels import LabelPlan, label_plan
 
