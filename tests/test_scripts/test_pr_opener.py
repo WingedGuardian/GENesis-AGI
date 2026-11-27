@@ -559,13 +559,12 @@ def test_a_correction_line_overrides_the_record_and_says_so(monkeypatch, db, cap
     assert [s["id"] for s in r["opener_sessions"]] == ["2bc87284-aaaa"]
     assert po.main(["4642"]) == 0
     out = capsys.readouterr().out
-    assert "from the body's Opened-by-session-correction line" in out
+    assert "from an Opened-by-session-correction line (the body or its edit history)" in out
     assert "the recorded stamp named 0d0d0d0d" in out
 
 
 def test_a_correction_inside_a_fence_or_in_history_only_does_not_count():
     assert po.correction("```\nOpened-by-session-correction: 2bc87284\n```") is None
-    # A correction is read from the CURRENT body only: removing it undoes it.
     assert po.correction("x") is None
     # It is not a stamp either way, so the hook never treats it as one.
     assert po.stamped("Opened-by-session-correction: 2bc87284") is None
@@ -664,3 +663,57 @@ def test_a_charter_under_the_row_id_is_preferred_when_both_ids_carry_one(db: Pat
     con.commit()
     con.close()
     assert [r["mission"] for r in po.sessions("0d0d0d0d", db)] == ["row id mission"]
+
+
+# --- a correction survives a rewrite that drops it -----------------------------------
+
+
+def test_a_correction_dropped_by_a_rewrite_still_counts(monkeypatch, db):
+    # A session rewrites the body from a local file that never had the correction.
+    _quiet(monkeypatch, db)
+    rewritten = "x\n\nOpened-by-session: 0d0d0d0d\n"
+    with_fix = rewritten + "Opened-by-session-correction: 2bc87284\n"
+    edits = [_edit("t2", rewritten), _edit("t1", with_fix), _edit("t0", rewritten)]
+    _fake_gh(monkeypatch, _view(rewritten, []), _edits(edits))
+    r = po.report(4642, "o/r")
+    assert (r["opener"], r["source"], r["recorded_opener"]) == ("2bc87284", "corrected", "0d0d0d0d")
+
+
+def test_the_newest_correction_wins_and_a_copied_one_never_does():
+    copied = "x\nOpened-by-session-correction: aaaaaaaa\n"
+    first = copied + "Opened-by-session-correction: bbbbbbbb\n"
+    edits = [_edit("t2", "x"), _edit("t1", first), _edit("t0", copied)]
+    # The copied aaaaaaaa is skipped; the hand-added bbbbbbbb stands after the drop.
+    assert po.corrected("x", edits) == "bbbbbbbb"
+    newer = [_edit("t3", "x\nOpened-by-session-correction: cccccccc\n"), *edits]
+    assert po.corrected("x\nOpened-by-session-correction: dddddddd\n", newer) == "dddddddd"
+    assert po.corrected("x", newer) == "cccccccc"
+    # Only the copy, anywhere: nothing counts. No history: nothing counts.
+    assert po.corrected(copied, [_edit("t1", copied), _edit("t0", copied)]) is None
+    assert po.corrected(copied, []) is None
+    # A deleted revision (diff null) is skipped, never an error.
+    assert po.corrected("x", [{"diff": None}, _edit("t1", first), _edit("t0", "x")]) == "bbbbbbbb"
+    # A correction shown in a fence is an example, not a correction.
+    fenced = "```\nOpened-by-session-correction: eeeeeeee\n```"
+    assert po.corrected(fenced, [_edit("t1", fenced), _edit("t0", "x")]) is None
+
+
+def test_a_correction_with_no_readable_as_created_body_never_counts():
+    # The as-created revision was deleted: a copied correction cannot be told apart.
+    copied = "x\nOpened-by-session-correction: aaaaaaaa\n"
+    assert po.corrected("x", [_edit("t1", copied), {"diff": None}]) is None
+
+
+def test_within_one_version_the_last_correction_line_wins_and_crlf_reads():
+    two = (
+        "x\r\nOpened-by-session-correction: bbbbbbbb\r\nOpened-by-session-correction: cccccccc\r\n"
+    )
+    assert po.corrected(two, [_edit("t1", two), _edit("t0", "x")]) == "cccccccc"
+    # A copied id written again later still does not count; the hand-added one does.
+    copied = "x\nOpened-by-session-correction: aaaaaaaa\n"
+    edits = [
+        _edit("t2", copied),
+        _edit("t1", "x\nOpened-by-session-correction: bbbbbbbb\n"),
+        _edit("t0", copied),
+    ]
+    assert po.corrected(copied, edits) == "bbbbbbbb"
