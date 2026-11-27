@@ -1687,6 +1687,7 @@ async def _declare_retired_count(bus, key: _FailureKey, state: list[float]) -> N
     session's error look active again to every recency consumer.
     """
     from genesis.cc import exceptions as cc_exceptions
+    from genesis.observability.session_context import session_scope
     from genesis.observability.types import Severity, Subsystem
 
     error_class, caller_tag, roster_model, session_id = key
@@ -1699,19 +1700,24 @@ async def _declare_retired_count(bus, key: _FailureKey, state: list[float]) -> N
     if roster_model and roster_model != roster.CLAUDE:
         message += f" via {roster_model}"
     message += f" ({count} similar failure(s) coalesced; no later failure was reported)"
-    await bus.emit(
-        Subsystem.PROVIDERS,
-        Severity.WARNING if is_limit else Severity.ERROR,
-        "cc.invocation_failed",
-        message,
-        occurred_seconds_ago=max(0.0, time.monotonic() - state[2]),
-        error_class=error_class,
-        roster_model=roster_model,
-        session_id=session_id,
-        caller_tag=caller_tag,
-        coalesced=count,
-        retired=True,
-    )
+    # Emitted under the entry's own session, not whichever one triggered the
+    # sweep: the bus fills a None session_id from the ambient session, so an
+    # unscoped count retired inside another session's claim would be stored
+    # against that unrelated session.
+    with session_scope(session_id):
+        await bus.emit(
+            Subsystem.PROVIDERS,
+            Severity.WARNING if is_limit else Severity.ERROR,
+            "cc.invocation_failed",
+            message,
+            occurred_seconds_ago=max(0.0, time.monotonic() - state[2]),
+            error_class=error_class,
+            roster_model=roster_model,
+            session_id=session_id,
+            caller_tag=caller_tag,
+            coalesced=count,
+            retired=True,
+        )
 
 
 async def declare_settled_failure_counts() -> int:

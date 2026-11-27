@@ -7297,6 +7297,50 @@ async def test_sweeper_declares_a_quiet_unscoped_callers_count(monkeypatch, fail
     assert not fail_bus.events[-1][4].get("retired")
 
 
+async def test_an_unscoped_retired_count_is_not_stored_against_the_claiming_session(
+    monkeypatch,
+):
+    """Review on #4433 round 3 (Codex, CodeRabbit): the real bus fills a None
+    session_id from the ambient session when it queues the persistence record.
+    An unscoped count retired by another session's claim must still be stored
+    with no session, not against the session whose failure retired it."""
+    import asyncio
+
+    import genesis.cc.invoker as inv_mod
+    from genesis.observability.events import GenesisEventBus
+    from genesis.observability.session_context import get_session_id, session_scope
+
+    bus = GenesisEventBus()
+    bus._write_queue = asyncio.Queue()
+    monkeypatch.setattr(inv_mod, "_runtime_event_bus", lambda: bus)
+    inv_mod._reset_failure_event_state()
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(inv_mod.time, "monotonic", lambda: clock["t"])
+    unscoped = CCInvocation(prompt="x", caller_tag="surplus.scan")
+    for _ in range(2):  # outside any session: one emitted, one owed
+        await inv_mod._emit_invocation_failed_event(
+            CCTimeoutError("slow"), unscoped, streaming=False
+        )
+
+    clock["t"] += 61.0
+    with session_scope("manager-b"):  # an unrelated failure retires the entry
+        await inv_mod._emit_invocation_failed_event(
+            CCTimeoutError("slow"),
+            CCInvocation(prompt="x", caller_tag="inbox.eval"),
+            streaming=False,
+        )
+        assert get_session_id() == "manager-b"  # restored after the declarations
+
+    records = []
+    while not bus._write_queue.empty():
+        records.append(bus._write_queue.get_nowait())
+    retired = [r for r in records if (r["details"] or {}).get("retired")]
+    assert [(r["details"]["caller_tag"], r["session_id"]) for r in retired] == [
+        ("surplus.scan", None)
+    ]
+    inv_mod._reset_failure_event_state()
+
+
 async def test_sweeper_keeps_counts_when_there_is_no_bus(monkeypatch, fail_bus):
     """Without a bus nothing could be declared, so nothing is retired."""
     import genesis.cc.invoker as inv_mod
