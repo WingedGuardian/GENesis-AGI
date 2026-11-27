@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -28,12 +29,32 @@ def _cc_canary_stubbed(request, monkeypatch):
     test_cc_canary.py exercises the real call path against a stub binary and
     opts out."""
     if request.module.__name__.endswith("test_cc_canary"):
+        yield
         return
+
+    from genesis.guardian import cc_canary
 
     async def _ok(_config, _engine):
         return "ok", "ok (stubbed by tests/test_guardian/conftest.py)"
 
-    monkeypatch.setattr("genesis.guardian.cc_canary._run_once", _ok)
+    # run_check swallows canary exceptions, so a stub that no longer fits
+    # _run_once's contract would fail quietly. Record what each run saved
+    # and check it after the test instead.
+    real_maybe_run = cc_canary.maybe_run_cc_canary
+    saved: list[object] = []
+
+    async def _recording(config, *args, **kwargs):
+        try:
+            await real_maybe_run(config, *args, **kwargs)
+        finally:
+            path = config.state_path / cc_canary._STATE_FILE
+            if path.exists():
+                saved.append(json.loads(path.read_text()).get("status"))
+
+    monkeypatch.setattr(cc_canary, "_run_once", _ok)
+    monkeypatch.setattr(cc_canary, "maybe_run_cc_canary", _recording)
+    yield
+    assert all(status == "ok" for status in saved), f"stubbed canary saved {saved}"
 
 
 @pytest.fixture
