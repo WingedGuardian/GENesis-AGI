@@ -89,10 +89,68 @@ def _full_legacy(
     return schema + (schema_extra or []), data + (data_extra or [])
 
 
+def _pinned_base(repo_root: Path | None = None) -> str:
+    """The commit this tree was built FROM, for tests that read the real tree.
+
+    Reading ``_REPO`` with no base falls back to ``_DEFAULT_BASE_REF``, which
+    names the CURRENT tip of the default branch, fetched when the job runs,
+    while the tree under test is the merge ref, fixed when the event fired. A
+    migration merged into main between the two therefore looks deleted here and
+    the guard fails a pull request that broke nothing (seen 2026-11-13 on three
+    unrelated PRs).
+
+    The base is the MERGE BASE, never this checkout's ``HEAD``. In the PR
+    merge-ref checkout, ``HEAD`` is a commit that already contains the pull
+    request's own migrations, so comparing ``HEAD`` with the tree leaves no
+    difference at all and the deleted-or-renamed rule can never fire on the real
+    tree: the three tests would pass while measuring only the non-diff rules,
+    which is the silent pass this guard exists to remove.
+
+    ``PR_BASE_SHA`` wins when it is set, because that is the base commit CI knows
+    the pull request to have (``ci.yml`` exports it for the guard's own step), so
+    the tests compare against the same ref the harness does. Otherwise
+    ``git merge-base HEAD origin/main``: the commit the branch forked from, so a
+    migration the branch deletes still shows as missing from the base, and main
+    moving after checkout cannot make a file appear that the tree never had.
+
+    Empty when no base resolves, and the three real-tree tests SKIP rather than
+    fall back to ``HEAD``: such a fallback would quietly bring the vacuous
+    comparison back. A shallow checkout with no merge base is the everyday case.
+
+    *repo_root* defaults to ``_REPO``. The tests pass a fixture repo instead, so
+    both branches of this helper are measurable without touching the checkout.
+    """
+    root = repo_root if repo_root is not None else _REPO
+    env_base = os.environ.get("PR_BASE_SHA", "").strip()
+    if env_base:
+        return env_base
+    try:
+        out = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            ["git", "-C", str(root), "merge-base", "HEAD", "origin/main"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover - no git
+        return ""
+    if out.returncode != 0:
+        return ""
+    return out.stdout.strip()
+
+
+_BASE = _pinned_base()
+_needs_base = pytest.mark.skipif(
+    not _BASE, reason="no merge base to pin to: needs git history and origin/main"
+)
+
+
+@_needs_base
 def test_real_repo_is_clean():
-    """The acceptance baseline: the guard must pass on the ACTUAL tree, or it
-    is measuring something other than what ships."""
-    assert _mod.check(_REPO) == []
+    """The acceptance baseline: the guard must pass on the ACTUAL tree (against
+    its own HEAD, see ``_pinned_base``), or it is measuring something other than
+    what ships."""
+    assert _mod.check(_REPO, base_ref=_BASE) == []
 
 
 def test_clean_mixed_tree_passes(tmp_path):
@@ -350,17 +408,26 @@ def test_plumbing_failure_exits_2_never_0(tmp_path, monkeypatch, capsys):
     assert "could not run" in capsys.readouterr().err
 
 
+@_needs_base
 def test_clean_run_exits_0_and_says_so(monkeypatch, capsys):
-    monkeypatch.setattr(sys, "argv", ["check", "--repo-root", str(_REPO)])
+    monkeypatch.setattr(sys, "argv", ["check", "--repo-root", str(_REPO), "--base", _BASE])
     assert _mod.main() == 0
     assert "CLEAN" in capsys.readouterr().out
 
 
-def _run_as_ci(repo_root: Path) -> subprocess.CompletedProcess:
+def _run_as_ci(repo_root: Path, *, base: str | None = None) -> subprocess.CompletedProcess:
     """Run the script EXACTLY as ci.yml does: a bare interpreter with no venv,
-    no PYTHONPATH, and nothing pip-installed."""
+    no PYTHONPATH, and nothing pip-installed.
+
+    ``base`` goes through to ``--base`` for the cases that read the real tree:
+    without it the script answers "what was already merged" from the current tip
+    of the default branch, which may have moved since the tree was fixed.
+    """
+    argv = [sys.executable, "-E", "-S", str(_SCRIPT), "--repo-root", str(repo_root)]
+    if base is not None:
+        argv += ["--base", base]
     return subprocess.run(
-        [sys.executable, "-E", "-S", str(_SCRIPT), "--repo-root", str(repo_root)],
+        argv,
         capture_output=True,
         text=True,
         cwd=str(_REPO),
@@ -368,13 +435,14 @@ def _run_as_ci(repo_root: Path) -> subprocess.CompletedProcess:
     )
 
 
+@_needs_base
 def test_ci_command_line_runs_at_all_on_the_real_tree():
     """BLOCKER regression: the first version of this guard bound to the runner
     modules, which import aiosqlite at module scope, so it exited 2 on every PR
     in a job that installs nothing — while every check()-level test passed
     inside the venv. The id contract is stdlib-only so this stays true, and
     ``datetime`` (added for timestamp validation) keeps it true."""
-    proc = _run_as_ci(_REPO)
+    proc = _run_as_ci(_REPO, base=_BASE)
     assert proc.returncode == 0, f"exit {proc.returncode}\n{proc.stdout}\n{proc.stderr}"
     assert "CLEAN" in proc.stdout
 
@@ -428,6 +496,123 @@ def _committed_repo(tmp_path: Path, *, extra_schema: list[str] | None = None) ->
 # A real, well-formed timestamp id — the namespace the enumerated list can
 # never cover, which is the whole point of the finding.
 _MERGED_TS = "20260101000000_add_a_column.py"
+
+
+def _committed_repo_with_origin(tmp_path: Path) -> tuple[Path, str]:
+    """A committed fake repo that also has ``origin/main``. Returns (repo, sha).
+
+    The two candidates for the base are the same commit here, so a test that
+    wants them to differ moves ``origin/main`` on itself.
+    """
+    repo, base = _committed_repo(tmp_path)
+    _git(repo, "update-ref", "refs/remotes/origin/main", base)
+    return repo, base
+
+
+def _commit_migration(repo: Path, name: str, message: str) -> str:
+    """Commit an empty schema migration at *name*, and return the new sha."""
+    (repo / "src/genesis/db/migrations" / name).write_text("")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", message)
+    return _git(repo, "rev-parse", "HEAD").strip()
+
+
+def test_a_base_that_resolves_is_the_merge_base_never_head(tmp_path, monkeypatch):
+    """#4602: a resolved base must be the merge base, and the check must be able
+    to tell it from ``HEAD``.
+
+    The two are told apart by a deletion that is COMMITTED. ``git rm`` without a
+    commit leaves the file in ``HEAD``, and a HEAD-pinned check still sees it on
+    both sides, which is the version confusion this test exists to prevent.
+
+    - base = HEAD: the tree is compared with itself. Nothing can differ, so the
+      file that went missing is not reported.
+    - base = merge base: the file is at the base and gone from the tree, so it
+      is reported as an already-merged migration that is missing here.
+
+    Both assertions matter: the first pins the vacuous comparison as the thing we
+    are NOT doing, the second pins that the real check still fires.
+    """
+    repo, base = _committed_repo_with_origin(tmp_path)
+    head = _commit_migration(repo, _MERGED_TS, "add the merged migration")
+    _git(repo, "update-ref", "refs/remotes/origin/main", head)
+
+    _git(repo, "rm", "-q", f"src/genesis/db/migrations/{_MERGED_TS}")
+    _git(repo, "commit", "-qm", "delete the already-merged migration")
+
+    head_sha = _git(repo, "rev-parse", "HEAD").strip()
+    merge_base = _git(repo, "merge-base", "HEAD", "origin/main").strip()
+    assert head_sha != merge_base, "the fixture must separate HEAD from the merge base"
+
+    # Exercise the helper itself, not only _git: a regression that makes
+    # _pinned_base return HEAD would still pass every other test in this file.
+    monkeypatch.delenv("PR_BASE_SHA", raising=False)
+    pinned = _pinned_base(repo)
+    assert pinned == merge_base, (
+        f"_pinned_base must resolve the merge base ({merge_base[:8]}), not HEAD "
+        f"({head_sha[:8]}); it resolved {pinned[:8] or '(empty)'}"
+    )
+
+    assert _mod.check(repo, base_ref=head_sha) == [], (
+        "a HEAD-pinned base compares the tree with itself and reports nothing; "
+        "if this ever fails the comparison is no longer vacuous and the test "
+        "stopped measuring what #4602 is about"
+    )
+    violations = _mod.check(repo, base_ref=pinned)
+    assert any(_MERGED_TS in v and "already-merged" in v for v in violations), (
+        f"the merge base must still catch the committed deletion, got {violations}"
+    )
+
+
+def test_no_resolvable_base_skips_rather_than_falling_back_to_head(tmp_path, monkeypatch):
+    """#4602: when no base resolves the helper returns empty so the real-tree
+    tests SKIP.
+
+    A fallback to ``HEAD`` is the quiet failure: the tests keep passing while
+    comparing the tree with itself, and nobody sees that the base rule is off.
+    The everyday case is a shallow checkout, which has no merge base to give.
+    """
+    repo, _base = _committed_repo_with_origin(tmp_path)
+    monkeypatch.delenv("PR_BASE_SHA", raising=False)
+    _git(repo, "update-ref", "-d", "refs/remotes/origin/main")
+
+    assert _pinned_base(repo) == "", (
+        "with no base resolvable the helper must return empty, so the real-tree "
+        "cases skip; returning HEAD would restore the vacuous comparison silently"
+    )
+
+
+def test_a_pr_base_sha_wins_over_the_merge_base(tmp_path, monkeypatch):
+    """#4602: ``PR_BASE_SHA`` is the base CI knows, so it is used as given.
+
+    CI exports it for the guard's own step, so the tests compare against the same
+    ref the harness does instead of re-deriving one that can disagree with it.
+
+    PR_BASE_SHA names a commit that is NOT the merge base, so the two can be told
+    apart. With them equal, a regression that ignored PR_BASE_SHA would still
+    return the right answer and this test would pass while measuring nothing,
+    which is the gap CodeRabbit found in the first version.
+    """
+    repo, fork_point = _committed_repo_with_origin(tmp_path)
+
+    _git(repo, "checkout", "-q", "-b", "feature")
+    branch_tip = _commit_migration(repo, _MERGED_TS, "a commit on the branch")
+
+    _git(repo, "checkout", "-q", "--detach", fork_point)
+    origin_tip = _commit_migration(repo, "20260102000000_on_main.py", "a commit on main")
+    _git(repo, "update-ref", "refs/remotes/origin/main", origin_tip)
+    _git(repo, "checkout", "-q", "feature")
+
+    merge_base = _git(repo, "merge-base", "HEAD", "origin/main").strip()
+    assert merge_base == fork_point, (
+        f"the fork point must be the merge base, got {merge_base[:8]} vs {fork_point[:8]}"
+    )
+    assert branch_tip != fork_point, "the branch tip must differ from the fork point"
+
+    monkeypatch.setenv("PR_BASE_SHA", branch_tip)
+    assert _pinned_base(repo) == branch_tip, (
+        f"PR_BASE_SHA must win: expected {branch_tip[:8]}, not the merge base {merge_base[:8]}"
+    )
 
 
 def test_deleting_an_already_merged_timestamp_migration_is_caught(tmp_path):
