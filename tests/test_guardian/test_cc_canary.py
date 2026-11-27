@@ -97,6 +97,62 @@ async def test_recovery_after_a_failure_pages_an_all_clear(tmp_path, monkeypatch
     assert _state(config)["alerted"] is False
 
 
+@pytest.mark.parametrize(
+    ("body", "code", "status", "reason"),
+    [
+        (_OK, 0, "ok", "ok"),
+        (_FAIL, 0, "failed", "exit 0: Failed to authenticate"),
+        (_FAIL, 1, "failed", "exit 1: Failed to authenticate"),
+        ("", 0, "unconfirmed", "exit 0 with empty output"),
+        ("{not json SECRET-OUTPUT", 0, "unconfirmed", "exit 0 with invalid JSON"),
+        (
+            '{"type": "system", "note": "SECRET-OUTPUT"}',
+            0,
+            "unconfirmed",
+            "exit 0 with unrecognized result",
+        ),
+        ('["ok"]', 0, "unconfirmed", "exit 0 with unrecognized result"),
+    ],
+    ids=["success", "reported-error", "command-failure", "empty", "invalid", "other-dict", "list"],
+)
+@pytest.mark.asyncio
+async def test_only_a_recognized_success_records_ok(
+    tmp_path, monkeypatch, body, code, status, reason
+):
+    config, engine, dispatcher, _ = _setup(tmp_path, monkeypatch, body, code)
+    await maybe_run_cc_canary(config, engine, dispatcher)
+    state = _state(config)
+    assert state["status"] == status
+    assert state["ok"] is (status == "ok")
+    assert state["reason"].startswith(reason)
+    alerts = [c.args[0] for c in dispatcher.send_or_queue.await_args_list]
+    assert [a.severity for a in alerts] == ([] if status == "ok" else ["warning"])
+    # The raw output never reaches the page or the saved state.
+    assert all("SECRET-OUTPUT" not in a.body for a in alerts)
+    assert "SECRET-OUTPUT" not in state["reason"]
+
+
+@pytest.mark.parametrize("body", ["", "not json", '{"type": "system"}'])
+@pytest.mark.asyncio
+async def test_an_unconfirmed_result_does_not_clear_a_failure(tmp_path, monkeypatch, body):
+    config, engine, dispatcher, _ = _setup(tmp_path, monkeypatch, _FAIL, 1)
+    now = datetime(2026, 11, 18, 12, tzinfo=UTC)
+    await maybe_run_cc_canary(config, engine, dispatcher, now=now)
+    _stub(tmp_path, body, 0)  # exits 0 but proves nothing
+    await maybe_run_cc_canary(config, engine, dispatcher, now=now + timedelta(hours=25))
+    severities = [c.args[0].severity for c in dispatcher.send_or_queue.await_args_list]
+    assert severities == ["warning"]  # no all-clear, and no second page
+    state = _state(config)
+    assert state["alerted"] is True and state["ok"] is False
+    assert state["status"] == "unconfirmed"
+    # A confirmed success afterwards still clears it.
+    _stub(tmp_path, _OK, 0)
+    await maybe_run_cc_canary(config, engine, dispatcher, now=now + timedelta(hours=50))
+    severities = [c.args[0].severity for c in dispatcher.send_or_queue.await_args_list]
+    assert severities == ["warning", "info"]
+    assert _state(config)["alerted"] is False
+
+
 @pytest.mark.asyncio
 async def test_runs_at_most_once_per_interval(tmp_path, monkeypatch):
     config, engine, dispatcher, calls = _setup(tmp_path, monkeypatch, _OK, 0)
