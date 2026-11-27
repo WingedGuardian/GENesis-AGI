@@ -252,6 +252,21 @@ async def test_expand_skips_dangling_neighbors(db, qdrant):
     assert [r.memory_id for r in out] == [point_id("nbr-1")]
 
 
+async def test_expand_never_returns_a_deleted_memorys_leftover_point(db, qdrant):
+    """A deleted memory can leave its vector point behind, payload text and all,
+    and auto_link can link to it. Recall drops such a ghost, and so does
+    expansion: no metadata row, no neighbour."""
+    await _seed_memory(db, qdrant, point_id("seed-1"))
+    qdrant.put("episodic_memory", point_id("deleted-1"), content="deleted text", tags=[])
+    await _link(db, point_id("seed-1"), point_id("deleted-1"), strength=0.9)
+    await _seed_memory(db, qdrant, point_id("nbr-1"))
+    await _link(db, point_id("seed-1"), point_id("nbr-1"), strength=0.5)
+
+    out = await graph_expansion.expand_neighbors(db, qdrant, [point_id("seed-1")], cap=10)
+
+    assert [r.memory_id for r in out] == [point_id("nbr-1")]
+
+
 async def test_expand_cap_and_strength_ordering(db, qdrant):
     await _seed_memory(db, qdrant, point_id("seed-1"))
     for i, s in enumerate((0.3, 0.9, 0.6)):
@@ -590,8 +605,9 @@ async def test_hydrate_neighbours_reads_points_and_metadata(db, real_qdrant):
         source_type="memory",
         deprecated=False,
     )
-    # A point with no metadata companion reads as visible and unclassified.
-    _put_point(real_qdrant, "episodic_memory", NO_META, content="bare", tags=[], source_type="m")
+    # A point with no metadata row is a deleted memory's leftover vector: its
+    # payload still holds the deleted text, and recall drops it as a ghost.
+    _put_point(real_qdrant, "episodic_memory", NO_META, content="deleted", source_type="m")
     # An embedded memory whose point is gone is a dangling link, even when a
     # stale FTS row survives it.
     await _metadata(db, GHOST)
@@ -621,15 +637,6 @@ async def test_hydrate_neighbours_reads_points_and_metadata(db, real_qdrant):
             "invalid_at": "2099-01-01T00:00:00+00:00",
             "deprecated": 1,
         },
-        NO_META: {
-            "content": "bare",
-            "source_type": "m",
-            "tags": "",
-            "collection": "episodic_memory",
-            "origin_class": None,
-            "invalid_at": None,
-            "deprecated": 0,
-        },
     }
     assert await graph_expansion.hydrate_neighbours(db, real_qdrant, []) == {}
 
@@ -648,6 +655,8 @@ async def test_hydrate_neighbours_omits_memories_without_a_vector(db, real_qdran
 async def test_hydrate_neighbours_point_in_both_collections_reads_as_knowledge_base(
     db, real_qdrant
 ):
+    await _metadata(db, ALIVE)
+    await db.commit()
     _put_point(real_qdrant, "episodic_memory", ALIVE, content="ep", source_type="memory")
     _put_point(real_qdrant, "knowledge_base", ALIVE, content="kb", source_type="memory")
 
@@ -662,12 +671,17 @@ async def test_hydrate_neighbours_ignores_points_not_asked_for(db):
         def retrieve(self, collection_name, ids, with_payload, with_vectors):
             return [SimpleNamespace(id=ABSENT, payload={"content": "not asked for"})]
 
+    # A real memory, so only the asked-for filter can keep it out.
+    await _metadata(db, ABSENT)
+    await db.commit()
     assert await graph_expansion.hydrate_neighbours(db, _ExtraPoint(), [ALIVE]) == {}
 
 
 async def test_hydrate_neighbours_drops_ids_that_cannot_be_points(db, qdrant):
     """A Qdrant server rejects a whole retrieve that names a non-UUID id (the
     fake does too), so one malformed link must not cost the other neighbours."""
+    await _metadata(db, ALIVE)
+    await db.commit()
     qdrant.put("episodic_memory", ALIVE, content="kept", source_type="memory", tags=[])
     with pytest.raises(ValueError):
         qdrant.retrieve(collection_name="episodic_memory", ids=[ALIVE, "ghost-no-such-memory"])

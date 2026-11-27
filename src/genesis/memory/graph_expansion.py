@@ -297,12 +297,15 @@ async def hydrate_neighbours(
     (``tags`` as the space-separated string ``store()`` also writes to FTS);
     ``collection`` is the collection that holds the point. ``origin_class``,
     ``invalid_at`` and ``deprecated`` come from ``memory_metadata``, the
-    authoritative copy; no row there reads as visible and unclassified.
+    authoritative copy.
 
     An id with no point is omitted: a dangling link (an id that is not a UUID
     cannot have one, so it is dropped before the read), and also a memory that has
     no vector (a ``fts5_only`` subsystem write, or one still ``pending``
-    embedding, which returns once embedded). A failed point read raises; both
+    embedding, which returns once embedded). So is a point with no
+    ``memory_metadata`` row: that is a deleted memory's leftover vector, whose
+    payload still holds the deleted text, and recall drops it as a ghost too
+    (``retrieval.metadata_missing_ids``). A failed point read raises; both
     callers already log it and skip expansion.
     """
     # An id that is not a UUID cannot have a point, so it is dangling too.
@@ -313,8 +316,10 @@ async def hydrate_neighbours(
     meta = await memory_crud.expansion_metadata_by_ids(db, list(points))
     out: dict[str, dict] = {}
     for mid, (collection, payload) in points.items():
+        row = meta.get(mid)
+        if row is None:
+            continue  # a ghost: the memory was deleted, its point was not
         tags = payload.get("tags")
-        row = meta.get(mid, {})
         out[mid] = {
             "content": payload.get("content"),
             "source_type": payload.get("source_type"),
@@ -322,7 +327,7 @@ async def hydrate_neighbours(
             "collection": collection,
             "origin_class": row.get("origin_class"),
             "invalid_at": row.get("invalid_at"),
-            "deprecated": row.get("deprecated", 0),
+            "deprecated": row["deprecated"],
         }
     return out
 
