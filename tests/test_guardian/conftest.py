@@ -31,7 +31,7 @@ def _cc_canary_stubbed(request, monkeypatch):
         return
 
     async def _ok(_config, _engine):
-        return True, "ok (stubbed by tests/test_guardian/conftest.py)"
+        return "ok", "ok (stubbed by tests/test_guardian/conftest.py)"
 
     monkeypatch.setattr("genesis.guardian.cc_canary._run_once", _ok)
 
