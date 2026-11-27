@@ -292,3 +292,63 @@ def test_the_dedup_paragraph_names_every_store_time_layer(rep, db_path, tmp_path
     assert "context-overlap check against trusted lessons only" in md
     assert "store drafts with none of them" in md  # e.g. the executor retrospective
     assert "duplicates it lets through" not in md
+
+
+# ── Round-2 review fixes on #4721 ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("alias", ["same-name", "symlink", "csv-sibling", "wal-via-db-symlink"])
+def test_an_output_that_is_the_input_database_is_refused(rep, db_path, tmp_path, alias):
+    """Codex P1: --out (or its .csv sibling) naming the input database would
+    truncate it, though the database is only ever opened read-only."""
+    before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+    db = db_path
+    if alias == "same-name":
+        out = db_path
+    elif alias == "symlink":
+        out = tmp_path / "link.md"
+        out.symlink_to(db_path)
+    elif alias == "csv-sibling":  # a database named *.csv is the .csv sibling of an .md --out
+        db = db_path.rename(tmp_path / "lessons.csv")
+        out = tmp_path / "lessons.md"
+    else:  # --db is a symlink; SQLite names the WAL after the real file
+        db = tmp_path / "link.db"
+        db.symlink_to(db_path)
+        out = Path(str(db_path) + "-wal")
+    assert rep.main(["--db", str(db), "--out", str(out)]) == 2
+    assert hashlib.sha256(db.read_bytes()).hexdigest() == before
+    if alias == "wal-via-db-symlink":
+        assert not out.exists()
+
+
+def test_a_quarantined_lesson_is_never_live(rep, tmp_path):
+    """Codex P2: production readers filter quarantined = 0, so a quarantined
+    non-draft must not be reported as a draft's live absorber."""
+    path = tmp_path / "q.db"
+
+    async def _make():
+        import aiosqlite
+
+        async with aiosqlite.connect(path) as db:
+            await create_all_tables(db)
+            for pid, draft, quarantined, created in (
+                ("LQ", 0, 1, "2026-01-01T00:00:00+00:00"),
+                ("D", 1, 0, "2026-01-02T00:00:00+00:00"),
+            ):
+                await db.execute(
+                    "INSERT INTO procedural_memory (id, task_type, principle, steps, tools_used,"
+                    " context_tags, created_at, draft, quarantined, principle_embedding)"
+                    " VALUES (?, 't', 'p', '[]', '[]', '[]', ?, ?, ?, ?)",
+                    (pid, created, draft, quarantined, _e((0, 1.0))),
+                )
+            await db.commit()
+
+    asyncio.run(_make())
+    lessons = rep.load(path)
+    result = rep.analyse(lessons, block=8)
+    assert _by_id(lessons, result, "nearest_live")["D"] is None
+    out = tmp_path / "q.md"
+    assert rep.main(["--db", str(path), "--out", str(out)]) == 0
+    md = out.read_text()
+    assert "live (not draft, not quarantined): 0; quarantined non-drafts: 1" in md
+    assert "0 of 1 drafts have such a live lesson" in md

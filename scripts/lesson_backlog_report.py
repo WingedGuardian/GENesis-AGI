@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sqlite3
 import sys
 from dataclasses import dataclass
@@ -63,6 +64,7 @@ class Lessons:
     principles: list[str]
     created: list[str]
     draft: np.ndarray  # bool (N,)
+    quarantined: np.ndarray  # bool (N,); never live, as every production reader treats it
     vectors: np.ndarray  # float32 (N, D), L2-normalised
     skipped: int  # rows with no usable embedding
 
@@ -84,7 +86,8 @@ def load(db_path: Path) -> Lessons:
     conn = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
     try:
         rows = conn.execute(
-            "SELECT id, task_type, principle, created_at, draft, principle_embedding"
+            "SELECT id, task_type, principle, created_at, draft, principle_embedding,"
+            " quarantined"
             " FROM procedural_memory WHERE deprecated = 0"
             " ORDER BY julianday(created_at), created_at, id"
         ).fetchall()
@@ -113,6 +116,7 @@ def load(db_path: Path) -> Lessons:
         principles=[r[2] for r in keep],
         created=[r[3] for r in keep],
         draft=np.array([bool(r[4]) for r in keep], dtype=bool),
+        quarantined=np.array([bool(r[6]) for r in keep], dtype=bool),
         vectors=matrix / norms,
         skipped=skipped,
     )
@@ -162,7 +166,9 @@ def analyse(lessons: Lessons, *, block: int) -> dict:
     "earlier" is "lower index"."""
     n = len(lessons.ids)
     x = lessons.vectors
-    live_mask = ~lessons.draft
+    # Live means usable now: neither a draft nor quarantined (the production
+    # readers filter quarantined = 0), so a failed procedure absorbs nothing.
+    live_mask = ~lessons.draft & ~lessons.quarantined
     comps = _Components(n)
     nearest_earlier = np.full(n, -1)
     nearest_earlier_cos = np.full(n, np.nan)
@@ -232,6 +238,7 @@ def render(lessons: Lessons, result: dict, *, generated_at: str, csv_name: str) 
     n = len(lessons.ids)
     drafts = np.nonzero(lessons.draft)[0]
     nd = len(drafts)
+    live = ~lessons.draft & ~lessons.quarantined
     out = [
         "# Lesson backlog report",
         "",
@@ -239,7 +246,8 @@ def render(lessons: Lessons, result: dict, *, generated_at: str, csv_name: str) 
         "",
         f"- Lessons read (not deprecated): {n + lessons.skipped}",
         f"- Without a usable embedding, left out: {lessons.skipped}",
-        f"- Drafts: {nd}; live (not draft): {n - nd}",
+        f"- Drafts: {nd}; live (not draft, not quarantined): {int(live.sum())}; "
+        f"quarantined non-drafts: {n - nd - int(live.sum())}",
         f"- Per-draft detail: `{csv_name}`",
         "",
     ]
@@ -290,7 +298,8 @@ def render(lessons: Lessons, result: dict, *, generated_at: str, csv_name: str) 
     ]
     for rank, topic in enumerate(topics[:TOP_TOPICS], 1):
         d = int(lessons.draft[topic].sum())
-        out.append(f"{rank}. **{len(topic)} lessons** ({d} drafts, {len(topic) - d} live)")
+        lv = int(live[topic].sum())
+        out.append(f"{rank}. **{len(topic)} lessons** ({d} drafts, {lv} live)")
         for i in topic[:EXAMPLES_PER_TOPIC]:
             out.append(f"   - `{lessons.task_types[i]}`: {_one_line(lessons.principles[i])}")
     absorbed: dict[int, list[int]] = {}
@@ -374,6 +383,24 @@ def write_csv(path: Path, lessons: Lessons, result: dict) -> None:
             )
 
 
+def _aliases_database(target: Path, db_path: Path) -> bool:
+    """Whether writing ``target`` would write over the input database or one of
+    its SQLite files (the -wal, -shm and -journal siblings), by name, symlink or
+    hard link. A read-only report must never write to what it reads."""
+    # SQLite names its sidecar files after the file it opened, the resolved path.
+    real_db = Path(db_path).resolve()
+    for sibling in ("", "-wal", "-shm", "-journal"):
+        db_file = Path(str(real_db) + sibling)
+        if target.resolve() == db_file.resolve():
+            return True
+        try:
+            if target.exists() and db_file.exists() and os.path.samefile(target, db_file):
+                return True
+        except OSError:
+            return True  # cannot tell, so do not write
+    return False
+
+
 def _positive(text: str) -> int:
     value = int(text)
     if value < 1:
@@ -414,8 +441,16 @@ def main(argv: list[str] | None = None) -> int:
     now = datetime.now(UTC).astimezone(ZoneInfo(user_timezone()))
     if out is None:
         out = output_dir() / f"lesson-backlog-report-{now.date()}.md"
-    out.parent.mkdir(parents=True, exist_ok=True)
     csv_path = out.with_suffix(".csv")
+    for target in (out, csv_path):
+        if _aliases_database(target, db_path):
+            print(
+                f"lesson_backlog_report: {target} is the input database or one of its"
+                " files; not writing over it",
+                file=sys.stderr,
+            )
+            return 2
+    out.parent.mkdir(parents=True, exist_ok=True)
     write_csv(csv_path, lessons, result)
     out.write_text(render(lessons, result, generated_at=now.isoformat(), csv_name=csv_path.name))
     print(f"wrote {out} and {csv_path} ({len(lessons.ids)} lessons, block={block})")
