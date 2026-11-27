@@ -106,14 +106,31 @@ async def test_recovery_after_a_failure_pages_an_all_clear(tmp_path, monkeypatch
         ("", 0, "unconfirmed", "exit 0 with empty output"),
         ("{not json SECRET-OUTPUT", 0, "unconfirmed", "exit 0 with invalid JSON"),
         (
-            '{"type": "system", "note": "SECRET-OUTPUT"}',
+            '{"type": "system", "is_error": false, "note": "SECRET-OUTPUT"}',
+            0,
+            "unconfirmed",
+            "exit 0 with unrecognized result",
+        ),
+        ('{"type": "result", "result": "ok"}', 0, "unconfirmed", "exit 0 with unrecognized result"),
+        (
+            '{"type": "result", "is_error": 0, "result": "ok"}',
             0,
             "unconfirmed",
             "exit 0 with unrecognized result",
         ),
         ('["ok"]', 0, "unconfirmed", "exit 0 with unrecognized result"),
     ],
-    ids=["success", "reported-error", "command-failure", "empty", "invalid", "other-dict", "list"],
+    ids=[
+        "success",
+        "reported-error",
+        "command-failure",
+        "empty",
+        "invalid",
+        "other-dict",
+        "no-is-error",
+        "zero-is-error",
+        "list",
+    ],
 )
 @pytest.mark.asyncio
 async def test_only_a_recognized_success_records_ok(
