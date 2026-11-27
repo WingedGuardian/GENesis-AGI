@@ -18,13 +18,61 @@ from tests.test_hooks.native_codex import (
     run_native,
     trust_fixture_hook,
 )
+from tests.test_mcp.test_validator_writer_profiles import (
+    HEALTH_READS,
+    MEMORY_READS,
+    VALIDATOR_ONLY_TOOLS,
+)
 from tests.test_mcp.validator_stdio_fixture import prepare
 from tests.test_scripts.test_pr_verification_closer import _doc
 
 ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.skipif(os.environ.get("GENESIS_CODEX_NATIVE_TESTS") != "1",
                               reason="opt-in pinned native writer qualification")
-CASES = ["private", "preview", "record", "episodic_memory", "knowledge_base", "external_health", "external_memory"]
+VERDICTS = {"preview": "pass-mechanical", "record": "pass-mechanical",
+            "inconclusive": "cannot-verify", "failed": "fail-intent"}
+CASES = ["private", *VERDICTS, "episodic_memory", "knowledge_base", "external_health", "external_memory"]
+PACKAGE_DIGESTS = {
+    "codex-cli 0.166.0": {
+        "codex": "b8a11fedf24b2dfb59a70c9e52b030f9a508dcd49cd2dd0d41956f4c785156b8",
+        "codex-code-mode-host": "657f4e902726e05867c937b583049d5997e057f8cd0ab40450633c9c9ef8d630",
+    },
+    "codex-cli 0.171.0": {
+        "codex": "b76a027d6b210f9a8da7aaf321dd235c700f0ef7a794d4a5314b9af6c134f0f0",
+        "codex-code-mode-host": "f49bd4f0c0cc73cf1ec3a719009e07ce5b6e100520d023c760cc203fb37e5c6f",
+    },
+}
+
+
+def measured_evidence(root, case):
+    """Measure an actual CLI against a disposable release candidate before submitting the claim."""
+    scanner = ROOT / "scripts/ci/private_pattern_scan.py"
+    patterns = root / "fixture-patterns"
+    marker = "validator-reserved-test-marker"
+    if case != "inconclusive":
+        patterns.write_text(marker + "\n")
+    run = subprocess.run(
+        [sys.executable, str(scanner), "--patterns", str(patterns)],
+        input=marker if case == "failed" else "ordinary fixture content",
+        text=True, capture_output=True, check=False,
+    )
+    exit_code, expected_banner, verdict, tier = {
+        "preview": (0, "Private-pattern exact scan: CLEAN", "pass", "MEASURED"),
+        "record": (0, "Private-pattern exact scan: CLEAN", "pass", "MEASURED"),
+        "failed": (1, "match count: 1", "fail", "MEASURED"),
+        "inconclusive": (3, "::error::cannot read pattern file (FileNotFoundError)",
+                         "unverified", "NOT_VERIFIABLE_HERE"),
+    }[case]
+    assert run.returncode == exit_code
+    assert expected_banner in (run.stdout + run.stderr).splitlines()
+    return _doc(
+        deploy={"method": "content", "established": True,
+                "detail": "Executed private_pattern_scan.py at sha256 " + hashlib.sha256(scanner.read_bytes()).hexdigest()},
+        claims=[{"claim": "The candidate passes the configured private-pattern scan.",
+                 "verdict": verdict, "tier": tier,
+                 "measurement": f"Scanner exit {run.returncode}. {(run.stdout or run.stderr).strip()}"}],
+        controls=["Reserved marker present, absent, or pattern file unavailable in separate fixture cases."],
+    )
 
 
 def decoded_tool_result(result):
@@ -45,22 +93,29 @@ def decoded_tool_result(result):
 async def test_native_validator_writer_dispatch(tmp_path, monkeypatch, client, case):
     binary = os.environ["GENESIS_CODEX_CLI_BIN" if client == "cli" else "GENESIS_CODEX_APP_SERVER_BIN"]
     app = os.environ["GENESIS_CODEX_APP_SERVER_BIN"]
-    assert subprocess.check_output([binary, "--version"], text=True).strip() == "codex-cli 0.166.0"
-    expected_binary = bytes.fromhex("b8a11fed f24b2dfb 59a70c9e 52b030f9 a508dcd4 9cd2dd0d 41956f4c 785156b8")
-    assert hashlib.sha256(Path(binary).read_bytes()).digest() == expected_binary
-    assert hashlib.sha256(Path(app).read_bytes()).digest() == expected_binary
+    version = subprocess.check_output([binary, "--version"], text=True).strip()
+    expected_binary = PACKAGE_DIGESTS[version]
+    for executable in {binary, app}:
+        codex = Path(executable).resolve()
+        for artifact, digest in expected_binary.items():
+            path = codex if artifact == "codex" else codex.with_name(artifact)
+            with path.open("rb") as stream:
+                assert hashlib.file_digest(stream, "sha256").hexdigest() == digest
     profile = "external" if case.startswith("external_") else "validator"
-    fixture = await prepare(tmp_path, profile=profile, recording=case == "record")
+    recording = case in {"record", "inconclusive", "failed"}
+    fixture = await prepare(tmp_path, profile=profile, recording=recording)
     memory = case in {"episodic_memory", "knowledge_base", "external_memory"}
     server = "memory" if memory else "health"
-    tool = "memory_store" if memory else "pr_verification_close" if case in {"preview", "record"} else "follow_up_create"
+    tool = "memory_store" if memory else "pr_verification_close" if case in VERDICTS else "follow_up_create"
     arguments = ({"content": "Owner-directed synthetic native measurement", "source": "native fixture",
                   "confidence": 0.95, "memory_class": "fact", "wing": "dev_workflow", "room": "validation",
                   "collection": case if memory and profile == "validator" else "episodic_memory"}
-                 if memory else {"pr": 7, "evidence_json": json.dumps(_doc())}
-                 if case in {"preview", "record"} else
+                 if memory else {"pr": 7, "evidence_json": json.dumps(measured_evidence(tmp_path, case))}
+                 if case in VERDICTS else
                  {"content": "Synthetic native private finding", "reason": "Synthetic native evidence",
                   "work_state": "ready", "strategy": "user_input_needed", "request_key": "native-finding"})
+    if case in {"inconclusive", "failed"}:
+        arguments["note"] = "Synthetic functional evidence requires follow-up."
     key = "mcp__genesis_validator_" + server + "__" + tool
     program = ('const key=' + json.dumps(key) + '; const catalog=ALL_TOOLS.filter(t=>'
                't.name.startsWith("mcp__genesis_validator_")).map(t=>t.name).sort(); '
@@ -83,14 +138,18 @@ async def test_native_validator_writer_dispatch(tmp_path, monkeypatch, client, c
     definition = private_module("native_writer_adapter", runtime / "scripts/hooks/codex_validator_adapter.py")
     sources = {"writer/" + str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
                for p in [ROOT / "scripts/genesis_mcp_server.py", Path(__file__),
+                         ROOT / "tests/test_mcp/test_validator_writer_profiles.py",
                          ROOT / "tests/test_mcp/validator_stdio_fixture.py", ROOT / "tests/test_hooks/native_codex.py",
+                         ROOT / "tests/test_scripts/test_pr_verification_closer.py",
                          *sorted((ROOT / "src/genesis").rglob("*.py"))]}
     sources.update({"adapter/" + str(p.relative_to(runtime)): hashlib.sha256(p.read_bytes()).hexdigest()
                     for p in runtime.rglob("*") if p.is_file() and ".venv" not in p.parts})
-    evidence = {"client": client, "case": case, "profile": profile, "source_root": str(ROOT),
+    evidence = {"binary_version": version, "binary_sha256": expected_binary["codex"],
+                "code_mode_host_sha256": expected_binary["codex-code-mode-host"],
+                "client": client, "case": case, "profile": profile, "source_root": str(ROOT),
                 "adapter_source": str(adapter), "adapter_runtime": str(runtime), "hashes": sources,
                 "database": str(fixture["database"]), "integration_preview": True,
-                "owned_recording_enabled": case == "record"}
+                "owned_recording_enabled": recording}
     try:
         with fixture_provider(item) as (url, requests):
             env = configure(tmp_path, url, "allow") | fixture["environment"]
@@ -117,9 +176,13 @@ async def test_native_validator_writer_dispatch(tmp_path, monkeypatch, client, c
                    for line in output.splitlines() if line.startswith("VALIDATOR_WRITER:")]
         assert len(records) == 1, outputs
         record = records[0]
-        health = [name for name in record["catalog"] if name.startswith("mcp__genesis_validator_health__")]
-        memories = [name for name in record["catalog"] if name.startswith("mcp__genesis_validator_memory__")]
-        assert (len(health), len(memories)) == ((5, 8) if profile == "external" else (9, 9))
+        expected = {"health": HEALTH_READS, "memory": MEMORY_READS}
+        if profile == "validator":
+            expected = {scope: reads | VALIDATOR_ONLY_TOOLS[scope] for scope, reads in expected.items()}
+        expected_tools = {f"mcp__genesis_validator_{scope}__{name}"
+                          for scope, names in expected.items() for name in names}
+        assert len(record["catalog"]) == len(expected_tools)
+        assert set(record["catalog"]) == expected_tools
         hooks = [json.loads(line) for line in (tmp_path / "hooks.jsonl").read_text().splitlines()] if (tmp_path / "hooks.jsonl").exists() else []
         if profile == "external":
             assert key not in record["catalog"] and "not a function" in record["result"]["error"]
@@ -128,16 +191,23 @@ async def test_native_validator_writer_dispatch(tmp_path, monkeypatch, client, c
             assert key in record["catalog"]
             returned = decoded_tool_result(record["result"])
             assert len(hooks) == 1 and hooks[0]["tool_name"] == key
-            if case in {"preview", "record"}:
+            if case in VERDICTS:
                 assert returned["dry_run"] is (case == "preview")
                 assert returned["server_dry_run_only"] is (case == "preview")
-                assert returned["recorded"] is (case == "record")
-                assert returned["would_close"] is True and returned["pr"] == 7 and returned["repo"] == "owner/repo"
-                assert returned["verdict"] == "pass-mechanical"
+                assert returned["recorded"] is recording
+                assert returned["would_close"] is (case in {"preview", "record"})
+                assert returned["pr"] == 7 and returned["repo"] == "owner/repo"
+                assert returned["verdict"] == VERDICTS[case]
         with sqlite3.connect(fixture["database"]) as reader:
             assert reader.execute("SELECT COUNT(*) FROM follow_ups").fetchone()[0] == int(case == "private")
-            assert reader.execute("SELECT status,attempt_count FROM pr_verifications").fetchall() == [
-                ("closed" if case == "record" else "open", int(case == "record"))]
+            assert reader.execute("SELECT status,attempt_count,verdict FROM pr_verifications").fetchall() == [
+                ("closed" if case == "record" else "open", int(recording), VERDICTS[case] if recording else None)]
+            stored = reader.execute("SELECT evidence FROM pr_verifications").fetchone()[0]
+            if recording:
+                submitted = json.loads(arguments["evidence_json"])
+                assert json.loads(stored)["claims"] == submitted["claims"]
+            else:
+                assert stored is None
             assert reader.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0] == int(memory and profile == "validator")
             if memory and profile == "validator":
                 assert reader.execute("SELECT collection FROM memory_fts").fetchall() == [(case,)]
