@@ -39,6 +39,13 @@ Applies to any PR whose diff touches the enforcement-hook surface (`scripts/revi
   dispatched alike, a push onto the PR's branch, `gh pr update-branch`, and an
   `@codex` mention off the terminal head (`_past_terminal_route_deny`,
   `_past_terminal_push_deny`); an unreadable budget leaves these as they were.
+  An owner's "merge at head X" is pinned with a PR comment
+  from a maintainer's account whose first line is the marker
+  `<!-- genesis-pin head=<full sha> -->`, nothing else on that line: post it as its
+  own comment (any other author's pin, and a marker on a later line, is ignored;
+  a malformed first-line marker blocks); the merge must then be at X as well, and only
+  the owner removes a pin (a deletion leaves no trace on GitHub,
+  so that limit is best effort).
 
   **Scope: any PR whose diff touches the enforcement-hook surface** —
   `HOOK_SURFACE_PREFIXES` + `HOOK_SURFACE_FILES` in `scripts/review_budget.py`.

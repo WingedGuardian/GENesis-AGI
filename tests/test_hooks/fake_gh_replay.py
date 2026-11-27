@@ -244,8 +244,8 @@ GRAPHQL_DOCUMENTS = {
         " body author { login __typename } commit { oid } comments(first: 100) {"
         " pageInfo { hasNextPage } nodes { fullDatabaseId replyTo { id } body path } } } }"
         " comments(first: 100, after: $after_comments) { pageInfo { hasNextPage"
-        " endCursor } nodes { fullDatabaseId body createdAt updatedAt author { login"
-        " __typename } } } files(first: 100, after: $after_files) { pageInfo {"
+        " endCursor } nodes { fullDatabaseId body createdAt updatedAt authorAssociation"
+        " author { login __typename } } } files(first: 100, after: $after_files) { pageInfo {"
         " hasNextPage endCursor } nodes { path changeType } } commits(first: 100,"
         " after: $after_commits) { pageInfo { hasNextPage endCursor } nodes { commit"
         " { oid committedDate tree { oid } parents(first: 100) { totalCount nodes {"
@@ -260,8 +260,8 @@ GRAPHQL_DOCUMENTS = {
         " author { login __typename } commit { oid } comments(first: 100) { pageInfo"
         " { hasNextPage } nodes { fullDatabaseId replyTo { id } body path } } } }"
         " comments(first: 100, after: $after_comments) { pageInfo { hasNextPage"
-        " endCursor } nodes { fullDatabaseId body createdAt updatedAt author { login"
-        " __typename } } } commits(first: 100, after: $after_commits) { pageInfo {"
+        " endCursor } nodes { fullDatabaseId body createdAt updatedAt authorAssociation"
+        " author { login __typename } } } commits(first: 100, after: $after_commits) { pageInfo {"
         " hasNextPage endCursor } nodes { commit { oid committedDate tree { oid }"
         " parents(first: 100) { totalCount nodes { oid } } } } } } } }"
     ),
@@ -479,6 +479,8 @@ def _review_budget_answer(state: dict, connections: tuple[str, ...]) -> dict:
             "body": c["body"],
             "createdAt": c["created_at"],
             "updatedAt": c["updated_at"],
+            # REST's own field; GitHub always answers one, so a fixture without it is NONE.
+            "authorAssociation": c.get("author_association", "NONE"),
             "author": _graphql_author(c["user"]),
         }
         for c in api[f"issues/{pr}/comments"]

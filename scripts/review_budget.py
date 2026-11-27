@@ -168,8 +168,40 @@ _CONFIRMATION_RE = re.compile(
     r"kind=confirmation\s*-->",
     re.IGNORECASE,
 )
+#: An owner's "merge at head X" ruling, posted as a PR comment (owner ruling
+#: 3f6ad6fb, F-B2). It only restricts which head an agent may merge.
+_PIN_RE = re.compile(r"<!--\s*genesis-pin\s+head=([0-9a-fA-F]{40})\s*-->", re.IGNORECASE)
+#: A first line that STARTS a pin marker (``genesis-pin`` as a whole word, so not
+#: ``genesis-pin-help``) but is not the strict form: a malformed pin, which blocks.
+_PIN_START_RE = re.compile(r"<!--+\s*genesis-pin(?![\w-])", re.IGNORECASE)
+#: Zero-width characters str.strip() keeps; a leading one must not hide a pin.
+_INVISIBLE = "\ufeff\u200b\u200c\u200d\u2060"
+#: The GitHub ``authorAssociation`` values whose pin comments count: the repo's maintainers.
+_PIN_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 
 Runner = Callable[..., tuple[int, str, str]]
+
+
+def _pin_marker(body: str) -> tuple[str | None, bool]:
+    """``(head, malformed)``: the pin a comment carries, read from its FIRST
+    non-blank line only, which must be the whole strict marker. Every other line
+    is ignored, wherever ``genesis-pin`` appears in it: the agent posts from the
+    maintainer's account, so an example it quotes (in code, a quote or prose) must
+    never bind, and no markdown model is needed to tell an example from a pin.
+    A first line that starts a marker but is not the strict form is malformed.
+    A first line indented four or more columns (or by a tab) is an indented code
+    block as GitHub renders it, so it is an example: never a pin, never malformed.
+    Leading zero-width characters are dropped first, so they cannot hide a pin."""
+    lines = (line.lstrip(_INVISIBLE) for line in body.splitlines())
+    raw = next((line for line in lines if line.strip()), "")
+    indent = raw[: len(raw) - len(raw.lstrip(" \t"))]
+    if "\t" in indent or len(indent) >= 4:
+        return None, False
+    first = raw.strip()
+    strict = _PIN_RE.fullmatch(first)
+    if strict is not None:
+        return strict.group(1).lower(), False
+    return None, _PIN_START_RE.match(first) is not None
 
 
 def _parse_external_identity_scalar(raw: str) -> object:
@@ -274,6 +306,8 @@ def _unknown(*errors: str, current_head: str = "") -> dict[str, Any]:
         "terminal_head": None,
         "terminal_error": "evidence_unknown",
         "confirmation_heads": [],
+        "pin_heads": [],
+        "pin_error": "evidence_unknown",
         "open_keys": [],
         "reflection_keys": "unknown",
         "body": None,
@@ -809,6 +843,8 @@ def evaluate_evidence(
     # head. A marker with no time cannot be placed among the others.
     confirmation_times: dict[str, datetime] = {}
     confirmation_untimed: set[str] = set()
+    pin_heads: set[str] = set()
+    pin_malformed = False
     for item in issue_comments:
         if not isinstance(item, Mapping):
             return _unknown("malformed_comment_record", current_head=head)
@@ -840,6 +876,14 @@ def evaluate_evidence(
                 confirmation_untimed.add(marker_head)
             elif marker_head not in confirmation_times or marked < confirmation_times[marker_head]:
                 confirmation_times[marker_head] = marked
+        # Only a maintainer's pin counts. On a public repo anyone can comment, and a
+        # stranger's stale or disagreeing pin would block every agent merge until the
+        # owner removed it. Anyone else's pin-shaped text, or a deleted author's, is ignored.
+        if login is not None and item.get("author_association") in _PIN_ASSOCIATIONS:
+            pin_head, malformed_pin = _pin_marker(body)
+            if pin_head is not None:
+                pin_heads.add(pin_head)
+            pin_malformed = pin_malformed or malformed_pin
         for index, pattern in enumerate(identities):
             for match in pattern.finditer(body):
                 resolved, error = _resolve_sha(match.group(1), commits)
@@ -1083,6 +1127,15 @@ def evaluate_evidence(
         if terminal_error is not None:
             terminal_state, terminal_head = "unknown", None
 
+    # Every live pin must hold (F-B2): the newest does not win, so two heads disagree.
+    pin_error = None
+    if pin_malformed:
+        pin_error = "malformed_pin"
+    elif any(sha not in order for sha in pin_heads):
+        pin_error = "pin_not_in_pr"
+    elif len(pin_heads) > 1:
+        pin_error = "pins_disagree"
+
     # Live rounds only: a head a force-push removed has no position, so its place
     # in this order (and so in the trend) would be a guess.
     scored = [r["findings"] for r in rounds if r["findings"] is not None and r["head"] in order]
@@ -1212,6 +1265,8 @@ def evaluate_evidence(
             }
             for sha in sorted(confirmation_heads)
         ],
+        "pin_heads": sorted(pin_heads),
+        "pin_error": pin_error,
         "rounds": rounds,
         "round_state": round_state,
         "trend": trend,
@@ -1393,7 +1448,8 @@ _GRAPHQL_CONNECTIONS = {
     ),
     "comments": (
         "comments(first: 100, after: $after_comments) { pageInfo { hasNextPage endCursor } "
-        "nodes { fullDatabaseId body createdAt updatedAt author { login __typename } } }"
+        "nodes { fullDatabaseId body createdAt updatedAt authorAssociation "
+        "author { login __typename } } }"
     ),
     "files": (
         "files(first: 100, after: $after_files) { pageInfo { hasNextPage endCursor } "
@@ -1523,6 +1579,7 @@ def _graphql_rows(name: str, nodes: object) -> tuple[list[dict[str, Any]], bool]
                     "id": _node_id(node),
                     "login": login,
                     "type": kind,
+                    "author_association": node.get("authorAssociation"),
                     "body": node.get("body"),
                     "created_at": node.get("createdAt"),
                     "updated_at": node.get("updatedAt"),

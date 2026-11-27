@@ -475,3 +475,357 @@ def test_the_report_row_is_ok_below_terminal(monkeypatch, capsys):
     row = next(ln for ln in out.splitlines() if ln.startswith("terminal-head"))
     assert row == "terminal-head  : ok (below terminal)"
     assert rc == 0, out
+
+
+# -- the pin (owner ruling 3f6ad6fb, F-B2): an owner's "merge at head X" ----------
+
+
+def _pin(
+    head: str, when: str = _at(9), *, login: str | None = "owner", assoc: str | None = "OWNER"
+) -> dict:
+    return {
+        "login": login,
+        "type": "User" if login else None,
+        "author_association": assoc,
+        "body": f"<!-- genesis-pin head={head} -->\nOwner ruled: merge at this head.",
+        "created_at": when,
+    }
+
+
+def test_no_pin_reads_as_no_pin():
+    got = _ev(head=H5)
+    assert got["pin_heads"] == [] and got["pin_error"] is None
+
+
+def test_a_pin_comment_is_read_lowercased():
+    got = _ev(head=H5, comments=(_pin("A" * 40),), commits=(H1, "a" * 40, H5))
+    assert got["pin_heads"] == ["a" * 40] and got["pin_error"] is None
+
+
+@pytest.mark.parametrize("assoc", ["OWNER", "MEMBER", "COLLABORATOR"])
+def test_a_maintainers_pin_binds(assoc):
+    got = _ev(head=H5, comments=(_pin(H3, login="maintainer", assoc=assoc),))
+    assert got["pin_heads"] == [H3] and got["pin_error"] is None
+    assert G._check_past_terminal("7", "o/r", H5, budget=got)[0] is True
+
+
+@pytest.mark.parametrize("assoc", ["NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", None])
+def test_a_strangers_pin_is_ignored(assoc):
+    # On a public repo anyone can comment: a stranger's pin must not bind or block.
+    got = _ev(head=H5, comments=(_pin(H3, login="stranger", assoc=assoc),))
+    assert got["pin_heads"] == [] and got["pin_error"] is None
+    assert G._check_past_terminal("7", "o/r", H5, budget=got)[0] is False
+
+
+def test_a_deleted_authors_pin_is_ignored():
+    got = _ev(head=H5, comments=(_pin(H3, login=None, assoc="OWNER"),))
+    assert got["pin_heads"] == [] and got["pin_error"] is None
+
+
+def test_a_strangers_disagreeing_or_stray_pin_creates_no_error():
+    comments = (
+        _pin(H3, _at(8)),
+        _pin(H2, _at(9), login="stranger", assoc="NONE"),
+        _pin("9" * 40, _at(10), login="stranger", assoc="CONTRIBUTOR"),
+    )
+    got = _ev(head=H5, comments=comments)
+    assert got["pin_heads"] == [H3] and got["pin_error"] is None
+    assert G._check_past_terminal("7", "o/r", H3, budget=got)[0] is False
+
+
+def test_a_pin_outside_the_prs_commits_is_an_error():
+    got = _ev(head=H5, comments=(_pin("9" * 40),))
+    assert got["status"] == "ok"
+    assert got["pin_error"] == "pin_not_in_pr"
+
+
+def test_two_pins_naming_different_heads_disagree():
+    # The newest pin does NOT win (F-B2): every live pin must hold.
+    got = _ev(head=H5, comments=(_pin(H2, _at(8)), _pin(H3, _at(9))))
+    assert got["pin_heads"] == [H2, H3]
+    assert got["pin_error"] == "pins_disagree"
+
+
+def test_two_pins_naming_one_head_agree():
+    got = _ev(head=H5, comments=(_pin(H3, _at(8)), _pin(H3, _at(9))))
+    assert got["pin_heads"] == [H3] and got["pin_error"] is None
+
+
+def test_unknown_evidence_carries_a_blocking_pin_error():
+    got = _ev(head="not-a-sha")
+    assert got["pin_heads"] == [] and got["pin_error"] == "evidence_unknown"
+
+
+def _says(body: str, *, assoc: str | None = "OWNER", when=None, edited=None) -> dict:
+    """A comment with exactly ``body``, from a maintainer unless ``assoc`` says otherwise."""
+    when = when or _at(9)
+    return {
+        "login": "owner" if assoc else "stranger",
+        "type": "User",
+        "author_association": assoc or "NONE",
+        "body": body,
+        "created_at": when,
+        "updated_at": edited or when,
+    }
+
+
+PIN3 = f"<!-- genesis-pin head={H3} -->"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(PIN3, id="marker-alone"),
+        pytest.param(f"\n\n  {PIN3}  \nOwner ruled: merge here.", id="after-blank-lines"),
+        pytest.param(PIN3.upper().replace(H3.upper(), H3), id="upper-case-marker"),
+        pytest.param(f"<!--genesis-pin   head={H3}-->", id="tight-spacing"),
+        pytest.param(f"   {PIN3}", id="three-space-indent"),
+        pytest.param(f"\ufeff{PIN3}", id="leading-bom"),
+        pytest.param(f"\u200b{PIN3}", id="leading-zero-width-space"),
+    ],
+)
+def test_a_first_line_strict_pin_binds(body):
+    got = _ev(head=H5, comments=(_says(body),))
+    assert got["pin_heads"] == [H3] and got["pin_error"] is None
+
+
+@pytest.mark.parametrize(
+    "first_line",
+    [
+        pytest.param(f"<!-- genesis-pin head={H3[:7]} -->", id="short-sha"),
+        pytest.param(f'<!-- genesis-pin head="{H3}" -->', id="quoted-sha"),
+        pytest.param(f"<!-- genesis-pin head={H3} by=owner -->", id="extra-attribute"),
+        pytest.param(f"<!-- genesis-pin {H3} -->", id="no-head-key"),
+        pytest.param(f"<!-- genesis-pin head={H3}", id="unterminated"),
+        pytest.param(f"<!-- genesis-pin head={H3} --> trailing text", id="text-after-marker"),
+        pytest.param("<!-- genesis-pin", id="bare-keyword"),
+        pytest.param(f"<!--- genesis-pin head={H3} -->", id="three-dash-opener"),
+        pytest.param(f"\u200b<!-- genesis-pin head={H3[:7]} -->", id="zero-width-then-short"),
+    ],
+)
+def test_a_maintainers_malformed_first_line_pin_blocks(first_line):
+    got = _ev(head=H5, comments=(_says(f"{first_line}\nRuling: merge here."),))
+    assert got["pin_error"] == "malformed_pin", got["pin_heads"]
+    blocked, msg = G._check_past_terminal("7", "o/r", H5, budget=got)
+    assert blocked is True
+    assert "malformed_pin" in msg and "<!-- genesis-pin head=<full 40-hex sha> -->" in msg
+
+
+def test_a_strangers_malformed_pin_is_ignored():
+    got = _ev(head=H5, comments=(_says(f"<!-- genesis-pin head={H3[:7]} -->", assoc=None),))
+    assert got["pin_heads"] == [] and got["pin_error"] is None
+
+
+@pytest.mark.parametrize(
+    "first_line",
+    [
+        pytest.param("<!-- genesis-pin-help -->", id="genesis-pin-help"),
+        pytest.param("<!-- not-a-genesis-pin -->", id="not-a-genesis-pin"),
+        pytest.param(f"<!-- genesis-review-request head={H3} kind=confirmation -->", id="other"),
+    ],
+)
+def test_a_first_line_that_only_resembles_a_pin_is_ignored(first_line):
+    got = _ev(head=H5, comments=(_says(f"{first_line}\n{PIN3}"),))
+    assert got["pin_heads"] == [] and got["pin_error"] is None
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(f"> {PIN3}", id="quote-line"),
+        pytest.param(f"```\n{PIN3}\n```", id="backtick-fence"),
+        pytest.param(f"````\n```\n{PIN3}\n```\n````", id="nested-fence"),
+        pytest.param(f"~~~md\n{PIN3}\n~~~", id="tilde-fence"),
+        pytest.param(f"Example:\n\n    {PIN3}", id="indented-code"),
+        pytest.param(f"  ```\n{PIN3}\n  ```", id="indented-fence"),
+        pytest.param(f"To pin, post `{PIN3}`.", id="inline-code"),
+        pytest.param(f"To pin, post ``\n{PIN3}\n``.", id="inline-code-across-lines"),
+        pytest.param(f"`{PIN3}`", id="inline-code-first-line"),
+        pytest.param(f"```\n<!-- genesis-pin head={H3[:7]} -->\n```", id="malformed-in-fence"),
+        pytest.param(f"> <!-- genesis-pin head={H3[:7]} -->", id="malformed-in-quote"),
+        pytest.param(f"Ruling below.\n<!-- genesis-pin head={H3[:7]}", id="unterminated-later"),
+        pytest.param(f"    {PIN3}", id="first-line-indented-code"),
+        pytest.param(f"\t{PIN3}", id="first-line-tab-indent"),
+        pytest.param(f"    <!-- genesis-pin head={H3[:7]} -->", id="indented-malformed"),
+    ],
+)
+def test_a_quoted_or_example_pin_never_binds_and_never_blocks(body):
+    # The agent posts from the maintainer account: an example it quotes must not bind.
+    got = _ev(head=H5, comments=(_says(body),))
+    assert got["pin_heads"] == [] and got["pin_error"] is None
+
+
+def test_a_pin_on_a_later_line_is_ignored():
+    """The one fail-open edge of the first-line rule: a real pin placed below other
+    text is not read, so it binds nothing. Accepted, because the agent posts a pin
+    in a controlled format (the marker as its own comment's first line), and the
+    rule's job is to make every quoted or example marker inert."""
+    got = _ev(head=H5, comments=(_says(f"Owner ruled: merge at this head.\n{PIN3}"),))
+    assert got["pin_heads"] == [] and got["pin_error"] is None
+
+
+def test_a_pin_added_by_editing_a_comment_counts():
+    got = _ev(head=H5, comments=(_says(PIN3, when=_at(1), edited=_at(9)),))
+    assert got["pin_heads"] == [H3] and got["pin_error"] is None
+
+
+def test_a_second_marker_in_one_comment_is_ignored():
+    # Only the first line is read, so a second marker, same or different, adds nothing.
+    for second in (PIN3, f"<!-- genesis-pin head={H2} -->"):
+        got = _ev(head=H5, comments=(_says(f"{PIN3}\n{second}"),))
+        assert got["pin_heads"] == [H3] and got["pin_error"] is None, second
+def test_a_pin_landing_between_the_two_reads_is_unknown(monkeypatch):
+    """The double read compares the pin fields too: a pin posted mid-evaluation
+    is a policy change, never silently dropped."""
+    from tests.test_hooks import test_review_budget as trb
+
+    trb._no_seams(monkeypatch)
+    late = {
+        "body": f"<!-- genesis-pin head={trb.H3} -->",
+        "authorAssociation": "OWNER",
+        "author": {"login": "owner", "__typename": "User"},
+    }
+    base = trb._graphql_server(files=trb._FILES, commits=trb._COMMITS)
+    grown = trb._graphql_server(comments=[late], files=trb._FILES, commits=trb._COMMITS)
+    alone = rb.evaluate_pr("owner/repo", 7, runner=grown, external_identity_templates=())
+    assert alone["status"] == "ok" and alone["pin_heads"] == [trb.H3], alone
+    calls = []
+
+    def serve(argv, *, timeout):
+        calls.append(argv)
+        return (base if len(calls) == 1 else grown)(argv, timeout=timeout)
+
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "unknown"
+    assert "evidence_changed_during_evaluation" in got["errors"], got
+
+
+@pytest.mark.parametrize("assoc,counts", [("COLLABORATOR", True), ("NONE", False)])
+def test_the_graphql_read_carries_the_author_association(monkeypatch, assoc, counts):
+    from tests.test_hooks import test_review_budget as trb
+
+    trb._no_seams(monkeypatch)
+    node = {
+        "body": f"<!-- genesis-pin head={trb.H3} -->",
+        "authorAssociation": assoc,
+        "author": {"login": "someone", "__typename": "User"},
+    }
+    run = trb._graphql_server(comments=[node], files=trb._FILES, commits=trb._COMMITS)
+    got = rb.evaluate_pr("owner/repo", 7, runner=run, external_identity_templates=())
+    assert got["status"] == "ok", got
+    assert got["pin_heads"] == ([trb.H3] if counts else [])
+    assert any("authorAssociation" in a for a in run.seen[0])
+
+
+X, Y = N1, N2  # two PR heads
+
+
+def _below(current: str = Y, *, pins=(), pin_error=None) -> dict:
+    return {
+        "status": "ok",
+        "terminal_state": "below",
+        "terminal_head": None,
+        "current_head": current,
+        "pin_heads": list(pins),
+        "pin_error": pin_error,
+    }
+
+
+def test_below_terminal_a_pin_lets_its_head_pass():
+    blocked, msg = G._check_past_terminal("7", "o/r", X, budget=_below(X, pins=[X]))
+    assert blocked is False, msg
+    assert f"pinned head {X[:12]}" in msg
+
+
+def test_below_terminal_a_pin_blocks_any_other_head():
+    blocked, msg = G._check_past_terminal("7", "o/r", Y, budget=_below(Y, pins=[X]))
+    assert blocked is True
+    assert f"pinned head {X}" in msg
+    assert "! gh pr merge 7" in msg
+
+
+def test_an_unbound_merge_on_a_pinned_pr_blocks():
+    blocked, _ = G._check_past_terminal("7", "o/r", "", budget=_below(X, pins=[X]))
+    assert blocked is True
+
+
+def test_a_pin_head_comparison_ignores_case():
+    blocked, msg = G._check_past_terminal("7", "o/r", X.upper(), budget=_below(X, pins=[X]))
+    assert blocked is False, msg
+
+
+@pytest.mark.parametrize("error", ["pin_not_in_pr", "pins_disagree", "evidence_unknown"])
+def test_a_pin_error_blocks_even_at_a_pinned_head(error):
+    budget = _below(X, pins=[X], pin_error=error)
+    blocked, msg = G._check_past_terminal("7", "o/r", X, budget=budget)
+    assert blocked is True
+    assert error in msg and "! gh pr merge 7" in msg
+
+
+def test_a_malformed_pin_record_blocks():
+    budget = {**_below(X), "pin_heads": X}  # a string, not a list
+    assert G._check_past_terminal("7", "o/r", X, budget=budget)[0] is True
+
+
+def test_past_terminal_a_pin_never_loosens_the_terminal_rule():
+    # Pinned at N1 (not the terminal head T): merging at the pin still blocks...
+    budget = {**_past(N1), "pin_heads": [N1], "pin_error": None}
+    blocked, msg = G._check_past_terminal("7", "o/r", N1, budget=budget)
+    assert blocked is True and f"terminal head {T}" in msg
+    # ...and merging at T blocks too, since the pin names N1.
+    blocked, msg = G._check_past_terminal("7", "o/r", T, budget={**budget, "current_head": T})
+    assert blocked is True and f"pinned head {N1}" in msg
+
+
+def test_past_terminal_a_pin_at_the_terminal_head_passes():
+    budget = {**_past(T), "pin_heads": [T], "pin_error": None}
+    blocked, msg = G._check_past_terminal("7", "o/r", T, budget=budget)
+    assert blocked is False, msg
+    assert "pinned" in msg
+
+
+def test_past_terminal_a_pin_is_strict_over_empty_commits():
+    # The empty-commit allowance is the terminal rule's; a pin names one sha.
+    budget = {**_past(E1), "pin_heads": [T], "pin_error": None}
+    assert G._check_past_terminal("7", "o/r", E1, budget=budget)[0] is True
+
+
+def test_the_evaluator_pin_drives_the_check_end_to_end():
+    pinned = _ev(head=H5, comments=(_pin(H3),))
+    assert G._check_past_terminal("7", "o/r", H3, budget=pinned)[0] is False
+    assert G._check_past_terminal("7", "o/r", H5, budget=pinned)[0] is True
+    stray = _ev(head=H5, comments=(_pin("9" * 40),))
+    assert G._check_past_terminal("7", "o/r", H5, budget=stray)[0] is True
+
+
+def test_the_merge_arm_blocks_a_merge_off_the_pinned_head(monkeypatch, capsys):
+    _seam(monkeypatch, _below(ch.HEAD, pins=[T]))
+    rc = ch._run(monkeypatch, ch._merge_cmd())
+    assert rc == 2
+    assert f"pinned head {T}" in capsys.readouterr().err
+
+
+def test_the_merge_arm_allows_a_merge_at_the_pinned_head(monkeypatch):
+    _seam(monkeypatch, _below(ch.HEAD, pins=[ch.HEAD]))
+    assert ch._run(monkeypatch, ch._merge_cmd()) == 0
+
+
+def test_the_report_row_shows_a_pin_it_blocks_on(monkeypatch, capsys):
+    ch._report_env(monkeypatch, scheduled=ch._scheduled_marker(ch.HEAD))
+    _seam(monkeypatch, _below(ch.HEAD, pins=[T]))
+    rc = G.check_pr_report("100", repo=ch.REPO)
+    out = capsys.readouterr().out
+    row = next(ln for ln in out.splitlines() if ln.startswith("terminal-head"))
+    assert row.startswith("terminal-head  : BLOCK — ") and f"pinned head {T}" in row, row
+    assert rc == 1
+
+
+def test_the_report_row_shows_a_pin_it_passes(monkeypatch, capsys):
+    ch._report_env(monkeypatch, scheduled=ch._scheduled_marker(ch.HEAD))
+    _seam(monkeypatch, _below(ch.HEAD, pins=[ch.HEAD]))
+    rc = G.check_pr_report("100", repo=ch.REPO)
+    out = capsys.readouterr().out
+    row = next(ln for ln in out.splitlines() if ln.startswith("terminal-head"))
+    want = f"terminal-head  : ok (below terminal, merging at the pinned head {ch.HEAD[:12]})"
+    assert row == want, row
+    assert rc == 0, out
