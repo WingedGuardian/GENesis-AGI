@@ -111,6 +111,7 @@ def test_default_false_marker_preserves_prechange_fingerprint():
     ordinary = request()
     legacy = asdict(ordinary)
     legacy.pop("contained_peer", None)
+    legacy.pop("owner_relay", None)  # added after contained_peer, same rule
     expected = hashlib.sha256(json.dumps(legacy, sort_keys=True).encode()).hexdigest()
     assert fingerprint(ordinary) == expected
     assert hasattr(ordinary, "contained_peer"), "missing server-owned marker"

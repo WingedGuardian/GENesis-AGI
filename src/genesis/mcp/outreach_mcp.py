@@ -233,9 +233,10 @@ async def outreach_send(
             logger.warning("Thread %s not found for recipient lookup", thread_id)
     from genesis.outreach.types import OWNER_RELAY_ALERT_SUBJECT
 
-    if channel == "email" and clean_header(subject or "") == OWNER_RELAY_ALERT_SUBJECT:
+    if clean_header(subject or "") == OWNER_RELAY_ALERT_SUBJECT:
         # Reserved for the owner-relay alert, the one email the autonomy gate lets
-        # through: no session may send one that looks like it.
+        # through: no session may send one that looks like it, on any channel,
+        # since an empty channel resolves to the install's preference later.
         return json.dumps({
             "status": "refused",
             "code": "reserved_subject",

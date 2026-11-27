@@ -21,6 +21,9 @@ it on every Claude Code child, and stdio MCP servers inherit it:
 - ``CLAUDECODE``: set by Claude Code in the shells and MCP servers it starts.
 - ``CODEX_THREAD_ID``: set by Codex in the shells it runs commands in (not in
   its MCP servers, which get a filtered environment).
+- ``GENESIS_OWNER_RELAY=1``: a session answering a same-owner peer that holds
+  the ``owner_relay`` grant. Read into :attr:`CallerContext.owner_relay`; the
+  browser tools refuse purchase-like controls for it.
 - ``GENESIS_BUILDER_KEY``: set by ``scripts/cc-slot.sh launch`` (its launch
   mode lands in #4700) in a builder slot the board launcher started (the Build
   move's key). Read into
@@ -91,6 +94,7 @@ PROFILE_ENV = "GENESIS_CALLER_PROFILE"
 CLAUDE_CODE_ENV = "CLAUDECODE"
 CODEX_THREAD_ENV = "CODEX_THREAD_ID"
 BUILDER_KEY_ENV = "GENESIS_BUILDER_KEY"
+OWNER_RELAY_ENV = "GENESIS_OWNER_RELAY"
 
 IDENTITY_ENV_VARS = frozenset(
     {
@@ -104,6 +108,7 @@ IDENTITY_ENV_VARS = frozenset(
         CLAUDE_CODE_ENV,
         CODEX_THREAD_ENV,
         BUILDER_KEY_ENV,
+        OWNER_RELAY_ENV,
     }
 )
 
@@ -139,6 +144,10 @@ class CallerContext:
     claude_code: str | None = None
     codex_thread: str | None = None
     builder_key: str | None = None
+    # A relayed session: purchase-like browser controls are refused. False is
+    # the default so an explicit caller keeps its behaviour; a caller of
+    # unknown scope sets it (see _LOST_SCOPE_CALLER).
+    owner_relay: bool = False
 
     @property
     def unsupervised_dispatched(self) -> bool:
@@ -152,7 +161,7 @@ _REQUEST_CALLER: ContextVar[CallerContext | None] = ContextVar(
 _shared_service = False
 #: Work that lost its request scope. The literal is provenance's
 #: ``ORIGIN_EXTERNAL_UNTRUSTED``; provenance imports this module, so a test pins it.
-_LOST_SCOPE_CALLER = CallerContext(origin="external_untrusted")
+_LOST_SCOPE_CALLER = CallerContext(origin="external_untrusted", owner_relay=True)
 _warned_sites: set[tuple[str, int]] = set()
 
 
@@ -195,6 +204,7 @@ def caller_context_from_env() -> CallerContext:
         claude_code=env.get(CLAUDE_CODE_ENV),
         codex_thread=env.get(CODEX_THREAD_ENV),
         builder_key=env.get(BUILDER_KEY_ENV),
+        owner_relay=env.get(OWNER_RELAY_ENV) == "1",
     )
 
 

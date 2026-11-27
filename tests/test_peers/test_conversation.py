@@ -1516,12 +1516,17 @@ async def _relay_admission(bridge, decision, **options):
     # A grant bumps the peer revision; admission must see the current row.
     fresh = {p["peer_id"]: p for p in await bridge.registry.rows()}["alpha"]
     identity = PeerIdentity(bridge.identities["alpha"].credential_name, fresh)
+    seen, build = [], bridge.runner._build_invocation
+    bridge.runner._build_invocation = lambda req, sid: (seen.append(req), build(req, sid))[1]
     done = await settle(bridge, await bridge.service.send(identity, incoming(message(**options))))
-    prompt = bridge.invoker.run_streaming.call_args.args[0].system_prompt
+    invocation = bridge.invoker.run_streaming.call_args.args[0]
     from genesis.db.crud import cc_sessions
 
     meta = json.loads((await cc_sessions.get_by_id(bridge.db, done["id"]))["metadata"])
-    return prompt, meta
+    # The browser tools learn a session is relayed from this flag alone; the
+    # invocation's environment is built from it (test_browser_relay_purchase).
+    assert seen[-1].owner_relay is (decision == "allow")
+    return invocation.system_prompt, meta
 
 
 @pytest.mark.parametrize("decision", [None, "ask", "deny"])

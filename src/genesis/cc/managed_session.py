@@ -74,6 +74,8 @@ async def _notify_owner_relay(
             f"is incomplete; ended {ended}."
         )
     channel = _owner_alert_channel()
+    # The pipeline drops the summary only if the outbound content scan would
+    # otherwise block the alert (OutreachPipeline._relay_alert_without_summary).
     text = f"{head} {relay.quoted(reason)}"
     await pending_outreach.enqueue(
         db,
@@ -102,7 +104,10 @@ def _owner_alert_channel() -> str:
     channel = prefs.get("alert", prefs.get("default", "telegram"))
     # The queue's channel column is NOT NULL: a blank or null preference would
     # otherwise fail every finalization retry.
-    return channel if isinstance(channel, str) and channel.strip() else "telegram"
+    # The agent channel carries peer envelopes, never an owner alert.
+    if not isinstance(channel, str) or not channel.strip() or channel == "agent":
+        return "telegram"
+    return channel
 
 
 def _failure_outcome(partial, error) -> tuple[str, str | None]:
@@ -124,8 +129,9 @@ _HOLD_PARK_S = 3600.0
 
 def fingerprint(request) -> str:
     fields = asdict(request)
-    if not fields.get("contained_peer"):
-        fields.pop("contained_peer", None)  # Preserve all existing prepared receipts.
+    for flag in ("contained_peer", "owner_relay"):
+        if not fields.get(flag):
+            fields.pop(flag, None)  # Preserve all existing prepared receipts.
     return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
 
 
@@ -364,9 +370,7 @@ async def _execute(runner, request, sid):
     _set_obs_session(sid)
     await runner._check_background(request)
     await runner._session_manager.start_prepared(sid)
-    # ``launched`` outlives the state: a cancel or deadline later rewrites
-    # native_state, and _finalize must still know the child ran.
-    await update_state(runner._session_manager.db, sid, "running", launched=True)
+    await update_state(runner._session_manager.db, sid, "running")
     start = time.monotonic()
     telemetry = []
 
@@ -406,12 +410,16 @@ async def _finalize(runner, request, result, state):
     while True:
         try:
             if launched is None:
-                # Read before _store_result overwrites it: _execute marks the receipt
-                # running just before invoking the child, so only a run that got that
-                # far can have stopped with part of its stream unread.
+                # Read before _store_result rewrites the metadata: only a run whose
+                # child launched can have stopped with part of its stream unread.
                 row = await cc_sessions.get_by_id(runner._session_manager.db, result.session_id)
                 meta = metadata(row) if row else {}
-                launched = bool(meta.get("launched")) or meta.get("native_state") == "running"
+                # execution_started is written when the child process spawns, after
+                # its slot and provider were admitted (managed_fallback), and no later
+                # state change clears it, so a cancel or deadline cannot hide a launch.
+                launched = result.session_id in getattr(
+                    runner, "_spawned_sessions", ()
+                ) or bool(meta.get("execution_started"))
             await runner._store_result(
                 result.session_id,
                 request,

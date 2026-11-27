@@ -1655,3 +1655,26 @@ async def test_only_a_relay_alert_to_the_owner_skips_the_email_gate(
     assert (result.status == OutreachStatus.HELD) is gated
     assert smtp.send_message.called is not gated
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("summary", "sent_summary"),
+    [("Booked the call for Tuesday", True), ("Saved it to /home/someone/private/notes.txt", False)],
+)
+async def test_a_relay_alert_keeps_its_summary_unless_the_scan_would_block_it(
+    config, db, monkeypatch, summary, sent_summary,
+):
+    from genesis.outreach.types import OWNER_RELAY_ALERT_SUBJECT
+
+    pipe, smtp = _smtp_pipe(monkeypatch, config, db, None)
+    pipe._recipients = {"email": "owner@example.com"}
+    head = "[abcd1234] Acted on your behalf via muse: used outreach_send; ended done."
+    result = await pipe.submit(OutreachRequest(
+        category=OutreachCategory.ALERT, topic="t", email_subject=OWNER_RELAY_ALERT_SUBJECT,
+        context=f'{head} Session said: "{summary}"', salience_score=1.0, channel="email",
+        verbatim=True,
+    ))
+    assert result.status == OutreachStatus.DELIVERED
+    body = smtp.send_message.call_args.args[0].get_content()
+    assert head in body and (summary in body) is sent_summary
+

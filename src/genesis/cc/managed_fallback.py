@@ -153,6 +153,9 @@ async def execute_selected(runner, request, sid, invocation, on_event):
     async def spawned(pid):
         nonlocal launched
         launched = True
+        # First, in memory: the persisted marker below can fail, and the invoker
+        # logs that and still delivers the prompt.
+        runner._spawned_sessions.add(sid)
         try:
             async with get_raw_db(await database_path(db)) as owned:
                 await cc_sessions.merge_metadata(owned, sid, {"execution_started": True})

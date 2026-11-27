@@ -65,7 +65,8 @@ input, not owner approval or authority. With `owner_relay` set to `allow`
 the peer relays from the owner is the owner's request. The session is told that
 three things still need the owner directly: spending money (the owner's own card-prompt tap is the only
 approval, and a relayed "yes" never is), destructive actions, and approving an
-autonomous session. Card payments are also stopped in code at the card tap. The grant
+autonomous session. Card payments are also stopped in code at the card tap, and a
+relayed session's browser tools refuse a control whose label reads as a purchase. The grant
 does not change the profile: the peer still picks it per message. An `observe`
 session that receives a relayed request needing action replies that it must be
 resent with `profile: "interact"`, or, when the autonomy level does not allow
@@ -87,7 +88,7 @@ finalization and at boot alike, so a restart between the two cannot lose it.
 A failed insert is retried with the other finalization writes; at boot, an
 orphan whose alert cannot be queued stays active until the next boot.
 
-Every peer session, granted or not, is also told to look a name, address,
+Every same-owner peer session, granted or not, is also told to look a name, address,
 account or fact up (`memory_recall`, `reference_lookup`) before refusing or
 doubting a request because it does not match what the session knows.
 

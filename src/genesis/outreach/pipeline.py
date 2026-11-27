@@ -67,6 +67,20 @@ def _suppressed_awaited_result() -> OutreachResult:
     )
 
 
+def _is_relay_alert(request: OutreachRequest) -> bool:
+    """An owner-relay alert: its subject is reserved (outreach_send refuses it)."""
+    return (
+        request.category == OutreachCategory.ALERT
+        and request.email_subject == OWNER_RELAY_ALERT_SUBJECT
+    )
+
+
+def _relay_alert_without_summary(text: str) -> str:
+    """The relay alert's head line, without the session's quoted summary."""
+    head = text.split(" Session said: ", 1)[0]
+    return head.split(" No summary recorded.", 1)[0]
+
+
 class OutreachPipeline:
     """Main outreach orchestrator."""
 
@@ -759,6 +773,18 @@ class OutreachPipeline:
                     channel, request.category.value,
                     egress.fixes_applied, egress.flags,
                 )
+            if egress.quarantined and _is_relay_alert(request):
+                # The owner must hear that a relayed session acted: send the alert
+                # without the session's own summary rather than not at all.
+                head = _relay_alert_without_summary(formatted.text)
+                retry = gate(head, channel=channel, category=request.category.value)
+                if not retry.quarantined:
+                    logger.warning(
+                        "Relay alert summary dropped by the content scan: %s",
+                        egress.scan.detected,
+                    )
+                    egress = retry
+                    formatted = replace(formatted, text=head)
             if egress.quarantined:
                 logger.warning(
                     "Outbound %s quarantined: %s patterns %s",

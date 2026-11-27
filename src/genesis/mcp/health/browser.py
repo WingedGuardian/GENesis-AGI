@@ -37,6 +37,7 @@ from fastmcp import Context
 
 from genesis.browser import chromium, engine, packages, profile_backup
 from genesis.browser.types import CAMOUFOX_PROFILE_DIR, BrowserLayer
+from genesis.caller_context import caller_context
 from genesis.mcp.health import mcp, payment_context
 from genesis.payments import card_fill
 from genesis.security.card_redaction import CARD_FILTER, contains_card_text, redact_text
@@ -1797,6 +1798,10 @@ async def _with_tool_timeout(
 
 
 # ---------------------------------------------------------------------------
+class RelayPurchaseRefused(Exception):
+    """A relayed session's click fallback would submit a purchase: stop the click."""
+
+
 class ClickBlocked(Exception):
     """Another element covers the click target (Playwright: "intercepts pointer
     events"). Raised instead of falling back, because every fallback would act
@@ -2286,6 +2291,7 @@ async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
             # --- Keyboard fallback (last resort) ---
             # Focus the element and press Space/Enter.  Works for radios,
             # checkboxes, buttons — anything keyboard-navigable per WCAG.
+            refused = False
             try:
                 el = await page.wait_for_selector(selector, timeout=5000)
                 if el:
@@ -2294,14 +2300,18 @@ async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
                     input_type = await el.evaluate(
                         "e => (e.getAttribute('type') || '').toLowerCase()"
                     )
-                    if tag == "input" and input_type in ("radio", "checkbox"):
-                        await page.keyboard.press("Space")
+                    key = "Space" if tag == "input" and input_type in ("radio", "checkbox") else "Enter"
+                    # A relayed session's purchase check, on what this press submits.
+                    if await _relay_key_refusal(page, key):
+                        refused = True
                     else:
-                        await page.keyboard.press("Enter")
-                    logger.info("Keyboard fallback succeeded for '%s'", selector)
-                    return
+                        await page.keyboard.press(key)
+                        logger.info("Keyboard fallback succeeded for '%s'", selector)
+                        return
             except Exception as kb_err:
                 logger.warning("Keyboard fallback also failed for '%s': %s", selector, kb_err)
+            if refused:  # the shadow-DOM fallback would click the same control
+                raise RelayPurchaseRefused() from None
             # --- Shadow DOM fallback ---
             # Element may be inside an open shadow root that Playwright's
             # selector engine can't pierce (common with Lit/Reddit-style
@@ -3675,6 +3685,188 @@ async def _follow_new_page(old, new) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Relayed sessions never buy
+# ---------------------------------------------------------------------------
+# A session answering a same-owner peer that holds owner_relay acts on the
+# owner's relayed request, and money needs the owner's own card tap. A click or
+# a submitting key press on a control whose label reads as a purchase is refused
+# there. It is best effort, and functionality comes first (owner, 2026-11-24): it
+# refuses only on a positive match of the control's words, and allows whatever it
+# cannot read. A script, a frame, a control with no readable label, a word outside
+# the list, navigation to a purchase URL, or the remote web_agent (a fresh browser
+# with no saved payment methods) is not caught.
+_OWN = r"(?:(?:your|my|the|a|an)\s+)?"
+_PURCHASE_WORDS = re.compile(
+    r"\b(?:pay|pay\s+now|buy|buy\s+now|purchase(?!\s+history)|checkout|check\s*out(?!\s+(?:our|this|these|the|more|all))"
+    r"|subscribe|donate|upgrade|order\s+now|book\s+now|reserve|request\s+to\s+book|place\s+" + _OWN + r"(?:order|bid)"
+    r"|(?:submit|confirm|complete|finali[sz]e)\s+" + _OWN + r"(?:order|purchase|payment|booking)"
+    r"|(?:make|send|process|submit)\s+(?:a\s+)?payment|authori[sz]e\s+payment"
+    r"|start\s+" + _OWN + r"(?:free\s+trial|subscription|membership))\b",
+    re.IGNORECASE,
+)
+_REFUSE_PURCHASE = (
+    "Refused in a relayed session: this control looks like a purchase, and only the "
+    "owner can buy. Prepare the purchase, stop here, and say what is ready."
+)
+_REFUSE_NEWLINE = (
+    "Refused in a relayed session: a line break in this field would submit a form "
+    "that reads as a purchase, and only the owner can buy."
+)
+# The words a control shows or announces, from itself, aria-labelledby, an image
+# inside it and the button, link or label around it.
+_LABEL_FN = r"""
+function label(n) {
+  if (!n) return '';
+  const words = (x) => {
+    const out = [];
+    const walk = (x.ownerDocument || document).createTreeWalker(x, NodeFilter.SHOW_TEXT);
+    while (walk.nextNode()) out.push(walk.currentNode.nodeValue);
+    return out.join(' ');
+  };
+  const own = (x) => [words(x), x.value, x.getAttribute && x.getAttribute('aria-label'),
+    x.getAttribute && x.getAttribute('title'), x.getAttribute && x.getAttribute('alt')]
+    .filter((v) => typeof v === 'string' && v).join(' ');
+  const of = (x) => {
+    const parts = [own(x)];
+    const ids = x.getAttribute && x.getAttribute('aria-labelledby');
+    if (ids) for (const id of ids.split(/\s+/)) {
+      const t = x.getRootNode().getElementById(id);
+      if (t) parts.push(words(t));
+    }
+    if (x.querySelectorAll) for (const img of x.querySelectorAll('img[alt]')) parts.push(img.alt);
+    return parts.join(' ');
+  };
+  const host = n.closest && n.closest('button, a, [role=button], label');
+  return of(n) + (host && host !== n ? ' ' + of(host) : '');
+}
+"""
+# An open shadow root's text is read as part of its host. A frame's contents
+# cannot be read from here and are not checked.
+_CONTROL_LABEL_JS = "(el) => {" + _LABEL_FN + r"""
+  const inner = [];
+  if (el.shadowRoot) {
+    const walk = document.createTreeWalker(el.shadowRoot, NodeFilter.SHOW_TEXT);
+    while (walk.nextNode()) inner.push(walk.currentNode.nodeValue);
+  }
+  return label(el) + ' ' + inner.join(' ');
+}"""
+# The submit control of el's form: Enter in a field submits through it.
+_SUBMIT_FN = r"""
+function submitOf(el) {
+  // A form control's owner is el.form (null when form="<id>" names no form);
+  // anything else submits the form around it.
+  const form = el && ('form' in el ? el.form : el.closest && el.closest('form'));
+  // form.elements leaves out <input type=image>, which also submits.
+  if (!form) return null;
+  // An image input outside the form can belong to it through form="<id>".
+  const outside = form.id
+    ? [...form.getRootNode().querySelectorAll(
+      'input[type=image][form="' + CSS.escape(form.id) + '"]')]
+    : [];
+  // Only controls this form owns: form="<other id>" moves one to another form.
+  const submits = [...form.elements, ...form.querySelectorAll('input[type=image]'), ...outside]
+    .filter((e) => e.form === form && (e.type === 'submit' || e.type === 'image'
+      || (e.tagName === 'BUTTON' && !e.getAttribute('type'))));
+  // The browser submits through the first one in tree order.
+  submits.sort((a, b) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1));
+  return submits[0] || null;
+}
+"""
+# What a key press on the focused control would activate, for kind "enter" or
+# "space": the form's submit for Enter in a one-line field, the control itself
+# for a button or link, and nothing where the key only types or toggles.
+_FOCUSED_LABEL_JS = "(kind) => {" + _LABEL_FN + _SUBMIT_FN + r"""
+  // Keys go to the focused control, through open shadow roots and into a
+  // frame. A frame from another origin cannot be read and is allowed.
+  let el = document.activeElement;
+  for (;;) {
+    while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
+    if (!el || !['IFRAME', 'FRAME'].includes(el.tagName)) break;
+    let inner = null;
+    try { inner = el.contentDocument; } catch (e) { inner = null; }
+    if (!inner) return '';
+    el = inner.activeElement;
+  }
+  if (!el || el === el.ownerDocument.body) return '';
+  const tag = el.tagName;
+  const type = (el.getAttribute && (el.getAttribute('type') || '')).toLowerCase();
+  const role = (el.getAttribute && el.getAttribute('role')) || '';
+  const multiline = tag === 'TEXTAREA' || el.isContentEditable;
+  const typing = multiline || (tag === 'INPUT' && !['button', 'submit', 'image', 'reset',
+    'checkbox', 'radio', 'file', 'color', 'range'].includes(type));
+  if (typing) return kind === 'enter' && !multiline ? label(submitOf(el)) : '';
+  // Enter on a checkbox, radio or range submits the form (measured, Chromium);
+  // Space only toggles it.
+  if (['checkbox', 'radio', 'range'].includes(type)) {
+    return kind === 'enter' ? label(submitOf(el)) : '';
+  }
+  // Picking from a list or a menu never submits the form.
+  if (tag === 'SELECT' || ['combobox', 'listbox', 'option', 'menu', 'menuitem',
+      'checkbox', 'radio', 'switch'].includes(role)) return '';
+  // Space activates only a button; Enter also follows a link.
+  const button = tag === 'BUTTON' || role === 'button'
+    || (tag === 'INPUT' && ['button', 'submit', 'image', 'reset'].includes(type));
+  if (kind === 'space' && !button) return '';
+  return button || tag === 'A' ? label(el) : '';
+}"""
+# What a line break typed into el would submit: nothing in a multi-line box.
+_NEWLINE_SUBMIT_LABEL_JS = "(el) => {" + _LABEL_FN + _SUBMIT_FN + r"""
+  if (el.tagName === 'TEXTAREA' || el.isContentEditable) return '';
+  return label(submitOf(el));
+}"""
+_SUBMIT_KEYS = frozenset({"Enter", "NumpadEnter", "Space", " ", "\n", "\r"})
+
+
+def _relayed() -> bool:
+    return caller_context().owner_relay
+
+
+async def _relay_purchase_refusal(page, selector: str) -> dict | None:
+    """The refusal for clicking *selector* in a relayed session, or None."""
+    if not _relayed():
+        return None
+    target = page.locator(selector).first
+    try:
+        if not await asyncio.wait_for(target.count(), timeout=3.0):
+            return None  # not there yet: the click waits and reports as usual
+        text = await asyncio.wait_for(target.evaluate(_CONTROL_LABEL_JS), timeout=3.0)
+    except Exception:
+        return None  # best effort: what cannot be read is allowed
+    if _PURCHASE_WORDS.search(str(text or "")):
+        return {"error": _REFUSE_PURCHASE, "code": "relay_purchase_refused"}
+    return None
+
+
+async def _relay_key_refusal(page, key: str) -> dict | None:
+    """The refusal for a submitting key press in a relayed session, or None."""
+    if not _relayed() or (key.rsplit("+", 1)[-1] or key) not in _SUBMIT_KEYS:
+        return None
+    try:
+        kind = "space" if (key.rsplit("+", 1)[-1] or key) in {"Space", " "} else "enter"
+        text = await asyncio.wait_for(page.evaluate(_FOCUSED_LABEL_JS, kind), timeout=3.0)
+    except Exception:
+        return None  # best effort: what cannot be read is allowed
+    if _PURCHASE_WORDS.search(str(text or "")):
+        return {"error": _REFUSE_PURCHASE, "code": "relay_purchase_refused"}
+    return None
+
+
+async def _relay_fill_refusal(page, selector: str, value: str) -> dict | None:
+    """The refusal for a line break that would submit a purchase form, or None."""
+    if not _relayed() or ("\n" not in value and "\r" not in value):
+        return None
+    try:
+        text = await asyncio.wait_for(
+            page.locator(selector).first.evaluate(_NEWLINE_SUBMIT_LABEL_JS), timeout=3.0
+        )
+    except Exception:
+        return None  # best effort: what cannot be read is allowed
+    if _PURCHASE_WORDS.search(str(text or "")):
+        return {"error": _REFUSE_NEWLINE, "code": "relay_purchase_refused"}
+    return None
+
+
 @_redacted
 async def _impl_browser_click(selector: str) -> dict:
     """Click an element on the current page.
@@ -3702,7 +3894,15 @@ async def _impl_browser_click(selector: str) -> dict:
     # Its tab watch must see only what this click opens, so no other click,
     # key press or script runs on this page meanwhile (_page_action).
     async with _page_action(page) as refused:
-        return refused or await _click_and_follow(page, selector)
+        if refused:
+            return refused
+        refusal = await _relay_purchase_refusal(page, selector)
+        if refusal:
+            return refusal
+        try:
+            return await _click_and_follow(page, selector)
+        except RelayPurchaseRefused:
+            return {"error": _REFUSE_PURCHASE, "code": "relay_purchase_refused"}
 
 
 async def _click_and_follow(page, selector: str) -> dict:
@@ -3759,6 +3959,8 @@ async def _click_and_follow(page, selector: str) -> dict:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(arrived.wait(), timeout=remaining)
     except Exception as e:
+        if isinstance(e, RelayPurchaseRefused):
+            raise  # _impl_browser_click reports it as the refusal
         return await _with_stall_diagnostics(
             _click_failed(selector, e), page, selector, e, "browser_click", nav
         )
@@ -4224,7 +4426,13 @@ async def _impl_browser_fill(selector: str, value: str) -> dict:
     # _human_type's focus click can open a tab, which a concurrent click's tab
     # watch would otherwise claim as its own (_page_action).
     async with _page_action(page) as refused:
-        return refused or await _fill(page, selector, value)
+        return (
+            refused
+            or await _relay_fill_refusal(page, selector, value)
+            # The fill clicks its target to focus it: checked like a click.
+            or await _relay_purchase_refusal(page, selector)
+            or await _fill(page, selector, value)
+        )
 
 
 async def _fill(page, selector: str, value: str) -> dict:
@@ -4734,6 +4942,10 @@ async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
             for i in range(count):
                 if i > 0:
                     await asyncio.sleep(random.uniform(0.05, 0.15))
+                # Before every press: an Enter can move focus to the next control.
+                refusal = await _relay_key_refusal(page, key)
+                if refusal:
+                    return refusal
                 await page.keyboard.press(key)
             return {"pressed": key, "count": count, "url": page.url}
         except Exception as e:

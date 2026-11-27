@@ -651,6 +651,7 @@ def test_env_writer_allowlist_has_no_stale_entries():
 _CONSTANT_USERS = {
     "memory/provenance.py": "names the origin variable in one log message",
     "routing/standalone.py": "clears external identity and excludes it from file imports; never reads caller identity",
+    "cc/direct_session.py": "sets the owner-relay flag on the child it starts; never reads caller identity",
 }
 _EXPORTED_NAMES = _ACCESSOR_CONSTANTS | {"IDENTITY_ENV_VARS", "EXTERNAL_IDENTITY_ENV_VARS"}
 

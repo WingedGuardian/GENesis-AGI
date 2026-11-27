@@ -324,6 +324,7 @@ class ConversationService:
                     managed=True,
                     notify=False,
                     contained_peer=shared,
+                    owner_relay=relay,
                 )
                 meta = prepared_metadata(req)
                 meta.update(
