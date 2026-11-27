@@ -133,6 +133,50 @@ def test_complete_synthetic_report_is_current_but_not_execution_proof(tmp_path):
     assert parse_evidence(raw).completeness.review_execution_ref == "fixture-only:no-model-ran"
 
 
+@pytest.mark.parametrize(("start", "end", "quote", "matches"), [
+    (2, 3, "β\nline\r", True),
+    (2, 3, "β\nline\r\n", False),
+    (3, 4, "line\r\nlast", True),
+    (4, 4, "last\n", False),
+    (4, 5, "last\n", True),
+    (5, 5, "\n", False),
+])
+def test_source_references_keep_exact_line_boundaries(tmp_path, start, end, quote, matches):
+    from dataclasses import replace
+
+    from genesis.session_awareness.pr_completeness import BodySource, _references
+
+    source = replace(snapshot(tmp_path), body="first\nαβ\nline\r\nlast\n")
+    reference = BodySource(kind="body", start=start, end=end, quote=quote)
+    if matches:
+        _references([reference], source)
+    else:
+        with pytest.raises(SourceError, match="quote does not match its exact lines"):
+            _references([reference], source)
+
+
+def test_repeated_diff_references_share_search_and_use_the_first_matching_hunk(tmp_path):
+    from dataclasses import replace
+
+    from genesis.session_awareness.pr_completeness import DiffSource, _references
+
+    class CountingText(str):
+        searches = 0
+
+        def find(self, *args):
+            self.searches += 1
+            return super().find(*args)
+
+    hunk = "@@ -1 +1 @@"
+    diff = CountingText(f"{hunk}\n+first\n{hunk}\n+later")
+    source = replace(snapshot(tmp_path), diff=diff)
+    reference = DiffSource(kind="diff", path="ordinary.txt", start=2, quote="+first", hunk=hunk)
+    _references([reference] * 16, source)
+    assert diff.searches == 1
+    with pytest.raises(SourceError, match="diff reference hunk is absent"):
+        _references([reference.model_copy(update={"hunk": hunk + "\n+first"})], source)
+
+
 def test_evidence_hash_binds_every_semantic_field_except_report():
     import hashlib
 

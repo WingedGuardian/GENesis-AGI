@@ -762,11 +762,11 @@ before the reviewer sees the candidate. Stage B audits that retained inventory,
 every claim/gap/control, and every file disposition against the evidence. Retain
 the actual fresh-context execution; JSON alone does not prove independence.
 
-The current P2 release can parse and check this optional receipt. It does not
-yet enforce completeness in either close writer, authorize a validator launch,
-or release HOLD. A successful offline `check` establishes binding to the supplied
-packet, not fresh GitHub state or a complete semantic judgment. The shared close
-gate and its installed qualification are separate work. Historical documents
+The CLI and MCP require the receipt for any result that would close an
+obligation with complete tracking. Both verify it against a fresh PR source
+snapshot. A successful offline `check` establishes binding to the supplied
+packet. Keep installed qualification and the owner's explicit HOLD release as
+separate steps. Historical documents
 without the field still parse; omit malformed/incomplete output when recording
 a legitimate open attempt and retain the raw review separately.
 

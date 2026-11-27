@@ -84,10 +84,10 @@ the commit cannot be resolved (gh missing, offline, no merge commit) the close i
 refused and says why — a fault never waves a document through. ``--dry-run`` runs
 the check too.
 
-Declared E2E plans are checked in that same read. A closing result needs an
-``e2e`` mapping from each complete declaration to an existing claim or typed gap;
-missing or stale mappings refuse, including on ``--dry-run``. A reasoned
-``E2E: none`` needs none. Open attempts may still record incomplete evidence.
+A closing result checks its E2E mappings and completeness receipt against one
+fresh PR source snapshot. Each declaration needs an ``e2e`` mapping to an existing
+claim or typed gap. A reasoned ``E2E: none`` needs none. The same checks apply
+to ``--dry-run``. Open attempts may still record incomplete evidence.
 
 WHERE THE DATABASE IS, and the trap that costs a confusing run: ``genesis_db_path()``
 resolves RELATIVE TO THE REPO ROOT, so running this from a linked worktree points
@@ -117,7 +117,7 @@ EXIT CODES. 0 wrote (or dry-ran) with complete tracking; 4 measurement recorded
 measurement write succeeded. 1 the ledger declined (no such open row, a race,
 an absent or quarantined database); 2 the request was malformed (bad evidence, a
 missing or discarded note, a PR mismatch, a --verdict/--park the document does not
-support, a merge commit that cannot be resolved); 3 refused on policy (a failing
+support, unavailable PR sources, missing or invalid closing evidence); 3 refused on policy (a failing
 claim under any other --verdict, --park on a failure, a ``merge_commit`` that is
 not the PR's). Deliberately meaningful, which is why this is a separate script
 rather than a subcommand of ``repo_pulse_worker.py``: that module's documented
@@ -150,8 +150,6 @@ from genesis.session_awareness.pr_evidence import (  # noqa: E402
     EvidenceDocument,
     EvidenceError,
     Refusal,
-    check_e2e_coverage,
-    check_event_dates,
     completeness_prompts,
     decide,
     parse_evidence,
@@ -165,6 +163,7 @@ from genesis.session_awareness.pr_recording import (  # noqa: E402
     _DuplicateKey,
     _no_duplicates,
     attempt_note,
+    check_closing_evidence,
     check_merge_commit,
     gh_merge_commit,
     gh_pr_metadata,
@@ -233,6 +232,7 @@ SCHEMA_TEMPLATE = {
         "document derives pass-with-measured-gaps, never pass-mechanical"
     ],
     "e2e": [{"step": "exact E2E declaration text, without the E2E: prefix", "claim": 0}],
+    "completeness": None,
     "gaps": [
         {"kind": "method", "detail": "a limit of HOW this was verified, accepted as it is"},
         {"kind": "owner_only", "detail": "what only the owner can check"},
@@ -367,12 +367,10 @@ async def _write(
 
             tracking = await assess_tracking(doc, db=db)
             closing = decision.closing and tracking.complete
-            coverage = check_e2e_coverage(doc, actual.body) if closing else None
-            if coverage:
-                return _refuse(coverage.message, coverage.code)
-            dated = check_event_dates(doc, closing, _today())
-            if dated:
-                return _refuse(dated.message, dated.code)
+            if closing and (
+                refusal := await check_closing_evidence(doc, merge_commit=actual.merge_commit, today=_today)
+            ):
+                return _refuse(f"{refusal.message}\nNothing was written.", refusal.code)
             rechecks = rechecks_for(doc) if closing else []
             if rechecks:
                 schema_error = await _close_schema_refusal(db, rechecks)
@@ -699,7 +697,10 @@ def main(
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser(
-        "print-schema", help="print a fill-in evidence template and exit (no database access)"
+        "print-schema",
+        help="print a fill-in evidence template and exit (no database access)",
+        description='An unreviewed attempt can use {"completeness": null}. Embed the '
+        "completed receipt described in docs/reference/verification-review.md before closing.",
     )
 
     close = sub.add_parser("close", help="record a validation against an OPEN obligation")

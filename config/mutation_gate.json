@@ -26,6 +26,24 @@
   ],
   "cases": [
     {
+      "label": "CLI verification close skips the receipt gate",
+      "path": "scripts/pr_verification.py",
+      "anchor": "if closing and (\n                refusal := await check_closing_evidence",
+      "replacement": "if False and (\n                refusal := await check_closing_evidence",
+      "validator": "python",
+      "test": "tests/test_scripts/test_pr_verification_closer.py::test_close_requires_an_independent_receipt[False-missing]",
+      "why": "The CLI must refuse an otherwise valid close with no receipt, without changing the owned row."
+    },
+    {
+      "label": "MCP verification close skips the receipt gate",
+      "path": "src/genesis/mcp/health/validator_writes.py",
+      "anchor": "if closing and (\n            refusal := await check_closing_evidence",
+      "replacement": "if False and (\n            refusal := await check_closing_evidence",
+      "validator": "python",
+      "test": "tests/test_mcp/test_validator_verification_writer.py::test_close_requires_an_independent_receipt[write-missing]",
+      "why": "The registered MCP tool must refuse an otherwise valid close with no receipt, without changing the owned row."
+    },
+    {
       "label": "rm-guard depth floor weakened from 4 to 1",
       "path": "scripts/hooks/destructive_command_guard.py",
       "anchor": "    if len(parts) < 4:",

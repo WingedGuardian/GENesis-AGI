@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "src"))
+sys.path[:0] = [str(ROOT / "src"), str(ROOT)]
 
 
 async def prepare(root, *, profile="validator", recording=False):
@@ -18,7 +18,7 @@ async def prepare(root, *, profile="validator", recording=False):
 
     from genesis.db.crud import pr_verifications
     from genesis.db.schema import create_all_tables, seed_data
-    from tests.test_scripts.test_pr_verification_closer import MERGE_SHA
+    from tests.fixtures.verification_sources import MERGE_SHA
 
     home = root / "home"
     (home / ".genesis/config").mkdir(parents=True)
@@ -116,6 +116,8 @@ def serve(server_name, root, profile):
         from functools import partial
 
         from genesis.mcp.health import validator_writes
+        from genesis.session_awareness import pr_verification_sources
+        from tests.fixtures.verification_sources import writer_source
 
         def pr_metadata_of(repo, pr):
             from genesis.session_awareness.pr_recording import PrMetadata
@@ -129,6 +131,7 @@ def serve(server_name, root, profile):
         validator_writes.record_verification = partial(
             validator_writes.record_verification, pr_metadata_of=pr_metadata_of
         )
+        pr_verification_sources.acquire_sources = writer_source
         path = ROOT / "scripts/genesis_mcp_server.py"
         spec = importlib.util.spec_from_file_location("owned_stdio_health", path)
         wrapper = importlib.util.module_from_spec(spec)

@@ -107,6 +107,24 @@ check also applies the writers' E2E coverage rule, so a mapping they would
 refuse cannot verify here (the refusal names unmapped steps by position, never by text). That includes documents the validator will record
 with `--park`, and rows whose tracking is incomplete (the writers then record
 the row open and skip the rule; tracking needs the database and is not read
-offline). In both cases the check is stricter than the writers, never looser. Both close writers retain their earlier behavior in this P2
-intermediate release; enforcement and installed qualification are separate work,
-and HOLD remains in force.
+offline).
+
+## Closing an obligation
+
+The CLI and MCP close paths require a completed completeness receipt when the
+verdict would close an open obligation and tracking is complete. They acquire a
+fresh source snapshot and check merge identity, E2E mappings and the receipt
+against it before any close, including previews. If sources are unavailable or
+the receipt is missing, failed or stale, the row is untouched. The CLI exits
+with status 2 for these refusals, and the MCP tool reports an error. A separate
+fresh-context review and retained execution evidence establish reviewer
+independence.
+
+Nonclosing attempts and tracking-pending measurements still record without
+fetching the full source snapshot. Older closed records remain readable.
+`validator_checkpoint.py` reports `review_status` separately from routing
+completion. `stored_bindings_verified` confirms the receipt against the stored
+evidence only. `source_freshness: not_checked` applies even when the checkpoint
+performs live tracking lookups. A closed document without a receipt is
+`historical_unreviewed`. Installed qualification and the owner's HOLD decision
+remain separate from these checks.

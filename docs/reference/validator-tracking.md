@@ -114,6 +114,12 @@ a Stop-hook trap. The shared writers enforce completion; the workflow requires
 the checkpoint before claiming a batch handled. A client that never submits its
 measurement is not covered by a writer gate.
 
+Each row reports `review_status` alongside its routing result. A valid stored
+receipt gives `stored_bindings_verified`. A closed record with evidence that
+predates receipts gives `historical_unreviewed`. The checkpoint sets
+`source_freshness` to `not_checked`, including when it checks public tracking
+receipts online. The writers check fresh PR sources on a would-close decision.
+
 ## Historical audit
 
 ```bash

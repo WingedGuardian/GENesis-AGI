@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import shlex
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date
 
-from genesis.session_awareness.pr_evidence import NOTE_PREFIXED_GAPS, Decision
+from genesis.session_awareness.pr_evidence import (
+    NOTE_PREFIXED_GAPS,
+    Decision,
+    EvidenceDocument,
+    Refusal,
+    check_e2e_coverage,
+    check_event_dates,
+)
 
 
 def resolve_repo(open_repos: list[str], pr_number: int, repo: str) -> str:
@@ -78,8 +88,8 @@ def gh_merge_commit(repo: str, pr: int) -> str:
 def gh_pr_metadata(repo: str, pr: int) -> PrMetadata:
     """The PR's merge SHA and body from one GitHub read, or a named LookupError.
 
-    The one network call in this tool, kept to one function so tests replace it
-    (``main(..., pr_metadata_of=...)``) and never call gh for real.
+    This initial lookup is enough for attempts that keep the row open. Closing
+    also requires the complete source snapshot.
     """
     import shutil
     import subprocess
@@ -124,3 +134,28 @@ def check_merge_commit(claimed: str, actual: str) -> str | None:
         f"as 7 to 40 hex characters. MEASURED 2026-10-27: 5 of 15 documents in one group "
         f"named the wrong commit. Correct the document."
     )
+
+
+async def check_closing_evidence(
+    doc: EvidenceDocument, *, merge_commit: str, today: Callable[[], date]
+) -> Refusal | None:
+    """Check both writers' closing evidence against one current source snapshot."""
+    from genesis.session_awareness.pr_completeness import assess_completeness
+    from genesis.session_awareness.pr_verification_sources import SourceError, acquire_sources
+
+    try:
+        snapshot = await asyncio.to_thread(acquire_sources, doc.repo, doc.pr)
+    except SourceError as exc:
+        return Refusal(2, f"Cannot obtain current PR sources for completeness review: {exc}")
+    if (doc.repo, doc.pr, merge_commit) != (snapshot.repo, snapshot.pr, snapshot.merge_commit):
+        return Refusal(2, "Evidence merge identity differs from current PR sources")
+
+    refusal = check_e2e_coverage(doc, snapshot.body)
+    if refusal:
+        return refusal
+    assessment = await asyncio.to_thread(assess_completeness, doc, snapshot)
+    if dated := check_event_dates(doc, True, today()):
+        return dated
+    if not assessment.valid:
+        return Refusal(2, assessment.reason)
+    return None

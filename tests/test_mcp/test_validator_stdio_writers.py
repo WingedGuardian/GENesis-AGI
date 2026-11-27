@@ -8,6 +8,7 @@ from fastmcp import Client
 from fastmcp.client.transports import StdioTransport
 from fastmcp.exceptions import ToolError
 
+from tests.fixtures.verification_sources import simple_receipt
 from tests.test_mcp.validator_stdio_fixture import prepare
 from tests.test_scripts.test_pr_verification_closer import _doc
 
@@ -24,10 +25,11 @@ async def test_stdio_health_records_or_forces_preview(tmp_path, recording):
     async with client(fixture, "health") as mcp:
         assert len(await mcp.list_tools()) == 9
         result = (await mcp.call_tool("pr_verification_close", {
-            "pr": 7, "evidence_json": json.dumps(_doc()),
+            "pr": 7, "evidence_json": json.dumps(simple_receipt(_doc())),
         })).data
         assert result["dry_run"] is (not recording)
         assert result["recorded"] is recording
+        assert result["completeness"] == "verified"
         created = (await mcp.call_tool("follow_up_create", {
             "content": "Synthetic transport finding", "reason": "Synthetic transport evidence",
             "work_state": "ready", "strategy": "user_input_needed", "request_key": "stdio-finding",

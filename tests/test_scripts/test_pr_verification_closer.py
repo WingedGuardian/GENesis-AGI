@@ -39,6 +39,14 @@ import pytest
 
 from genesis.session_awareness.pr_recording import PrMetadata
 from tests.conftest import private_module
+from tests.fixtures.verification_sources import (
+    CLOSE_CASES,
+    MERGE_SHA,
+    reviewed_close,
+    simple_receipt,
+    stub_legacy_writer_review,
+    writer_source,
+)
 from tests.test_session_awareness.conftest import build_pr_verifications
 
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "pr_verification.py"
@@ -47,11 +55,6 @@ _prv = private_module("pr_verification_under_test", _SCRIPT)
 REPO = "owner/repo"
 OTHER = "owner/fork"
 NOW = "2026-09-20T11:00:00+00:00"
-#: The PR's merge commit as the stubbed GitHub lookup reports it. Every document
-#: below names its first 12 characters, the form a validator usually copies.
-MERGE_SHA = "deadbeef1234" + "0" * 28
-
-
 #: The date every close in these tests is judged on: before EVENT_GAP's trigger, so a
 #: close may still store it as a recheck. The refusal of a due trigger is tested
 #: with its own dates below.
@@ -75,6 +78,7 @@ def _no_real_github(monkeypatch):
 
     monkeypatch.setattr(_prv, "gh_pr_metadata", fake)
     from genesis.session_awareness import pr_tracking
+    stub_legacy_writer_review(monkeypatch)
     monkeypatch.setattr(pr_tracking, "public_receipt", lambda *a: "synthetic task covers concern")
     return calls
 
@@ -229,32 +233,36 @@ def _run(tmp_path: Path, doc: dict, *extra: str, pr: int = 7, route: bool = True
     )
 
 
-@pytest.mark.parametrize("review_complete", [False, True])
-def test_p2_receipt_is_stored_without_claiming_close_enforcement(tmp_path, monkeypatch, review_complete):
-    from dataclasses import replace
-
-    from genesis.session_awareness.pr_completeness import source_binding
-    from tests.test_session_awareness.test_pr_completeness import refresh, reviewed
-
+@pytest.mark.parametrize("case", CLOSE_CASES)
+@pytest.mark.parametrize("preview", [False, True])
+def test_close_requires_an_independent_receipt(tmp_path, monkeypatch, capsys, case, preview):
     source_dir = tmp_path / "source"
     source_dir.mkdir()
-    doc, source = reviewed(source_dir)
-    source = replace(source, merge_commit=MERGE_SHA)
-    doc["merge_commit"] = MERGE_SHA
-    doc["completeness"]["inventory"]["source"] = source_binding(source).model_dump(mode="json")
-    doc["completeness"]["complete"] = review_complete
-    refresh(doc)
+    doc, source = reviewed_close(source_dir, monkeypatch, case)
     monkeypatch.setattr(_prv, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, source.body))
-    _seed(tmp_path / "genesis.db")
-    assert _run(tmp_path, doc, route=False) == 0
-    stored = _row(tmp_path / "genesis.db")
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    before = _row(db)
+    flags = ["--dry-run"] if preview else []
+    if reason := CLOSE_CASES[case]:
+        assert _run(tmp_path, doc, *flags, route=False) == 2
+        stderr = capsys.readouterr().err
+        assert reason in stderr and "Nothing was written" in stderr
+        assert _row(db) == before
+        return
+    assert _run(tmp_path, doc, *flags, route=False) == 0
+    stored = _row(db)
+    if preview:
+        assert "CLOSES the row" in capsys.readouterr().out
+        assert stored == before
+        return
     assert stored["status"] == "closed"
     receipt = json.loads(stored["evidence"])["completeness"]
-    assert receipt["complete"] is review_complete
+    assert receipt["complete"] is True
     assert receipt["evidence_sha256"] == doc["completeness"]["evidence_sha256"]
     assert receipt["review_execution_ref"] == "fixture-only:no-model-ran"
-    # P3 replaces this intermediate expectation with the shared close refusal;
-    # these owned writes are not permission to release an installed HOLD.
+    assert _run(tmp_path, doc, route=False) == 1
+    assert _row(db) == stored
 
 
 # ── print-schema ─────────────────────────────────────────────────────────
@@ -273,8 +281,11 @@ def test_unlinked_finding_saves_measurement_without_completing_tracking(tmp_path
 
 
 def test_pending_tracking_retains_measurement_before_close_only_e2e_gate(tmp_path, monkeypatch):
+    from genesis.session_awareness import pr_verification_sources
+
     _seed(tmp_path / "genesis.db")
     monkeypatch.setattr(_prv, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, "E2E: run timer"))
+    monkeypatch.setattr(pr_verification_sources, "acquire_sources", lambda *a: pytest.fail("opened full sources"))
     doc = _doc(findings=[dict(summary="timer defect", disposition="not yet filed")])
     assert _run(tmp_path, doc, route=False) == 4
     assert _row(tmp_path / "genesis.db")["verdict"] == "pass-mechanical"
@@ -1376,14 +1387,22 @@ def test_print_schema_carries_no_progress_as_a_real_bool(capsys):
 
 
 def test_a_declared_no_progress_says_when_the_row_is_offered_again(tmp_path, capsys):
+    from tests.test_scripts.test_verification_readers import _w
+
     db = tmp_path / "genesis.db"
     _seed(db)
-    assert _run(tmp_path, _doc(gaps=[UNDONE_GAP], no_progress=True)) == 0
+    doc = simple_receipt(_with_tracking(_doc(gaps=[UNDONE_GAP], no_progress=True)))
+    assert _run(tmp_path, doc, route=False) == 0
     out = capsys.readouterr().out
     after = re.search(r"declared no progress: offered again after (\S+ \S+) UTC", out)
     assert after, out
-    last = datetime.fromisoformat(_row(db)["last_attempt_at"])
+    stored = _row(db)
+    assert json.loads(stored["evidence"])["completeness"]["evidence_sha256"] == doc["completeness"]["evidence_sha256"]
+    last = datetime.fromisoformat(stored["last_attempt_at"])
     assert after.group(1) == (last + timedelta(days=7)).astimezone(UTC).strftime("%Y-%m-%d %H:%M")
+    _w._print_verification_backlog(str(db))
+    backlog = capsys.readouterr().out
+    assert f"OPEN  {REPO}#7" in backlog and "ATTEMPTED 1x  not-yet-done" in backlog
     assert _candidates(db) == []
 
 
@@ -1518,11 +1537,13 @@ _REAL_METADATA = _prv.gh_pr_metadata
 @pytest.mark.parametrize("dry_run", [False, True])
 @pytest.mark.parametrize("target", ["claim", "gap"])
 def test_declared_e2e_mapping_allows_the_existing_close(tmp_path, monkeypatch, dry_run, target):
+    from genesis.session_awareness import pr_verification_sources
     db = tmp_path / "genesis.db"
     _seed(db)
     before = _row(db)
     step = "measure the next timer run"
     monkeypatch.setattr(_prv, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, "E2E: " + step))
+    monkeypatch.setattr(pr_verification_sources, "acquire_sources", lambda *a: writer_source(*a, "E2E: " + step))
     doc = _doc(e2e=[{"step": step, target: 0}], gaps=[EVENT_GAP] if target == "gap" else [])
     assert _run(tmp_path, doc, *(["--dry-run"] if dry_run else [])) == 0
     stored = _row(db)
@@ -1539,10 +1560,12 @@ def test_missing_declared_e2e_coverage_refuses_without_writing(tmp_path, monkeyp
     import shutil
     import subprocess
 
+    from genesis.session_awareness import pr_verification_sources
     db = tmp_path / "genesis.db"
     _seed(db)
     before = _row(db)
     step = "restart the timer and measure its next scheduled run"
+    monkeypatch.setattr(pr_verification_sources, "acquire_sources", lambda *a: writer_source(*a, "E2E: " + step))
     monkeypatch.setattr(_prv, "gh_pr_metadata", _REAL_METADATA)
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/gh")
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _Proc(
