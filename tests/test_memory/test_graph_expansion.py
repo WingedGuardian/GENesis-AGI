@@ -545,6 +545,7 @@ GHOST = "00000000-0000-4000-8000-000000000004"
 ABSENT = "00000000-0000-4000-8000-000000000005"
 KEYWORD_ONLY = "00000000-0000-4000-8000-000000000006"
 PENDING = "00000000-0000-4000-8000-000000000007"
+FAILED = "00000000-0000-4000-8000-000000000008"
 
 
 @pytest.fixture
@@ -641,15 +642,75 @@ async def test_hydrate_neighbours_reads_points_and_metadata(db, real_qdrant):
     assert await graph_expansion.hydrate_neighbours(db, real_qdrant, []) == {}
 
 
-async def test_hydrate_neighbours_omits_memories_without_a_vector(db, real_qdrant):
-    """No point means no neighbour, even when FTS holds the text: a subsystem
-    write is FTS-only for good, and a pending one returns once embedded."""
-    for mid, status in ((KEYWORD_ONLY, "fts5_only"), (PENDING, "pending")):
+async def test_hydrate_neighbours_reads_never_embedded_memories_from_fts(db, real_qdrant):
+    """A memory that was never embedded has no point, and FTS holds its only
+    text: it stays a neighbour, as before #5052, with visibility from
+    memory_metadata. A subsystem write is FTS-only for good; a pending or
+    failed one has no vector yet."""
+    for mid, status in ((KEYWORD_ONLY, "fts5_only"), (PENDING, "pending"), (FAILED, "failed")):
         await _metadata(db, mid, embedding_status=status)
-        await memory_crud.create(db, memory_id=mid, content=f"{status} text")
+        await memory_crud.create(
+            db,
+            memory_id=mid,
+            content=f"{status} text",
+            source_type="memory",
+            tags="a b",
+            collection="knowledge_base",
+        )
+    await db.execute(
+        "UPDATE memory_metadata SET deprecated = 1, origin_class = 'external_untrusted', "
+        "invalid_at = '2099-01-01T00:00:00+00:00' WHERE memory_id = ?",
+        (PENDING,),
+    )
+    # A neighbour with a point, in the same call: it keeps the point path.
+    await _metadata(db, ALIVE)
+    _put_point(real_qdrant, "episodic_memory", ALIVE, content="pointed", source_type="memory")
     await db.commit()
 
-    assert await graph_expansion.hydrate_neighbours(db, real_qdrant, [KEYWORD_ONLY, PENDING]) == {}
+    got = await graph_expansion.hydrate_neighbours(
+        db, real_qdrant, [ALIVE, KEYWORD_ONLY, PENDING, FAILED]
+    )
+
+    assert set(got) == {ALIVE, KEYWORD_ONLY, PENDING, FAILED}
+    assert got[ALIVE]["content"] == "pointed"
+    assert got[KEYWORD_ONLY] == {
+        "content": "fts5_only text",
+        "source_type": "memory",
+        "tags": "a b",
+        "collection": "knowledge_base",  # from the FTS row, as before #5052
+        "origin_class": None,
+        "invalid_at": None,
+        "deprecated": 0,
+    }
+    # memory_metadata, not FTS, decides visibility and origin
+    assert got[PENDING]["deprecated"] == 1
+    assert got[PENDING]["origin_class"] == "external_untrusted"
+    assert got[PENDING]["invalid_at"] == "2099-01-01T00:00:00+00:00"
+
+
+async def test_hydrate_neighbours_skips_the_fts_scan_when_every_neighbour_has_a_point(
+    db, real_qdrant, monkeypatch
+):
+    """The FTS read is the one scan left, so it runs only for a never-embedded
+    neighbour; an embedded memory whose point is gone stays dangling."""
+    await _metadata(db, ALIVE)
+    _put_point(real_qdrant, "episodic_memory", ALIVE, content="text", source_type="memory")
+    await _metadata(db, GHOST)
+    await memory_crud.create(db, memory_id=GHOST, content="stale fts row")
+    await db.commit()
+    asked: list[list[str]] = []
+    real = memory_crud.expansion_fts_rows_by_ids
+
+    async def spy(conn, ids):
+        asked.append(list(ids))
+        return await real(conn, ids)
+
+    monkeypatch.setattr(memory_crud, "expansion_fts_rows_by_ids", spy)
+
+    got = await graph_expansion.hydrate_neighbours(db, real_qdrant, [ALIVE, GHOST])
+
+    assert set(got) == {ALIVE}
+    assert asked == []  # FTS is never read
 
 
 async def test_hydrate_neighbours_point_in_both_collections_reads_as_knowledge_base(

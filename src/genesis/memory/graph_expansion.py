@@ -236,6 +236,9 @@ def reranker_enabled() -> bool:
 # in both reports ``knowledge_base``: the external collection, which the
 # injection gate's fallback treats as external.
 _POINT_COLLECTIONS = ("episodic_memory", "knowledge_base")
+# ``memory_metadata.embedding_status`` values of a memory that has no vector
+# point yet or ever, so its text is read from FTS instead.
+_NO_VECTOR_STATUSES = frozenset({"fts5_only", "pending", "failed"})
 
 
 def _is_point_id(memory_id: str) -> bool:
@@ -289,9 +292,8 @@ async def hydrate_neighbours(
 
     Every read is keyed by id (#5052): one point ``retrieve`` per collection,
     concurrent and off the event loop, then the ``memory_metadata`` primary
-    key. Nothing reads
-    ``memory_fts``, whose ``memory_id`` column is UNINDEXED, so a lookup by it
-    scans the whole index.
+    key. ``memory_fts``, whose ``memory_id`` column is UNINDEXED (a lookup by it
+    scans the whole index), is read only for a memory that has no point.
 
     ``content``, ``source_type`` and ``tags`` come from the point payload
     (``tags`` as the space-separated string ``store()`` also writes to FTS);
@@ -299,13 +301,18 @@ async def hydrate_neighbours(
     ``invalid_at`` and ``deprecated`` come from ``memory_metadata``, the
     authoritative copy.
 
-    An id with no point is omitted: a dangling link (an id that is not a UUID
-    cannot have one, so it is dropped before the read), and also a memory that has
-    no vector (a ``fts5_only`` subsystem write, or one still ``pending``
-    embedding, which returns once embedded). So is a point with no
-    ``memory_metadata`` row: that is a deleted memory's leftover vector, whose
-    payload still holds the deleted text, and recall drops it as a ghost too
-    (``retrieval.metadata_missing_ids``). A failed point read raises; both
+    A memory that was never embedded (``memory_metadata`` says ``fts5_only``,
+    ``pending`` or ``failed``) has no point, and its text exists only in FTS, so
+    it is hydrated from there, as before #5052, with the visibility still from
+    ``memory_metadata``. That read is the one scan left, and it runs only when
+    such a neighbour is asked for.
+
+    Any other id with no point is a dangling link and is omitted: no metadata
+    row, or an embedded memory whose point is gone, even when a stale FTS row
+    survives it (an id that is not a UUID is dropped before any read). So is a point
+    with no ``memory_metadata`` row: that is a deleted memory's leftover vector,
+    whose payload still holds the deleted text, and recall drops it as a ghost
+    too (``retrieval.metadata_missing_ids``). A failed point read raises; both
     callers already log it and skip expansion.
     """
     # An id that is not a UUID cannot have a point, so it is dangling too.
@@ -313,8 +320,22 @@ async def hydrate_neighbours(
     if not ids:
         return {}
     points = await _neighbour_points(db, qdrant, ids)
-    meta = await memory_crud.expansion_metadata_by_ids(db, list(points))
+    meta = await memory_crud.expansion_metadata_by_ids(db, ids)
+    no_vector = [
+        i
+        for i in ids
+        if i not in points and i in meta and meta[i].get("embedding_status") in _NO_VECTOR_STATUSES
+    ]
+    fts_rows = await memory_crud.expansion_fts_rows_by_ids(db, no_vector) if no_vector else {}
     out: dict[str, dict] = {}
+    for mid, fts in fts_rows.items():
+        row = meta[mid]
+        out[mid] = {
+            **fts,
+            "origin_class": row.get("origin_class"),
+            "invalid_at": row.get("invalid_at"),
+            "deprecated": row["deprecated"],
+        }
     for mid, (collection, payload) in points.items():
         row = meta.get(mid)
         if row is None:

@@ -330,7 +330,8 @@ async def origin_class_by_ids(db: aiosqlite.Connection, ids: list[str]) -> dict[
 
 
 async def expansion_metadata_by_ids(db: aiosqlite.Connection, ids: list[str]) -> dict[str, dict]:
-    """memory_id → {origin_class, invalid_at, deprecated} (missing ids omitted).
+    """memory_id → {origin_class, invalid_at, deprecated, embedding_status}
+    (missing ids omitted).
 
     The indexed half of graph-expansion neighbour hydration
     (``graph_expansion.hydrate_neighbours``): ``memory_metadata`` is keyed by
@@ -342,11 +343,41 @@ async def expansion_metadata_by_ids(db: aiosqlite.Connection, ids: list[str]) ->
         return {}
     marks = ",".join("?" * len(ids))
     rows = await db.execute_fetchall(
-        f"SELECT memory_id, origin_class, invalid_at, deprecated "  # noqa: S608 - placeholders bound
+        f"SELECT memory_id, origin_class, invalid_at, deprecated, embedding_status "  # noqa: S608 - placeholders bound
         f"FROM memory_metadata WHERE memory_id IN ({marks})",
         ids,
     )
-    return {r[0]: {"origin_class": r[1], "invalid_at": r[2], "deprecated": r[3]} for r in rows}
+    return {
+        r[0]: {
+            "origin_class": r[1],
+            "invalid_at": r[2],
+            "deprecated": r[3],
+            "embedding_status": r[4],
+        }
+        for r in rows
+    }
+
+
+async def expansion_fts_rows_by_ids(db: aiosqlite.Connection, ids: list[str]) -> dict[str, dict]:
+    """memory_id → {content, source_type, tags, collection} from ``memory_fts``.
+
+    Only for neighbours that exist but have no vector point (an ``fts5_only``
+    write, or one ``pending`` or ``failed`` embedding): FTS is the only copy of
+    their text. ``memory_id`` is an UNINDEXED FTS5 column, so this scans the
+    index; ``graph_expansion.hydrate_neighbours`` calls it only when such a
+    neighbour is asked for, which keeps the common recall off the scan.
+    """
+    if not ids:
+        return {}
+    marks = ",".join("?" * len(ids))
+    rows = await db.execute_fetchall(
+        f"SELECT memory_id, content, source_type, tags, collection "  # noqa: S608 - placeholders bound
+        f"FROM memory_fts WHERE memory_id IN ({marks})",
+        ids,
+    )
+    return {
+        r[0]: {"content": r[1], "source_type": r[2], "tags": r[3], "collection": r[4]} for r in rows
+    }
 
 
 async def delete(db: aiosqlite.Connection, *, memory_id: str) -> bool:

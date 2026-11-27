@@ -184,16 +184,23 @@ async def test_expansion_metadata_by_ids(tmp_path):
         )
 
         assert got == {
-            "alive": {"origin_class": "external_untrusted", "invalid_at": None, "deprecated": 0},
+            "alive": {
+                "origin_class": "external_untrusted",
+                "invalid_at": None,
+                "deprecated": 0,
+                "embedding_status": "embedded",
+            },
             "future": {
                 "origin_class": None,
                 "invalid_at": "2099-01-01T00:00:00+00:00",
                 "deprecated": 1,
+                "embedding_status": "embedded",
             },
             "expired": {
                 "origin_class": None,
                 "invalid_at": "2020-01-01T00:00:00+00:00",
                 "deprecated": 0,
+                "embedding_status": "embedded",
             },
         }
         assert await memory_crud.expansion_metadata_by_ids(conn, []) == {}
