@@ -280,7 +280,9 @@ names, so an overlay of a read-only file is editable (#2446).
   `src/genesis/identity/paths.py`: SOUL and VOICE read `<name>`, else `<name>.example`;
   CONVERSATION and STEERING read the tracked file with a per-install `<stem>.local.md`
   appended after a `---` (a local file whose first line is `<!-- genesis: replace -->`
-  replaces the tracked text). The dashboard file editor
+  replaces the tracked text, and the result opens with a line saying so). The
+  steering writer (`IdentityLoader.add_steering_rule`) appends captured rules to
+  `STEERING.local.md`, never to the tracked file. The dashboard file editor
   may edit these, and may create one only where a `.example` exists.
 - **Claude Code** — `.claude/settings.json` (tracked, hook wiring, ships to every clone);
   `.claude/settings.local.json` (gitignored); `~/.claude/settings.json` (user level;

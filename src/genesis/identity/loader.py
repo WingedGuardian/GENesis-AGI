@@ -2,19 +2,31 @@
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import logging
+import os
 import re
+import stat
+import tempfile
+import unicodedata
 from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 
-from genesis.identity.paths import effective_sources, read_identity
+from genesis.identity.paths import read_identity
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_DIR = Path(__file__).parent
 _STEERING_SEPARATOR = "---"
-_STEERING_MAX_RULES = 20
+# A captured rule longer than this is refused, never cut: the directive filter
+# counts words, and one "word" can be any length (a path, or text joined by a
+# non-space blank).
+_MAX_RULE_CHARS = 600
+# A rule line that could pass for file structure: a heading, an HTML comment
+# (the replace marker is one), or a `_[` note like the resolver's own.
+_STRUCTURE_LINE = re.compile(r"^\s*(#|_\[)|<!--")
 
 # USER.md auto-synthesis — line cap keeps context injection under ~1500 tokens.
 _MAX_USER_MD_LINES = 50
@@ -125,12 +137,9 @@ class IdentityLoader:
     def __init__(
         self,
         identity_dir: Path = _DEFAULT_DIR,
-        *,
-        steering_max_rules: int = _STEERING_MAX_RULES,
     ) -> None:
         self._dir = identity_dir
         self._cache: dict[str, str] = {}
-        self._steering_max_rules = steering_max_rules
 
     def soul(self) -> str:
         return self._load("SOUL.md")
@@ -419,35 +428,78 @@ class IdentityLoader:
                 return label
         return None
 
-    def add_steering_rule(self, rule: str) -> None:
-        """Append a steering rule to STEERING.md with FIFO eviction.
+    def add_steering_rule(self, rule: str) -> bool:
+        """Append a steering rule to STEERING.local.md, the per-install layer.
 
-        If the rule count exceeds the cap, the oldest rule is dropped.
-        Clears the STEERING.md cache so the next read picks up the change.
-        Any line inside the rule that is exactly the block separator (``---``)
-        is neutralized to an em-dash, so a rule body can never be silently split
-        into two blocks on the next read→write round-trip.
+        The shipped STEERING.md is never written, and no stored rule is ever
+        evicted or cut. The rule becomes its own ``---``-delimited block after
+        the local file's existing ones (inside a replace layer, after its
+        body), so the resolver reads it after every rule already in force. A
+        rule already in force (compared with whitespace normalized) is not
+        added twice. A line that is exactly the separator is neutralized to an
+        em-dash, so a body is never split.
+
+        Refused with a warning, returning False: a rule over _MAX_RULE_CHARS,
+        or one with a line matching _STRUCTURE_LINE. A STEERING.local.md that
+        is a symlink or not a regular file raises.
+
+        The read-modify-write holds a lock on the identity directory (held for
+        milliseconds; the server is the only writer today) and swaps in a
+        fresh 0600 file, fsynced, created under a random name. Returns whether
+        a rule was written. Logs name a rule by a short key, never its text: the
+        text is private (gitignored, 0600) and the journal reaches diagnostics.
         """
-        path = self._dir / "STEERING.md"
-        if path.exists() and [p.name for p in effective_sources("STEERING.md", self._dir)] == [
-            "STEERING.local.md"
-        ]:
-            # A replace layer is in force, so no reader sees STEERING.md. The rule is
-            # still kept there (recoverable) until the layered writer moves it.
-            logger.warning(
-                "Steering rule saved to STEERING.md, which the STEERING.local.md replace "
-                "layer hides: it is not in force until that layer includes it"
+        safe_rule = re.sub(r"(?m)^\s*---\s*$", "—", "\n".join(rule.strip().splitlines()))
+        if not safe_rule:
+            return False
+        structure = [
+            n for n, line in enumerate(safe_rule.splitlines(), 1) if _STRUCTURE_LINE.search(line)
+        ]
+        if len(safe_rule) > _MAX_RULE_CHARS or structure:
+            reason = (
+                f"over {_MAX_RULE_CHARS} chars"
+                if len(safe_rule) > _MAX_RULE_CHARS
+                else f"a heading, comment or note on line {structure[0]}"
             )
-        # Parse the file this writes, never the layered text steering() returns:
-        # a STEERING.local.md rule must not be copied into the shipped file.
-        rules = self._parse_rules(path.read_text(encoding="utf-8").strip() if path.exists() else "")
-        safe_rule = re.sub(r"(?m)^\s*---\s*$", "—", rule.strip())
-        rules.append(safe_rule)
-        # FIFO eviction — drop oldest if over cap
-        while len(rules) > self._steering_max_rules:
-            rules.pop(0)
-        self._write_steering(path, rules)
-        self._cache.pop("STEERING.md", None)
+            logger.warning(
+                "Steering rule refused (%s; %d chars, key %s)", reason, len(safe_rule), _rule_tag(safe_rule)
+            )
+            return False
+        path = self._dir / "STEERING.local.md"
+        fd = os.open(self._dir, os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            # First, so the resolver read below never opens a symlink or a FIFO.
+            text = _read_regular_file(path)
+            # A staging file only outlives a write killed mid-swap; the lock means
+            # no other writer is using one, so any left here is garbage. Only
+            # mkstemp's own names (8 of [a-z0-9_]) are removed. The .tmp suffix
+            # keeps a leftover out of the identity backup, which lists *.md.
+            for stale in self._dir.glob("." + path.name + "." + "?" * 8 + ".tmp"):
+                if re.fullmatch(r"\." + re.escape(path.name) + r"\.[a-z0-9_]{8}\.tmp", stale.name):
+                    stale.unlink(missing_ok=True)
+            if _rule_key(safe_rule) in _in_force_keys(read_identity("STEERING.md", self._dir) or ""):
+                logger.debug("Steering rule already in force (key %s)", _rule_tag(safe_rule))
+                return False
+            # Every rule follows a separator, the first one too: the resolver
+            # and _parse_rules read a file's first block as a preamble, never a
+            # rule, and a rule can then never become the replace marker line.
+            new = text.rstrip() + ("\n\n" if text.strip() else "") + "---\n\n" + safe_rule + "\n"
+            tmp_fd, tmp = tempfile.mkstemp(dir=self._dir, prefix="." + path.name + ".", suffix=".tmp")
+            try:
+                with os.fdopen(tmp_fd, "w", encoding="utf-8") as out:
+                    out.write(new)
+                    out.flush()
+                    os.fsync(out.fileno())
+                os.replace(tmp, path)
+            except BaseException:
+                Path(tmp).unlink(missing_ok=True)
+                raise
+        finally:
+            os.close(fd)
+            self._cache.pop("STEERING.md", None)
+        logger.info("Steering rule written to %s (%d chars, key %s)", path.name, len(safe_rule), _rule_tag(safe_rule))
+        return True
 
     def reload(self) -> None:
         self._cache.clear()
@@ -464,27 +516,41 @@ class IdentityLoader:
         self._cache[filename] = text
         return text
 
-    @staticmethod
-    def _write_steering(path: Path, rules: list[str]) -> None:
-        """Write STEERING.md as preamble + ``---``-delimited rule blocks.
 
-        Each rule is emitted as its own block preceded by a ``---`` separator,
-        so a rule's ``## header`` and multi-line body survive read→append→write
-        round-trips. Counterpart to :meth:`steering_rules` (which splits on the
-        same separator). FIFO eviction in :meth:`add_steering_rule` now drops
-        whole oldest blocks, not partial lines.
-        """
-        preamble = "\n".join([
-            "# Steering Rules",
-            "",
-            "Rules below are hard constraints on Genesis behavior, set by the user.",
-            "Genesis MUST NOT violate these rules under any circumstances.",
-            "",
-            "When the user gives strong negative feedback (\"never do X\", \"stop doing Y\"),",
-            "a new rule is appended here. Oldest rules are evicted when the cap is reached.",
-        ])
-        parts = [preamble]
-        for rule in rules:
-            parts.append(_STEERING_SEPARATOR)
-            parts.append(rule.strip())
-        path.write_text("\n\n".join(parts) + "\n", encoding="utf-8")
+def _rule_key(rule: str) -> str:
+    """A rule compared for duplicates: NFC, whitespace runs collapsed.
+
+    NFC, never NFKC or casefold: those fold characters that mean different
+    things (a fullwidth digit, a superscript, a flag's case), and a false
+    match drops a distinct owner rule, where a missed one only stores a
+    duplicate.
+    """
+    return " ".join(unicodedata.normalize("NFC", rule).split())
+
+
+def _rule_tag(rule: str) -> str:
+    """A short, text-free name for a rule in logs."""
+    return hashlib.sha256(_rule_key(rule).encode("utf-8")).hexdigest()[:12]
+
+
+def _in_force_keys(resolved: str) -> set[str]:
+    """Keys of every block of the resolved steering text, the first one too: a
+    hand-written local or replace layer often has no separator. Whole blocks
+    only, never single lines: a line of a longer rule is not that rule, and a
+    false match would drop the new one. An accepted rule never holds a heading,
+    so it can never equal the shipped preamble or a shipped block.
+    """
+    resolved = re.sub(r"\A_\[The shipped .*?\]_\n\n", "", resolved)
+    return {_rule_key(b) for b in (b.strip() for b in ("\n" + resolved).split("\n---\n")) if b}
+
+
+def _read_regular_file(path: Path) -> str:
+    """The text of *path*, "" when absent; never through a symlink or a non-file."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return ""
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise OSError(f"{path} is not a regular file")
+        return handle.read().decode("utf-8")

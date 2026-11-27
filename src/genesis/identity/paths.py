@@ -9,7 +9,8 @@ Three policies (#2862):
   ``<name>.example``.
 * LAYER (CONVERSATION, STEERING): the shipped ``<name>`` plus the per-install
   ``<stem>.local.md``, appended after a ``---`` separator. A local file whose
-  first line is ``<!-- genesis: replace -->`` replaces the shipped text.
+  first line is ``<!-- genesis: replace -->`` replaces the shipped text, and
+  the result opens with a line saying so.
 * PLAIN (every other name): ``<name>`` as it stands.
 """
 
@@ -87,10 +88,17 @@ def read_identity(name: str, identity_dir: Path) -> str | None:
     local = found[-1].read_text(encoding="utf-8").lstrip("\ufeff")
     first, _, rest = local.partition("\n")
     if first.strip() == REPLACE_MARKER:
-        return rest
+        if len(found) == 1:
+            return rest
+        # Say so in the text itself: a replaced STEERING.md drops shipped hard
+        # constraints, and git cannot show it (the local file is ignored).
+        return f"_[The shipped {name} is replaced by {found[-1].name}.]_\n\n{rest}"
     default = found[0].read_text(encoding="utf-8") if len(found) == 2 else ""
     if not local.strip():
         return default if len(found) == 2 else None
     if not default.strip():
         return local
-    return default.rstrip() + _LAYER_SEPARATOR + local.strip() + "\n"
+    body = local.strip()
+    # A local file that already opens with the separator needs no second one.
+    sep = "\n\n" if body.partition("\n")[0].strip() == "---" else _LAYER_SEPARATOR
+    return default.rstrip() + sep + body + "\n"

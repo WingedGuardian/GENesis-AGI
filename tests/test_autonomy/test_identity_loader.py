@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import re
 from pathlib import Path
 
 import pytest
@@ -102,26 +104,191 @@ class TestSteering:
 
 
 class TestAddSteeringRule:
-    """Adding rules to STEERING.md with FIFO eviction."""
+    """Adding rules: they go to STEERING.local.md, and none is ever dropped."""
 
     def test_add_rule_appended(self, loader: IdentityLoader) -> None:
         loader.add_steering_rule("Do not modify CLAUDE.md")
         rules = loader.steering_rules()
         assert "Do not modify CLAUDE.md" in rules
 
-    def test_fifo_eviction(self, tmp_path: Path) -> None:
-        # Start with an empty STEERING.md (no rules)
-        loader = IdentityLoader(identity_dir=tmp_path, steering_max_rules=3)
-        loader.add_steering_rule("rule-1")
-        loader.add_steering_rule("rule-2")
-        loader.add_steering_rule("rule-3")
-        loader.add_steering_rule("rule-4")
-
+    def test_no_rule_is_ever_evicted(self, tmp_path: Path) -> None:
+        (tmp_path / "STEERING.md").write_text("# Steering\n", encoding="utf-8")
+        loader = IdentityLoader(identity_dir=tmp_path)
+        for i in range(25):
+            assert loader.add_steering_rule(f"rule-{i}") is True
         rules = loader.steering_rules()
-        assert len(rules) == 3
-        # Oldest rule (rule-1) should have been evicted
-        assert "rule-1" not in rules
-        assert "rule-4" in rules
+        assert rules == [f"rule-{i}" for i in range(25)]
+
+    def test_writes_the_local_layer_never_the_shipped_file(self, loader: IdentityLoader) -> None:
+        shipped = (loader._dir / "STEERING.md").read_text(encoding="utf-8")
+        loader.add_steering_rule("Do not modify CLAUDE.md")
+        loader.add_steering_rule("Never force-push")
+        assert (loader._dir / "STEERING.md").read_text(encoding="utf-8") == shipped
+        local = (loader._dir / "STEERING.local.md").read_text(encoding="utf-8")
+        assert local == "---\n\nDo not modify CLAUDE.md\n\n---\n\nNever force-push\n"
+        assert sorted(p.name for p in loader._dir.iterdir() if "STEERING" in p.name) == [
+            "STEERING.local.md", "STEERING.md",
+        ]
+        assert (loader._dir / "STEERING.local.md").stat().st_mode & 0o777 == 0o600
+
+    def test_concurrent_writers_lose_no_rule(self, tmp_path: Path) -> None:
+        import multiprocessing
+
+        (tmp_path / "STEERING.md").write_text("# Steering\n", encoding="utf-8")
+        ctx = multiprocessing.get_context("fork")
+        procs = [ctx.Process(target=_append_rules, args=(tmp_path, w)) for w in ("a", "b")]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(60)
+        assert [p.exitcode for p in procs] == [0, 0]
+        rules = IdentityLoader(identity_dir=tmp_path).steering_rules()
+        assert sorted(rules) == sorted(f"{w}-{i}" for w in ("a", "b") for i in range(40))
+
+    def test_first_rule_counts_without_a_shipped_file(self, tmp_path: Path) -> None:
+        loader = IdentityLoader(identity_dir=tmp_path)
+        assert loader.add_steering_rule("Never A") is True
+        assert loader.steering_rules() == ["Never A"]
+        assert loader.add_steering_rule("Never A") is False
+
+    def test_a_rule_can_never_become_the_replace_marker(self, loader: IdentityLoader) -> None:
+        assert loader.add_steering_rule("<!-- genesis: replace -->\nNever B") is False
+        assert "replaced by" not in loader.steering()
+        assert len(loader.steering_rules()) == 2  # the 2 shipped rules, nothing replaced
+
+    def test_crlf_rule_is_deduplicated(self, loader: IdentityLoader) -> None:
+        assert loader.add_steering_rule("Never Y\r\nok") is True
+        assert loader.add_steering_rule("Never Y\r\nok") is False
+        assert b"\r" not in (loader._dir / "STEERING.local.md").read_bytes()
+
+    def test_symlinked_local_file_is_refused(self, loader: IdentityLoader, tmp_path: Path) -> None:
+        target = tmp_path / "elsewhere.md"
+        target.write_text("", encoding="utf-8")
+        (loader._dir / "STEERING.local.md").symlink_to(target)
+        with pytest.raises(OSError):
+            loader.add_steering_rule("Never C")
+        assert target.read_text(encoding="utf-8") == ""
+        assert (loader._dir / "STEERING.local.md").is_symlink()
+
+    def test_failed_write_leaves_no_temp_file(self, loader: IdentityLoader, monkeypatch) -> None:
+        def boom(*a, **k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr("genesis.identity.loader.os.replace", boom)
+        with pytest.raises(OSError):
+            loader.add_steering_rule("Never D")
+        assert [p.name for p in loader._dir.iterdir() if "STEERING" in p.name] == ["STEERING.md"]
+
+    def test_oversized_rule_is_refused_not_cut(self, loader: IdentityLoader) -> None:
+        long_word = "\u2800".join(["never"] * 200)  # one "word" to str.split()
+        assert loader.add_steering_rule(long_word) is False
+        assert not (loader._dir / "STEERING.local.md").exists()
+
+    @pytest.mark.parametrize("rule", [
+        "## Rule 1 (shipped)\nNever X",
+        "Never X <!-- hidden",
+        "_[The shipped STEERING.md is replaced by STEERING.local.md.]_",
+    ])
+    def test_a_rule_that_could_pass_for_structure_is_refused(self, loader, rule) -> None:
+        assert loader.add_steering_rule(rule) is False
+        assert not (loader._dir / "STEERING.local.md").exists()
+
+    def test_whitespace_variants_are_one_rule(self, loader: IdentityLoader) -> None:
+        assert loader.add_steering_rule("Never push to main") is True
+        assert loader.add_steering_rule("Never  push\u00a0to main") is False
+
+    def test_a_fifo_at_the_path_raises_without_blocking(self, loader: IdentityLoader) -> None:
+        os.mkfifo(loader._dir / "STEERING.local.md")
+        with pytest.raises(OSError):
+            loader.add_steering_rule("Never E")
+
+    def test_layered_text_has_one_separator_before_the_local_rules(self, loader) -> None:
+        loader.add_steering_rule("Never F")
+        assert "---\n\n---" not in loader.steering()
+
+    def test_a_rule_already_in_force_is_not_added_twice(self, loader: IdentityLoader) -> None:
+        assert loader.add_steering_rule("Never force-push") is True
+        assert loader.add_steering_rule("Never force-push") is False
+        assert loader.steering_rules().count("Never force-push") == 1
+
+    def test_appends_inside_a_replace_layer(self, loader: IdentityLoader) -> None:
+        (loader._dir / "STEERING.local.md").write_text(
+            "<!-- genesis: replace -->\n# Mine\n\n---\n\nmy rule\n", encoding="utf-8"
+        )
+        loader.add_steering_rule("new rule")
+        assert loader.steering_rules() == ["my rule", "new rule"]
+        assert "replaced by STEERING.local.md" in loader.steering()
+
+    def test_logs_never_carry_the_rule_text(self, loader: IdentityLoader, caplog) -> None:
+        """The rule is private (gitignored, 0600); the journal reaches diagnostics."""
+        caplog.set_level("DEBUG", logger="genesis.identity.loader")
+        loader.add_steering_rule("Never mention PRIVATE-MARKER-1")
+        loader.add_steering_rule("PRIVATE-MARKER-2 " + "x" * 700)  # refused: too long
+        loader.add_steering_rule("# PRIVATE-MARKER-3")  # refused: a heading
+        text = " ".join(r.getMessage() for r in caplog.records)
+        assert "PRIVATE-MARKER" not in text, text
+        assert "written" in text and "refused" in text
+
+    @pytest.mark.parametrize(("first", "second"), [("report-1.csv", "report-\uff11.csv"), ("x\u00b2", "x2")])
+    def test_compatibility_variants_are_distinct_rules(self, loader: IdentityLoader, first, second) -> None:
+        """NFKC would fold these together and drop the second rule."""
+        assert loader.add_steering_rule(f"Never touch {first}")
+        assert loader.add_steering_rule(f"Never touch {second}")
+
+    def test_canonically_equal_rules_merge(self, loader: IdentityLoader) -> None:
+        assert loader.add_steering_rule("Never say caf\u00e9")
+        assert not loader.add_steering_rule("Never say cafe\u0301")
+
+    @pytest.mark.parametrize(
+        "local",
+        [
+            "Never X\n",  # local-only body, no separator
+            "<!-- genesis: replace -->\nNever X\n",  # hand-written replace layer
+        ],
+    )
+    def test_a_rule_already_in_force_is_not_added_again(self, loader: IdentityLoader, local) -> None:
+        (loader._dir / "STEERING.local.md").write_text(local, encoding="utf-8")
+        assert not loader.add_steering_rule("Never X")
+        assert (loader._dir / "STEERING.local.md").read_text(encoding="utf-8") == local
+
+    def test_a_line_of_a_longer_rule_does_not_block_a_new_rule(self, loader: IdentityLoader) -> None:
+        """A false duplicate would drop the new (here stronger) rule."""
+        (loader._dir / "STEERING.local.md").write_text(
+            "---\n\nNever push to main\nunless the owner approves in chat\n", encoding="utf-8"
+        )
+        assert loader.add_steering_rule("Never push to main")
+
+    def test_a_staging_file_left_by_a_killed_write_is_swept(self, loader: IdentityLoader) -> None:
+        stale = loader._dir / ".STEERING.local.md.abcd1234.tmp"
+        stale.write_text("half a write\n", encoding="utf-8")
+        mine = loader._dir / ".STEERING.local.md.backup-1.tmp"  # not a mkstemp name: kept
+        mine.write_text("kept\n", encoding="utf-8")
+        loader.add_steering_rule("Fresh rule")
+        assert loader.add_steering_rule("Fresh rule") is False  # a duplicate still sweeps
+        assert not stale.exists()
+        assert mine.exists()
+
+    def test_staging_name_is_never_listed_by_the_identity_backup(
+        self, loader: IdentityLoader, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Backup section 6e lists *.md in the identity dir and reports a gap for a
+        dot-named *.local.md, so a staging file left by a killed write must not be one."""
+        import tempfile
+
+        names: list[str] = []
+        real = tempfile.mkstemp
+
+        def spy(*args, **kwargs):
+            fd, name = real(*args, **kwargs)
+            names.append(Path(name).name)
+            return fd, name
+
+        monkeypatch.setattr(tempfile, "mkstemp", spy)
+        assert loader.add_steering_rule("Staged rule")
+        assert names
+        for name in names:
+            assert not name.endswith(".md"), name
+            assert re.fullmatch(r"\.STEERING\.local\.md\.[a-z0-9_]{8}\.tmp", name), name
 
     def test_cache_cleared_after_add(self, loader: IdentityLoader) -> None:
         # Read steering to populate cache
@@ -189,17 +356,10 @@ class TestStructurePreservation:
         assert len(rules) == 3
         assert "Never merge to main without a PR." in rules[-1]
 
-    def test_eviction_drops_whole_block(self, structured_loader: IdentityLoader) -> None:
-        loader = IdentityLoader(
-            identity_dir=structured_loader._dir, steering_max_rules=2,
-        )
-        loader.add_steering_rule("A brand new terse rule.")
-        rules = loader.steering_rules()
-        # Cap=2: oldest whole block (Capability Honesty) evicted, not a stray line.
-        assert len(rules) == 2
-        assert not any("Capability Honesty" in r for r in rules)
-        assert any("Ambiguous Signals" in r for r in rules)
-        assert any("A brand new terse rule." in r for r in rules)
+    def test_shipped_blocks_are_never_rewritten(self, structured_loader: IdentityLoader) -> None:
+        shipped = (structured_loader._dir / "STEERING.md").read_text(encoding="utf-8")
+        structured_loader.add_steering_rule("A brand new terse rule.")
+        assert (structured_loader._dir / "STEERING.md").read_text(encoding="utf-8") == shipped
 
 
 # ===========================================================================
@@ -232,3 +392,9 @@ class TestBackwardCompat:
         # After reload, fresh content is picked up
         loader.reload()
         assert "New rule only" in loader.steering()
+
+
+def _append_rules(identity_dir: Path, writer: str) -> None:
+    loader = IdentityLoader(identity_dir=identity_dir)
+    for i in range(40):
+        loader.add_steering_rule(f"{writer}-{i}")
