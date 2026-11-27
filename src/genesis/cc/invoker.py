@@ -1624,17 +1624,162 @@ async def _emit_bg_truncation_event(cc_session_id: str) -> None:
 # ``cc.invocation_failed`` coalescing. A burst of identical failures (a rate
 # limit hitting every caller of one lane, a network outage parking every
 # dispatch) would otherwise emit one event per call. One event per
-# (error_class, caller_tag, routed model) per window keeps the signal while bounding the
-# volume; the count swallowed in between rides on the NEXT emitted event
-# (``coalesced``), so the omission is declared, never silent. Untagged calls
-# (caller_tag None) are never coalesced: they share no identity to key on.
+# (error_class, caller_tag, routed model, session) per window keeps the signal
+# while bounding the volume; the count swallowed in between rides on the NEXT
+# emitted event for the same key (``coalesced``), so the omission is declared,
+# never silent. Untagged calls (caller_tag None) are never coalesced: they share
+# no identity to key on.
+# The active session (session_context) is part of the key (#4342): one caller
+# tag is shared by every inbox batch, each batch runs under its own manager
+# session, and without the session two batches failing the same way inside the
+# window merged into one event, with the swallowed count landing on whichever
+# session failed next. Calls outside a session scope key on None, as before.
 # 60s: short enough that a recurring failure re-surfaces within a minute, long
 # enough to collapse one incident's fan-out burst into one row.
 _FAILURE_EVENT_COALESCE_S = 60.0
-# (error_class, caller_tag, roster_model) -> [monotonic time of last emit,
-# suppressed since]. Keyed on a small closed set (exception classes x call-site
-# tags x roster models) — bounded.
-_failure_event_state: dict[tuple[str, str | None, str], list[float]] = {}
+# (error_class, caller_tag, roster_model, session_id) -> [monotonic time of last
+# emit, suppressed since, monotonic time of the last failure (emitted or
+# suppressed)]. Session ids are an open set and most sessions are
+# one-shot (an inbox batch, an ego cycle), so a session's swallowed count usually
+# has no "next event" of its own to ride on. Each claim therefore retires every
+# entry whose window has passed, and any count it still owes is declared in an
+# event of its own, against its own session (or None)
+# (_declare_retired_counts). A session that goes quiet makes no further claim,
+# so a runtime-owned sweeper (run_failure_count_sweeper) does the same retiring
+# on a timer; without it a quiet session's count waited for an unrelated later
+# failure, or was lost at exit. A declared count is back-dated to its last
+# failure, so it never reads as a fresh error. Unscoped entries (session None,
+# a tagged call made outside any session scope) are retired the same way: a
+# tagged background caller that fails inside the window and then stops would
+# otherwise keep its count until a same-key failure that may never come.
+_FailureKey = tuple[str, str | None, str, str | None]
+_failure_event_state: dict[_FailureKey, list[float]] = {}
+
+
+def _sweep_failure_event_state(now: float) -> list[tuple[_FailureKey, list[float]]]:
+    """Retire expired coalescing entries; return the retired ones that owe a count."""
+    owed: list[tuple[_FailureKey, list[float]]] = []
+    for key, state in list(_failure_event_state.items()):
+        if now - state[0] < _FAILURE_EVENT_COALESCE_S:
+            continue
+        del _failure_event_state[key]
+        if state[1]:
+            owed.append((key, state))
+    return owed
+
+
+def _put_back_owed(key: _FailureKey, state: list[float]) -> None:
+    """Return an undeclared owed count to the coalescing state.
+
+    If the key has been re-claimed meanwhile, the count is added to that live
+    entry (it rides on the key's next event) instead of being dropped.
+    """
+    current = _failure_event_state.get(key)
+    if current is None:
+        _failure_event_state[key] = state
+    else:
+        current[1] += state[1]
+        current[2] = max(current[2], state[2])
+
+
+async def _declare_retired_counts(bus, owed: list[tuple[_FailureKey, list[float]]]) -> None:
+    """Emit the count each retired entry still owed, attributed to its session.
+
+    The event stands for ``coalesced`` failures that were swallowed and never
+    re-reported (``retired=True``), not for a new failure. Never raises an
+    ordinary error: a failed emit puts the entry back so a later claim retries
+    the declaration. A cancellation puts back every count after the one being
+    declared (which the bus had already accepted), then propagates. That relies
+    on ``GenesisEventBus.emit`` accepting an event before its first await; a bus
+    that awaits first would lose the current count on cancellation instead.
+    """
+    for index, (key, state) in enumerate(owed):
+        try:
+            await _declare_retired_count(bus, key, state)
+        except Exception:
+            _put_back_owed(key, state)
+            logger.debug("cc.invocation_failed retired-count emit failed", exc_info=True)
+        except BaseException:
+            # The bus accepts an event (ring + write queue) before its first
+            # await, so a cancellation can only land after the current entry was
+            # accepted, while a listener runs. Put back only the entries after it;
+            # restoring this one too would declare its count twice.
+            for undeclared_key, undeclared_state in owed[index + 1 :]:
+                _put_back_owed(undeclared_key, undeclared_state)
+            raise
+
+
+async def _declare_retired_count(bus, key: _FailureKey, state: list[float]) -> None:
+    """Emit one retired entry's owed count (see ``_declare_retired_counts``).
+
+    The event is back-dated to the entry's last failure: it reports failures
+    that already happened, and stamping it "now" would make a long-finished
+    session's error look active again to every recency consumer.
+    """
+    from genesis.cc import exceptions as cc_exceptions
+    from genesis.observability.session_context import session_scope
+    from genesis.observability.types import Severity, Subsystem
+
+    error_class, caller_tag, roster_model, session_id = key
+    count = int(state[1])
+    exc_type = getattr(cc_exceptions, error_class, None)
+    is_limit = isinstance(exc_type, type) and issubclass(
+        exc_type, (CCRateLimitError, CCQuotaExhaustedError)
+    )
+    message = f"CC invocation failed ({error_class}) for {caller_tag}"
+    if roster_model and roster_model != roster.CLAUDE:
+        message += f" via {roster_model}"
+    message += f" ({count} similar failure(s) coalesced; no later failure was reported)"
+    # Emitted under the entry's own session, not whichever one triggered the
+    # sweep: the bus fills a None session_id from the ambient session, so an
+    # unscoped count retired inside another session's claim would be stored
+    # against that unrelated session.
+    with session_scope(session_id):
+        await bus.emit(
+            Subsystem.PROVIDERS,
+            Severity.WARNING if is_limit else Severity.ERROR,
+            "cc.invocation_failed",
+            message,
+            occurred_seconds_ago=max(0.0, time.monotonic() - state[2]),
+            error_class=error_class,
+            roster_model=roster_model,
+            session_id=session_id,
+            caller_tag=caller_tag,
+            coalesced=count,
+            retired=True,
+        )
+
+
+async def declare_settled_failure_counts() -> int:
+    """Retire expired coalescing entries now and declare the counts they owe.
+
+    The same retiring a claim does, without waiting for a claim: a session that
+    goes quiet after a swallowed failure makes none. Returns how many entries
+    were declared (or put back on a failed emit). No-ops without a bus, so
+    nothing is retired that could not be declared.
+    """
+    bus = _runtime_event_bus()
+    if bus is None:
+        return 0
+    owed = _sweep_failure_event_state(time.monotonic())
+    if owed:
+        await _declare_retired_counts(bus, owed)
+    return len(owed)
+
+
+async def run_failure_count_sweeper(interval_s: float = _FAILURE_EVENT_COALESCE_S) -> None:
+    """Runtime-owned loop: every ``interval_s``, declare settled failure counts.
+
+    Started at bootstrap and cancelled at shutdown (GenesisRuntime). A count is
+    declared at most one window plus one interval after its session's last
+    emitted event. Never exits on an ordinary error.
+    """
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            await declare_settled_failure_counts()
+        except Exception:
+            logger.debug("cc.invocation_failed failure-count sweep failed", exc_info=True)
 
 
 def _runtime_event_bus():
@@ -1683,17 +1828,22 @@ async def _emit_invocation_failed_event(
     unrelated subsystems under ``(class, None)`` would hide one behind another.
     The routed roster model is part of the key and the payload: one caller tag
     can reach native Claude and a peer endpoint, and those are separate outages.
+    So is the active session (#4342): one caller tag is shared by many sessions,
+    and each session's failures are coalesced and attributed separately.
     Same bus resolution as ``_emit_bg_truncation_event``: no-ops when the
     runtime/bus is absent and never raises — observability must not mask the
     real error the caller is about to receive.
     """
+    from genesis.observability.session_context import get_session_id
     from genesis.util.execution_privacy import private_execution_active
 
     if private_execution_active():
         return  # Managed receipts expose classified failures, not raw provider data.
     is_limit = isinstance(exc, (CCRateLimitError, CCQuotaExhaustedError))
-    key: tuple[str, str | None, str] | None = None
+    key: _FailureKey | None = None
     prev_state: list[float] | None = None
+    owed: list[tuple[_FailureKey, list[float]]] = []
+    declaring = False
     try:
         if invocation.caller_tag == PROBE_CALLER_TAG and is_limit:
             return
@@ -1709,20 +1859,25 @@ async def _emit_invocation_failed_event(
         ):
             roster_model = invocation.model_id_override or "routed"
         coalesced = 0
+        session_id = get_session_id()
         if invocation.caller_tag is not None:
-            key = (error_class, invocation.caller_tag, roster_model)
+            key = (error_class, invocation.caller_tag, roster_model, session_id)
             now = time.monotonic()
             prev_state = _failure_event_state.get(key)
             if prev_state is not None and now - prev_state[0] < _FAILURE_EVENT_COALESCE_S:
                 prev_state[1] += 1
+                prev_state[2] = now
                 key = None  # suppressed: nothing to roll back
                 return
             coalesced = int(prev_state[1]) if prev_state is not None else 0
+            owed = _sweep_failure_event_state(now)
+            # This key's own expired entry is carried by `coalesced` above, not
+            # declared separately.
+            owed = [(k, st) for k, st in owed if k != key]
             # Claimed BEFORE the await so concurrent failures coalesce instead of
             # racing to emit; rolled back below if the emit itself fails.
-            _failure_event_state[key] = [now, 0]
+            _failure_event_state[key] = [now, 0, now]
 
-        from genesis.observability.session_context import get_session_id
         from genesis.observability.types import Severity, Subsystem
 
         severity = Severity.WARNING if is_limit else Severity.ERROR
@@ -1750,20 +1905,33 @@ async def _emit_invocation_failed_event(
             streaming=streaming,
             model=str(invocation.model),
             roster_model=roster_model,
-            session_id=get_session_id(),
+            session_id=session_id,
             caller_tag=invocation.caller_tag,
             coalesced=coalesced,
         )
+        declaring = True  # from here _declare_retired_counts owns every put-back
+        if owed:
+            await _declare_retired_counts(bus, owed)
     except Exception:
         # The emit failed: do not leave a window open for an event that never
         # landed. Restore the prior state (keeping its suppressed count) so the
-        # next failure retries the bus instead of being coalesced away.
+        # next failure retries the bus instead of being coalesced away, and put
+        # back the retired entries whose counts were never declared.
         if key is not None:
             if prev_state is None:
                 _failure_event_state.pop(key, None)
             else:
                 _failure_event_state[key] = prev_state
+        for owed_key, owed_state in owed:
+            _put_back_owed(owed_key, owed_state)
         logger.debug("cc.invocation_failed event emit failed", exc_info=True)
+    except BaseException:
+        # Cancelled before the declarations began: the retired counts were taken
+        # out of the state and never declared, so put them back.
+        if not declaring:
+            for owed_key, owed_state in owed:
+                _put_back_owed(owed_key, owed_state)
+        raise
 
 
 def cc_span_settings_path(env_pins: dict[str, str] | None = None) -> str | None:

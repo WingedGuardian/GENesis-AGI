@@ -28,10 +28,12 @@ def set_session_id(session_id: str | None) -> None:
 
 
 @contextmanager
-def session_scope(session_id: str) -> Generator[None]:
+def session_scope(session_id: str | None) -> Generator[None]:
     """Context manager that sets session_id for the duration of a block.
 
-    Restores the previous value on exit (supports nesting).
+    Restores the previous value on exit (supports nesting). ``None`` clears the
+    session for the block, so an event emitted there is not attributed to an
+    enclosing scope.
     """
     token = _current_session_id.set(session_id)
     try:

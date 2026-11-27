@@ -239,6 +239,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._autonomous_dispatcher: object | None = None
         self._autonomous_cli_policy_exporter: object | None = None
         self._approval_timeout_task: asyncio.Task | None = None
+        self._failure_count_sweeper_task: asyncio.Task | None = None
         self._status_writer_task: asyncio.Task | None = None
         self._findings_bridge: object | None = None
         self._idle_detector: IdleDetector | None = None
@@ -654,6 +655,12 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
                 logger.exception("Failed to stop outreach recovery worker")
 
     async def shutdown(self) -> None:
+        # Started with the event bus, so stop it even after an incomplete bootstrap.
+        sweeper = self._failure_count_sweeper_task
+        if sweeper is not None and not sweeper.done():
+            sweeper.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sweeper
         # Also retire a writer installed by an incomplete bootstrap. Cancel the
         # loop first, then wait for any worker it left behind before DB teardown.
         if self._status_writer_task is not None and not self._status_writer_task.done():

@@ -34,6 +34,25 @@ class TestEmit:
         )
         assert event.details == {"call_site": "chat", "attempts": 3}
 
+    @pytest.mark.asyncio
+    async def test_emit_back_dates_an_event_that_happened_earlier(self, bus):
+        """A report of an earlier occurrence carries that occurrence's time,
+        and the back-dating hint is not stored as a detail."""
+        event = await bus.emit(
+            Subsystem.PROVIDERS, Severity.ERROR, "cc.invocation_failed", "old count",
+            occurred_seconds_ago=90.0, coalesced=2,
+        )
+        assert event.timestamp == "2026-03-03T23:58:30+00:00"
+        assert event.details == {"coalesced": 2}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("ago", [None, 0.0, -5.0])
+    async def test_emit_never_dates_an_event_into_the_future(self, bus, ago):
+        event = await bus.emit(
+            Subsystem.PROVIDERS, Severity.ERROR, "x", "y", occurred_seconds_ago=ago,
+        )
+        assert event.timestamp == "2026-03-04T00:00:00+00:00"
+
 
 class TestListeners:
     @pytest.mark.asyncio

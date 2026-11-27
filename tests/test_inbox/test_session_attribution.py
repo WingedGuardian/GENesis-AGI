@@ -200,6 +200,54 @@ async def test_sequential_batches_restore_context_between_manager_ids(
 
 
 @pytest.mark.asyncio
+async def test_sequential_same_model_failures_in_one_scan_each_reach_their_manager(
+    monitor,
+    inbox_dir,
+    mock_invoker,
+    mock_session_manager,
+    db,
+    monkeypatch,
+):
+    """#4342: two batches of one scan fail the same way (same error class,
+    caller tag and model) inside the coalescing window. Each failure belongs
+    to its own manager session, so each gets its own event; neither is
+    swallowed into the other's coalesced count."""
+    (inbox_dir / "Note.md").write_text("https://example.com/first\nhttps://example.com/second")
+    monitor._config = replace(monitor._config, items_per_eval=1)
+    bus = GenesisEventBus()
+    bus.enable_persistence(db)
+    monkeypatch.setattr(invoker_module, "_runtime_event_bus", lambda: bus)
+    monkeypatch.setattr(invoker_module, "_failure_event_state", {})
+    creates = []
+
+    async def create(**kwargs):
+        creates.append(1)
+        return {"id": f"manager-{len(creates)}"}
+
+    async def invoke(invocation):
+        exc = CCError("synthetic transport error")
+        await invoker_module._emit_invocation_failed_event(exc, invocation, streaming=False)
+        raise exc
+
+    mock_session_manager.create_background.side_effect = create
+    mock_invoker.run.side_effect = invoke
+    try:
+        result = await monitor.check_once()
+        assert result.batches_dispatched == 0
+        await bus.stop()
+        rows = await (
+            await db.execute(
+                "SELECT session_id,details FROM events "
+                "WHERE event_type='cc.invocation_failed' ORDER BY rowid",
+            )
+        ).fetchall()
+        assert [r["session_id"] for r in rows] == ["manager-1", "manager-2"]
+        assert [json.loads(r["details"])["coalesced"] for r in rows] == [0, 0]
+    finally:
+        await bus.stop()
+
+
+@pytest.mark.asyncio
 async def test_concurrent_monitors_keep_their_own_context(
     monitor,
     inbox_dir,
