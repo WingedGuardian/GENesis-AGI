@@ -7122,7 +7122,8 @@ async def test_invocation_failed_coalesces_per_session(monkeypatch, fail_bus):
 
 
 async def test_invocation_failed_unscoped_calls_keep_one_window(monkeypatch, fail_bus):
-    """Outside any session scope the key's session is None: behaviour is unchanged."""
+    """Outside any session scope the key's session is None; inside the window its
+    failures still coalesce into one event."""
     import genesis.cc.invoker as inv_mod
 
     clock = {"t": 1000.0}
@@ -7272,6 +7273,30 @@ async def test_sweeper_declares_a_quiet_sessions_count_without_a_later_failure(
     assert await inv_mod.declare_settled_failure_counts() == 0  # declared once only
 
 
+async def test_sweeper_declares_a_quiet_unscoped_callers_count(monkeypatch, fail_bus):
+    """Review on #4433: a tagged call made outside any session scope keys on
+    session None. When it swallows a failure and then stops, the sweep declares
+    its count too, instead of holding it for a same-key failure that may never
+    come. A later same-key failure starts a fresh window and is not counted twice."""
+    import genesis.cc.invoker as inv_mod
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(inv_mod.time, "monotonic", lambda: clock["t"])
+    inv = CCInvocation(prompt="x", caller_tag="surplus.scan")
+    for _ in range(3):  # one emitted, two swallowed
+        await inv_mod._emit_invocation_failed_event(CCTimeoutError("slow"), inv, streaming=False)
+
+    clock["t"] += 61.0
+    assert await inv_mod.declare_settled_failure_counts() == 1
+    declared = [e[4] for e in fail_bus.events if e[4].get("retired")]
+    assert [(d["session_id"], d["coalesced"]) for d in declared] == [(None, 2)]
+    assert inv_mod._failure_event_state == {}
+
+    await inv_mod._emit_invocation_failed_event(CCTimeoutError("slow"), inv, streaming=False)
+    assert fail_bus.events[-1][4].get("coalesced", 0) == 0
+    assert not fail_bus.events[-1][4].get("retired")
+
+
 async def test_sweeper_keeps_counts_when_there_is_no_bus(monkeypatch, fail_bus):
     """Without a bus nothing could be declared, so nothing is retired."""
     import genesis.cc.invoker as inv_mod
@@ -7339,7 +7364,10 @@ async def test_retired_count_is_dated_to_the_sessions_last_failure(monkeypatch, 
 
 
 async def test_cancelled_declaration_puts_back_the_undeclared_counts(monkeypatch, fail_bus):
-    """Cancellation propagates, and every count not yet declared is kept."""
+    """Cancellation propagates, and every count not yet declared is kept. The bus
+    accepts an event before its first await, so a cancellation lands while a
+    listener runs, after the current count was accepted: that one is not put
+    back, or the next sweep would declare it twice (Codex, #4433 round 2)."""
     import genesis.cc.invoker as inv_mod
     from genesis.observability.session_context import session_scope
 
@@ -7351,15 +7379,19 @@ async def test_cancelled_declaration_puts_back_the_undeclared_counts(monkeypatch
             await inv_mod._emit_invocation_failed_event(CCTimeoutError("slow"), inv, streaming=False)
     clock["t"] += 61.0
 
+    accepted: list[str] = []
+
     async def emit(*args, **kwargs):
         if kwargs.get("retired"):
+            accepted.append(kwargs["session_id"])  # in the ring, then a listener is cancelled
             raise asyncio.CancelledError()
 
     fail_bus.emit.side_effect = emit
     with session_scope("batch-c"), pytest.raises(asyncio.CancelledError):
         await inv_mod._emit_invocation_failed_event(CCTimeoutError("slow"), inv, streaming=False)
     owed = {k[3]: s[1] for k, s in inv_mod._failure_event_state.items() if s[1]}
-    assert owed == {"batch-a": 1, "batch-b": 1}
+    [declared] = accepted  # the first retired count was accepted, then cancelled
+    assert owed == {s: 1 for s in ("batch-a", "batch-b") if s != declared}
 
 
 async def test_cancelled_main_emit_puts_back_the_retired_counts(monkeypatch, fail_bus):

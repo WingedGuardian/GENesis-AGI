@@ -1612,15 +1612,16 @@ _FAILURE_EVENT_COALESCE_S = 60.0
 # suppressed)]. Session ids are an open set and most sessions are
 # one-shot (an inbox batch, an ego cycle), so a session's swallowed count usually
 # has no "next event" of its own to ride on. Each claim therefore retires every
-# session-scoped entry whose window has passed, and any count it still owes is
-# declared in an event of its own, against its own session
+# entry whose window has passed, and any count it still owes is declared in an
+# event of its own, against its own session (or None)
 # (_declare_retired_counts). A session that goes quiet makes no further claim,
 # so a runtime-owned sweeper (run_failure_count_sweeper) does the same retiring
 # on a timer; without it a quiet session's count waited for an unrelated later
 # failure, or was lost at exit. A declared count is back-dated to its last
-# failure, so it never reads as a fresh error. Unscoped entries (session None)
-# are a closed set and keep the original rule: dropped when they owe nothing,
-# otherwise kept so the count rides on the next event for the same key.
+# failure, so it never reads as a fresh error. Unscoped entries (session None,
+# a tagged call made outside any session scope) are retired the same way: a
+# tagged background caller that fails inside the window and then stops would
+# otherwise keep its count until a same-key failure that may never come.
 _FailureKey = tuple[str, str | None, str, str | None]
 _failure_event_state: dict[_FailureKey, list[float]] = {}
 
@@ -1631,8 +1632,6 @@ def _sweep_failure_event_state(now: float) -> list[tuple[_FailureKey, list[float
     for key, state in list(_failure_event_state.items()):
         if now - state[0] < _FAILURE_EVENT_COALESCE_S:
             continue
-        if key[3] is None and state[1]:
-            continue  # unscoped and owing: rides on the next same-key event
         del _failure_event_state[key]
         if state[1]:
             owed.append((key, state))
@@ -1642,8 +1641,8 @@ def _sweep_failure_event_state(now: float) -> list[tuple[_FailureKey, list[float
 def _put_back_owed(key: _FailureKey, state: list[float]) -> None:
     """Return an undeclared owed count to the coalescing state.
 
-    If the session has re-claimed the key meanwhile, the count is added to that
-    live entry (it rides on the session's next event) instead of being dropped.
+    If the key has been re-claimed meanwhile, the count is added to that live
+    entry (it rides on the key's next event) instead of being dropped.
     """
     current = _failure_event_state.get(key)
     if current is None:
@@ -1654,13 +1653,15 @@ def _put_back_owed(key: _FailureKey, state: list[float]) -> None:
 
 
 async def _declare_retired_counts(bus, owed: list[tuple[_FailureKey, list[float]]]) -> None:
-    """Emit the count each retired session still owed, attributed to that session.
+    """Emit the count each retired entry still owed, attributed to its session.
 
     The event stands for ``coalesced`` failures that were swallowed and never
     re-reported (``retired=True``), not for a new failure. Never raises an
     ordinary error: a failed emit puts the entry back so a later claim retries
-    the declaration. A cancellation puts back every count not yet declared, then
-    propagates.
+    the declaration. A cancellation puts back every count after the one being
+    declared (which the bus had already accepted), then propagates. That relies
+    on ``GenesisEventBus.emit`` accepting an event before its first await; a bus
+    that awaits first would lose the current count on cancellation instead.
     """
     for index, (key, state) in enumerate(owed):
         try:
@@ -1669,15 +1670,19 @@ async def _declare_retired_counts(bus, owed: list[tuple[_FailureKey, list[float]
             _put_back_owed(key, state)
             logger.debug("cc.invocation_failed retired-count emit failed", exc_info=True)
         except BaseException:
-            for undeclared_key, undeclared_state in owed[index:]:
+            # The bus accepts an event (ring + write queue) before its first
+            # await, so a cancellation can only land after the current entry was
+            # accepted, while a listener runs. Put back only the entries after it;
+            # restoring this one too would declare its count twice.
+            for undeclared_key, undeclared_state in owed[index + 1 :]:
                 _put_back_owed(undeclared_key, undeclared_state)
             raise
 
 
 async def _declare_retired_count(bus, key: _FailureKey, state: list[float]) -> None:
-    """Emit one retired session's owed count (see ``_declare_retired_counts``).
+    """Emit one retired entry's owed count (see ``_declare_retired_counts``).
 
-    The event is back-dated to the session's last failure: it reports failures
+    The event is back-dated to the entry's last failure: it reports failures
     that already happened, and stamping it "now" would make a long-finished
     session's error look active again to every recency consumer.
     """
@@ -1693,7 +1698,7 @@ async def _declare_retired_count(bus, key: _FailureKey, state: list[float]) -> N
     message = f"CC invocation failed ({error_class}) for {caller_tag}"
     if roster_model and roster_model != roster.CLAUDE:
         message += f" via {roster_model}"
-    message += f" ({count} similar failure(s) coalesced; the session reported no later failure)"
+    message += f" ({count} similar failure(s) coalesced; no later failure was reported)"
     await bus.emit(
         Subsystem.PROVIDERS,
         Severity.WARNING if is_limit else Severity.ERROR,
