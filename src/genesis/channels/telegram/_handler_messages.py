@@ -21,7 +21,11 @@ from genesis.channels.telegram._handler_helpers import (
     interrupt_key,
 )
 from genesis.channels.telegram._progress import PROGRESS_SENDER, TurnProgress
-from genesis.channels.telegram.transport.streaming import DraftStreamer, generate_draft_id
+from genesis.channels.telegram.transport.streaming import (
+    _strip_duplicate_header,
+    DraftStreamer,
+    generate_draft_id,
+)
 from genesis.channels.telegram.transport.update_dedupe import message_key
 from genesis.util.approval_words import phrase_decision, scoped_decision
 
@@ -123,11 +127,15 @@ def _with_model_prefix(streamer: DraftStreamer | None, response: str) -> str:
     contingency reply was not written by that model and carries its own
     ``[Contingency mode via <provider> ...]`` label, so it gets no prefix:
     stacking both told the reader two different models answered.
+
+    A model that writes the header itself gets its copy dropped first, so the
+    reply carries exactly one header (#4885).
     """
     if not (streamer and streamer._prefix):
         return response
     if response.startswith(CONTINGENCY_HEADER_PREFIX):
         return response
+    response = _strip_duplicate_header(response, streamer._prefix)
     return streamer._prefix + "\n" + response
 
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 import time
 from typing import TYPE_CHECKING
@@ -59,6 +60,49 @@ _TOOL_ICONS: dict[str, str] = {
 
 def _tool_icon(name: str) -> str:
     return _TOOL_ICONS.get(name, "\U0001f527")
+
+
+# A model-written ``[Model / Effort]`` first line: the relay prefix is added
+# separately, so the model's own copy must go — but only when it names the
+# running model. Widening this to any ``Word N`` label would delete ordinary
+# headings such as ``[Step 2 / max]`` (#4885).
+_HEADER_LINE_RE = re.compile(r"^\[(?P<model>.+)\s+/\s+(?P<effort>[^\]/]+)\]\s*$")
+
+
+def _model_part(prefix: str) -> str | None:
+    """The model label of a relay prefix such as ``[Sonnet / Medium]``."""
+    match = _HEADER_LINE_RE.match(prefix.strip())
+    return match.group("model").strip() if match else None
+
+
+def _strip_duplicate_header(text: str, prefix: str) -> str:
+    """Drop a self-written ``[Model / Effort]`` first line duplicating ``prefix``.
+
+    The relay adds its own ``[Model / Effort]`` prefix to drafts and to the
+    final reply, so a model that writes the same header itself would show two.
+    Only a first line whose model label is the running model's own (the model
+    part of ``prefix``) is dropped — a new family such as ``Mythos 5`` and a
+    provider-qualified id are recognised because they are compared against the
+    running model's label, not against a fixed list. Anything else, including
+    an ordinary heading like ``[Step 2 / max]``, is left alone. ``text`` is
+    returned unchanged when there is nothing to strip.
+    """
+    model = _model_part(prefix)
+    if model is None:
+        return text
+    lines = text.split("\n")
+    first = 0
+    while first < len(lines) and not lines[first].strip():
+        first += 1
+    if first >= len(lines):
+        return text
+    match = _HEADER_LINE_RE.match(lines[first].strip())
+    if match is None or match.group("model").strip().casefold() != model.casefold():
+        return text
+    rest = lines[first + 1 :]
+    if rest and not rest[0].strip():
+        rest = rest[1:]
+    return "\n".join(rest)
 
 
 class DraftStreamer:
@@ -226,9 +270,11 @@ class DraftStreamer:
         if self._thinking and not self._text:
             parts.append("\n\U0001f914 Thinking...")
         elif self._text:
-            if parts:
-                parts.append("")  # blank separator
-            parts.append(self._text)
+            body = _strip_duplicate_header(self._text, self._prefix)
+            if body:
+                if parts:
+                    parts.append("")  # blank separator
+                parts.append(body)
 
         if self._waiting_s is not None:
             parts.append(f"\n\u23f3 still working ({int(self._waiting_s)} s)")
