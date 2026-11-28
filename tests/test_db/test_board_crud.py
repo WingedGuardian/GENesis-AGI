@@ -208,6 +208,27 @@ async def test_record_link_refuses_malformed_input(db, over):
     assert await board.count_links(db) == 0
 
 
+@pytest.mark.parametrize("suffix", ["\n", "\r\n", "x"])
+async def test_record_link_refuses_trailing_suffix_without_writing(db, suffix):
+    """Python's `$` also matches before a final LF; a raw caller must not be
+    able to commit an identity one character longer than the canonical one."""
+    with pytest.raises(ValueError):
+        await _link(db, source_id=SRC + suffix)
+    assert await board.count_links(db) == 0
+
+
+async def test_record_link_refuses_trailing_suffix_in_repo(db):
+    with pytest.raises(ValueError):
+        await _link(db, repo=REPO + "\n")
+    assert await board.count_links(db) == 0
+
+
+async def test_canonical_link_is_retrievable_by_source(db):
+    row = await _link(db)
+    found = await board.get_link_by_source(db, source_kind="follow_up", source_id=SRC)
+    assert found is not None and found["id"] == row["id"]
+
+
 async def _raw_link(db, *, source_id, issue_number, repo=REPO):
     """Insert a pointer directly — what a concurrent writer's row looks like."""
     await db.execute(
@@ -332,6 +353,31 @@ async def test_closed_or_unknown_question_cannot_block(db):
 def test_validate_target_refuses_malformed(kind, target):
     with pytest.raises(ValueError):
         board.validate_target(kind, target)
+
+
+@pytest.mark.parametrize(
+    "kind,target",
+    [
+        ("ledger", SRC + "\n"),
+        ("follow_up", SRC + "\r\n"),
+        ("follow_up", SRC + "x"),
+        ("card", "owner/repo#5\n"),
+        ("card", "owner/repo#5x"),
+    ],
+)
+def test_validate_target_refuses_trailing_suffix(kind, target):
+    with pytest.raises(ValueError):
+        board.validate_target(kind, target)
+
+
+@pytest.mark.parametrize("target", ["owner/repo#5\n", "owner/repo#5\r\n", "owner/repo#5x"])
+def test_normalize_target_refuses_card_trailing_suffix(target):
+    with pytest.raises(ValueError):
+        board.normalize_target("card", target)
+
+
+def test_normalize_target_lowercases_valid_card():
+    assert board.normalize_target("card", "Owner/Repo#5") == "owner/repo#5"
 
 
 async def test_raise_with_blocks_is_all_or_nothing(db):
@@ -717,6 +763,13 @@ async def test_list_events_filters_and_totals(db):
 async def test_append_event_bounds_every_column(db, over):
     with pytest.raises(ValueError):
         await board.append_event(db, event="drag", now=NOW, **over)
+    assert (await board.list_events(db))["total"] == 0
+
+
+@pytest.mark.parametrize("suffix", ["\n", "\r\n", "!"])
+async def test_append_event_refuses_trailing_suffix_in_repo(db, suffix):
+    with pytest.raises(ValueError):
+        await board.append_event(db, event="drag", now=NOW, repo=REPO + suffix, issue_number=1)
     assert (await board.list_events(db))["total"] == 0
 
 
