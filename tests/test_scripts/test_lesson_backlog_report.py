@@ -352,3 +352,31 @@ def test_a_quarantined_lesson_is_never_live(rep, tmp_path):
     md = out.read_text()
     assert "live (not draft, not quarantined): 0; quarantined non-drafts: 1" in md
     assert "0 of 1 drafts have such a live lesson" in md
+
+
+# ── Round-3 review fixes on #4721 ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("scale", [1e20, 1e-30])
+def test_extreme_embeddings_still_normalise(rep, tmp_path, scale):
+    """CodeRabbit: a float32 sum of squares overflows at 1e20 and underflows at
+    1e-30, so the norm is taken in float64 and identical drafts stay identical."""
+    path = _single_table(
+        tmp_path,
+        [("D1", 1, _e((0, scale))), ("D2", 1, _e((0, scale)))],
+    )
+    lessons = rep.load(path)
+    assert np.allclose(np.linalg.norm(lessons.vectors, axis=1), 1.0)
+    result = rep.analyse(lessons, block=8)
+    assert float(np.nanmax(result["best_cos"])) == pytest.approx(1.0)
+
+
+def test_live_coverage_is_not_reported_as_what_the_gate_saw(rep, db_path, tmp_path):
+    """CodeRabbit: the live lessons compared are today's, so a match does not
+    show the novelty gate refused that draft when it was written."""
+    out = tmp_path / "r.md"
+    assert rep.main(["--db", str(db_path), "--out", str(out)]) == 0
+    md = out.read_text()
+    assert "was refused when it was built" not in md
+    assert "current coverage, not a record of what the gate saw" in md
+    assert "drafts included, held lessons excluded, the 50 highest-confidence" in md

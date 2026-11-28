@@ -11,11 +11,15 @@ topic through a run of near neighbours. The per-row nearest-neighbour figures
 are the reliable ones; the topics are a map, not a verdict.
 
 The 0.85 threshold is the store-time novelty gate's (extractor
-NOVELTY_THRESHOLD): a draft at or above it against a same-type live lesson was
-refused when it was built, so a low absorbed count mostly shows that gate held.
+NOVELTY_THRESHOLD). The gate refuses a new lesson at or above it against the
+same-type lessons stored when it was written (drafts included, held lessons
+excluded, the 50 highest-confidence). The report compares against the lessons
+live now, which may have been written or promoted later, so a current match
+does not show the gate ever saw the pair.
 The report splits near-duplicates by whether they share a task type.
 
-Similarity runs in row blocks bounded by a share of MemAvailable (one block may
+Similarity runs in row blocks bounded by a share of the memory this process can
+use, capped by its cgroup (one block may
 be the whole table when it is small). The database is opened read-only (mode=ro) after the admission fence;
 a fenced database is refused. Output: markdown plus a per-draft CSV in
 ~/.genesis/output/ (or --out). No row is changed.
@@ -108,7 +112,8 @@ def load(db_path: Path) -> Lessons:
     matrix = (
         np.vstack(vecs).astype(np.float32) if vecs else np.zeros((0, EMBEDDING_DIM), np.float32)
     )
-    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    # float64: a float32 sum of squares overflows or underflows for extreme components.
+    norms = np.linalg.norm(matrix.astype(np.float64), axis=1, keepdims=True)
     norms[norms == 0.0] = 1.0
     return Lessons(
         ids=[r[0] for r in keep],
@@ -117,7 +122,7 @@ def load(db_path: Path) -> Lessons:
         created=[r[3] for r in keep],
         draft=np.array([bool(r[4]) for r in keep], dtype=bool),
         quarantined=np.array([bool(r[6]) for r in keep], dtype=bool),
-        vectors=matrix / norms,
+        vectors=(matrix / norms).astype(np.float32),
         skipped=skipped,
     )
 
@@ -313,9 +318,11 @@ def render(lessons: Lessons, result: dict, *, generated_at: str, csv_name: str) 
         "",
         f"## Drafts each live lesson would absorb (nearest live lesson at cosine >= {TOPIC_COSINE})",
         "",
-        "This is the store-time novelty threshold: a draft this close to a same-type "
-        "live lesson was refused when it was built, so a low count here mostly shows "
-        "that gate held, not that live lessons cover nothing.",
+        "This is the store-time novelty threshold. The gate refuses a new lesson this "
+        "close to the same-type lessons stored when it was written (drafts included, "
+        "held lessons excluded, the 50 highest-confidence); these live lessons are "
+        "today's and may have been written or promoted later, so a match here is "
+        "current coverage, not a record of what the gate saw.",
         "",
         f"{total} of {nd} drafts have such a live lesson; {len(ranked)} live lessons "
         f"would absorb at least one. The {min(TOP_TOPICS, len(ranked))} that absorb the most:",
