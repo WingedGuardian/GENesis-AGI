@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from genesis.channels.telegram.transport.update_dedupe import TelegramUpdateDedupe
     from genesis.channels.voice import VoiceDeliveryHelper
 
+
 log = logging.getLogger(__name__)
 
 # The argument that says what a tool call is doing, in the order tools use them.
@@ -127,6 +128,21 @@ class HandlerContext:
                     synthetic=event.is_synthetic,
                     raw=event.raw,
                 )
+            if streamer and event.event_type == "init":
+                # Even on a disabled streamer: a failover peer's init follows the
+                # home run's rate limit, and the final header must name the peer.
+                running = (event.raw or {}).get("model")
+                if isinstance(running, str) and running:
+                    streamer.set_running_model(running)
+                return
+            if streamer and event.event_type == "session_opened":
+                # This run opens a CC session (fresh, or a stale resume retried
+                # fresh). Telegram sessions do not write their own header, so the
+                # relay shows one here; init then names the model that ran.
+                raw = event.raw or {}
+                streamer.show_header(str(raw.get("model") or ""), str(raw.get("effort") or ""))
+                await streamer.flush()
+                return
             # A subagent's lines (the Agent tool) are not this turn's narration:
             # the draft leaves them out, as progress does.
             subagent = bool((event.raw or {}).get("parent_tool_use_id"))
