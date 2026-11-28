@@ -19,13 +19,15 @@ def _study_arguments(command, name):
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
-    for name in ("check", "run", "report", "study-check", "study-report", "study-run"):
+    for name in ("check", "run", "report", "study-check", "study-report", "study-run", "screen-check"):
         command = commands.add_parser(name)
         for flag in ("corpus", "temp-root", "reference-policy", "current-reference-policy",
                      "reference-approval", "source-files", "params"):
             command.add_argument("--" + flag, type=Path, required=flag in ("corpus", "temp-root"))
         if name.startswith("study-"):
             _study_arguments(command, name)
+        elif name == "screen-check":
+            command.add_argument("--sample-sha256", required=True)
         else:
             command.add_argument("--alias", required=name != "check")
         if name in ("run", "report"):
@@ -60,7 +62,8 @@ async def admit(args, cases, configured, options):
                 or len({path.resolve() for path in paths.values()}) != len(aliases)):
             raise Incomplete("paired_campaigns_invalid")
     else:
-        aliases = [args.alias] if args.alias else list(configured)
+        alias = getattr(args, "alias", None)
+        aliases = [alias] if alias else list(configured)
     checked = await preflight.check(
         cases, args.temp_root, reference_policy=options["reference_policy"],
         current_policy=options["current_reference_policy"],
@@ -69,6 +72,12 @@ async def admit(args, cases, configured, options):
     )
     if args.command == "check":
         return {"status": "pass", "scope": "offline admission only", "corpus": corpus.counts(cases)}
+    if args.command == "screen-check":
+        from . import run, screen
+        from .evidence import digest
+
+        result = screen.check(cases, checked, args.sample_sha256)
+        return {**result, "admission_sha256": digest(run.admission_identity(checked))}
     if not args.operating_plan or not args.spending_approval:
         raise Incomplete("financial_eligibility_unavailable")
     return await execution.execute(
@@ -144,7 +153,7 @@ async def _run(args, *, study_inputs=()):
 
         return await inspect(args.study_plan, cases, args.temp_root, candidates=configured,
                              options=options, scoring=args.command == "study-report", root_path=args.study_root)
-    if args.command in ("check", "run"):
+    if args.command in ("check", "run", "screen-check"):
         return await admit(args, cases, configured, options)
     against = args.against
     if bool(against) != bool(args.against_campaign) or against == args.alias:

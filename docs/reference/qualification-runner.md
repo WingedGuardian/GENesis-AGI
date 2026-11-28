@@ -226,3 +226,22 @@ The CLI prints aggregate results and fixed failure codes. Exit codes are 0 for
 pass, 1 for fail and 2 for incomplete. Private campaign evidence can contain model
 answers; retain its operator-controlled 0700 directory and 0600 files. Reports
 authorize no spending, deployment or judge/novelty promotion.
+
+## Fixed judge screen admission
+
+Use `screen-check` with the same complete reference and source inputs as
+`check`, plus `--sample-sha256`. Retain the expected digest independently of
+the checkout. It hashes the compact UTF-8 JSON array of ordered
+`[contract, case_id, reference_passed, prompt_sha256]` rows using the
+qualification canonical JSON encoding. The prior TSV's file hash remains
+a separate integrity check.
+
+The sample ranks cases within each reference class using the frozen
+`genesis-judge-screen-20261121-v1` seed. It takes five per class from J9
+relevance, reflection quality, and skill-edit regression. The command
+renders the full approved corpus, checks the sample against the expected
+digest, and prints only digests and the sample count. The admission digest
+binds the shared grading evidence, including its source inventory,
+corpus, reference policy and rendered prompts. Freeze the candidate model,
+parameters, wire and screen implementation separately in any later paid plan.
+A zero exit confirms offline admission for this screen.
