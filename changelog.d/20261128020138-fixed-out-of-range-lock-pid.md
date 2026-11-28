@@ -1,0 +1,1 @@
+- **Service health stays visible when a lock file holds an out-of-range PID.** A numeric PID too large for the kernel's process ID type is now treated as a stale lock instead of aborting the service status collector, so the service section no longer disappears from health output.

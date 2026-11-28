@@ -28,6 +28,8 @@ _LOCK_FOR_UNIT = {
     "genesis-server.service": "genesis-server.lock",
     "genesis-bridge.service": "bridge.lock",
 }
+# Linux pid_t is signed 32-bit; os.kill raises OverflowError above this.
+_MAX_PID = 2**31 - 1
 _WATCHDOG_STATE = Path.home() / ".genesis" / "watchdog_state.json"
 
 # Qdrant collections that must exist for Genesis to function.
@@ -131,11 +133,13 @@ def _service_pid_alive(unit_name: str, main_pid: str | None) -> tuple[int | None
         pid = int((_PID_DIR / lock_name).read_text().strip())
     except (OSError, ValueError):
         return None, False
-    if pid <= 1:  # 0 / -1 address a process group or every process, not a service
+    # 0 / -1 address a process group or every process, not a service; a pid
+    # above the kernel pid_t range is garbage that os.kill cannot even encode.
+    if pid <= 1 or pid > _MAX_PID:
         return None, False
     try:
         os.kill(pid, 0)  # signal 0 = existence check
-    except OSError:
+    except (OSError, OverflowError):
         return None, False
     if main_pid:
         try:
