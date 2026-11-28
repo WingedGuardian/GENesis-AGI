@@ -1,0 +1,1 @@
+- Add an offline admission check for the fixed 30-case judge diagnostic sample.
