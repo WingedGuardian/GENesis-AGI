@@ -169,9 +169,9 @@ def validate_target(kind: str, target_id: str) -> None:
     ``owner/repo#N``."""
     _one_of("target_kind", kind, TARGET_KINDS)
     if kind == "card":
-        if not _CARD.match(target_id or ""):
+        if not _CARD.fullmatch(target_id or ""):
             raise ValueError(f"card target must look like owner/repo#123; got {target_id!r}")
-    elif not _HEX32.match(target_id or ""):
+    elif not _HEX32.fullmatch(target_id or ""):
         raise ValueError(f"{kind} target must be a full 32-hex id; got {target_id!r}")
 
 
@@ -233,9 +233,9 @@ async def record_link(
     never be retried), and a retry that finds the pointer adds no second event.
     """
     _one_of("source_kind", source_kind, SOURCE_KINDS)
-    if not _HEX32.match(source_id or ""):
+    if not _HEX32.fullmatch(source_id or ""):
         raise ValueError(f"source_id must be a full 32-hex id; got {source_id!r}")
-    if not _REPO.match(repo or ""):
+    if not _REPO.fullmatch(repo or ""):
         raise ValueError(f"repo must look like owner/name; got {repo!r}")
     repo = repo.lower()
     if not isinstance(issue_number, int) or isinstance(issue_number, bool) or issue_number <= 0:
@@ -747,7 +747,7 @@ def _event_values(
     if not now:
         raise ValueError("now is required")
     if repo is not None:
-        if not _REPO.match(repo):
+        if not _REPO.fullmatch(repo):
             raise ValueError(f"repo must look like owner/name; got {repo!r}")
         repo = repo.lower()
     for name, value in (("issue_number", issue_number), ("attempt", attempt)):
