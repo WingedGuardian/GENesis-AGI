@@ -7,16 +7,16 @@ from .evidence import Incomplete
 def select(alias, binding=None, *, config=None):
     """Unbound selection is offline preparation; acquisition needs a marker."""
     if binding is None:
-        profile = native if alias == native.ALIAS else pinned
+        profile = native if alias in native.KINDS else pinned
     elif not isinstance(binding, dict):
         raise Incomplete("invalid qualification transport binding")
     elif "transport_kind" not in binding:
         profile = pinned
-    elif binding["transport_kind"] == native.KIND and alias == native.ALIAS:
+    elif alias in native.KINDS and binding["transport_kind"] == native.KINDS[alias]:
         profile = native
     else:
         raise Incomplete("unknown or inconsistent qualification transport kind")
-    if profile is pinned and alias == native.ALIAS:
+    if profile is pinned and alias in native.KINDS:
         raise Incomplete("native qualification requires its explicit transport kind")
     # Retained evidence selection is pure: admission already froze the route.
     # Acquisition/preparation resolve against actual configuration separately.
