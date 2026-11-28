@@ -1643,7 +1643,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
-verified: 5e5f80fb9 2026-11-15
+verified: d70924fb5 2026-11-15
 ```
 
 Scoped verification covers `mcp/shared_http` composition. It receives
@@ -1657,7 +1657,7 @@ bind, skipping a stopping startup; notification failure uses the existing
 listener/SDK/registry cleanup path. Both installers render four inert
 `Type=notify` templates without enabling them. Actual manager readiness, measured
 start/stop settings, native clients and rollout remain separate. Ordinary session
-selection remains unchanged. See `docs/reference/shared-mcp-http.md`.
+selection retains the existing rollout gates. See `docs/reference/shared-mcp-http.md`.
 The explicit `scripts/genesis_mcp_forwarder.py` consumer reads existing P3
 credentials and forwards shared-only RPC through the qualified SDK dispatcher.
 It preserves request IDs, reports uncertain outcomes without resending tools,
@@ -1679,9 +1679,14 @@ The memory-only `/mcp/v3` backend contract additionally requires a matching
 configured logical DB target on every authenticated unprofiled tool call,
 before instrumentation/checkout/bookmark/body effects. Its digest is not a
 credential, file opener or dataset identity. It retains v2's caller-file and
-pending-input rules on the same SDK manager. This scoped backend increment
-does not yet change ordinary frontend target selection/stamping, fix split-DB
-routing or activate sharing; those consumer and integration gates remain.
+pending-input rules on the same SDK manager. Ordinary memory selection now
+binds its actual captured DB before resource preparation or stdin ownership,
+uses bounded authenticated status to select matching targets, and keeps the
+ordinary path on initial mismatch/unavailable/unsupported status. Bound peers
+use v3 and stamp the captured target on every forwarded call; later backend
+incompatibility refuses without retargeting, downgrade or local replay.
+This is scoped consumer verification, not whole-entry/native/rollout clearance;
+sharing stays off and memory measurements remain separate gates.
 An older backend without v2 refuses the actual request after idle replacement;
 whole-catalog equality remains a generation preflight. Ordinary memory now uses
 the same mixed SDK owner at `memory-floor` and `health-reads`, forwarding eight

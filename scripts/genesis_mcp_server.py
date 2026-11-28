@@ -761,6 +761,15 @@ def _local_frontend(args, argv):
             return forwarder_headers(caller_context_from_env())
 
         headers()  # Refusal still leaves ordinary startup/input untouched.
+        memory_target = None
+        if args.server == "memory":
+            import anyio
+
+            from genesis.mcp.shared_client._target import select_memory_target
+
+            memory_target = anyio.run(select_memory_target, selected.settings, headers, _DEFAULT_DB)
+            if memory_target is None:
+                return None
     except Exception as error:
         logger.warning("Local shared frontend preflight declined (%s)", type(error).__name__)
         return None
@@ -789,7 +798,8 @@ def _local_frontend(args, argv):
             else:
                 server = _prepare_memory()
                 if server is not None:
-                    await serve_stdio(selected.settings, headers, local_server=server, stage=selected.stage)
+                    await serve_stdio(selected.settings, headers, local_server=server,
+                                      stage=selected.stage, memory_target=memory_target)
 
         anyio.run(execute)
 

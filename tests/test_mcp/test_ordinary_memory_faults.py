@@ -36,6 +36,8 @@ async def pair(tmp_path, install, fault):
     local = environment(install, tmp_path / "mixed", injection, role="mixed", mixed=True)
     for env in [remote, local]:
         env["LOCAL_MEMORY_TEST_FAULT"] = fault
+    # Exercise running-peer refusal after the new initial pre-input selection.
+    local["LOCAL_MEMORY_TEST_FAULT_AFTER_PREFLIGHT"] = "1"
     owner = child = None
     with (tmp_path / "backend.stderr").open("w") as backend_errors, (tmp_path / "mixed/stderr.log").open("w") as errors:
         try:

@@ -123,9 +123,15 @@ DELETE use the existing SDK session manager; v3 starts no additional service.
 The backend rechecks each call, including calls on a retained logical
 generation. Older servers without v3 refuse the request; a bound client must
 not downgrade or replay it through an older route. Existing v1/v2 peers retain
-their current behavior. Ordinary target-aware selection/stamping is a separate
-consumer change: this backend increment alone does not fix mixed-DB routing,
-activate sharing or establish memory savings.
+their current behavior. Eligible ordinary memory frontends first compare their
+captured ordinary database with authenticated status before claiming stdin.
+Initial unsupported or mismatched targets keep ordinary execution; selected
+clients carry the captured target through each v3 call and refuse subsequent
+incompatibility without downgrade or replay. The preflight uses the existing
+SDK 30-second whole-operation budget with proxies and redirects disabled.
+See [the ordinary frontend contract](mcp-shared-forwarder.md#ordinary-memory-floor-frontend).
+Sharing remains gated by the existing rollout ceiling; ordinary initialization
+and matched all-process memory measurements remain separate work.
 
 Targeted tests: pure `test_shared_http_settings.py`; qualified
 `test_shared_http_admission.py`, `test_shared_http_policy.py` and

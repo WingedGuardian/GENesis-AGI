@@ -61,7 +61,8 @@ async def bookmark_tcp(bookmark_app):
 
         async def observed():
             message = await receive()
-            if scope.get("path") in {"/mcp/v1", "/mcp/v2"} and message["type"] == "http.request":
+            if (scope.get("method") == "POST" and scope.get("path") in {"/mcp/v1", "/mcp/v2", "/mcp/v3"}
+                    and message["type"] == "http.request"):
                 pieces.append(message.get("body", b""))
                 if not message.get("more_body", False):
                     runtime.frames.append(json.loads(b"".join(pieces)))

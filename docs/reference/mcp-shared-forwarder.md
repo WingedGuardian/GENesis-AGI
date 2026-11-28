@@ -20,10 +20,10 @@ The memory backend additionally exposes the opt-in `/mcp/v3` database-target
 contract described in [shared HTTP](shared-mcp-http.md#memory-database-target-contract).
 It checks its configured logical database against each call's reserved metadata
 before execution, while retaining v2's caller-file and pending-bookmark rules
-on the same SDK transport. The ordinary frontend in this increment still uses
-v2: target-aware pre-input selection and per-call stamping are a separate
-consumer change. Existing mixed-DB routing is not yet qualified or fixed by
-the backend contract alone.
+on the same SDK transport. Eligible ordinary memory frontends bind their
+captured database target before claiming input and use v3 on matching backends.
+An initial mismatch or unsupported contract keeps ordinary execution. The
+backend contract alone cannot select the caller's ordinary database.
 
 The internal memory `RemotePeer` accepts an optional `pending_file` for the
 caller bookmark contract. Default peers, including the explicit CLI and health
@@ -42,7 +42,8 @@ the bookmark execution contract; dynamic catalog equality remains only a
 logical-generation preflight. Only `tools/call` gains the reserved
 `genesis/planBookmarkPending` metadata, with arguments, IDs and other metadata
 preserved. A client-supplied reserved key refuses before network activity.
-The ordinary memory frontend below consumes this contract without expanding
+The ordinary memory frontend below additionally supplies its captured database
+target and uses v3. Unbound pending peers retain v2. Neither contract expands
 credentials. See [shared HTTP](shared-mcp-http.md).
 
 The ordinary launcher exposes internal `_prepare_health` and `_prepare_memory`
@@ -67,12 +68,31 @@ memory tools through the existing shared memory backend: `memory_recall`,
 memory tools, including writes, execute locally. This does not admit the final
 `writes` stage. Health remains eligible only at `health-reads`.
 
-The memory peer always opts into `/mcp/v2` with the ordinary process's
+Before preparing resources or claiming stdin, selection compares the actual
+ordinary launcher's captured `_DEFAULT_DB` with authenticated `/status`.
+Only an existing absolute regular-file path whose spelling equals its strict
+canonical resolution can share. Relative, parent-traversal or symlink aliases
+keep ordinary execution; distinct hardlink path names compare as distinct
+logical targets. Selection preserves the ordinary snapshot if the environment
+later changes. It does not choose a database from the backend's response.
+
+The complete status preflight uses the existing SDK 30-second budget, including
+client ownership and response consumption. It disables environment proxies and
+redirects and closes the client before fallback. Missing, malformed, unavailable,
+unsupported or mismatched initial contracts use the unchanged ordinary path
+with input untouched. The preflight requires a well-formed catalog revision.
+The connection generation compares it with the local catalog.
+
+A selected memory peer uses `/mcp/v3` and stamps its captured target on every
+forwarded tool call. Client-supplied target metadata refuses before HTTP.
+It also supplies the ordinary process's
 `HOME/.genesis/plan_bookmark_pending.json`, including when that file is absent.
 Reserved metadata selects the caller's marker and sibling session directory;
 shared readers do not fall back to the server's HOME. Ordinary local tools keep
 their existing pending-bookmark behavior. SDK validation precedes execution,
-and authenticated capability/catalog refusal does not replay locally.
+and authenticated capability/catalog/target refusal after selection does not
+replay locally. Backend replacement or rollback cannot retarget the running
+client or downgrade it to v1/v2. A fresh launcher can select ordinary mode.
 
 The same P7 snapshot, exact selected command, readiness, stdio and unlabelled
 client restrictions apply. The shipped ceiling stays off, adapters stay empty,

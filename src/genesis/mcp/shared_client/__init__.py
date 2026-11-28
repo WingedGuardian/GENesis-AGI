@@ -4,7 +4,7 @@ from genesis.mcp.shared_http import require_qualified_stack
 from genesis.mcp.shared_settings import LOCAL_FRONTEND_STAGES
 
 
-async def serve_stdio(settings, header_factory, *, local_server=None, stage=None, module_owner=None):
+async def serve_stdio(settings, header_factory, *, local_server=None, stage=None, module_owner=None, memory_target=None):
     """Serve one frontend after qualification, without initializing a service."""
     require_qualified_stack()
     if (local_server is None) != (stage is None):
@@ -13,6 +13,9 @@ async def serve_stdio(settings, header_factory, *, local_server=None, stage=None
         raise ValueError("Unsupported local frontend")
     if module_owner is not None and (local_server is None or settings.http.service != 'health'):
         raise ValueError('Module ownership requires the local health frontend')
+    if memory_target is not None and (local_server is None or settings.http.service != "memory"):
+        raise ValueError("Database targets require the local memory frontend")
     from ._stdio import serve
 
-    await serve(settings, header_factory, local_server=local_server, stage=stage, module_owner=module_owner)
+    await serve(settings, header_factory, local_server=local_server, stage=stage,
+                module_owner=module_owner, memory_target=memory_target)

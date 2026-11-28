@@ -469,8 +469,15 @@ and server marker/session decoys, invalid requests, complete catalog traversal,
 cancellation/EOF and feature/catalog refusal cover the mixed consumer. Its
 existing heavy local initialization and final resource owner remain outside
 the savings/activation claim.
-Its fresh JUnit report must pass `scripts/check_skip_ceiling.py` with zero skips
-and a floor of 532 cases. Installation, collection, test or report-check failure
+The memory target suites use CLI, TCP and independent SQLite checks in both
+protocol eras. They cover matching targets, ordinary fallback before input
+ownership, pre-contract backends, and backend replacement before a call or
+after idle. A suppressed TCP reply after an independently verified bookmark
+commit checks that the caller sees an unknown outcome and the tool is called
+only once. An optional local `GENESIS_TEST_TARGET_STDIN_TRACE=1` run uses
+`strace` to check the input boundary before the launch decision.
+The fresh JUnit report must pass `scripts/check_skip_ceiling.py` with zero skips
+and a floor of 681 cases. Installation, collection, test or report-check failure
 fails the job; missing or filtered workflow runs do not qualify a PR. Closing
 checks its actual head/base result. Ordinary skip-budget changes require observed
 skip identities; this workflow does not raise that budget automatically.
