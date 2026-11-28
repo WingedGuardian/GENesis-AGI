@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shlex
+import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -35,11 +36,20 @@ class SnapshotError(Exception):
 
 
 def _ssh_base(cfg: AmbientRemoteConfig) -> list[str]:
+    for part in (cfg.host_user, cfg.host_ip):
+        if part.startswith("-") or any(
+            char.isspace() or unicodedata.category(char) == "Cc" for char in part
+        ):
+            raise SnapshotError(
+                "ambient_remote.yaml host_user/host_ip must not start with '-' or contain "
+                "whitespace or control characters"
+            )
     return [
         "ssh", "-i", str(Path(cfg.ssh_key).expanduser()),
         "-o", "StrictHostKeyChecking=accept-new",
         "-o", "ConnectTimeout=10",
         "-o", "BatchMode=yes",
+        "--",
         f"{cfg.host_user}@{cfg.host_ip}",
     ]
 
