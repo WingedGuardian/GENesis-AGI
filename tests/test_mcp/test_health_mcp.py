@@ -503,10 +503,11 @@ async def test_session_set_model_success():
     old = health_mcp_mod._service
     try:
         health_mcp_mod._service = mock_svc
-        with patch("genesis.db.crud.cc_sessions.update_model_effort", new_callable=AsyncMock, return_value=True) as mock_update:
+        with patch("genesis.db.crud.cc_sessions.apply_model_effort", new_callable=AsyncMock, return_value="medium") as mock_update:
             result = await _impl_session_set_model("sess-1", "opus")
             assert result["success"] is True
             assert result["model"] == "opus"
+            assert result["effort"] == "medium"  # the effort the write itself returned
             mock_update.assert_awaited_once_with(
                 mock_svc._db, "sess-1", model="opus",
             )
@@ -520,7 +521,7 @@ async def test_session_set_model_not_found():
     old = health_mcp_mod._service
     try:
         health_mcp_mod._service = mock_svc
-        with patch("genesis.db.crud.cc_sessions.update_model_effort", new_callable=AsyncMock, return_value=False):
+        with patch("genesis.db.crud.cc_sessions.apply_model_effort", new_callable=AsyncMock, return_value=None):
             result = await _impl_session_set_model("bad-id", "opus")
             assert "error" in result
             assert "not found" in result["error"]
@@ -551,7 +552,7 @@ async def test_session_set_model_case_insensitive():
     old = health_mcp_mod._service
     try:
         health_mcp_mod._service = mock_svc
-        with patch("genesis.db.crud.cc_sessions.update_model_effort", new_callable=AsyncMock, return_value=True):
+        with patch("genesis.db.crud.cc_sessions.apply_model_effort", new_callable=AsyncMock, return_value="high"):
             result = await _impl_session_set_model("sess-1", "OPUS")
             assert result["success"] is True
             assert result["model"] == "opus"

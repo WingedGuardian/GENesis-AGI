@@ -48,6 +48,21 @@ class GuardianState(StrEnum):
     PAUSED = "paused"
 
 
+_DROP_ATTEMPT_KEYS = frozenset({"branch", "pinned_head", "tip", "at"})
+
+
+def _drop_attempt(raw: object) -> dict | None:
+    """A persisted drop attempt, or None when it is not one (a hand-edited or
+    older state file)."""
+    if (
+        isinstance(raw, dict)
+        and set(raw) == _DROP_ATTEMPT_KEYS
+        and all(isinstance(v, str) for v in raw.values())
+    ):
+        return dict(raw)
+    return None
+
+
 @dataclass
 class StateData:
     """Persistent state between timer invocations."""
@@ -75,6 +90,14 @@ class StateData:
     io_triage_attempts: int = 0  # Separate counter for IO_TRIAGE (low-risk, repeatable)
     snapshot_size_history: list[int] = field(default_factory=list)  # Last N snapshot sizes in bytes
     boot_id: str = ""  # kernel boot UUID when this state was last written; "" = unknown
+    rebooted_at: str | None = None  # when this process last saw a host reboot (post-reboot grace)
+    # The Guardian's last drop on `live` this episode (#2978): branch,
+    # pinned_head, tip (`live` before it) and at. Read only with
+    # recovery.live_engine on; kept through the auto-reset, a DENY and a failed
+    # send; cleared when the episode ends (a healthy snapshot). While it is set,
+    # an action that ran ends in RECOVERED, whose one transition to
+    # CONFIRMED_DEAD lets the next diagnosis past the down-alert latch.
+    live_drop_attempt: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -101,6 +124,8 @@ class StateData:
             "io_triage_attempts": self.io_triage_attempts,
             "snapshot_size_history": self.snapshot_size_history[-5:],
             "boot_id": self.boot_id,
+            "rebooted_at": self.rebooted_at,
+            "live_drop_attempt": self.live_drop_attempt,
         }
 
     @classmethod
@@ -133,6 +158,8 @@ class StateData:
             io_triage_attempts=data.get("io_triage_attempts", 0),
             snapshot_size_history=data.get("snapshot_size_history", []),
             boot_id=str(data.get("boot_id") or ""),
+            rebooted_at=data.get("rebooted_at") or None,
+            live_drop_attempt=_drop_attempt(data.get("live_drop_attempt")),
         )
 
 
@@ -161,6 +188,7 @@ class ConfirmationStateMachine:
     def __init__(self, config: GuardianConfig) -> None:
         self._config = config
         self._state = StateData()
+        self._path: Path | None = None  # what load_state read: persist() writes there
 
     @property
     def state(self) -> StateData:
@@ -172,6 +200,7 @@ class ConfirmationStateMachine:
 
     def load_state(self, path: Path) -> None:
         """Load state from disk. Starts fresh on any error (F3)."""
+        self._path = path
         try:
             if path.exists():
                 data = json.loads(path.read_text())
@@ -183,15 +212,27 @@ class ConfirmationStateMachine:
             logger.warning("State file corrupted, starting fresh: %s", exc)
             self._state = StateData()
 
-    def save_state(self, path: Path) -> None:
-        """Persist state to disk atomically."""
-        path.parent.mkdir(parents=True, exist_ok=True)
+    def save_state(self, path: Path) -> bool:
+        """Persist state to disk atomically. True once it is on disk."""
         tmp = path.with_suffix(".tmp")
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_text(json.dumps(self._state.to_dict(), indent=2))
             tmp.replace(path)
         except OSError as exc:
             logger.error("Failed to save state: %s", exc, exc_info=True)
+            return False
+        return True
+
+    @property
+    def path(self) -> Path | None:
+        return self._path
+
+    def persist(self) -> bool:
+        """Save to the path load_state read, mid-tick (#5007): a tick killed
+        later still leaves this on disk. False when it could not be saved; no
+        path read (tests): nothing written, True."""
+        return self._path is None or self.save_state(self._path)
 
     def recovery_backoff_remaining_s(self, action: str = "") -> float:
         """Seconds remaining before next recovery attempt is allowed.
@@ -219,14 +260,25 @@ class ConfirmationStateMachine:
                 return float("inf")
             backoff_s = 100.0 * (3.0 ** (attempts - 1))
 
-        if not self._state.last_recovery_at:
-            return backoff_s
+        elapsed = (datetime.now(UTC) - self._recovery_stamp()).total_seconds()
+        return max(0.0, backoff_s - elapsed)
+
+    def _recovery_stamp(self) -> datetime:
+        """last_recovery_at, readable. A missing, unparseable, naive or future
+        stamp would freeze the backoff at its full length on every tick (a held
+        or deferred action that never runs), so it is reset to now and the
+        backoff counts down once from there; the state is saved every cycle."""
+        now = datetime.now(UTC)
+        raw = self._state.last_recovery_at
         try:
-            last = datetime.fromisoformat(self._state.last_recovery_at)
-            elapsed = (datetime.now(UTC) - last).total_seconds()
-            return max(0.0, backoff_s - elapsed)
+            last = datetime.fromisoformat(raw or "")
+            if last.tzinfo is not None and last <= now:
+                return last
         except (ValueError, TypeError):
-            return backoff_s
+            pass
+        logger.warning("last_recovery_at %r is unusable; counting the backoff from now", raw)
+        self._state.last_recovery_at = now.isoformat()
+        return now
 
     def record_recovery_attempt(self, action: str = "") -> None:
         """Record that a recovery attempt was made (for backoff tracking).
@@ -258,6 +310,8 @@ class ConfirmationStateMachine:
         })
         # Keep last 20
         self._state.signal_history = self._state.signal_history[-20:]
+        if snapshot.all_alive:  # the episode is over: its drop needs no naming
+            self._state.live_drop_attempt = None
 
         old_state = self._state.current_state
 
@@ -383,13 +437,9 @@ class ConfirmationStateMachine:
                 reason="awaiting recovery",
                 action_needed=True,
             )
-        elif old_state == GuardianState.RECOVERING:
-            return Transition(
-                old_state=old_state,
-                new_state=GuardianState.RECOVERING,
-                reason="recovery in progress",
-            )
-        elif old_state == GuardianState.RECOVERED:
+        elif old_state in (GuardianState.RECOVERING, GuardianState.RECOVERED):
+            # Each tick is a fresh process, so RECOVERING on disk is a killed
+            # tick's: an action whose outcome was not seen (#5007).
             return self._from_recovered(snapshot, now)
         else:
             # Unknown state — reset to healthy
@@ -590,6 +640,19 @@ class ConfirmationStateMachine:
                 reason="recovery verified — all probes healthy",
             )
 
+        # After a `live` drop attempt (#2978) the next decision waits out the
+        # backoff here: CONFIRMED_DEAD would auto-reset, or stay latched. At
+        # max_escalations the backoff never ends, so it goes on to the escalation.
+        # RECOVERED has no auto-reset; the hold ends because the backoff always
+        # counts down (an unusable stamp restarts it from now, _recovery_stamp).
+        backoff = self.recovery_backoff_remaining_s()
+        drop = self._config.recovery.live_engine and self._state.live_drop_attempt
+        if drop and 0 < backoff < float("inf"):
+            return Transition(
+                old_state=GuardianState.RECOVERED,
+                new_state=GuardianState.RECOVERED,
+                reason=f"after a drop attempt: {backoff:.0f}s of backoff before the next decision",
+            )
         # Recovery failed — back to CONFIRMED_DEAD for escalation.
         # recovery_attempts already incremented by record_recovery_attempt().
         self._state.current_state = GuardianState.CONFIRMED_DEAD
@@ -606,15 +669,29 @@ class ConfirmationStateMachine:
         )
 
     def _is_within_bootstrap_grace(self) -> bool:
-        """Check if we're within the bootstrap grace period (F4)."""
+        """Check if we're within the bootstrap grace period (F4).
+
+        An episode whose first failure falls within ``post_reboot_grace_s`` of
+        a detected host reboot gets that longer grace: a cold boot of the
+        container stack takes far longer than a service restart.
+        """
         if not self._state.first_failure_at:
             return False
         try:
             first = datetime.fromisoformat(self._state.first_failure_at)
             elapsed = (datetime.now(UTC) - first).total_seconds()
-            return elapsed < self._config.confirmation.bootstrap_grace_s
         except (ValueError, TypeError):
             return False
+        grace = self._config.confirmation.bootstrap_grace_s
+        post = self._config.confirmation.post_reboot_grace_s
+        if self._state.rebooted_at and post > grace:
+            try:
+                since_boot = (first - datetime.fromisoformat(self._state.rebooted_at)).total_seconds()
+            except (ValueError, TypeError):
+                since_boot = None
+            if since_boot is not None and -60 <= since_boot < post:
+                grace = post
+        return elapsed < grace
 
     def reset_if_rebooted(self, current_boot_id: str | None) -> bool:
         """Drop a stale episode when the host has rebooted since it was written.
@@ -685,6 +762,7 @@ class ConfirmationStateMachine:
         self._clear_dialogue_state()
         self.clear_cc_unavailable()
         self._state.boot_id = current_boot_id
+        self._state.rebooted_at = datetime.now(UTC).isoformat()
         return True
 
     def _reset_to_healthy(self, now: str) -> None:
@@ -797,6 +875,10 @@ class ConfirmationStateMachine:
         """Clear the down-alert flag — called by check.py on genuine recovery only."""
         self._state.down_alert_sent = False
 
-    def should_escalate(self) -> bool:
-        """Check if we've exceeded max recovery attempts."""
+    def should_escalate(self, action: str = "") -> bool:
+        """Max recovery attempts exceeded for the proposed action's OWN budget
+        (#5007), the counter execute() reads: IO_TRIAGE's, or the main one."""
+        if action == "IO_TRIAGE":
+            max_io = getattr(self._config.recovery, "max_io_triage_attempts", 5)
+            return self._state.io_triage_attempts >= max_io
         return self._state.recovery_attempts >= self._config.recovery.max_escalations

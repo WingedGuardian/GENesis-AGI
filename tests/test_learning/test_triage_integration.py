@@ -54,7 +54,7 @@ async def test_triage_pipeline_called_after_response():
     with patch("genesis.cc.conversation.cc_sessions") as mock_crud:
         mock_crud.get_active_foreground = AsyncMock(return_value=None)
         mock_crud.update_cc_session_id = AsyncMock()
-        mock_crud.update_model_effort = AsyncMock()
+        mock_crud.apply_model_effort = AsyncMock(return_value=None)
         result = await loop.handle_message(
             "hi there", user_id="u1", channel=ChannelType.TERMINAL,
         )
@@ -82,7 +82,7 @@ async def test_triage_pipeline_failure_does_not_affect_response():
     with patch("genesis.cc.conversation.cc_sessions") as mock_crud:
         mock_crud.get_active_foreground = AsyncMock(return_value=None)
         mock_crud.update_cc_session_id = AsyncMock()
-        mock_crud.update_model_effort = AsyncMock()
+        mock_crud.apply_model_effort = AsyncMock(return_value=None)
         result = await loop.handle_message(
             "hello", user_id="u1", channel=ChannelType.TERMINAL,
         )
@@ -101,7 +101,7 @@ async def test_triage_pipeline_none_no_error():
     with patch("genesis.cc.conversation.cc_sessions") as mock_crud:
         mock_crud.get_active_foreground = AsyncMock(return_value=None)
         mock_crud.update_cc_session_id = AsyncMock()
-        mock_crud.update_model_effort = AsyncMock()
+        mock_crud.apply_model_effort = AsyncMock(return_value=None)
         result = await loop.handle_message(
             "yo", user_id="u1", channel=ChannelType.TERMINAL,
         )

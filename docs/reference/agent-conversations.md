@@ -1,4 +1,4 @@
-# Same-owner agent conversations
+# Enrolled agent conversations
 
 Genesis-originated messages use the [pull outbox](agent-outbox.md). A reply
 supplies the outgoing message's contextId and metadata.inReplyTo. The first
@@ -11,8 +11,12 @@ current cognitive state, available prior-experience retrieval and permitted nati
 tools. It may answer, clarify or refuse. External messages are input, never owner
 instructions or approval. The API changes no listener. Access starts disabled.
 
-For the MVP, enroll only agents owned by the operator. Registry entries for
-other owners are refused by conversation admission. The registry authenticates
+Same-owner enrollment retains normal Genesis identity/cognition and permitted
+tools. A cross-owner peer additionally needs explicit `conversation_shared allow`:
+its turns use only repository-owned public identity and this peer/epoch's shared
+conversation, with no tools, MCP, private enrichment or transcript persistence.
+Registration and a `conversation` grant alone never activate foreign access.
+The registry authenticates
 explicit fallback scoped credentials or an explicitly configured SAM backend;
 there is no automatic downgrade or acceptance of a general MCP/desk token.
 SAM is optional, not needed for the direct fallback client. See
@@ -45,6 +49,47 @@ background autonomy remain in force. A changed/revoked relationship takes effect
 on the next request; no new admission or disclosure is allowed. Accepted work is
 Genesis-owned and can be canceled explicitly; revocation does not replay it or
 introduce new per-tool leases. See restore/epoch cautions in the registry guide.
+
+### Owner relay (optional, per peer)
+
+A same-owner agent that the owner talks to directly can relay the owner's own
+requests. Grant it explicitly:
+
+```bash
+python -m genesis peers grant muse owner_relay allow
+```
+
+Without this grant, every peer session is told that peer content is external
+input, not owner approval or authority. With `owner_relay` set to `allow`
+(`ask` and `deny` count as no grant), the session is told instead that a request
+the peer relays from the owner is the owner's request. The session is told that
+three things still need the owner directly: spending money (the owner's own card-prompt tap is the only
+approval, and a relayed "yes" never is), destructive actions, and approving an
+autonomous session. Card payments are also stopped in code at the card tap. The grant
+does not change the profile: the peer still picks it per message. An `observe`
+session that receives a relayed request needing action replies that it must be
+resent with `profile: "interact"`, or, when the autonomy level does not allow
+`interact`, that it cannot be done at this level. Neither is a refusal.
+
+When a relayed session used any tool outside a short read-only set, finalization
+queues one alert to the owner, on the install's alert channel:
+`[<session>] Acted on your behalf via <peer>: used <tools>; ended <outcome>.`
+followed by the session's own summary, quoted and cut to 200 characters. A tool
+not on the read-only set counts as acting, so a newly added tool alerts by
+default. The alert reads the full tool record, not the stored summary (which
+keeps only the first 100 calls). A session whose record may be incomplete (a
+partial stream, or one cut off by a restart and finished by boot reconciliation)
+alerts that it may have acted. Alerts are exempt from the daily notification
+budget and quiet hours but not from duplicate suppression, so the session id
+leads the text. A retried finalization never queues a second alert.
+The alert is queued before the session's terminal status commits, at
+finalization and at boot alike, so a restart between the two cannot lose it.
+A failed insert is retried with the other finalization writes; at boot, an
+orphan whose alert cannot be queued stays active until the next boot.
+
+Every peer session, granted or not, is also told to look a name, address,
+account or fact up (`memory_recall`, `reference_lookup`) before refusing or
+doubting a request because it does not match what the session knows.
 
 ## Connect a same-owner agent (generic client)
 
@@ -93,6 +138,50 @@ session, so the caller writes a self-contained brief. A completed task whose rep
 a credential comes back with `replyError: disclosure_refused` and no text; the
 client says so rather than returning an empty answer.
 
+## Explicit shared conversations
+
+After review, merge, deploy and ingress qualification, an owner may register a
+separate agent with `--cross-owner` and grant both `conversation allow` and
+`conversation_shared allow`. This is an intentional expansion of enrollment,
+not inferred from a saved foreign row. Normal same-owner clients need no change.
+The new grant has no seed or automatic migration.
+
+Each new receipt records immutable same-owner/shared trust alongside peer and
+epoch. Reads, retries, history, contexts, cancellation and owner-action booleans
+must match the currently authorized relationship and the saved trust mode.
+Reclassifying ownership does not expose or upgrade earlier receipts, even within
+the same epoch. Missing legacy markers are usable only by current same-owner
+relationships; malformed markers are refused. Revocation stops subsequent access
+without automatically canceling accepted Genesis-owned work.
+
+Shared conversations can reason, clarify, refuse and propose. They cannot call
+tools, schedule work, import knowledge, access private identity/memory/workspace,
+resolve approvals or use proactive outbox routes. Replies and bounded shared
+continuations use the ordinary asynchronous send/poll/result paths. The public
+identity file is `src/genesis/identity/PEER_PUBLIC.md`; missing/empty/unreadable
+public identity fails closed, without private identity fallback. The whole
+contained native lifetime leaves shared provider health and Fallback observations
+unchanged. Native background limits and canonical committed result checks remain.
+
+Each newly accepted shared task atomically queues one fixed owner notice with
+its receipt. Exact retries neither enqueue again nor adopt again. The notice
+contains enrolled peer/task/context identifiers, no peer-authored instructions or
+private results. Existing pending-outreach governance can delay, hold, decline
+or age it out; a queued notice or the queue's `delivered` flag is not proof of
+owner receipt or approval. Shared cognition never waits on that notice.
+
+An owner who wants Genesis to act starts a **new normal trusted workflow** through
+their existing owner channel. No notice, button, new grant or continuation
+promotes/resumes the external session, and no trusted result is automatically
+copied back. Recurrence remains an owner-created definition in the current
+scheduler; no remote scheduling endpoint or daily submission budget is added.
+
+A definite pre-adopt commit-acknowledgement failure is reconciled against the
+exact inserted receipt before releasing admission ownership. A matching durable
+receipt becomes failed/not_started, never adopted or replayed; unavailable
+persistence retains the claim until disposition or runtime shutdown. Existing
+rows and post-adoption uncertainty keep their existing native ownership rules.
+
 ## Wire contract
 
 Use `Authorization: Bearer <vault-supplied value>` and `A2A-Version: 1.0`.
@@ -107,7 +196,7 @@ Streaming, push notifications and extended cards are unavailable.
 | List tasks | `GET /tasks` |
 | Cancel task | `POST /tasks/<task_id>:cancel` |
 | Full saved result, text/plain | `GET /tasks/<task_id>/result` |
-| Read pending owner actions | `GET /approvals` |
+| Read pending owner actions (same-owner only) | `GET /approvals` |
 | Authenticated runtime/native readiness | `GET /health` |
 
 Example request (no credential value):
@@ -134,8 +223,10 @@ cancel; it returns `503 not_ready` rather than reading an unbounded stream.
 Server-supported options are `profile` (`observe`/`interact`), a native `CCModel`
 tier, `effort` (`low`/`medium`/`high`) and integral `timeout_s` (default 3600,
 range 1–7200). No tool exceptions, system prompt, provider selection or autonomy
-override. The current native background effective level chooses the default
-profile; explicit interact requires at least L3, observe at least L1. The runner
+override. For same-owner turns, the current native background effective level chooses the
+default profile; explicit interact requires at least L3, observe at least L1.
+Shared foreign turns require observe (at least L1); explicit interact and
+inReplyTo are refused before construction. The runner
 rechecks its existing breaker and ceiling before hooks or execution. Native
 profile/roster model selection still applies; interact currently pins Opus before
 normal roster handling, so a requested tier is not a guaranteed provider/model.

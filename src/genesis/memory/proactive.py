@@ -317,7 +317,10 @@ def render_cc_hook(enriched: list[dict]) -> list[str]:
         tag = " | ".join(parts)
         related = r.get("related_ids")
         if related:
-            tag += " | → " + ", ".join(f"id:{rid}" for rid in related)
+            labels = r.get("related_labels") or {}
+            tag += " | → " + ", ".join(
+                f"id:{rid} ({labels[rid]})" if labels.get(rid) else f"id:{rid}" for rid in related
+            )
         lines.append(f"[{tag}] {content}")
 
     if lines:
@@ -621,16 +624,34 @@ async def _enrich(db: Any, dicts: list[dict]) -> None:
         d["_wing"] = payload_wing or wing
 
 
+# Strong links read per delivered memory before hidden neighbours are dropped,
+# so visible ones can fill the 2 hint slots. A bound, not a scan: if all 10
+# strongest links are hidden, the memory gets no breadcrumb even when a weaker
+# visible link exists past them.
+_BREADCRUMB_CANDIDATES = 10
+
+
 async def _breadcrumbs(db: Any, dicts: list[dict]) -> None:
     """Attach up to 2 strongly-linked neighbor id-prefixes to the top 3
     delivered memories (``related_ids``), for memory_expand follow-up.
 
+    Never offers a memory normal recall hides (deprecated or expired, the
+    predicate ``memory_recall``'s graph traversal uses by default; stricter than
+    ``memory_expand``, which shows deprecated neighbours): those are dropped
+    before the cap, so a visible neighbour takes the freed slot. A target linked
+    by several relationship types takes one slot.
+
     Lets a DB read error PROPAGATE (see :func:`_enrich`): the caller's ``_ro_read``
-    fallback + best-effort guard handle it, and the writes are idempotent.
+    fallback + best-effort guard handle it, and the writes are idempotent. A
+    failed visibility read therefore costs the breadcrumbs, never shows a
+    hidden id. Nothing is written until every read has succeeded.
     """
     if not dicts:
         return
+    from genesis.memory.graphstore import invalid_memory_ids_among
+
     seen = {d.get("memory_id") for d in dicts}
+    candidates: list[tuple[dict, list[str]]] = []
     for d in dicts[:3]:
         mid = d.get("memory_id")
         if not mid:
@@ -638,12 +659,85 @@ async def _breadcrumbs(db: Any, dicts: list[dict]) -> None:
         rows = await db.execute_fetchall(
             "SELECT target_id FROM memory_links "
             "WHERE source_id = ? AND strength >= 0.5 "
-            "ORDER BY strength DESC LIMIT 2",
-            (mid,),
+            "ORDER BY strength DESC LIMIT ?",
+            (mid, _BREADCRUMB_CANDIDATES),
         )
-        related = [row[0][:8] for row in rows if row[0] not in seen]
-        if related:
-            d["related_ids"] = related
+        if rows:
+            candidates.append((d, [row[0] for row in rows]))
+    if not candidates:
+        return
+    hidden = await invalid_memory_ids_among(db, {i for _, ids in candidates for i in ids})
+    for d, ids in candidates:
+        # Cap the distinct visible links, then drop delivered ones (as before
+        # hidden ids were filtered), so a delivered neighbour still uses a slot.
+        visible = list(dict.fromkeys(i for i in ids if i not in hidden))[:2]
+        full = [i for i in visible if i not in seen]
+        if full:
+            d["related_ids"] = [mid[:8] for mid in full]
+            # Full ids for the label step and the recall trace; never rendered.
+            d["_related_full"] = full
+
+
+async def _breadcrumb_label_plan(db: Any, dicts: list[dict]) -> Any:
+    """The SQLite half of the breadcrumb labels: which hint ids may be labelled.
+
+    Runs on a pooled read connection (``_ro_read``); the vector-store read in
+    :func:`_attach_breadcrumb_labels` runs after that connection is released, so
+    a slow label read never holds a pool slot. Never labels a hidden memory
+    (:func:`_breadcrumbs` already drops them; a hint can expire between the two
+    reads). ``None`` means every label is withheld.
+    """
+    from genesis.memory.neighbour_labels import LabelPlan, label_plan
+
+    ids = [mid for d in dicts for mid in d.get("_related_full") or ()]
+    if not ids:
+        return LabelPlan()
+    return await label_plan(db, ids, include_hidden=False)
+
+
+async def _attach_breadcrumb_labels(db: Any, dicts: list[dict], qdrant: Any, plan: Any) -> None:
+    """Attach ``related_labels`` ({8-char id: a few words}) to the breadcrumbs.
+
+    Separate from :func:`_breadcrumbs` so a failure here costs only the labels.
+    Shares the label exclusions with ``memory_expand``
+    (``memory.neighbour_labels``). ``db`` only owns the worker thread. Never
+    raises.
+    """
+    if qdrant is None or plan is None:
+        return
+    from genesis.memory.neighbour_labels import labels_from_plan
+
+    try:
+        labels = await labels_from_plan(db, qdrant, plan, max_words=6)
+    except Exception:
+        logger.debug("breadcrumb labels failed", exc_info=True)
+        return
+    for d in dicts:
+        shown = {
+            mid[:8]: labels[mid] for mid in d.get("_related_full") or () if labels and mid in labels
+        }
+        if shown:
+            d["related_labels"] = shown
+
+
+async def _breadcrumb_labels(db: Any, dicts: list[dict], qdrant: Any) -> None:
+    """Both halves on one connection (tests and callers without a pool)."""
+    if qdrant is None:
+        return
+    try:
+        plan = await _breadcrumb_label_plan(db, dicts)
+    except Exception:
+        logger.debug("breadcrumb label plan failed", exc_info=True)
+        return
+    await _attach_breadcrumb_labels(db, dicts, qdrant, plan)
+
+
+def _shown_hints(dicts: list[dict]) -> list[str]:
+    """The full ids of the breadcrumb hints shown, once each, in order (recall trace).
+
+    Two delivered memories can share a neighbour; the metric counts ids shown.
+    """
+    return list(dict.fromkeys(mid for d in dicts for mid in d.get("_related_full") or ()))
 
 
 # ---------------------------------------------------------------------------
@@ -894,6 +988,15 @@ async def proactive_context(
             await retriever._ro_read(_breadcrumbs, dicts)
         except Exception:
             logger.debug("post-recall enrichment/breadcrumbs failed", exc_info=True)
+        # Labels in their own try: a failure keeps the bare hint ids above.
+        qdrant = getattr(retriever, "_qdrant", None)
+        if qdrant is not None:
+            try:
+                # SQLite on the pool; the vector read after the slot is released.
+                plan = await retriever._ro_read(_breadcrumb_label_plan, dicts)
+                await _attach_breadcrumb_labels(db, dicts, qdrant, plan)
+            except Exception:
+                logger.debug("breadcrumb labels failed", exc_info=True)
         timings["enrich"] = round((time.monotonic() - t_enrich) * 1000, 1)
 
         lines = prof.renderer(dicts)
@@ -1015,6 +1118,7 @@ async def proactive_context(
         trace["intent"] = intent_category
         trace["timings_ms"] = dict(timings)
         trace["delivered"] = [d.get("memory_id") for d in dicts if d.get("memory_id")]
+        trace["hints"] = _shown_hints(dicts)
         trace["degraded_reasons"] = _degraded_reasons(engine_stats, vector, rerank_live, trace)
         _schedule_trace_write(db, trace, session_id)
     return {

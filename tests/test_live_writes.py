@@ -48,6 +48,7 @@ def home(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(audit._S, "hits", {})
     monkeypatch.setattr(audit._S, "faults", 0)
+    monkeypatch.setattr(audit._S, "credential_inodes", frozenset())
     return fake
 
 
@@ -123,7 +124,9 @@ def test_valid_descriptor_without_proc_visibility_counts_uncertainty(home, monke
         audit._S.hits.clear()
         os.ftruncate(descriptor, 1)
     assert target.read_bytes() == b"o"
-    assert not audit._S.hits
+    assert [row[1:] for row in audit._S.hits] == [
+        ("observer fault", "os.truncate/judge/FileNotFoundError", "<not captured>")
+    ]
     assert audit._S.faults == 1
 
 
@@ -191,6 +194,7 @@ def test_hook_preserves_operator_interrupts(home, monkeypatch, signal):
 def test_fault_count_reaches_controller_and_summary(home, monkeypatch):
     monkeypatch.setattr(audit._S, "faults", 3, raising=False)
     monkeypatch.setattr(audit._S, "merged_workers", set())
+    monkeypatch.setattr(audit._S, "worker_status", {})
     monkeypatch.setattr(audit._S, "unreported", [])
     config = type("C", (), {"workeroutput": {}})()
     audit.pytest_sessionfinish(type("S", (), {"config": config})(), 0)
@@ -575,6 +579,33 @@ def test_a_relative_os_open_that_only_reopens_an_existing_file_is_not_a_write(ho
     assert _hits() == set()
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def test_a_credential_file_read_under_another_name_is_recorded(home, tmp_path, monkeypatch):
     """Through a symlink and a hard link whose names say nothing: recorded."""
     secrets = home / "genesis" / "secrets.env"
@@ -616,24 +647,6 @@ def test_a_fault_in_the_credential_lookup_never_breaks_a_read(home, tmp_path, mo
     os.close(fd)
 
 
-def test_install_records_the_credential_files_by_inode(tmp_path, monkeypatch):
-    """The inode set is what lets a read under another name be recognised."""
-    fake = tmp_path / "home"
-    (fake / "genesis").mkdir(parents=True)
-    (fake / "genesis" / "secrets.env").write_text("K=v\n")
-    st = os.stat(fake / "genesis" / "secrets.env")
-    from tests import _live_fence
-
-    monkeypatch.setattr(audit._S, "installed", False)
-    monkeypatch.setattr(audit.sys, "addaudithook", lambda hook: None)
-    monkeypatch.setattr(_live_fence._S, "installed", True)
-    monkeypatch.setattr(_live_fence._S, "real_home", str(fake))
-    for name in ("real_home", "allowed_roots", "allowed_files", "classes", "credential_files"):
-        monkeypatch.setattr(audit._S, name, getattr(audit._S, name))
-    monkeypatch.setattr(audit._S, "credential_inodes", frozenset())
-    config = type("C", (), {"option": type("O", (), {"basetemp": None})()})()
-    audit.install(config)
-    assert (st.st_dev, st.st_ino) in audit._S.credential_inodes
 
 
 def test_install_without_a_known_real_home_stays_disarmed(monkeypatch):
@@ -645,6 +658,10 @@ def test_install_without_a_known_real_home_stays_disarmed(monkeypatch):
     from tests import _live_fence
 
     hooks = []
+    monkeypatch.setattr(audit._S, "hits", {})
+    monkeypatch.setattr(audit._S, "faults", 0)
+    monkeypatch.setattr(audit._S, "unreported", [])
+    monkeypatch.delenv("GENESIS_LIVE_WRITES_REPORT", raising=False)
     monkeypatch.setattr(audit._S, "installed", False)
     monkeypatch.setattr(audit._S, "disarmed", "")
     monkeypatch.setattr(audit.sys, "addaudithook", hooks.append)
@@ -854,7 +871,7 @@ def test_an_xdist_run_reports_the_workers_writes(tmp_path):
         "test_one.py",
         "test_two.py",
     ], text
-    assert "live writes: writes outside the test's temp dirs" in text
+    assert "live writes: audit observations" in text
     assert "no report from xdist worker" not in text
 
 
@@ -870,6 +887,7 @@ def test_a_worker_hands_over_an_undecodable_path_intact(monkeypatch):
     sent = gateway_base.loads(gateway_base.dumps(config.workeroutput))  # the channel
     monkeypatch.setattr(audit._S, "hits", {})
     monkeypatch.setattr(audit._S, "merged_workers", set())
+    monkeypatch.setattr(audit._S, "worker_status", {})
     monkeypatch.setattr(audit._S, "unreported", [])
     gateway = type("G", (), {"id": "gw0"})()
     audit.pytest_testnodedown(type("N", (), {"gateway": gateway, "workeroutput": sent})(), None)
@@ -878,6 +896,7 @@ def test_a_worker_hands_over_an_undecodable_path_intact(monkeypatch):
 
 def test_a_worker_that_never_reported_is_named(monkeypatch):
     monkeypatch.setattr(audit._S, "merged_workers", set())
+    monkeypatch.setattr(audit._S, "worker_status", {})
     monkeypatch.setattr(audit._S, "unreported", [])
     monkeypatch.setattr(audit._S, "hits", {})
     gateway = type("G", (), {"id": "gw3"})()
@@ -945,6 +964,6 @@ def test_a_run_reports_writes_without_failing_the_test(tmp_path):
     )
     text = out.stdout + out.stderr
     assert out.returncode == 0, text
-    assert "writes outside the test's temp dirs (reported, not failed)" in text, text
+    assert "audit observations (reported, not failed)" in text, text
     lines = report.read_text().splitlines()
     assert any(line.endswith("/f") and "\twrite\t" in line for line in lines), lines

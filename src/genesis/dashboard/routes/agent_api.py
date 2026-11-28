@@ -284,7 +284,7 @@ async def agent_card():
     settings = await service.registry.settings()
     card = AgentCard(
         name="Genesis",
-        description="Same-owner asynchronous conversations with Genesis",
+        description="Explicitly enrolled asynchronous conversations with Genesis",
         version="1",
         supported_interfaces=[
             AgentInterface(
@@ -361,6 +361,14 @@ async def outbox_list():
         size,
         request.args.get("pageToken"),
     )
+    for item in messages:
+        # Ids and a byte length only: proves what this side served, never the text.
+        logger.info(
+            "peer_outbox_served peer=%s message_id=%s text_bytes=%d",
+            g.peer_identity.peer["peer_id"],
+            item["message"]["messageId"],
+            len(item["message"]["parts"][0]["text"].encode("utf-8")),
+        )
     return jsonify(messages=messages, nextPageToken=token)
 
 

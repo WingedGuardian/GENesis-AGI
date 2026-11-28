@@ -116,6 +116,118 @@ class TestGenesisFormatter:
         assert "Traceback" not in output
 
 
+def _record() -> logging.LogRecord:
+    return logging.LogRecord(
+        name="genesis.test",
+        level=logging.INFO,
+        pathname="",
+        lineno=0,
+        msg="hello",
+        args=(),
+        exc_info=None,
+    )
+
+
+def _stamp(line: str) -> datetime:
+    return datetime.fromisoformat(line.split(" ", 1)[0].removeprefix("ts="))
+
+
+class TestUserLocalTimestamp:
+    """The default clock stamps the configured user zone, with its offset."""
+
+    @pytest.mark.parametrize("zone", ["Europe/Paris", "Asia/Tokyo", "UTC"])
+    def test_default_clock_uses_the_cached_user_zone(self, monkeypatch, zone):
+        from zoneinfo import ZoneInfo
+
+        from genesis.util import tz
+
+        monkeypatch.setattr(tz, "_USER_TZ", ZoneInfo(zone))
+        before = datetime.now(UTC)
+        ts = _stamp(GenesisFormatter().format(_record()))
+        after = datetime.now(UTC)
+        assert ts.utcoffset() == datetime.now(ZoneInfo(zone)).utcoffset()
+        assert before <= ts <= after  # the same instant, only shown in local time
+
+    def test_follows_a_reload_without_a_new_formatter(self, monkeypatch):
+        from zoneinfo import ZoneInfo
+
+        from genesis.util import tz
+
+        fmt = GenesisFormatter()
+        monkeypatch.setattr(tz, "_USER_TZ", ZoneInfo("UTC"))
+        assert _stamp(fmt.format(_record())).utcoffset().total_seconds() == 0
+        monkeypatch.setattr(tz, "_USER_TZ", ZoneInfo("Asia/Tokyo"))
+        assert _stamp(fmt.format(_record())).utcoffset().total_seconds() == 9 * 3600
+
+    def test_falls_back_to_utc_when_the_zone_cannot_be_read(self, monkeypatch):
+        from zoneinfo import ZoneInfo
+
+        from genesis.util import tz
+
+        def _broken():
+            raise RuntimeError("zone lookup failed")
+
+        # A non-UTC cache proves the UTC stamp comes from the fallback.
+        monkeypatch.setattr(tz, "_USER_TZ", ZoneInfo("Asia/Tokyo"))
+        monkeypatch.setattr(tz, "user_zone", _broken)
+        ts = _stamp(GenesisFormatter().format(_record()))
+        assert ts.utcoffset().total_seconds() == 0
+
+    def test_invalid_zone_warning_during_tz_import_does_not_recurse(self, tmp_path):
+        # Fresh interpreter, so genesis.util.tz is imported for the first time
+        # while the formatter is live. An invalid genesis.yaml zone makes that
+        # import log a warning through this formatter.
+        import subprocess
+        import textwrap
+
+        script = textwrap.dedent(
+            """
+            import io, logging, sys
+            import genesis.env as env
+            env._local_config = lambda: {"timezone": "Not/AZone"}
+            from genesis.observability.logging_config import GenesisFormatter
+            buf = io.StringIO()
+            h = logging.StreamHandler(buf)
+            h.setFormatter(GenesisFormatter())
+            log = logging.getLogger("genesis")
+            log.handlers = [h]
+            log.propagate = False
+            assert "genesis.util.tz" not in sys.modules
+            import genesis.util.tz as tz
+            log.warning("after import")
+            print(buf.getvalue(), end="")
+            print("ZONE", tz.user_zone().key)
+            print("FROM", tz.__file__)
+            """
+        )
+        import os
+        from pathlib import Path
+
+        import genesis.observability.logging_config as lc
+
+        src = str(Path(lc.__file__).resolve().parents[2])  # this tree's src/
+        out = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=tmp_path,
+            # No USER_TIMEZONE, so an invalid genesis.yaml zone can only fall back to UTC.
+            env={
+                **{k: v for k, v in os.environ.items() if k != "USER_TIMEZONE"},
+                "PYTHONPATH": src,
+            },
+        )
+        assert out.returncode == 0, out.stderr
+        lines = out.stdout.splitlines()
+        warn = [ln for ln in lines if "not a valid IANA zone" in ln]
+        assert len(warn) == 1, out.stdout  # logged once, no recursion
+        assert _stamp(warn[0]).utcoffset().total_seconds() == 0  # stamped in UTC
+        assert "Logging error" not in out.stderr
+        assert lines[-2] == "ZONE UTC"
+        assert lines[-1].startswith("FROM " + src)  # the tree under test ran
+
+
 @pytest.mark.usefixtures("isolated_logging")
 class TestConfigureLogging:
     def test_sets_up_genesis_hierarchy(self):
@@ -130,6 +242,17 @@ class TestConfigureLogging:
         count = len(logging.getLogger("genesis").handlers)
         configure_logging()
         assert len(logging.getLogger("genesis").handlers) == count
+
+    def test_default_handlers_stamp_the_user_zone(self, monkeypatch):
+        from zoneinfo import ZoneInfo
+
+        from genesis.util import tz
+
+        monkeypatch.setattr(tz, "_USER_TZ", ZoneInfo("Asia/Tokyo"))
+        configure_logging()
+        handler = logging.getLogger("genesis").handlers[0]
+        line = handler.formatter.format(_record())
+        assert _stamp(line).utcoffset().total_seconds() == 9 * 3600
 
     def test_child_loggers_inherit(self):
         configure_logging(level=logging.WARNING)

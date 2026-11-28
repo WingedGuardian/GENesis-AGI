@@ -144,6 +144,29 @@ not to confirm:
   rank by real severity: **P1** (bug/security/data-loss) · **P2** (wrong under edge
   conditions, missing handling) · **P3** (quality/nit). Generic advice ("validate
   input") without a specific code path is not P1.
+- **Three kinds of finding are P1 whatever their size**, because the merge gate's
+  always-fix floor reads the severity label (Codex P1, CodeRabbit Critical or Major, Devin
+  severe), not what the finding is. The finding shows that the code:
+  - **leaks:** the change exposes data that is actually private (personal data, a
+    secret, a credential) to an audience beyond the one it is meant for, such as a
+    commit, a PR, an issue, a public log or a published file;
+  - **destroys:** it deletes or overwrites user data, or runs an irreversible operation
+    nobody asked for, with no trash, backup or confirmation to recover from;
+  - **fails open:** a check whose job is to stop data loss, credential exposure,
+    deletion or an unreviewed merge lets the action through when it errors, times out or
+    cannot read its input.
+
+  Not every fail-open qualifies. A fail-open the code documents as deliberate (an
+  advisory hook that must never wedge a session, for example) and a deliberate
+  multi-step evasion of an accident-prevention guard are notes at most; the threat-model
+  bullet below governs them.
+
+  Put one line naming the kind, exactly `Kind: leak`, `Kind: destructive` or
+  `Kind: fail-open`, as the first line of the finding's description: after your own
+  severity header or badge, never ahead of it. The gate reads the label from the
+  comment's first line, so a line ahead of the header hides the label.
+  Other reviewers' labels for this level: CodeRabbit **Critical**, Devin **severe**
+  (`REVIEW.md`).
 - **Check the fix does not REMOVE constraints** (validation, guards, type enforcement)
   and does not break existing behavior; a finding whose "fix" regresses something is
   itself a finding. Verify claims against the code — a stated mechanism can be wrong
@@ -298,7 +321,7 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 - **research** (`src/genesis/skills/research/SKILL.md`) — Deep research on a topic — use when investigating unfamiliar domains, answering complex questions requiring multiple sources, or when an evaluation flags something for deeper analysis
 - **retrospective** (`src/genesis/skills/retrospective/SKILL.md`) — Post-interaction retrospective analysis — use after completing a significant task, conversation, or phase to extract lessons, identify process improvements, and update procedures
 - **shelve** (`.claude/skills/shelve/SKILL.md`) — Shelve the current session — create a bookmark so you can find and resume it later with /unshelve.
-- **spec-session** (`.claude/skills/spec-session/SKILL.md`) — This skill should be used when a session SPECIFIES a Genesis change before it is planned or built: shaping the problem, the PRD, the architecture and the tickets a build session will take. Load `genesis-development` (the shared core) first. Do NOT load it for building (`build-session`), closing open PRs (`closing-session`), or post-merge verification (`validating-merges`).
+- **spec-session** (`.claude/skills/spec-session/SKILL.md`) — This skill should be used when a session SPECIFIES a Genesis change before it is planned or built: shaping the problem, the PRD, the architecture and the tickets a build session will take. It is the default for a foreground development session whose type the owner did not state. Load `genesis-development` (the shared core) first. Do NOT load it for building (`build-session`), closing open PRs (`closing-session`), or post-merge verification (`validating-merges`).
 - **stealth-browser** (`src/genesis/skills/stealth-browser/SKILL.md`) — Anti-detection behaviour for Genesis browser automation - what the Camoufox tools already do, what the agent must still do, Cloudflare Turnstile handling, and per-site notes for bot-hostile sites
 - **subsystem-map** (`.claude/skills/subsystem-map/SKILL.md`) — This skill should be used before answering "does Genesis have X", "does Genesis lack X", auditing Genesis capabilities, comparing Genesis to an external system, or reviewing/summarizing the architecture. It routes to the canonical judgment-layer subsystem map so audits start from the map, not from a cold grep. Also fires after changing a subsystem's capabilities, to keep the map current.
 - **taste** (`.claude/skills/taste/SKILL.md`) — Use before generating, editing, or reviewing any user interface — a dashboard panel, a landing page, an email, a slide, an app screen. Sets three deliberate design dials (variance, motion, density) BEFORE generation so the output has a point of view instead of defaulting to the timid, uniform look that reads as "AI made this". Applies to Genesis's OWN dashboard UI, not only things built for others.
@@ -323,7 +346,7 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 
 - `board_item` — One issue or PR on the work board: its column and Genesis status (a live read), what blocks it (GitHub's blocked-by list, flagged when truncated), unverified open questions blocking it, and whether it was promoted from a private record.
 - `board_promote` — Propose turning a private ledger row or follow-up into a PUBLIC GitHub issue on the work board. Held for the owner's approval; nothing is posted by this call.
-- `board_status` — The work board as the reconciler last read it: counts by column, by Genesis status and by kind, coverage (open repo issues and PRs on the board against the repo's open total), drags logged, and whether the reconciler is alive. Reads stored heartbeats only, never GitHub, so it is cheap and safe.
+- `board_status` — The work board as the reconciler last read it: counts by column, by Genesis status and by kind, coverage (open repo issues and PRs on the board against the repo's open total), drags logged, what the last tick wrote (or would have written, outside ``live``), and whether the reconciler is alive. Reads stored heartbeats only, never GitHub, so it is cheap and safe.
 - `bootstrap_manifest` — Which subsystems initialized successfully, failed, or degraded at startup.
 - `browser_clear_domain` — Clear cookies for a domain and its subdomains (selective logout).
 - `browser_click` — Click an element on the current page by CSS selector or text.

@@ -79,9 +79,11 @@ _NOVELTY_CALL_SITE = "38a_procedure_novelty_llm"
 #   - model alone would accept the right model reached through a call site whose
 #     cost and policy we never evaluated.
 #
+# A valid configured pair must also report the validated serving model.
 # Adding an entry requires running the same zero-false-merge evaluation that put
 # deepseek-v4 in it; matching S-tier is not that evidence.
-_NOVELTY_VALIDATED_MODELS = {"openrouter-deepseek-v4": "deepseek/deepseek-v4-pro"}
+_OPENROUTER_NOVELTY_ALIAS = "openrouter-deepseek-v4"
+_NOVELTY_VALIDATED_MODELS = {_OPENROUTER_NOVELTY_ALIAS: "deepseek/deepseek-v4-pro"}
 CROSS_TYPE_PREFILTER = 0.62  # cosine floor for candidates (spike found dups @0.66)
 CROSS_TYPE_TOPK = 10  # cap candidates sent to the LLM (bounds cost)
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
@@ -216,12 +218,17 @@ async def _cross_type_duplicate(
             # a real procedure destroyed).
             answered_by = getattr(result, "provider_used", None) or ""
             answered_with = getattr(result, "model_id", None) or ""
-            if _NOVELTY_VALIDATED_MODELS.get(answered_by) != answered_with:
+            validated_model = _NOVELTY_VALIDATED_MODELS.get(answered_by)
+            served_model = getattr(result, "served_model", None)
+            # LiteLLM can include one OpenRouter wrapper. Preserve the model
+            # namespace, spelling and version suffix.
+            if answered_by == _OPENROUTER_NOVELTY_ALIAS and isinstance(served_model, str):
+                served_model = served_model.removeprefix("openrouter/")
+            if validated_model != answered_with or served_model != validated_model:
                 logger.info(
-                    "Cross-type dedup: %s (model %s) judged the new '%s' "
-                    "procedure redundant, but that alias/model pair's "
-                    "false-merge rate is unmeasured — treating as novel and "
-                    "storing it. Only a validated pair may suppress.",
+                    "Cross-type dedup: %s (configured model %s) judged the new '%s' "
+                    "procedure redundant, but the configured pair or serving identity "
+                    "is unverified — treating as novel and storing it.",
                     answered_by or "<unknown provider>",
                     answered_with or "<unknown model>",
                     task_type,

@@ -48,7 +48,7 @@ async def test_task_intent_creates_observation(db):
         handler._get_lock = MagicMock(return_value=AsyncMock(
             __aenter__=AsyncMock(), __aexit__=AsyncMock(),
         ))
-        handler._persist_overrides = AsyncMock()
+        handler._persist_overrides = AsyncMock(side_effect=lambda s, m, e, **k: e)
         handler._enrich_with_context = AsyncMock(return_value="enriched")
         handler._try_invoke = AsyncMock(side_effect=Exception("stop here"))
 
@@ -98,7 +98,7 @@ async def test_no_observation_when_no_task(db):
         handler._get_lock = MagicMock(return_value=AsyncMock(
             __aenter__=AsyncMock(), __aexit__=AsyncMock(),
         ))
-        handler._persist_overrides = AsyncMock()
+        handler._persist_overrides = AsyncMock(side_effect=lambda s, m, e, **k: e)
         handler._enrich_with_context = AsyncMock(return_value="enriched")
         handler._try_invoke = AsyncMock(side_effect=Exception("stop here"))
 
@@ -145,7 +145,7 @@ async def test_streaming_task_intent_creates_observation(db):
         handler._get_lock = MagicMock(return_value=AsyncMock(
             __aenter__=AsyncMock(), __aexit__=AsyncMock(),
         ))
-        handler._persist_overrides = AsyncMock()
+        handler._persist_overrides = AsyncMock(side_effect=lambda s, m, e, **k: e)
         handler._enrich_with_context = AsyncMock(return_value="enriched")
         handler._build_recovery_context = AsyncMock(return_value="")
         handler._try_invoke_streaming = AsyncMock(side_effect=Exception("stop"))
@@ -208,7 +208,7 @@ async def test_quoted_slash_task_not_detected(db):
         handler._get_lock = MagicMock(return_value=AsyncMock(
             __aenter__=AsyncMock(), __aexit__=AsyncMock(),
         ))
-        handler._persist_overrides = AsyncMock()
+        handler._persist_overrides = AsyncMock(side_effect=lambda s, m, e, **k: e)
         handler._enrich_with_context = AsyncMock(return_value="enriched")
         handler._build_recovery_context = AsyncMock(return_value="")
         handler._try_invoke_streaming = AsyncMock(side_effect=Exception("stop"))
@@ -241,7 +241,7 @@ async def test_owner_reply_slash_task_detected_owner_content_only(db):
         handler._get_lock = MagicMock(return_value=AsyncMock(
             __aenter__=AsyncMock(), __aexit__=AsyncMock(),
         ))
-        handler._persist_overrides = AsyncMock()
+        handler._persist_overrides = AsyncMock(side_effect=lambda s, m, e, **k: e)
         handler._enrich_with_context = AsyncMock(return_value="enriched")
         handler._build_recovery_context = AsyncMock(return_value="")
         handler._try_invoke_streaming = AsyncMock(side_effect=Exception("stop"))

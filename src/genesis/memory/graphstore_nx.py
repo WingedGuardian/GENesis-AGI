@@ -251,6 +251,43 @@ def _bfs_with_strength(
     return results
 
 
+def build_graph(fetched, invalid):
+    """Build a deterministic directed graph while preserving typed parallel edges."""
+    if not _NX_AVAILABLE:
+        raise GraphUnavailableError("NetworkX is unavailable")
+    rows = sorted(
+        (row for row in fetched if row[0] not in invalid and row[1] not in invalid),
+        key=lambda row: (row[0], row[1], row[2], row[3]),
+    )
+
+    # MultiDiGraph, not DiGraph: memory_links' primary key is
+    # (source_id, target_id, link_type), so one pair may legitimately carry
+    # several typed edges. A DiGraph cannot hold parallel edges — the second
+    # add_edge for a pair overwrites the first's attributes — so the graph kept
+    # an arbitrary survivor and the strength/link_type filters were
+    # evaluated against it.
+    G = nx.MultiDiGraph()
+    G.add_nodes_from(sorted({node for row in rows for node in row[:2]}))
+    for source_id, target_id, link_type, strength in rows:
+        G.add_edge(
+            source_id, target_id,
+            key=link_type,
+            link_type=link_type, strength=strength,
+        )
+    return G
+
+
+def ranked_betweenness(graph, top_n: int | None) -> list[tuple[str, float]]:
+    """Score every node with the same deterministic sampling used by the store."""
+    count = graph.number_of_nodes()
+    if count == 0:
+        return []
+    pivots = 200 if count > 200 else None
+    scores = nx.betweenness_centrality(graph, k=pivots, seed=_BETWEENNESS_SEED)
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    return ranked if top_n is None else ranked[:top_n]
+
+
 class NetworkxGraphStore:
     """In-process ``MultiDiGraph`` projection, rebuilt on demand.
 
@@ -387,25 +424,7 @@ class NetworkxGraphStore:
             raise GraphUnavailableError(
                 f"the memory database cannot be read — the graph cannot be built: {exc}"
             ) from exc
-        rows = sorted(
-            (row for row in fetched if row[0] not in invalid and row[1] not in invalid),
-            key=lambda row: (row[0], row[1], row[2], row[3]),
-        )
-
-        # MultiDiGraph, not DiGraph: memory_links' primary key is
-        # (source_id, target_id, link_type), so one pair may legitimately carry
-        # several typed edges. A DiGraph cannot hold parallel edges — the second
-        # add_edge for a pair overwrites the first's attributes — so the graph kept
-        # an arbitrary survivor and the strength/link_type filters were
-        # evaluated against it.
-        G = nx.MultiDiGraph()
-        G.add_nodes_from(sorted({node for row in rows for node in row[:2]}))
-        for source_id, target_id, link_type, strength in rows:
-            G.add_edge(
-                source_id, target_id,
-                key=link_type,
-                link_type=link_type, strength=strength,
-            )
+        G = build_graph(fetched, invalid)
 
         elapsed_ms = (time.monotonic() - start) * 1000
         logger.info(
@@ -525,12 +544,4 @@ class NetworkxGraphStore:
             )
 
         G = await self._ensure_graph(db)
-        if G.number_of_nodes() == 0:
-            return []
-
-        # Use approximate betweenness for large graphs to avoid blocking
-        n_nodes = G.number_of_nodes()
-        k = min(200, n_nodes) if n_nodes > 200 else None
-        scores = nx.betweenness_centrality(G, k=k, seed=_BETWEENNESS_SEED)
-        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        return ranked if top_n is None else ranked[:top_n]
+        return ranked_betweenness(G, top_n)

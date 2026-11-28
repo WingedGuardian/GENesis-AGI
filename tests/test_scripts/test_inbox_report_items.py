@@ -61,6 +61,14 @@ def test_legacy_input_membership_is_reported_without_baseline_promotion(tmp_path
     assert "mentioned: yes" in md
 
 
+def test_readable_legacy_input_does_not_obscure_unrelated_url(tmp_path):
+    other = "https://example.com/b"
+    md = run(tmp_path, URL + "\n" + other, [(URL, None, "completed")], response=URL)
+    assert f"| {URL} | evaluated | present | source_not_recorded |" in md
+    assert f"| {other} | never |" in md
+    assert "1 evaluated, 0 in flight, 0 failed, 0 unattributable, 1 never" in md
+
+
 @pytest.mark.parametrize(
     "payload",
     [

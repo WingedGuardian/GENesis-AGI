@@ -885,8 +885,8 @@ def test_a_retirement_never_removes_an_entry_re_added_meanwhile(dc, dc_ready, ca
     h2 = w.candidate("feat/a", {"later.txt": "after the merge\n"})
     real_move = dc.plan.move_checkout
 
-    def move_then_re_add(repo, plan, branch):
-        moved = real_move(repo, plan, branch)
+    def move_then_re_add(repo, plan, branch, *rest):
+        moved = real_move(repo, plan, branch, *rest)
         w.write_manifest([w.entry("feat/a", head=h2)])  # a concurrent re-add
         return moved
 
@@ -1968,3 +1968,110 @@ def test_td20_a_guard_the_engine_cannot_load_names_the_live_repair(
     why = dc.Engine(w.root, w.env)._update_state_refusal()
     assert why and "could not be checked" in why, why
     assert "scripts/deploy_candidates repair-move" in why, why
+
+
+# ── #5007 item 3: the harmless update record is retired only past the last refusal ──
+
+
+def _harmless_record_world(dc, w, capsys, command: str) -> tuple[Path, dict, list[str]]:
+    """On `live`, a move pending (rebuild switches, drop takes feat/b out), and a
+    harmless update_state.json at its rollback tag. Returns it and the argv."""
+    _second_rebuild_world(dc, w, capsys)
+    if command == "drop":
+        assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    w.git(w.root, "tag", "-f", "pre")
+    state = w.home / ".genesis" / "update_state.json"
+    record = {
+        "phase": "fetching",
+        "rollback_tag": "pre",
+        "deploy_head": w.rev("HEAD"),
+        "post_merge": False,
+    }
+    state.write_text(json.dumps(record))
+    capsys.readouterr()
+    return state, record, (["rebuild"] if command == "rebuild" else ["drop", "feat/b"])
+
+
+@pytest.mark.parametrize("command", ["rebuild", "drop"])
+def test_a_busy_checkout_lock_keeps_the_harmless_update_record(
+    dc, dc_ready, capsys, monkeypatch, command
+):
+    """The lock refusal says nothing changed: the record must still be there."""
+    w = dc_ready
+    state, record, argv = _harmless_record_world(dc, w, capsys, command)
+    monkeypatch.setattr(dc.plan, "_CHECKOUT_LOCK_WAIT_S", 0.1)
+    common = w.git(w.root, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+    with held(Path(common) / "genesis-checkout.lock", fcntl.LOCK_SH):
+        assert w.run(dc, *argv) == 1
+    err = capsys.readouterr().err
+    assert "checkout busy" in err and "nothing moved" in err, err
+    assert state.exists() and json.loads(state.read_text()) == record
+
+
+def test_a_refused_manifest_write_after_the_retirement_names_the_removal(
+    dc, dc_ready, capsys, monkeypatch
+):
+    """Round 1: drop's save() retires the record first, so a manifest write that
+    then refuses says the manifest is unchanged AND that the leftover went."""
+    w = dc_ready
+    state, _, argv = _harmless_record_world(dc, w, capsys, "drop")
+    before = w.manifest_path.read_text()
+
+    def refuse(self, change):
+        raise dc.core.Refusal("the manifest could not be written; nothing changed.")
+
+    monkeypatch.setattr(dc.manifest.ManifestStore, "update", refuse)
+    assert w.run(dc, *argv) == 1
+    err = capsys.readouterr().err
+    assert "The manifest is unchanged" in err and "WAS saved" not in err, err
+    assert "harmless update_state.json leftover was removed" in err, err
+    assert not state.exists() and w.manifest_path.read_text() == before
+
+
+def test_a_refused_manifest_write_with_no_leftover_names_no_removal(
+    dc, dc_ready, capsys, monkeypatch
+):
+    w = dc_ready
+    _, _, argv = _harmless_record_world(dc, w, capsys, "drop")
+    (w.home / ".genesis" / "update_state.json").unlink()
+
+    def refuse(self, change):
+        raise dc.core.Refusal("the manifest could not be written; nothing changed.")
+
+    monkeypatch.setattr(dc.manifest.ManifestStore, "update", refuse)
+    assert w.run(dc, *argv) == 1
+    err = capsys.readouterr().err
+    assert "The manifest is unchanged" in err and "leftover was removed" not in err, err
+
+
+def test_a_retirement_that_cannot_unlink_leaves_no_half_drop(dc, dc_ready, capsys, monkeypatch):
+    """Round 1: the unlink refuses before the manifest write, so feat/b is still
+    listed (no half-drop) and a retry once the file can go drops it."""
+    w = dc_ready
+    state, record, argv = _harmless_record_world(dc, w, capsys, "drop")
+    before = w.manifest_path.read_text()
+    real = os.unlink
+
+    def unlink(path, *a, **kw):
+        if str(path).endswith("update_state.json"):
+            raise PermissionError("read-only")
+        return real(path, *a, **kw)
+
+    monkeypatch.setattr(dc.os, "unlink", unlink)
+    assert w.run(dc, *argv) == 1
+    err = capsys.readouterr().err
+    assert "The manifest is unchanged" in err and "WAS saved" not in err, err
+    assert w.manifest_path.read_text() == before and json.loads(state.read_text()) == record
+    monkeypatch.setattr(dc.os, "unlink", real)
+    assert w.run(dc, *argv) == 0, capsys.readouterr()
+    assert not state.exists()
+
+
+@pytest.mark.parametrize("command", ["rebuild", "drop"])
+def test_a_move_that_goes_through_still_retires_the_harmless_update_record(
+    dc, dc_ready, capsys, command
+):
+    w = dc_ready
+    state, _, argv = _harmless_record_world(dc, w, capsys, command)
+    assert w.run(dc, *argv) == 0, capsys.readouterr()
+    assert not state.exists()

@@ -1069,7 +1069,7 @@ Global physical exclusion and production capacity remain separate gates.
 
 Existing standalone indexing policy remains unchanged.
 
-### Explicit owner-loss reconciliation
+### Owner-loss reconciliation
 
 The captured runner's queue endpoint accepts `reconcile-native --context` with
 the complete original protocol-3 context. Its supervisory caller must supply the
@@ -1096,6 +1096,22 @@ not resent; applied unknown accounting and its debt remain immutable even if a
 late success arrives. Replaying a lost reply uses the original witness and cannot
 replace a newer inflight pointer. Reconciliation does not issue a grant, accept a
 trial, clear the provider hold or enable automatic work.
+
+Once strict cutover permits automatic consumption, the captured runner also
+calls its internal owner-loss sweep before listing pending work. It looks for
+protocol-3 reservations that still lack control closure, including already
+accounted work. Each eligible execution uses the same reconciliation and lock
+order. The sweep opens an existing schema-5 queue without initializing it.
+Busy locks or database contention defer the tick before claims. Other operational
+errors stop the tick. An unresolved execution keeps its hold while the sweep
+can reconcile independent work.
+
+Automatic proof requires a stable boot change or an absent PID in the installed
+runner's full, shared producer PID namespace. Same-boot PID reuse, filtered proc
+views, unreadable observations, and uncertainty about a reporter or worker
+scope retain the hold. A queue must not be concurrently shared across PID
+namespaces or moved between them on the same boot. Native qualification must
+verify the installed producer and observer view before enablement.
 
 Recovery decisions can perform one final typed drain on that same connection and
 exclusive publication barrier after fresh-cleanup callbacks. Remaining bodies

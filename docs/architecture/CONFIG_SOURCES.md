@@ -184,6 +184,9 @@ the domain's `needs_restart` flag is the stated contract.
   save copies a repo-sibling overlay into the user dir, which then shadows it.
   `outreach` and `confidence_gates` have no validator, so their values are written
   unchecked (#2446).
+- **Backup:** `scripts/backup.sh` §6g encrypts every file in `~/.genesis/config/`
+  (except `genesis.yaml`, which §8 covers) and `scripts/restore.sh` §4e puts them
+  back; the repo-sibling `config/*.local.yaml` overlays are §6 / restore §6.
 - **Registry:** 48 domains in `_DOMAIN_REGISTRY`. `readonly` domains refuse writes;
   `recon_*` route to the `recon_config` tool; disabling
   `autonomous_cli_policy.manual_approval_required` needs `confirm_disable_approval_gate`.
@@ -272,7 +275,12 @@ names, so an overlay of a read-only file is editable (#2446).
   files: `USER.md` (user-edited, seeded from `USER.md.example`) and runtime-generated
   `USER_KNOWLEDGE.md` and `TRIAGE_CALIBRATION.md`. `IdentityLoader` caches
   per instance (the runtime's perception loader is built at init, so hand edits need a
-  restart); `src/genesis/cc/system_prompt.py` re-reads per call. The dashboard file editor
+  restart); `src/genesis/cc/system_prompt.py` re-reads per call. Every reader resolves
+  `SOUL.md`/`VOICE.md`/`CONVERSATION.md`/`STEERING.md` through
+  `src/genesis/identity/paths.py`: SOUL and VOICE read `<name>`, else `<name>.example`;
+  CONVERSATION and STEERING read the tracked file with a per-install `<stem>.local.md`
+  appended after a `---` (a local file whose first line is `<!-- genesis: replace -->`
+  replaces the tracked text). The dashboard file editor
   may edit these, and may create one only where a `.example` exists.
 - **Claude Code** — `.claude/settings.json` (tracked, hook wiring, ships to every clone);
   `.claude/settings.local.json` (gitignored); `~/.claude/settings.json` (user level;

@@ -103,6 +103,7 @@ class Group:
     cmd: str
     members: list[int] = field(default_factory=list)
     rss_kb: int = 0
+    app_server_pid: int | None = None
 
 
 @dataclass
@@ -113,6 +114,7 @@ class Scan:
     # Candidates that could not be classified: a structured list, never a
     # substring of the free-text reasons (a process could be named "unreadable").
     uncertain: list[str] = field(default_factory=list)
+    app_server_starttimes: dict[int, int] = field(default_factory=dict)
 
     def unreadable(self, entry: str) -> None:
         self.skipped.append(entry)
@@ -346,6 +348,7 @@ def scan() -> Scan:
         argv = _argv(pid)
         if argv and _is_daemon_app_server(argv):
             result.app_servers.append(pid)
+            result.app_server_starttimes[pid] = stats[pid][4]
     homes = {Path.home() / ".codex"}
     if os.environ.get("CODEX_HOME"):
         homes.add(Path(os.environ["CODEX_HOME"]))
@@ -472,6 +475,7 @@ def scan() -> Scan:
                     cmd=_safe_label(argv),
                     members=members,
                     rss_kb=rss_kb,
+                    app_server_pid=app,
                 )
             )
     return result

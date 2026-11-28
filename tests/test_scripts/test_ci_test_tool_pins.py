@@ -3,7 +3,8 @@
 `.github/test-tools/requirements.txt` pins the `[test]` extra's tools and is
 applied as a pip constraint on every CI install that runs or collects tests, so
 a new pytest release cannot turn main red between a PR's CI and its merge (it
-did on 2026-10-27). Dependabot bumps that folder alone, weekly.
+did on 2026-10-27). Nothing bumps those pins automatically: a version change is
+a deliberate PR that checks the new release first.
 """
 
 from __future__ import annotations
@@ -50,9 +51,10 @@ def test_every_pin_is_exact():
 
 #: The tools pinned by the owner's ruling (2026-10-28): the test runner and the
 #: two plugins whose releases change how the suite runs. pytest-xdist joined
-#: them (2026-11-05) because its scheduler decides test order under `-n`. The
-#: rest of `[test]` (hypothesis, aioresponses, ...) still floats.
-PINNED = {"pytest", "pytest-asyncio", "pytest-timeout", "pytest-xdist"}
+#: them (2026-11-05) because its scheduler decides test order under `-n`, and
+#: pytest-rerunfailures (2026-11-24, #5024) because it decides whether a failure
+#: fails the run. The rest of `[test]` (hypothesis, aioresponses, ...) still floats.
+PINNED = {"pytest", "pytest-asyncio", "pytest-rerunfailures", "pytest-timeout", "pytest-xdist"}
 
 
 def test_the_pins_are_the_named_test_tools():
@@ -120,8 +122,9 @@ def test_no_ci_test_install_floats():
     assert floating == FLOATING_BY_DESIGN
 
 
-def test_dependabot_bumps_the_pins_folder_and_nothing_else_in_pip():
-    updates = yaml.safe_load(DEPENDABOT.read_text())["updates"]
-    pip = [u for u in updates if u["package-ecosystem"] == "pip"]
-    assert [u["directory"] for u in pip] == ["/.github/test-tools"]
-    assert PINS.parent == REPO / pip[0]["directory"].lstrip("/")
+def test_dependabot_version_updates_stay_off():
+    """Dependabot version updates are off (owner decision, 2026-11-22): a bump
+    PR arrived for these pins that nobody had evaluated. Restoring the config
+    is a decision to make in a PR of its own, not a side effect."""
+    assert not DEPENDABOT.exists()
+    assert not DEPENDABOT.with_suffix(".yaml").exists()

@@ -651,3 +651,101 @@ class TestRebootResetsTheEpisode:
         sm.process(_dead_snapshot(["health_api"]))   # -> CONFIRMING, fresh onset
         assert sm.state.current_state is GuardianState.CONFIRMING
         assert sm._is_within_bootstrap_grace() is True
+
+
+class TestPostRebootGrace:
+    """A failure episode starting soon after a host reboot gets the longer
+    post-reboot grace: a cold boot of the container stack is slow (measured
+    ~13.5 min to healthy on a live install, against the 300 s default)."""
+
+    BOOT_A = "1a2b3c4d-0000-4111-8000-000000000001"
+    BOOT_B = "9f1c2d3e-0000-4444-8888-aaaabbbbcccc"
+
+    @staticmethod
+    def _ago(seconds: float) -> str:
+        from datetime import UTC, datetime, timedelta
+
+        return (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat()
+
+    def test_reboot_records_when_it_was_seen(self, sm: ConfirmationStateMachine) -> None:
+        sm._state.boot_id = self.BOOT_A
+        assert sm.reset_if_rebooted(self.BOOT_B) is True
+        assert sm.state.rebooted_at is not None
+
+    def test_failure_soon_after_a_reboot_stays_in_grace_past_the_default(
+        self, sm: ConfirmationStateMachine,
+    ) -> None:
+        sm._state.rebooted_at = self._ago(600)
+        sm._state.first_failure_at = self._ago(590)  # failing for ~10 min, past 300 s
+        assert sm._is_within_bootstrap_grace() is True
+
+    def test_post_reboot_grace_still_ends(self, sm: ConfirmationStateMachine) -> None:
+        sm._state.rebooted_at = self._ago(1300)
+        sm._state.first_failure_at = self._ago(1290)  # past the 1200 s post-reboot grace
+        assert sm._is_within_bootstrap_grace() is False
+
+    def test_without_a_reboot_the_default_grace_applies(self, sm: ConfirmationStateMachine) -> None:
+        sm._state.rebooted_at = None
+        sm._state.first_failure_at = self._ago(600)
+        assert sm._is_within_bootstrap_grace() is False
+
+    def test_a_failure_long_after_a_reboot_gets_the_default_grace(
+        self, sm: ConfirmationStateMachine,
+    ) -> None:
+        sm._state.rebooted_at = self._ago(3 * 86400)
+        sm._state.first_failure_at = self._ago(600)
+        assert sm._is_within_bootstrap_grace() is False
+
+    def test_rebooted_at_survives_a_state_round_trip(self, sm: ConfirmationStateMachine, tmp_path) -> None:
+        sm._state.rebooted_at = "2026-01-01T00:00:00+00:00"
+        sm.save_state(tmp_path / "state.json")
+        other = ConfirmationStateMachine(GuardianConfig())
+        other.load_state(tmp_path / "state.json")
+        assert other.state.rebooted_at == "2026-01-01T00:00:00+00:00"
+
+
+# ── #5007: a killed tick's state still has a next decision ──────────────────
+
+
+class TestKilledTickState:
+
+    def test_a_loaded_recovering_is_an_outcome_not_seen(self, sm: ConfirmationStateMachine) -> None:
+        """RECOVERING on disk is a killed tick's: it reaches _from_recovered,
+        never "recovery in progress" on every tick."""
+        sm._state.current_state = GuardianState.RECOVERING
+        sm.record_recovery_attempt("RESTART_SERVICES")
+        t = sm.process(_dead_snapshot())
+        assert t.new_state == GuardianState.CONFIRMED_DEAD and t.action_needed is True
+        sm._state.current_state = GuardianState.RECOVERING
+        assert sm.process(_healthy_snapshot()).new_state == GuardianState.HEALTHY
+
+    def test_persist_writes_to_the_path_load_state_read(
+        self, sm: ConfirmationStateMachine, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "state.json"
+        sm.persist()  # no path read yet: nothing written, nothing raised
+        sm.load_state(path)
+        sm.record_recovery_attempt("IO_TRIAGE")
+        sm.persist()
+        assert json.loads(path.read_text())["io_triage_attempts"] == 1
+
+    def test_escalation_reads_the_proposed_actions_own_counter(
+        self, sm: ConfirmationStateMachine, config: GuardianConfig
+    ) -> None:
+        sm._state.recovery_attempts = 1
+        sm._state.io_triage_attempts = config.recovery.max_io_triage_attempts
+        assert sm.should_escalate("IO_TRIAGE") is True
+        assert sm.should_escalate("RESTART_SERVICES") is False
+        sm._state.io_triage_attempts = 0
+        sm._state.recovery_attempts = config.recovery.max_escalations
+        assert sm.should_escalate("IO_TRIAGE") is False  # its own budget only (round 1)
+        assert sm.should_escalate("RESTART_SERVICES") is True
+
+
+def test_save_state_reports_whether_it_saved(tmp_path: Path) -> None:
+    sm = ConfirmationStateMachine(GuardianConfig())
+    assert sm.save_state(tmp_path / "state.json") is True
+    (tmp_path / "dir.json").mkdir()  # replace() onto a directory fails
+    assert sm.save_state(tmp_path / "dir.json") is False
+    sm.load_state(tmp_path / "dir.json")
+    assert sm.persist() is False

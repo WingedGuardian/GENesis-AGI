@@ -155,37 +155,60 @@ async def test_origin_class_by_ids_chunks_past_bind_cap(tmp_path):
         await conn.close()
 
 
-async def test_hydrate_for_expansion(tmp_path):
-    """Batched neighbor hydration for graph expansion: one query returns
-    content + provenance + visibility fields, replacing an N+1 get_by_id loop."""
+class _RecordingConnection:
+    """Passes reads through to a connection and records the SQL it was sent."""
+
+    def __init__(self, conn: aiosqlite.Connection) -> None:
+        self._conn = conn
+        self.calls: list[tuple[str, list]] = []
+
+    async def execute_fetchall(self, sql: str, params=()):
+        self.calls.append((sql, list(params)))
+        return await self._conn.execute_fetchall(sql, params)
+
+
+async def test_expansion_metadata_by_ids(tmp_path):
+    """Graph-expansion neighbours take visibility and origin from the indexed
+    memory_metadata row, never from the FTS index."""
     conn = await _build_db(str(tmp_path / "h.db"))
     try:
         await conn.execute(
             "UPDATE memory_metadata SET origin_class='external_untrusted' WHERE memory_id='alive'"
         )
-        # collection is read from the FTS row (parity with get_by_id), not metadata
-        await conn.execute(
-            "UPDATE memory_fts SET tags='foo,bar', collection='knowledge_base' "
-            "WHERE memory_id='alive'"
-        )
         await conn.execute("UPDATE memory_metadata SET deprecated=1 WHERE memory_id='future'")
         await conn.commit()
 
-        got = await memory_crud.hydrate_for_expansion(
-            conn, ["alive", "future", "expired", "absent"]
+        recorder = _RecordingConnection(conn)
+        got = await memory_crud.expansion_metadata_by_ids(
+            recorder, ["alive", "future", "expired", "absent"]
         )
-        assert set(got) == {"alive", "future", "expired"}  # absent omitted
-        alive = got["alive"]
-        assert alive["content"] == "this row never expires"
-        assert alive["source_type"] == "memory"
-        assert alive["tags"] == "foo,bar"
-        assert alive["collection"] == "knowledge_base"
-        assert alive["origin_class"] == "external_untrusted"
-        assert alive["invalid_at"] is None
-        assert alive["deprecated"] == 0
-        # visibility fields surface for filtering
-        assert got["future"]["deprecated"] == 1
-        assert got["expired"]["invalid_at"] == "2020-01-01T00:00:00+00:00"
-        assert await memory_crud.hydrate_for_expansion(conn, []) == {}
+
+        assert got == {
+            "alive": {
+                "origin_class": "external_untrusted",
+                "invalid_at": None,
+                "deprecated": 0,
+                "embedding_status": "embedded",
+            },
+            "future": {
+                "origin_class": None,
+                "invalid_at": "2099-01-01T00:00:00+00:00",
+                "deprecated": 1,
+                "embedding_status": "embedded",
+            },
+            "expired": {
+                "origin_class": None,
+                "invalid_at": "2020-01-01T00:00:00+00:00",
+                "deprecated": 0,
+                "embedding_status": "embedded",
+            },
+        }
+        assert await memory_crud.expansion_metadata_by_ids(conn, []) == {}
+        # The plan of the query the function ran, not of a copy of it.
+        [(sql, params)] = recorder.calls
+        plan = [row[3] for row in await conn.execute_fetchall(f"EXPLAIN QUERY PLAN {sql}", params)]
+        # A key lookup, not a scan: every step searches by memory_id.
+        assert plan, plan
+        assert all(step.startswith("SEARCH") and "(memory_id=?)" in step for step in plan), plan
     finally:
         await conn.close()

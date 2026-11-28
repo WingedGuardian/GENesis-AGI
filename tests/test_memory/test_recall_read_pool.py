@@ -112,11 +112,13 @@ async def test_enrich_and_breadcrumbs_run_through_pool(tmp_path):
     db_path = tmp_path / "engine.db"
     con = sqlite3.connect(str(db_path))
     con.executescript(
-        "CREATE TABLE memory_metadata (memory_id TEXT PRIMARY KEY, created_at TEXT, wing TEXT);"
+        "CREATE TABLE memory_metadata (memory_id TEXT PRIMARY KEY, created_at TEXT, wing TEXT, "
+        "invalid_at TEXT, deprecated INTEGER DEFAULT 0);"
         "CREATE TABLE memory_links (source_id TEXT, target_id TEXT, strength REAL);"
     )
     con.execute(
-        "INSERT INTO memory_metadata VALUES ('mem1', '2024-01-01T00:00:00+00:00', 'routing')"
+        "INSERT INTO memory_metadata (memory_id, created_at, wing) "
+        "VALUES ('mem1', '2024-01-01T00:00:00+00:00', 'routing')"
     )
     con.executemany(
         "INSERT INTO memory_links (source_id, target_id, strength) VALUES (?, ?, ?)",

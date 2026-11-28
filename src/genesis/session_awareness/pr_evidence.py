@@ -44,6 +44,7 @@ from pydantic import (
 )
 
 from genesis.db.crud.pr_verifications import MAX_EVIDENCE_BYTES, PASS_VERDICTS, VERDICTS
+from genesis.session_awareness.pr_completeness import CompletenessReview
 
 __all__ = [
     "CLAIM_VERDICTS",
@@ -340,9 +341,15 @@ class EvidenceDocument(BaseModel):
     # steps are the same as the stored previous attempt's. On a not-yet-done row the
     # picker then waits the re-attempt window. Absent or false: offered at once.
     no_progress: StrictBool = False
+    # P2 can parse/check a report; close enforcement is a separate integration.
+    completeness: CompletenessReview | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def _coverage_targets_exist(self) -> EvidenceDocument:
+        if self.completeness is not None:
+            self.completeness.validate_indices(self)
         for i, item in enumerate(self.e2e):
             for key in ("claim", "gap"):
                 index = getattr(item, key)
@@ -413,6 +420,17 @@ def _validate(model: type[BaseModel], obj: object, root: str) -> Any:
 def parse_evidence(obj: object) -> EvidenceDocument:
     """Validate *obj* strictly, or raise :class:`EvidenceError` naming every bad field."""
     return _validate(EvidenceDocument, obj, "evidence")
+
+
+def stored_evidence_json(doc: EvidenceDocument) -> str:
+    """The exact text both close writers store, and the bytes their size cap measures.
+
+    ensure_ascii=False: the escaped form spends up to 12 bytes on one non-ASCII
+    character, which would refuse an honest document for its alphabet.
+    """
+    import json
+
+    return json.dumps(doc.model_dump(mode="json"), indent=2, sort_keys=True, ensure_ascii=False)
 
 
 class RecheckResult(BaseModel):

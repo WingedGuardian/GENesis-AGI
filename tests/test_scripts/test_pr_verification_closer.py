@@ -229,6 +229,34 @@ def _run(tmp_path: Path, doc: dict, *extra: str, pr: int = 7, route: bool = True
     )
 
 
+@pytest.mark.parametrize("review_complete", [False, True])
+def test_p2_receipt_is_stored_without_claiming_close_enforcement(tmp_path, monkeypatch, review_complete):
+    from dataclasses import replace
+
+    from genesis.session_awareness.pr_completeness import source_binding
+    from tests.test_session_awareness.test_pr_completeness import refresh, reviewed
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    doc, source = reviewed(source_dir)
+    source = replace(source, merge_commit=MERGE_SHA)
+    doc["merge_commit"] = MERGE_SHA
+    doc["completeness"]["inventory"]["source"] = source_binding(source).model_dump(mode="json")
+    doc["completeness"]["complete"] = review_complete
+    refresh(doc)
+    monkeypatch.setattr(_prv, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, source.body))
+    _seed(tmp_path / "genesis.db")
+    assert _run(tmp_path, doc, route=False) == 0
+    stored = _row(tmp_path / "genesis.db")
+    assert stored["status"] == "closed"
+    receipt = json.loads(stored["evidence"])["completeness"]
+    assert receipt["complete"] is review_complete
+    assert receipt["evidence_sha256"] == doc["completeness"]["evidence_sha256"]
+    assert receipt["review_execution_ref"] == "fixture-only:no-model-ran"
+    # P3 replaces this intermediate expectation with the shared close refusal;
+    # these owned writes are not permission to release an installed HOLD.
+
+
 # ── print-schema ─────────────────────────────────────────────────────────
 
 

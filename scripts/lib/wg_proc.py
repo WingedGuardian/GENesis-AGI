@@ -224,7 +224,10 @@ def _parent(root: str, dfd: int, ppid: str) -> tuple[str, str]:
     return (ppid, parent[2])
 
 
-def holders(root: str, lines: list[str]) -> list[str]:
+def holders(root: str, lines: list[str], *, writers_only: bool = True) -> list[str]:
+    # writers_only: the runaway scan acts on writers, so only a descriptor open
+    # for writing counts; the deleted-file list names every holder (``openers``),
+    # since a reader keeps a deleted file's space as surely as a writer.
     # Grouped by pid, in first-seen order: one handle per pid, so a pid reused
     # between two of its candidates can never lend its identity to the first
     # one's file (review finding).
@@ -255,7 +258,11 @@ def holders(root: str, lines: list[str]) -> list[str]:
             for key, fd in cands:
                 try:
                     st = os.stat(f"fd/{fd}", dir_fd=dfd)
-                    if f"{st.st_dev}:{st.st_ino}" == key and _writer(dfd, fd) and key not in held:
+                    if (
+                        f"{st.st_dev}:{st.st_ino}" == key
+                        and (not writers_only or _writer(dfd, fd))
+                        and key not in held
+                    ):
                         held.append(key)
                 except OSError as exc:
                     if not _gone(exc) and key not in unread:
@@ -284,9 +291,13 @@ def main(argv: list[str]) -> int:
     if len(argv) == 3 and argv[2] == "safe":
         sys.stdout.write(_safe(sys.stdin.buffer.read()) + "\n")
         return 0
-    verbs = {"holders": holders, "chain": chain}
+    verbs = {
+        "holders": holders,
+        "openers": lambda root, lines: holders(root, lines, writers_only=False),
+        "chain": chain,
+    }
     if len(argv) != 3 or argv[2] not in verbs:
-        print("usage: wg_proc.py <proc root> holders|chain|safe", file=sys.stderr)
+        print("usage: wg_proc.py <proc root> holders|openers|chain|safe", file=sys.stderr)
         return 2
     lines = sys.stdin.read().splitlines()
     for row in verbs[argv[2]](argv[1], lines):

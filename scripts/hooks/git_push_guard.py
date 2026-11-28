@@ -37,7 +37,9 @@ cluster-safe ``--match-head-commit`` parse + fail-closed shadow-flag belt alread
 exceed the model (defense-in-depth), which is fine; they are not an invitation to
 chase every argv-shaping edge. Conscious escapes are split by boundary so one
 waiver cannot silently disarm an unrelated gate: ``# review-override`` waives the
-FINDING scans (review-body + inline P1s), ``# stale-review-override`` waives the
+FINDING scans (the review-body verdict, an unreadable inline scan and the P2 score, but
+never a floor finding the inline scan can read), ``# floor-accept=<id>[,<id>]`` records
+the owner's yes for named floor findings, ``# stale-review-override`` waives the
 review-CONTEXT gates (Codex-at-head freshness + base-is-default),
 ``# scheduled-review-override`` waives the SCHEDULED-Claude-review-at-head gate, and
 ``# ci-override`` waives the CI gate — red/pending everywhere, plus (canonical repo
@@ -345,6 +347,7 @@ try:
     # Inside this block on purpose: a broken module degrades the guard closed
     # (degraded_exit below) instead of exiting 1, which the harness reads as allow.
     from gh_merge import (  # noqa: E402
+        _graphql_code,
         api_merge_reason,
         body_file_path,
         body_file_path_problem,
@@ -371,7 +374,9 @@ try:
         analyze_checked,
         commit_skips_hooks,
         gh_api_request,
+        gh_bool,
         gh_command,
+        gh_option_values,
         gh_pr_subcommand,
         gh_requests_help,
         git_subcommand,
@@ -381,6 +386,7 @@ try:
         mentions,
         push_arg_stream,
         split_segments,
+        trailing_sigil_ids,
         unresolved_verb_programs,
     )
 except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degraded_exit.
@@ -640,7 +646,7 @@ def _resolve_against(current, target: str):
     return os.path.normpath(os.path.join(current, target))
 
 
-def _effective_cwd(cmd: str, payload: dict, seg=None):
+def _effective_cwd(cmd: str, payload: dict, seg=None, *, apply_dash_c: bool = True):
     """The ABSOLUTE directory where a SINGLE target segment actually runs.
 
     Returns ``str`` (resolved), ``None`` (no cwd info → run in the hook's own
@@ -679,7 +685,9 @@ def _effective_cwd(cmd: str, payload: dict, seg=None):
         if seg_redirects_repo(seg):
             return _CWD_UNKNOWN
         dash_c = _seg_dash_C(getattr(seg, "argv", None))
-        if dash_c is not None:
+        # ``apply_dash_c=False``: the shell's own directory, for text that reruns
+        # the command as typed (its ``-C`` then applies once, as it did here).
+        if dash_c is not None and apply_dash_c:
             return _resolve_against(cur, dash_c)
     return cur
 
@@ -1928,13 +1936,13 @@ _CR_BLOCKING_WEIGHT = 1.0
 _DEVIN_SEVERITY_RANK: dict[str | None, int] = {"floor": 3, "minor": 2, "analysis": 1, None: 0}
 # Devin may WITHDRAW its own finding: a reply from the SAME bot login, in that
 # finding's thread, whose first line starts with this marker clears it (owner
-# ruling, 2026-09-24). Consulted for DEVIN findings only — Codex and CodeRabbit
-# findings still clear on a maintainer reply alone. MEASURED on the open queue in a
+# ruling, 2026-09-24). Consulted for DEVIN findings only. On a floor finding the
+# marker is not enough by itself: see `_floor_cleared` (#4933). MEASURED on the open queue in a
 # later snapshot than the 166-comment count above (so the denominators differ): 50
 # of 167 Devin finding groups carried Devin's own "resolved" reply and no
 # maintainer reply. Only
-# this exact lead counts — Devin also posts builder-style prose ("Fixed in …"),
-# which is a claim about work, not the reviewer's verdict — and no bot can clear
+# this exact lead withdraws a finding — Devin's builder-style prose ("Fixed in …")
+# supplies a commit to test only on a thread carrying this marker — and no bot can clear
 # ANOTHER reviewer's finding.
 _BOT_SELF_RESOLVED_LEAD = "✅ **Resolved**"
 # Weighted review score for inline findings: a P1 is a full blocker (1.0), a P2
@@ -3455,12 +3463,573 @@ def _findings_distribution(
     return "\n".join(lines)
 
 
+#: The one form of reply that claims a fix: a line that STARTS with "Fixed in/at/by
+#: <sha>" (a list marker may precede it), then ends or goes on after . , : ; a dash or a
+#: parenthesis. A bare commit id is not a claim. MEASURED over 739 floor findings: 8 of
+#: 73 replies that did not fix their finding still cited a real later commit on the
+#: file ("Documented in <sha>", "Partly fixed in <sha>"). Matching the phrase anywhere
+#: let quoted, struck, tagged and mid-sentence text claim a fix (round-1 class audit);
+#: a line that starts with it is the form Devin's own replies use (23 of 62).
+_FIX_CLAIM_RE = re.compile(
+    r"^[ \t]*(?:[-*+][ \t]+)?fixe[ds] (?:in|at|by) (?:commit )?`?((?-i:[0-9a-f]{7,40}))`?"
+    r"(?=[ \t]*$|[.,:;]|[ \t]+[-(\u2013\u2014])",
+    re.IGNORECASE | re.MULTILINE,
+)
+#: A word that turns the claim into something else ("will be fixed in", "Fixed in X,
+#: pending CI"), looked for in the claim's own sentence on both sides.
+_FIX_HEDGE_RE = re.compile(
+    r"\b(?:not|never|yet|will|would|should|could|might|may|once|when|if|unless|until"
+    r"|whether|partly|partially|planned|pending|to be|cannot|hasnt|havent|isnt|wasnt"
+    r"|arent|probably|maybe|perhaps|hopefully|likely|reverted|revert|undone|wip|tbd"
+    r"|todo|except|mostly|remains|remaining|follow-up|followup)\b|n't\b",
+    re.IGNORECASE,
+)
+#: How far the sentence is read on each side. It bounds the CPU of a reply with many
+#: claims; a sentence is cut at . ! ? ; : or a blank line, and a soft line break
+#: continues it.
+_FIX_HEDGE_WINDOW = 400
+_FIX_SENTENCE_END_RE = re.compile(r"[.!?;:]|\n[ \t]*\n")
+#: A line that starts the way a claim does, whether or not it is one.
+_FIX_LINE_START_RE = re.compile(r"^[ \t]*(?:[-*+][ \t]+)?fixe[ds] (?:in|at|by) ", re.I | re.M)
+#: HTML a reader sees as code, a quote, struck text or a folded aside. The tag head
+#: excludes '<', so each attempt stops at the next tag and the scan stays linear.
+_HTML_ASIDE_RE = re.compile(
+    r"<(pre|code|kbd|samp|blockquote|details|del|s|strike|sub|sup)\b[^<>]*>.*?(?:</\1\s*>|\Z)",
+    re.IGNORECASE | re.S,
+)
+#: A closing fence is at least as long as its opener and carries no info string.
+_FENCED_BLOCK_RE = re.compile(
+    r"^ {0,3}(`{3,}|~{3,})[^\n]*\n.*?(?:^ {0,3}\1[`~]*[ \t]*$|\Z)", re.M | re.S
+)
+#: A quote runs on over the lines after it until a blank line (markdown's lazy
+#: continuation), so those lines are quoted text too.
+_QUOTED_LINE_RE = re.compile(r"^ {0,3}>.*(?:\n[ \t]*\S.*)*", re.M)
+_INDENTED_CODE_RE = re.compile(r"^(?: {4}|\t).*$", re.M)
+_HTML_COMMENT_RE = re.compile(r"<!--.*?(?:-->|\Z)", re.S)
+#: Distinct ids one finding's replies may cite. The most measured on a PR is 5; this
+#: bounds the CPU a crafted reply can spend on the merge path.
+_FIX_CHECK_MAX_CITED = 64
+
+
+def _claim_text(body: str) -> str:
+    """The reply as a reader sees it: no quotes, code, comments or HTML asides."""
+    body = body.replace("\r\n", "\n").replace("\r", "\n")  # the web editor writes CRLF
+    text = _FENCED_BLOCK_RE.sub("", _HTML_COMMENT_RE.sub("", body))
+    text = _HTML_ASIDE_RE.sub("", text)
+    return _INDENTED_CODE_RE.sub("", _QUOTED_LINE_RE.sub("", text)).replace("\u2019", "'")
+
+
+def _fix_claims(body: str) -> list[str]:
+    """The commit ids a reply claims as fixes. Text a reader sees as a quote or as
+    code, or does not see at all, claims nothing."""
+    text = _claim_text(body)
+    claims = []
+    for match in _FIX_CLAIM_RE.finditer(text):
+        before = _FIX_SENTENCE_END_RE.split(text[max(0, match.start() - _FIX_HEDGE_WINDOW) : match.start()])[-1]
+        after = text[match.end() : match.end() + _FIX_HEDGE_WINDOW]
+        end = _FIX_SENTENCE_END_RE.search(after)
+        clause = after[: end.start()] if end else after
+        asks = end is not None and end.group() == "?"
+        if not asks and not _FIX_HEDGE_RE.search(before) and not _FIX_HEDGE_RE.search(clause):
+            claims.append(match.group(1))
+    return claims
+
+
+#: GitHub returns at most this many commits from ``pulls/N/commits``.
+_PR_COMMITS_API_CAP = 250
+#: Distinct commits whose file lists one scan may read. Each is at least one API call
+#: on the merge path, which the merge deadline bounds too; the cap matches the cited
+#: ids one finding may name, so a large round of real fixes is not refused.
+_FIX_CHECK_MAX_COMMITS = 64
+#: Compares (one per finding head) and blob reads one scan may make to check that a
+#: fix is still in the head being merged (#5000). MEASURED: at most 4 finding heads
+#: in one PR, over 264 past cleared findings.
+_FIX_CHECK_MAX_COMPARES = 16
+_FIX_CHECK_MAX_BLOB_READS = 16
+#: GitHub lists at most this many files in a compare; a file past it has no row.
+_COMPARE_FILES_CAP = 300
+#: A listed compare row with one of these statuses differs between the two commits.
+#: GitHub drops line counts and patches on a big compare (MEASURED, #5000: 14 real
+#: fixes listed ``modified`` with 0 changes), so the counts prove nothing; only a
+#: rename can leave the content as it was.
+_COMPARE_CHANGED = frozenset({"modified", "added", "removed", "changed"})
+_FIX_UNCHANGED = "the finding's file is unchanged since the finding was posted (fix reverted?)"
+
+
+def _compare_rows(orig: str, head: str, repo: str | None) -> tuple[str, list[dict]] | None:
+    """``compare/<orig>...<head>``: its status and file rows, or None when unreadable."""
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "api",
+                f"repos/{repo or ':owner/:repo'}/compare/{orig}...{head}",
+                "--jq",
+                "{status: .status, files: [.files[]? | "
+                "{f: .filename, p: .previous_filename, s: .status, c: .changes}]}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(8),
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout or "{}")
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("status"), str):
+        return None
+    files = data.get("files")
+    if not isinstance(files, list):
+        return None
+    return data["status"], [r for r in files if isinstance(r, dict)]
+
+
+#: The blob oid of one path at each of two commits (``_blob_oids``).
+_BLOB_OIDS_QUERY = (
+    "query($owner:String!,$name:String!,$a:String!,$b:String!){"
+    "repository(owner:$owner,name:$name){"
+    "a:object(expression:$a){__typename ... on Blob{oid}} "
+    "b:object(expression:$b){__typename ... on Blob{oid}}}}"
+)
+
+
+def _blob_oids(
+    repo: str | None, at_orig: tuple[str, str], at_head: tuple[str, str]
+) -> tuple[str | None, str | None] | None:
+    """The blob oid of each ``(commit, path)``, None for a path absent there, or None
+    for the pair when the read fails or either path is not a plain file.
+
+    GraphQL, because it answers "absent" as ``null`` apart from an error, where a
+    REST 404 through gh looks the same as a failed read.
+    """
+    if repo is not None and not isinstance(repo, str):
+        return None
+    try:
+        slug = _normalize_repo(repo) if repo else _derive_repo_from_cwd(os.getcwd())
+    except Exception:
+        return None
+    if not slug or "/" not in slug:
+        return None
+    owner, name = slug.split("/", 1)
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "api",
+                "graphql",
+                "-f",
+                f"query={_BLOB_OIDS_QUERY}",
+                "-f",
+                f"owner={owner}",
+                "-f",
+                f"name={name}",
+                "-f",
+                f"a={at_orig[0]}:{at_orig[1]}",
+                "-f",
+                f"b={at_head[0]}:{at_head[1]}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(8),
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout or "{}")
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("errors"):
+        return None
+    got = ((data.get("data") or {}).get("repository")) if isinstance(data.get("data"), dict) else None
+    if not isinstance(got, dict) or "a" not in got or "b" not in got:
+        return None
+    oids: list[str | None] = []
+    for obj in (got["a"], got["b"]):
+        if obj is None:
+            oids.append(None)
+        elif isinstance(obj, dict) and obj.get("__typename") == "Blob" and isinstance(obj.get("oid"), str):
+            oids.append(obj["oid"])
+        else:
+            return None
+    return oids[0], oids[1]
+
+
+class _FixEvidence:
+    """Whether a reply's cited commit is a fix for one floor finding (#4933).
+
+    Evidence is a single-parent commit of THIS PR that descends from the head the
+    finding was posted on and touches the finding's file, or the name a rename in
+    this PR gave it. "Descends" is read from parent links: GitHub lists a PR's
+    commits by date, not ancestry (``review_budget``). The fix must also still be in
+    the head being merged (#5000): the cited commit is that head or one of its
+    ancestors, and the finding's file differs there from every head the finding was
+    posted on, so a fully reverted fix does not clear. A partial revert, or a revert
+    hidden by another change to the same file (another fix, a merge of main), still
+    clears; so does a reverted fix whose file was then moved past the compare's
+    300-file cap with its old name reused, or moved where the PR's own file list
+    (base to head) reads the move as a removal, as after a heavy rewrite before the
+    finding. Each needs a revert and a move together. It proves provenance, not that the change is correct. Every read failure means "not verified": the finding stays
+    blocked and the reason says why, so ``# floor-accept`` is the way through.
+
+    ``head`` is the head the merge is bound to; when the caller has none, the PR's
+    current head is read once, on first need.
+    """
+
+    def __init__(self, pr_num: str, repo: str | None, head: str | None = None) -> None:
+        self._pr_num = pr_num
+        self._repo = repo
+        self._head_arg = head
+        self._head: str | None = None
+        self._head_read = False
+        self._commits: tuple[list[dict] | None, bool] | None = None
+        self._files: dict[str, set[str] | None] = {}
+        self._ancestors: dict[str, set[str]] = {}
+        self._claims: dict[str, list[str]] = {}
+        self._compares: dict[str, tuple[str, list[dict]] | None] = {}
+        self._kept_why: dict[tuple[str, str], str | None] = {}
+        self._blob_reads = 0
+
+    def _bound_head(self) -> str:
+        if not self._head_read:
+            self._head_read = True
+            raw = self._head_arg or _pr_head_sha(self._pr_num, repo=self._repo) or ""
+            self._head = raw.strip().lower() if isinstance(raw, str) else ""
+        return self._head or ""
+
+    def _kept(self, path: str, orig: str) -> str | None:
+        """None when ``path`` differs between ``orig`` and the head, otherwise why not."""
+        key = (orig, path)
+        if key not in self._kept_why:
+            self._kept_why[key] = self._kept_read(path, orig)
+        return self._kept_why[key]
+
+    def _kept_read(self, path: str, orig: str) -> str | None:
+        head = self._bound_head()
+        if orig not in self._compares:
+            if len(self._compares) >= _FIX_CHECK_MAX_COMPARES:
+                return f"compare cap reached ({_FIX_CHECK_MAX_COMPARES} finding heads)"
+            if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
+                return "fix could not be verified (merge deadline reached)"
+            self._compares[orig] = _compare_rows(orig, head, self._repo)
+        got = self._compares[orig]
+        if got is None:
+            return "fix could not be verified (compare with the head being merged unreadable)"
+        status, rows = got
+        if status == "identical":
+            return _FIX_UNCHANGED
+        if status != "ahead":
+            return f"fix could not be verified (compare status {status!r})"
+        # A rename's old name first, so a new file reusing that name cannot stand in; a
+        # copy of the file is not the file.
+        row = next((r for r in rows if r.get("p") == path and r.get("s") == "renamed"), None) or next(
+            (r for r in rows if r.get("f") == path and r.get("s") != "renamed"), None
+        )
+        if row is not None:
+            if row.get("s") in _COMPARE_CHANGED:
+                return None
+            if row.get("s") != "renamed":
+                return f"fix could not be verified (compare lists {path} as {row.get('s')!r})"
+            if isinstance(row.get("c"), int) and row["c"] > 0:
+                return None
+            at_head = row.get("f")
+        elif len(rows) < _COMPARE_FILES_CAP:
+            return _FIX_UNCHANGED
+        else:
+            at_head = path
+        capped = row is None
+        if not isinstance(at_head, str) or not at_head:
+            return "fix could not be verified (compare row unreadable)"
+        oids = self._blobs(orig, path, head, at_head)
+        if isinstance(oids, str):
+            return oids
+        if (
+            capped
+            and oids[0] is not None
+            and oids[1] is None
+            and _pr_changed_files(self._pr_num, repo=self._repo) is not None
+        ):
+            # Past the cap, the old path is gone at the head: deleted, or renamed. The
+            # PR's own file list (base to head, not inflated by a merge of main) says
+            # which; anything it cannot confirm stays unverified.
+            dest = _pr_rename_map(self._pr_num, repo=self._repo).get(path)
+            if isinstance(dest, str) and dest:
+                oids = self._blobs(orig, path, head, dest)
+                if isinstance(oids, str):
+                    return oids
+            elif _pr_file_statuses(self._pr_num, repo=self._repo).get(path) == "removed":
+                return None
+        if oids[0] is None or oids[1] is None:
+            return (
+                f"fix could not be verified ({path} at the finding's head, or its name at "
+                "the head being merged, unreadable or absent)"
+            )
+        return _FIX_UNCHANGED if oids[0] == oids[1] else None
+
+    def _blobs(
+        self, orig: str, path: str, head: str, at_head: str
+    ) -> tuple[str | None, str | None] | str:
+        """Blob oids of ``orig:path`` and ``head:at_head``, or why they were not read."""
+        if self._blob_reads >= _FIX_CHECK_MAX_BLOB_READS:
+            return f"blob-read cap reached ({_FIX_CHECK_MAX_BLOB_READS} reads)"
+        if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
+            return "fix could not be verified (merge deadline reached)"
+        self._blob_reads += 1
+        oids = _blob_oids(self._repo, (orig, path), (head, at_head))
+        if oids is None:
+            return (
+                f"fix could not be verified ({path} at the finding's head, or {at_head} at "
+                "the head being merged, unreadable)"
+            )
+        return oids
+
+    def _commit_list(self) -> tuple[list[dict] | None, bool]:
+        if self._commits is None:
+            self._commits = _fetch_comments_paged(
+                f"pulls/{self._pr_num}/commits",
+                self._pr_num,
+                self._repo,
+                ".[] | {sha: .sha, parents: [.parents[]?.sha]}",
+            )
+        return self._commits
+
+    def _touched(self, sha: str) -> set[str] | None:
+        if sha not in self._files:
+            rows, complete = _fetch_comments_paged(
+                f"commits/{sha}",
+                self._pr_num,
+                self._repo,
+                ".files[]? | {f: .filename, p: .previous_filename, s: .status, c: .changes}",
+            )
+            # A row that changes no line (a pure rename, copy or mode change) fixes
+            # nothing, and only a rename's old name is the same file.
+            self._files[sha] = (
+                {
+                    name
+                    for r in rows
+                    if isinstance(r.get("c"), int) and r["c"] > 0
+                    for name in (r.get("f"), r.get("p") if r.get("s") == "renamed" else None)
+                    if isinstance(name, str) and name
+                }
+                if rows is not None and complete
+                else None
+            )
+        return self._files[sha]
+
+    def _ancestry(self, sha: str, parents: dict[str, list]) -> set[str]:
+        """The PR commits ``sha`` descends from, through parent links inside the PR."""
+        if sha not in self._ancestors:
+            seen: set[str] = set()
+            todo = list(parents.get(sha) or [])
+            while todo:
+                cur = todo.pop()
+                if isinstance(cur, str) and cur in parents and cur not in seen:
+                    seen.add(cur)
+                    todo.extend(parents.get(cur) or [])
+            seen.discard(sha)
+            self._ancestors[sha] = seen
+        return self._ancestors[sha]
+
+    def _names(self, path: str) -> set[str]:
+        """``path``, and the name a rename in this PR gave it."""
+        renamed = _pr_rename_map(self._pr_num, repo=self._repo).get(path)
+        return {path, renamed} if isinstance(renamed, str) else {path}
+
+    def verify(self, path: str | None, origs: list, bodies: list[str]) -> str | None:
+        """None when a cited commit is a fix, otherwise why none is.
+
+        ``origs`` holds the head of every copy of the finding on ``path``: the fix has
+        to descend from all of them.
+        """
+        if not path:
+            return "the finding names no file, so only the sigil can clear it"
+        if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
+            return "fix could not be verified (merge deadline reached)"
+        for b in bodies:
+            if b not in self._claims:
+                self._claims[b] = _fix_claims(b)
+        cited = list(dict.fromkeys(t for b in bodies for t in self._claims[b]))
+        if not cited:
+            if any(_FIX_LINE_START_RE.search(_claim_text(b)) for b in bodies):
+                return (
+                    "a reply's 'Fixed in' line is not a claim: it is hedged, a question, has "
+                    "no lowercase sha, or runs on after the sha; once the fix is complete, "
+                    "write 'Fixed in <sha>.'"
+                )
+            return "no reply has a line starting 'Fixed in <sha>'"
+        if len(cited) > _FIX_CHECK_MAX_CITED:
+            return f"replies cite more than {_FIX_CHECK_MAX_CITED} commits"
+        rows, complete = self._commit_list()
+        if rows is None or not complete:
+            return "fix could not be verified (PR commit list unreadable)"
+        rows = [r for r in rows if isinstance(r.get("sha"), str)]
+        if len(rows) >= _PR_COMMITS_API_CAP:
+            # An unlisted commit could sit on the path between the head and the fix.
+            return f"commit list clipped at {_PR_COMMITS_API_CAP} (GitHub cap); fix could not be verified"
+        parents = {
+            r["sha"]: r["parents"] if isinstance(r.get("parents"), list) else None for r in rows
+        }
+        if not origs or any(not isinstance(o, str) or o not in parents for o in origs):
+            return (
+                "the head this finding was posted on is gone (rebased or force-pushed), "
+                "so a later fix cannot be proven; only the sigil clears it"
+            )
+        head = self._bound_head()
+        if not re.fullmatch(r"[0-9a-f]{40}", head) or head not in parents:
+            return (
+                "the head being merged is unknown or not a full sha of this PR, so a fix "
+                "in it cannot be proven"
+            )
+        head_line = self._ancestry(head, parents) | {head}
+        why = ""
+        for token in cited:
+            if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
+                return "fix could not be verified (merge deadline reached)"
+            hits = [s for s in parents if s.startswith(token)]
+            if len(hits) != 1:
+                if hits:
+                    why = f"cited id {token} is ambiguous"
+                else:
+                    why = f"cited id {token} is not among the PR's commits (rebased?)"
+                continue
+            sha = hits[0]
+            if parents[sha] is None:
+                why = f"fix could not be verified (parents of {token} unreadable)"
+                continue
+            if len(parents[sha]) != 1:
+                why = f"cited commit {token} is a merge commit; cite the commit that made the fix"
+                continue
+            if not all(o in self._ancestry(sha, parents) for o in origs):
+                why = f"cited commit {token} does not come after the head the finding was posted on"
+                continue
+            if sha not in head_line:
+                why = f"cited commit {token} is not in the head being merged"
+                continue
+            if sha not in self._files and len(self._files) >= _FIX_CHECK_MAX_COMMITS:
+                why = f"fix-check cap reached ({_FIX_CHECK_MAX_COMMITS} commits read)"
+                continue
+            touched = self._touched(sha)
+            if touched is None:
+                why = f"fix could not be verified (file list of {token} unreadable)"
+                continue
+            if touched & self._names(path):
+                # Whether the file still differs is the same for every cited commit.
+                return next((w for o in dict.fromkeys(origs) if (w := self._kept(path, o))), None)
+            why = f"cited commit {token} does not touch {path}"
+        return why
+
+
+#: One reviewer comment's author and edit history, for up to 50 node ids (#5001).
+_EDIT_HISTORY_QUERY = (
+    "query($ids:[ID!]!){nodes(ids:$ids){... on PullRequestReviewComment{"
+    "fullDatabaseId author{__typename login} "
+    "userContentEdits(first:100){totalCount nodes{editor{__typename login} "
+    "deletedBy{__typename login}}}}}}"
+)
+_EDIT_HISTORY_BATCH = 50
+
+
+def _edit_histories(node_ids: list, rest_ids: list) -> list | None:
+    """The ``nodes`` answer for ``node_ids`` (at most ``_EDIT_HISTORY_BATCH``), or
+    None when the read fails or its answer is not a list of that length.
+
+    Tests inject via ``_TEST_GH_EDIT_HISTORY``: ``clean`` (no edits on any
+    comment), ``__error__`` (the read fails), or a JSON object mapping a REST
+    comment id to its node (a missing id answers ``clean``)."""
+    raw = os.environ.get("_TEST_GH_EDIT_HISTORY")
+    if raw is not None:
+        if raw == "__error__":
+            return None
+        given = {} if raw == "clean" else json.loads(raw)
+        clean = {"__typename": "Bot", "login": "reviewer"}
+        return [
+            given.get(
+                str(rid),
+                {"fullDatabaseId": str(rid), "author": clean, "userContentEdits": {"totalCount": 0, "nodes": []}},
+            )
+            for rid in rest_ids
+        ]
+    if not all(isinstance(n, str) and n for n in node_ids):
+        return None  # a comment with no node id cannot be looked up
+    args = ["gh", "api", "graphql", "-f", f"query={_EDIT_HISTORY_QUERY}"]
+    for n in node_ids:
+        args += ["-f", f"ids[]={n}"]
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=_gh_timeout(10))
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout or "{}")
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("errors"):
+        return None
+    nodes = (data.get("data") or {}).get("nodes") if isinstance(data.get("data"), dict) else None
+    if not isinstance(nodes, list) or len(nodes) != len(node_ids):
+        return None
+    return nodes
+
+
+#: ``_foreign_editor``'s answer for a node it cannot read: a retry, never a tamper.
+_HISTORY_UNREADABLE = "\x00unreadable"
+
+
+def _foreign_editor(node: object, rest_id: object) -> str | None:
+    """Who other than its author edited a reviewer comment, or None when only its
+    author did (or nobody). ``_HISTORY_UNREADABLE`` when the node is missing, of
+    another type, another comment's, or malformed: the caller retries rather than
+    calling that an edit. A history longer than one read is a floor entry.
+
+    The REST id is matched against ``fullDatabaseId``, never the deprecated
+    ``databaseId``, which cannot hold a 64-bit id; it is a BigInt sent as a JSON
+    string, normalised as ``review_budget._node_id`` does.
+
+    Identity is GraphQL ``(__typename, login)`` on both sides: REST spells a bot
+    ``name[bot]`` and GraphQL ``name``, so mixing them would make every own edit
+    look foreign (MEASURED, 2026-11-24)."""
+    if not isinstance(node, dict):
+        return _HISTORY_UNREADABLE
+    raw = node.get("fullDatabaseId")
+    # Bounded before int(): past 4,300 digits int() raises.
+    if isinstance(raw, str) and len(raw) <= 20 and raw.isascii() and raw.isdigit():
+        raw = int(raw)
+    if type(raw) is not int or raw != rest_id:
+        return _HISTORY_UNREADABLE
+    author = node.get("author")
+    if not isinstance(author, dict) or not author.get("login"):
+        return "an unknown account"
+    who = (author.get("__typename"), author.get("login"))
+    edits = node.get("userContentEdits")
+    if not isinstance(edits, dict):
+        return _HISTORY_UNREADABLE
+    rows = edits.get("nodes")
+    if not isinstance(rows, list) or not isinstance(edits.get("totalCount"), int):
+        return _HISTORY_UNREADABLE
+    if edits["totalCount"] > len(rows):
+        # Owner ruling 2026-11-25: a floor entry the sigil clears, never a retry
+        # block, which no sigil reaches and a retry cannot clear.
+        return "an account in an edit history too long to read"
+    for row in rows:
+        if not isinstance(row, dict):
+            return _HISTORY_UNREADABLE
+        for field in ("editor", "deletedBy"):
+            actor = row.get(field)
+            if field == "deletedBy" and actor is None:
+                continue
+            if not isinstance(actor, dict) or not actor.get("login"):
+                return "an unknown account"
+            if (actor.get("__typename"), actor.get("login")) != who:
+                return str(actor.get("login"))
+    return None
+
+
 def _check_inline_review_findings(
     pr_num: str,
     *,
     force: bool = False,
+    floor_accept: frozenset[int] = frozenset(),
+    floor_accept_used: set[int] | None = None,
     repo: str | None = None,
     uncounted_out: list[dict[str, int]] | None = None,
+    head: str | None = None,
 ) -> tuple[bool, str]:
     """Scan review findings from BOTH delivery channels and apply a weighted score.
 
@@ -3489,8 +4058,10 @@ def _check_inline_review_findings(
     threshold FOR THIS PR'S LANE (`_INLINE_SCORE_BLOCK_THRESHOLDS`): critical 1.0,
     standard 2.0, light 3.0. So two P2s stop a consequence surface, four ordinary
     code, six prose-and-tests. A P1 blocks in EVERY lane via the always-fix floor,
-    before the score is consulted at all. A finding is EXCLUDED from the score when its thread has a MAINTAINER
-    reply (engagement = consciously accepted), its path is documentation
+    before the score is consulted at all. A BELOW-FLOOR finding is EXCLUDED from the score when its thread has a
+    MAINTAINER reply (engagement = consciously accepted). A FLOOR finding is not: it
+    clears only on a reply citing a verified fix commit (``_FixEvidence``) or on the
+    owner's ``# floor-accept=<id>`` (#4933). Any finding is also excluded when its path is documentation
     (``_is_doc_path``), or its path is OUTSIDE the PR's diff (issue #1728: a
     merge of main stamps base-branch findings onto the PR; scoring them makes
     the gate demand base-branch fixes as this PR's price — reconciliation must
@@ -3510,13 +4081,23 @@ def _check_inline_review_findings(
     what still needs attention, not what a maintainer already handled (re-listing every
     replied finding on each check would bury the live ones). An UNREADABLE or
     INCOMPLETE scan (gh error/timeout/malformed/clipped budget) ALWAYS blocks
-    (fail-closed — see ``_scan_unreadable``); '# review-override' waives the whole scan.
+    (fail-closed — see ``_scan_unreadable``). '# review-override' (``force``) waives an
+    unreadable scan and the P2 score, never a floor finding this scan can see.
     """
-    if force:
-        return False, ""  # override NOTE already printed by the body gate
+
+    def _waived_unread(what: str) -> tuple[bool, str]:
+        """'# review-override' over a scan that did not read everything: allowed, never silent."""
+        print(
+            f"NOTE: PR #{pr_num} — '# review-override' waived {what}: a floor finding "
+            f"there was not seen and is not covered by this merge.",
+            file=sys.stderr,
+        )
+        _amend_note("review-override", waived="review-body+inline-scan-unread")
+        return False, ""
+
     scanner_sets, table_block = _enforced_logins_or_block()
     if table_block:
-        return True, table_block
+        return _waived_unread("an unusable reviewer table") if force else (True, table_block)
     # Paginate via the shared helper (findings beyond the first REST page must still
     # gate); it accumulates ALL pages as parsed dicts, NEL-safe. ``raw is None`` = the
     # first page was unreadable; ``complete`` False = a later page failed. Fetch in the
@@ -3530,10 +4111,73 @@ def _check_inline_review_findings(
         repo,
         ".[] | {id: .id, reply_to: .in_reply_to_id, login: .user.login, "
         "type: .user.type, assoc: .author_association, path: .path, body: .body, "
-        "review_id: .pull_request_review_id}",
+        "review_id: .pull_request_review_id, orig: .original_commit_id, node: .node_id}",
     )
     if raw is None:
+        if force:
+            return _waived_unread("an unreadable inline scan")
         return _scan_unreadable("inline review comments")
+
+    # The known-format registry decides which parser reads which login (read ONCE
+    # per scan).
+    devin_logins = scanner_sets.get("devin-marker", frozenset())
+    coderabbit_logins = scanner_sets.get("coderabbit-header", frozenset())
+    inline_review_logins = frozenset().union(
+        *(scanner_sets.get(p, frozenset()) for p in _INLINE_REVIEW_PARSERS)
+    )
+    codeql_logins = scanner_sets.get("codeql", frozenset())
+
+    def _parseable(login: str, utype: str) -> bool:
+        # WHOSE OUTPUT MAY BE PARSED FOR SEVERITY (see the classify loop).
+        return (utype == "Bot" or login in inline_review_logins) and login not in codeql_logins
+
+    def _believed(login: str, utype: str) -> bool:
+        # Every author whose comment the classify loop can score: the badge
+        # parsers' population, plus the CodeRabbit branch, which keys on the
+        # login alone (GitHub can type an App as `User`).
+        return _parseable(login, utype) or login in coderabbit_logins
+
+    # #5001: a reviewer comment edited by anyone but its reviewer. Read for every
+    # top-level comment the classify loop below may believe (`_believed`, the one
+    # predicate both use) and each reviewer's replies to its own comments (the
+    # Resolved route), never only the ones that score now: an edit that clears a
+    # finding is one that stops it scoring (a P1 made a P3, a stripped badge).
+    # MEASURED 0 foreign edits in 4,222 comments of the three named reviewers.
+    _author_of = {c.get("id"): c.get("login") for c in raw if c.get("id") is not None}
+    watched = [
+        c
+        for c in raw
+        if _believed(c.get("login") or "", c.get("type") or "")
+        and (not c.get("reply_to") or _author_of.get(c.get("reply_to")) == c.get("login"))
+    ]
+    tampered: dict[object, str] = {}
+    unread = cut = 0
+    for i in range(0, len(watched), _EDIT_HISTORY_BATCH):
+        batch = watched[i : i + _EDIT_HISTORY_BATCH]
+        if _merge_deadline is not None and time.monotonic() >= _merge_deadline:
+            cut += len(batch)
+            continue
+        nodes = _edit_histories([c.get("node") for c in batch], [c.get("id") for c in batch])
+        if nodes is None:
+            unread += len(batch)
+            continue
+        for c, node in zip(batch, nodes, strict=True):
+            editor = _foreign_editor(node, c.get("id"))
+            if editor is _HISTORY_UNREADABLE:
+                unread += 1
+            elif editor is not None:
+                tampered[c.get("id")] = editor
+    if unread or cut:
+        # One retry block, never a floor entry per comment: a transient failure
+        # must not teach the owner to sigil fixed findings. Not waived by
+        # '# review-override' (owner ruling, 2026-11-25).
+        parts = [f"unreadable for {unread}"] if unread else []
+        if cut:
+            parts.append(f"not read before the merge deadline for {cut}")
+        return True, (
+            f"edit history {' and '.join(parts)} reviewer comment(s), so the gate "
+            f"cannot tell whether a finding was edited after it was posted; retry."
+        )
 
     # Build replied_to over ALL accumulated pages BEFORE classifying, so a P1 on an
     # early page acknowledged by a reply on a later page is treated as engaged (never
@@ -3560,14 +4204,8 @@ def _check_inline_review_findings(
         and c.get("type") == "Bot"
         and (c.get("login") or "") == _login_of.get(c.get("reply_to"))
         and (c.get("body") or "").lstrip().split("\n", 1)[0].startswith(_BOT_SELF_RESOLVED_LEAD)
+        and c.get("id") not in tampered
     }
-    # The known-format registry decides which parser reads which login (read ONCE
-    # per scan).
-    devin_logins = scanner_sets.get("devin-marker", frozenset())
-    coderabbit_logins = scanner_sets.get("coderabbit-header", frozenset())
-    inline_review_logins = frozenset().union(
-        *(scanner_sets.get(p, frozenset()) for p in _INLINE_REVIEW_PARSERS)
-    )
     # Every Devin-format structure is keyed by (login, finding_id), never the bare
     # id: two reviewers' ids can collide, and one reviewer's answered finding must
     # never clear another's. Same-login duplicate copies still group.
@@ -3601,6 +4239,116 @@ def _check_inline_review_findings(
     devin_self_withdrawn: list[str] = []  # cleared by Devin's own reply only — surfaced
     devin_doc_skipped: list[str] = []  # scoring Devin findings on a doc path
     devin_off_diff: list[tuple[str, str]] = []  # scoring Devin findings outside the diff
+    evidence = _FixEvidence(pr_num, repo, head)
+    floor_verdicts: dict[tuple, bool] = {}
+    floor_unmet: list[tuple[int, str, str | None]] = []  # (finding id, why open, its file)
+    floor_fixed: set[int] = set()
+    floor_refused: set[int] = set()  # named by the sigil in a dispatched session
+    floor_devin_only: set[tuple] = set()  # cleared only with Devin's own reply
+    replies_to: dict[object, list[dict]] = {}
+    for r in raw:
+        if r.get("reply_to"):
+            replies_to.setdefault(r.get("reply_to"), []).append(r)
+    used_ids = floor_accept_used if floor_accept_used is not None else set()
+
+    def _floor_cleared(
+        group: list[dict], paths: list | None = None, sigil_copies: list[dict] | None = None
+    ) -> bool:
+        """Whether a floor finding (one comment, or a Devin group) is cleared.
+
+        A fix is tried first, so an id named in ``# floor-accept`` is only spent on a
+        finding that is really still open. Devin's ``Resolved`` marker never cites a
+        commit (MEASURED 0 of 23), so on a thread carrying it Devin's own replies may
+        supply the id; the id still has to pass the whole test. ``paths`` names the
+        files a duplicated finding scored on: each one needs its own fix.
+
+        ``sigil_copies`` (default ``group``) is the copies whose ids the sigil may name and the
+        block reports: a Devin group's untouched copies, while its edited ones still
+        lend their reply threads. A yes to an edit never clears the twin (owner
+        ruling, 2026-11-25).
+        """
+        sigil_copies = group if sigil_copies is None else sigil_copies
+        sigil_ids = {cp.get("id") for cp in sigil_copies}
+        key = tuple(cp.get("id") for cp in group)
+        if key in floor_verdicts:
+            return floor_verdicts[key]
+        why = "no reply"
+        wanted = list(dict.fromkeys(cp.get("path") for cp in group) if paths is None else dict.fromkeys(paths))
+        sources = []
+        for cp in group:
+            cid = cp.get("id")
+            thread = replies_to.get(cid, [])
+            sources.append(
+                (
+                    cp,
+                    [
+                        r.get("body") or ""
+                        for r in thread
+                        if r.get("assoc") in _MAINTAINER_ASSOCIATIONS
+                    ],
+                    False,
+                )
+            )
+            if cid in self_withdrawn and cp.get("login") in devin_logins:
+                own = [
+                    r.get("body") or ""
+                    for r in thread
+                    if r.get("type") == "Bot"
+                    and r.get("login") == cp.get("login")
+                    and r.get("id") not in tampered
+                ]
+                sources.append((cp, own, True))
+        rested_on_devin = False
+        cleared = bool(wanted)
+        open_path = group[0].get("path")  # the file the reason is about
+        for path in wanted:
+            covered = False
+            origs = [cp.get("orig") for cp in group if cp.get("path") == path]
+            for _cp, bodies, devin_only in sources:
+                if not bodies:
+                    continue
+                verdict = evidence.verify(path, origs, bodies)
+                if verdict is None:
+                    covered = True
+                    rested_on_devin = rested_on_devin or devin_only
+                    break
+                why = verdict
+            if not covered:
+                cleared = False
+                open_path = path
+                break
+        if cleared:
+            floor_fixed.update(i for i in key if isinstance(i, int))
+            if rested_on_devin:
+                floor_devin_only.add(key)
+        if not cleared:
+            named = {i for i in key if i in floor_accept and i in sigil_ids}
+            if named and _is_dispatched():
+                floor_refused.update(named)
+                why = "'# floor-accept' records the owner's yes, and a dispatched session has no owner present"
+            elif named:
+                used_ids.update(named)
+                cleared = True
+        if not cleared:
+            floor_unmet.append((sigil_copies[0].get("id"), why, open_path))
+        floor_verdicts[key] = cleared
+        return cleared
+
+    def _list_self_withdrawn(
+        dkey: tuple[str, str], group: list[dict], *, always: bool = False
+    ) -> None:
+        if always or dkey not in devin_maint_cleared:
+            devin_self_withdrawn.append(
+                next(
+                    (
+                        _inline_title(cp.get("body") or "")
+                        for cp in group
+                        if _devin_finding(cp.get("body") or "")[1] is not None
+                    ),
+                    _inline_title(group[0].get("body") or ""),
+                )
+            )
+
     p1: list[str] = []
     p2: list[str] = []
     # (severity, path) for every finding that SCORES, kept alongside the title
@@ -3615,13 +4363,17 @@ def _check_inline_review_findings(
     cr_unknown: list[str] = []  # a severity header naming a level we don't know
     cr_doc_skipped: list[str] = []  # CodeRabbit Critical/Major on a doc path
     unmatched_bot: list[tuple[str, str]] = []  # (login, title) — read, unrecognised
+    tampered_block: list[str] = []  # edited by someone else — the floor, sigil only (#5001)
+    # (title, path, "off_diff" | "doc"): edited, but excluded the way the finding
+    # would be — surfaced, never scored.
+    tampered_excluded: list[tuple[str, str, str]] = []
+    tampered_seen: set = set()
     # Which of those carry a P3 badge: informational by design (no parser
     # scores P3), so they are not format drift. Indices into unmatched_bot.
     informational: set[int] = set()
     # Which logins the registry knows at all, and which of them is CodeQL: the
     # unrecognised bucket is printed in three parts (see the NOTEs below).
     known_review_logins = frozenset().union(*scanner_sets.values())
-    codeql_logins = scanner_sets.get("codeql", frozenset())
     # Off-diff findings (issue #1728): (title, path) — surfaced, never scored.
     cr_off_diff: list[tuple[str, str]] = []
     off_diff_p1: list[tuple[str, str]] = []
@@ -3685,6 +4437,15 @@ def _check_inline_review_findings(
                 return "doc", sev
         return "scored", sev
 
+    def _tamper_excluded(path: str | None) -> bool:
+        # The exclusions an edited finding keeps (the floor's reading of the doc
+        # lever: excluded only under `skip`), shared by the edited-finding branch.
+        return _off_diff(path) or (_is_doc_path(path or "") and _doc_findings_mode() == "skip")
+
+    # A Devin finding posted twice: its edited copies are one edited entry, and its
+    # untouched copies are judged on their own text in the Devin branch, so a yes to
+    # the edit never clears an untouched copy (owner ruling, 2026-11-25).
+
     for c in raw:
         login, utype = c.get("login") or "", c.get("type") or ""
         body = c.get("body") or ""
@@ -3705,6 +4466,52 @@ def _check_inline_review_findings(
         # not by an assumption about who wrote it.
         if c.get("reply_to"):
             continue  # replies aren't findings
+        if c.get("id") in tampered:
+            # FIRST, before the maintainer-reply skip and every severity parse: the
+            # current text is not the reviewer's, so nothing in it is believed. The
+            # path is REST metadata an edit cannot change, so its exclusions stand.
+            path = c.get("path")
+            # Known limit: the group key is the finding id in the CURRENT text, so an
+            # edit can move a copy into another group. The edit itself still blocks
+            # until the sigil, and a floor copy needs a fix sha that no Resolved
+            # reply carries; only the original text would close it, which is not read.
+            fid = _devin_finding(body)[0] if login in devin_logins else None
+            group = devin_copies.get((login, fid), [c]) if fid is not None else [c]
+            gkey = tuple(cp.get("id") for cp in group)
+            if _tamper_excluded(path):
+                if ("excluded", gkey) not in tampered_seen:
+                    tampered_seen.add(("excluded", gkey))
+                    tampered_excluded.append(
+                        (
+                            f"[edited by {tampered[c.get('id')]}] {_inline_title(body)}",
+                            path or "",
+                            "off_diff" if _off_diff(path) else "doc",
+                        )
+                    )
+                continue
+            # The finding's in-scope edited copies: one entry, cleared only by their ids.
+            edited = tuple(
+                cp.get("id")
+                for cp in group
+                if cp.get("id") in tampered and not _tamper_excluded(cp.get("path"))
+            )
+            if edited in tampered_seen:
+                continue
+            tampered_seen.add(edited)
+            named = {i for i in edited if i in floor_accept}
+            why = (
+                f"edited by {tampered[c.get('id')]} after the reviewer posted it; "
+                "only the owner's sigil clears it"
+            )
+            if named and _is_dispatched():
+                floor_refused.update(named)
+                why = "'# floor-accept' records the owner's yes, and a dispatched session has no owner present"
+            elif named:
+                used_ids.update(named)
+                continue
+            tampered_block.append(f"[edited by {tampered[c.get('id')]}] {_inline_title(body)}")
+            floor_unmet.append((c.get("id"), why, path))
+            continue
         # WHOSE OUTPUT MAY BE PARSED FOR SEVERITY — deliberately the SAME
         # population the removed filter used to admit: a Bot, or an allowlisted
         # review account. Widening WHO IS SEEN must not widen WHO IS BELIEVED.
@@ -3721,9 +4528,7 @@ def _check_inline_review_findings(
         # unrecognised branch: SURFACED, never scored, never blocking.
         # CodeQL is surface-only (`review_findings.KNOWN_FORMATS`): its body is
         # never searched for a severity badge, so it reaches only the CodeQL NOTE.
-        parseable = (
-            utype == "Bot" or login in inline_review_logins
-        ) and login not in codeql_logins
+        parseable = _parseable(login, utype)
         if login in devin_logins and utype == "Bot":
             # EXCLUSIVE and terminal, and placed BEFORE the badge branches below:
             # Devin quotes guard output and code in its findings, so a body can
@@ -3743,14 +4548,18 @@ def _check_inline_review_findings(
             if dkey in devin_seen:
                 continue  # another post of a finding already classified
             devin_seen.add(dkey)
-            copies = devin_copies.get(dkey, [c])
+            # An edited copy's TEXT is not the reviewer's: the tampered branch
+            # answered for it, so severity and scope are read from untouched copies
+            # only. Its reply THREAD is still the finding's, so clearing reads the
+            # whole group, as `answered` (devin_cleared) does.
+            group_all = devin_copies.get(dkey, [c])
+            copies = [cp for cp in group_all if cp.get("id") not in tampered]
             # Drift is a fact about a COMMENT, so every unreadable copy is
             # reported: before dedup can fold it into a readable sibling under
             # the same id, and before clearing, for the reason given above.
             # This is the parser alone. The per-copy SCOPE judgement below
             # reads the PR's changed files, so it must stay AFTER the clearing
-            # check: an answered finding never pays for that read, exactly as
-            # the Codex and CodeRabbit branches check `replied_to` first.
+            # check: a finding answered below the floor never pays for that read.
             has_readable = any(_devin_finding(cp.get("body") or "")[1] is not None for cp in copies)
             for cp in copies:
                 if _devin_finding(cp.get("body") or "")[1] is None:
@@ -3758,20 +4567,13 @@ def _check_inline_review_findings(
                     if has_readable:
                         drift_title += " (a copy of a finding classified by its readable copy)"
                     devin_unknown.append(drift_title)
-            if dkey in devin_cleared:
-                # Answered: a maintainer reply, or Devin withdrew it. The second
-                # is listed, from the parser alone (no file-list read).
-                if dkey not in devin_maint_cleared:
-                    devin_self_withdrawn.append(
-                        next(
-                            (
-                                _inline_title(cp.get("body") or "")
-                                for cp in copies
-                                if _devin_finding(cp.get("body") or "")[1] is not None
-                            ),
-                            _inline_title(copies[0].get("body") or ""),
-                        )
-                    )
+            answered = dkey in devin_cleared
+            if answered and not any(
+                _devin_finding(cp.get("body") or "")[1] == "floor" for cp in copies
+            ):
+                # Answered below the floor: a maintainer reply, or Devin withdrew
+                # it. The second is listed, from the parser alone (no file read).
+                _list_self_withdrawn(dkey, copies)
                 continue
             judged = [(cp, *_devin_disposition(cp)) for cp in copies]
             # The group SCORES on its strongest copy that is eligible to score.
@@ -3788,6 +4590,9 @@ def _check_inline_review_findings(
                 continue  # every copy was drift, reported above
             eligible = [t for t in readable if t[1] == "scored"]
             best, disp, sev = eligible[0] if eligible else readable[0]
+            if answered and not (disp == "scored" and sev == "floor"):
+                _list_self_withdrawn(dkey, copies)
+                continue
             title = _inline_title(best.get("body") or "")
             dv_path = best.get("path")
             # A stronger copy that could not score is not dropped silently: the
@@ -3805,6 +4610,12 @@ def _check_inline_review_findings(
             elif disp == "doc":
                 devin_doc_skipped.append(title)
             elif sev == "floor":
+                if _floor_cleared(
+                    group_all, [t[0].get("path") for t in eligible if t[2] == "floor"], sigil_copies=copies
+                ):
+                    if tuple(cp.get("id") for cp in group_all) in floor_devin_only:
+                        _list_self_withdrawn(dkey, copies, always=True)
+                    continue
                 devin_block.append(title)
                 scored_at.append(("DV", dv_path or ""))
             else:
@@ -3812,20 +4623,15 @@ def _check_inline_review_findings(
                 scored_at.append(("DVm", dv_path or ""))
             continue
         if login in coderabbit_logins:
-            # Engagement is checked ONCE, for the whole comment, BEFORE severity —
-            # not per-severity below. It used to sit inside the blocking branch, so
-            # only Critical/Major honoured a maintainer reply while every Minor,
-            # Trivial, Info and unknown-severity finding was re-reported on every
-            # run no matter how many times it had been consciously answered. That
-            # contradicted the promise made two comments down ("the same engagement
-            # treatment the Codex path gets"), and a growing list of already-settled
-            # advisories is how a genuinely unresolved one gets buried.
+            # Engagement is read ONCE, for the whole comment. A reply silences every
+            # segment below the floor, because a growing list of already-settled
+            # advisories is how a genuinely unresolved one gets buried. A
+            # Critical/Major segment needs a verified fix or the sigil (#4933).
             #
             # Comment-level granularity is the only granularity GitHub offers — a
             # reply attaches to the comment, not to one finding inside a bundle —
-            # and it matches what the Codex P1/P2 paths already do.
-            if c.get("id") in replied_to:
-                continue
+            # so one fix or one sigil id covers every blocking segment of it.
+            cr_replied = c.get("id") in replied_to
             # ONE COMMENT CAN CARRY SEVERAL FINDINGS — see _cr_findings. Scoring
             # the comment rather than each finding undercounts, and a Major
             # bundled after a Minor disappears entirely.
@@ -3836,6 +4642,8 @@ def _check_inline_review_findings(
                 # would still block.
                 severity, _header_seen = _cr_severity(seg)
                 if severity not in _CR_BLOCKING_SEVERITIES:
+                    if cr_replied:
+                        continue
                     title = _coderabbit_title(seg)
                     if severity is None:
                         # No recognised severity — whether the header names a
@@ -3856,7 +4664,8 @@ def _check_inline_review_findings(
                     # answer whatever the file type), and unlike doc-skipping it
                     # is not mode-gated — it enforces ratified policy (#1728),
                     # not a per-install preference.
-                    cr_off_diff.append((_coderabbit_title(seg), c.get("path") or ""))
+                    if not cr_replied:
+                        cr_off_diff.append((_coderabbit_title(seg), c.get("path") or ""))
                     continue
                 if _is_doc_path(c.get("path") or "") and _doc_findings_mode() == "skip":
                     # Its OWN list, not the Codex `doc_skipped` one — landing a
@@ -3867,28 +4676,34 @@ def _check_inline_review_findings(
                     # weight, so under `p1_only` or `score` this falls through
                     # and DOES block — otherwise the stricter setting silently
                     # enforced one reviewer and not the other (Codex P2, #1677).
-                    cr_doc_skipped.append(_coderabbit_title(seg))
+                    if not cr_replied:
+                        cr_doc_skipped.append(_coderabbit_title(seg))
+                    continue
+                if _floor_cleared([c]):
                     continue
                 cr_block.append(_coderabbit_title(seg))
                 scored_at.append(("CR", c.get("path") or ""))
             continue
         if parseable and _INLINE_P1_RE.search(body):
-            if c.get("id") in replied_to:
-                continue  # thread engaged — treated as acknowledged
+            p1_replied = c.get("id") in replied_to
             if _off_diff(c.get("path")):
                 # Same scoping the CodeRabbit branch gets above — the stale-
                 # anchor mechanism (#1728) is reviewer-agnostic, and enforcing
                 # it for one reviewer only would be an asymmetry with no
                 # stated reason (the #1677 class).
-                off_diff_p1.append((_inline_title(body), c.get("path") or ""))
+                if not p1_replied:
+                    off_diff_p1.append((_inline_title(body), c.get("path") or ""))
                 continue
             if _is_doc_path(c.get("path") or "") and _doc_findings_mode() == "skip":
                 # A P1 on a documentation file (ledger 54eb3752) is surfaced but
                 # does NOT block; a code file (incl. code under docs/) still does.
                 # Under `p1_only` or `score` this falls through and DOES block —
                 # a doc-path P1 is the one a reader most often wants enforced.
-                doc_skipped.append(_inline_title(body))
+                if not p1_replied:
+                    doc_skipped.append(_inline_title(body))
                 continue
+            if _floor_cleared([c]):
+                continue  # a verified fix, or the owner's sigil (#4933)
             p1.append(_inline_title(body))
             scored_at.append(("P1", c.get("path") or ""))
         elif parseable and _INLINE_P2_RE.search(body):
@@ -4294,6 +5109,16 @@ def _check_inline_review_findings(
                 f"({_safe_report_path(fpath)})",
                 file=sys.stderr,
             )
+    if tampered_excluded:
+        print(
+            f"NOTE: PR #{pr_num} — {len(tampered_excluded)} reviewer comment(s) edited "
+            f"by someone other than their reviewer, on a file outside this PR's diff "
+            f"or a skipped documentation path — NOT scored, as the finding would not be:",
+            file=sys.stderr,
+        )
+        for title, fpath, kind in tampered_excluded[:5]:
+            where = "off-diff" if kind == "off_diff" else "doc"
+            print(f"  [{where}] {title} ({_safe_report_path(fpath)})", file=sys.stderr)
     if off_diff_p1 or off_diff_p2:
         print(
             f"NOTE: PR #{pr_num} — {len(off_diff_p1)} [P1] + {len(off_diff_p2)} "
@@ -4366,6 +5191,7 @@ def _check_inline_review_findings(
         + _CR_BLOCKING_WEIGHT * len(cr_block)
         + len(devin_block)
         + _INLINE_P2_SCORE_WEIGHT * len(devin_minor)
+        + len(tampered_block)
     )
     if devin_analysis:
         print(
@@ -4379,7 +5205,8 @@ def _check_inline_review_findings(
     if devin_self_withdrawn:
         print(
             f"NOTE: PR #{pr_num} — {len(devin_self_withdrawn)} Devin finding(s) "
-            f"cleared by Devin's own '✅ Resolved' reply, with no maintainer reply. "
+            f"cleared on Devin's own '✅ Resolved' reply, with no maintainer reply "
+            f"that clears it. "
             f"Devin's reviewer and builder share one login, so check the fix "
             f"really landed before relying on it:",
             file=sys.stderr,
@@ -4486,8 +5313,8 @@ def _check_inline_review_findings(
     # them. Recording at each return instead would be a convention four sites had
     # to remember, which is the shape that produces "the fifth return forgot".
     #
-    # The two EARLY returns above (`force`, and an unreadable first page) are
-    # deliberately NOT recorded: they exit before these lists exist, so the
+    # The EARLY return above (an unreadable first page) is
+    # deliberately NOT recorded: it exits before these lists exist, so the
     # caller sees an EMPTY out-param and must render UNKNOWN rather than zero.
     # "0 uncounted" on a path that counted nothing is the false confidence this
     # gate exists to remove, and reproducing it one field over would be worse
@@ -4529,6 +5356,7 @@ def _check_inline_review_findings(
                         + len(doc_skipped_p2)
                         + len(cr_doc_skipped)
                         + len(devin_doc_skipped)
+                        + sum(1 for t in tampered_excluded if t[2] == "doc")
                     ),
                     "below_major": len(cr_advisory),
                     "off_diff": (
@@ -4536,6 +5364,7 @@ def _check_inline_review_findings(
                         + len(off_diff_p1)
                         + len(off_diff_p2)
                         + len(devin_off_diff)
+                        + sum(1 for t in tampered_excluded if t[2] == "off_diff")
                     ),
                     "unanchored": (
                         len(outside_critical) + len(outside_major) + len(outside_minor)
@@ -4593,25 +5422,58 @@ def _check_inline_review_findings(
     # so a CodeRabbit MINOR naming a fail-open scores 0.0 and passes here. The
     # mechanical floor is the labelled subset; the rest still rests on somebody
     # reading the report.
-    floor_hits = len(p1) + len(cr_block) + len(devin_block)
+    for unused in sorted(floor_accept - used_ids):
+        state = (
+            "was refused in a dispatched session"
+            if unused in floor_refused
+            else "already cleared by a fix"
+            if unused in floor_fixed
+            else "names no open floor finding"
+        )
+        print(
+            f"NOTE: PR #{pr_num} — '# floor-accept' id {unused} {state} on this PR; it waived nothing.",
+            file=sys.stderr,
+        )
+    floor_hits = len(p1) + len(cr_block) + len(devin_block) + len(tampered_block)
     if floor_hits:
         listing = "\n".join(
             [f"  [P1] {t}" for t in p1[:5]]
             + [f"  [CodeRabbit Critical/Major] {t}" for t in cr_block[:5]]
             + [f"  [Devin severe] {t}" for t in devin_block[:5]]
+            + [f"  {_one_safe_line(t)}" for t in tampered_block[:5]]
         )
+        edited = (
+            f"\n{len(tampered_block)} reviewer comment(s) were edited by someone other "
+            "than their reviewer: a fix reply cannot clear those; only the owner's "
+            "'# floor-accept=<id>' can."
+            if tampered_block
+            else ""
+        )
+        reasons = "\n".join(
+            f"  finding {fid} ({_safe_report_path(fpath) if fpath else 'no file'}): "
+            f"{_one_safe_line(why)}"
+            for fid, why, fpath in floor_unmet[:10]
+        )
+        if len(floor_unmet) > 10:
+            reasons += f"\n  ... and {len(floor_unmet) - 10} more"
         return True, (
             f"always-fix floor: {len(p1)} unresolved [P1] + {len(cr_block)} "
             f"CodeRabbit Critical/Major + {len(devin_block)} Devin severe "
-            f"finding(s), none cleared (a maintainer reply, or Devin's own "
-            f"'Resolved' reply to a Devin finding) "
+            f"+ {len(tampered_block)} edited reviewer "
+            f"finding(s), none cleared by a 'Fixed in <sha>' reply naming a later PR "
+            f"commit that touches the finding's file "
             f"(review score {score:.1f}). Severity blocks in EVERY lane (this "
             f"change is {lane.upper()}); the per-lane score threshold "
             f"({threshold:.1f} here) governs how many P2s may accumulate, never "
-            f"whether a P1 counts:\n{listing}\n"
-            f"Fix and reply in-thread, or append '# review-override' "
-            f"to the merge command to acknowledge and proceed."
+            f"whether a P1 counts:\n{listing}\n{reasons}\n"
+            f"Fix it and reply in-thread with a line that starts 'Fixed in <sha>.' (the "
+            f"fix commit, not a merge; any explanation after it). Otherwise ask the owner, "
+            f"and on their yes append '# floor-accept=<id>[,<id>]' to the merge command."
+            f"{edited}"
         )
+    if force:
+        # '# review-override': no floor finding this scan read is open.
+        return _waived_unread("an incomplete inline scan") if not complete else (False, "")
     if score >= threshold:
         # Floor findings cannot reach here — the floor above returned on any of
         # them — so this branch is purely an accumulation of 0.5-weight findings
@@ -5489,15 +6351,23 @@ def _format_rounds(result: dict) -> str:
 
 
 def _rounds_row(
-    pr_num: str, repo: str | None = None, budget_out: list[dict] | None = None
+    pr_num: str,
+    repo: str | None = None,
+    budget_out: list[dict] | None = None,
+    read_out: list[dict] | None = None,
 ) -> str:
     """The ``rounds`` line of ``--check-pr``: ADVISORY, never a failure.
 
     ``budget_out``, when given, receives the evaluator's result if it is ``ok``, so
-    the no-change note reads the same budget instead of fetching it a second time.
+    the no-change note reads the same budget instead of fetching it again.
+    ``read_out`` receives whatever this row read, unreadable included, so the
+    ``terminal-head`` row judges the very read this row printed and the two never
+    disagree.
 
-    The round budget is enforced where it acts (the review-request ask above and
-    the commit gate); counting it here too would be a second enforcer of one rule.
+    The round budget is enforced where it acts (the review-request ask above, the
+    commit gate, and at merge the ``terminal-head`` row, ``_check_past_terminal``,
+    which blocks an unreadable budget and a merge off the terminal head). This
+    line only displays the count.
     It is printed so the round number is read from the evaluator rather than
     re-derived by hand (#1719), with findings per round so a rising count is
     visible without remembering the last one (#1957).
@@ -5509,11 +6379,17 @@ def _rounds_row(
         return seam
     target = repo or _derive_repo_from_cwd(os.getcwd())
     if not target or _review_budget is None:
+        if read_out is not None:
+            read_out.append({"status": "unknown", "errors": ["no repository or evaluator"]})
         return "unreadable (no repository or evaluator)"
     try:
         result = _review_budget.evaluate_pr(target, pr_num, timeout_for=_gh_timeout)
     except Exception:  # noqa: BLE001 - an advisory row never takes the report down.
+        if read_out is not None:
+            read_out.append({"status": "unknown", "errors": ["lookup failed"]})
         return "unreadable (lookup failed)"
+    if read_out is not None:
+        read_out.append(result)
     if result.get("status") == "ok":
         import review_remaining  # noqa: PLC0415
 
@@ -5524,6 +6400,169 @@ def _rounds_row(
         if budget_out is not None:
             budget_out.append(result)
     return _format_rounds(result)
+
+
+#: Each of the delivery row's own GitHub reads. The report arms no merge deadline, so
+#: ``_gh_timeout`` gives the cap itself; 20 s is the PR 3 reader's per-read budget
+#: for a paginated comment list, with headroom.
+_DELIVERY_GH_TIMEOUT_S = 20.0
+
+#: Basis kinds that carry no points of their own to judge a PR against: a ledger row
+#: or follow-up is one sentence, and a claim is the PR's own description.
+_DELIVERY_WEAK_BASIS = {
+    "ledger": "a ledger row",
+    "follow-up": "a follow-up",
+    "claim": "the PR's own claim",
+}
+
+
+def _delivery_self_attestable(files: list[str] | None) -> bool:
+    """Whether a builder's own delivery read may stand on a PR with these files.
+
+    Owner rulings R1 and S8 (2026-11-17): only when every changed file is prose,
+    none lives under ``src/`` or ``.claude/agents/`` (prose there is runtime or agent
+    behaviour), and none is a critical-lane path. The lane counts the enforcement-hook
+    surface as critical too (``classify_lane``'s ``hook_surface``), so prose there is
+    excluded as well. An unreadable or empty list is no."""
+    import review_scope  # noqa: PLC0415 - scripts/ is on sys.path (top of file)
+
+    return bool(files) and all(
+        review_scope._is_lane_prose(p)
+        and not p.startswith(("src/", ".claude/agents/"))
+        and not review_scope._is_lane_critical_path(p)
+        and not _is_hook_surface_path(p)
+        for p in files
+    )
+
+
+def _delivery_row(pr_num: str, repo: str | None, head: str | None) -> str:
+    """The ``delivery`` line of ``--check-pr``: ADVISORY, never a failure.
+
+    It says whether the owner recorded a read of whether the PR delivers what its
+    basis asked (closing-session step 1a), at which head, and what since may have
+    voided it. A block would only prove a sentence exists, so this never touches
+    ``failures``, and the merge arm prints nothing (owner ruling, 2026-11-15).
+    ``_TEST_DELIVERY_ROW`` short-circuits it so report tests make no live call.
+    """
+    seam = os.environ.get("_TEST_DELIVERY_ROW")
+    if seam is not None:
+        return seam
+    if not _scheduled_gate_applies(repo):
+        return "n/a (scoped to the public repo only)"
+    try:
+        text = _delivery_row_text(pr_num, repo, head)
+    except Exception:  # noqa: BLE001 - an advisory row never takes the report down.
+        return "could not check (lookup failed)"
+    # ONE report line, whatever a gh error or a comment carried: a line break here
+    # could print a line of its own, such as a forged `merge-with`. Each part above is
+    # already bounded, so this strips without cutting.
+    return "".join(" " if _gate_text_unsafe(ch) else ch for ch in text)
+
+
+def _delivery_row_text(pr_num: str, repo: str | None, head: str | None) -> str:
+    import delivery_marker as dm  # noqa: PLC0415 - scripts/ is on sys.path (top of file)
+
+    target = repo or _derive_repo_from_cwd(os.getcwd())
+    if not target:
+        return "could not check (no repository)"
+    pr, t = int(pr_num), _gh_timeout(_DELIVERY_GH_TIMEOUT_S)
+    try:
+        comments = dm._comments(target, pr, timeout=t)
+    except dm.Refused as exc:
+        return f"could not check ({_sanitize_gate_text(str(exc))[:200]})"
+    # The other reads each lose only what they carry (S5): an unreadable review list
+    # hides only review-body blocks, which never govern, and an unreadable PR leaves
+    # the basis unchecked. Neither is ever silent.
+    unread = []
+    try:
+        meta = dm._pr(target, pr, timeout=t)
+    except dm.Refused:
+        meta = None
+        unread.append("the PR body: could not check")
+    try:
+        reviews = dm._comments(target, pr, reviews=True, timeout=t)
+    except dm.Refused:
+        reviews = []
+        unread.append("review bodies: could not check")
+    head = head or (meta or {}).get("head")
+    if not head:
+        return "could not check (the PR head is unreadable)"
+    sel = dm.select(comments, reviews, target.split("/")[0].lower(), head)
+    ignored = len(sel["notes"])
+    tail = f" ({ignored} ignored: {_sanitize_gate_text(sel['notes'][0])[:160]})" if ignored else ""
+    tail += "".join(f"; {u}" for u in unread)
+    gov = sel["governing"]
+    if gov is None:
+        bad = [b for b in sel["blocks"] if b["treatment"].startswith("unusable")]
+        if bad:
+            return (
+                "advisory — no usable owner delivery check recorded: "
+                + _sanitize_gate_text(f"comment {bad[-1]['id']}: {bad[-1]['problem']}")[:200]
+                + tail
+            )
+        return (
+            "advisory — no delivery check recorded: read it (closing-session step 1a), then"
+            f" `python3 scripts/delivery_marker.py compose --pr {pr_num} ...`" + tail
+        )
+    f = gov["fields"]
+    verdict, ok = f["verdict"], f["verdict"] == "DELIVERS"
+    if f["head"] == head:
+        lead = f"{verdict} at head"
+    elif _classify_base_advance_delta(
+        f["head"], head, _pr_base_sha(pr_num, repo=target) or "", target
+    ) == "inline":
+        lead = f"{verdict} carried from {f['head'][:12]}: own change unchanged"
+    else:
+        lead = f"check recorded at {f['head'][:12]}; carry unconfirmed: re-read ({verdict} there)"
+        ok = False
+    # The grammar fixes the basis's shape, not its length, and compose derives it from
+    # the PR body: bound it so one pointer line cannot flood the report (GLM, round 1).
+    lead += f", basis {f['basis'][:80]}"
+    # Each extra says whether it voids the read (True: the row cannot be ok) or only
+    # names something (False), so no rule depends on how its text happens to start.
+    extra: list[tuple[str, bool]] = []
+    # Named, not demoted (owner ruling, 2026-11-18): a read against one of these was
+    # judged without an issue's or a spec's points, so its DELIVERS is a weaker claim.
+    weak = _DELIVERY_WEAK_BASIS.get(f["basis"].split(":", 1)[0])
+    if weak:
+        extra.append((f"basis is {weak}, not an issue, spec or plan: a weaker check", False))
+    if f["scope"] != "CLEAN":
+        extra.append((f"scope {f['scope']}", False))
+    if f.get("intended") in ("not-stated", "unsupported"):
+        extra.append((f"intended={f['intended']}", True))
+    if ok and not any(v for _t, v in extra) and f["checker"] == "author-review":
+        if _delivery_self_attestable(_pr_changed_files(pr_num, repo=target)):
+            extra.append(("self-attested", False))
+        else:
+            lead = "the builder's own read: a closing read (checker=other) is owed; " + lead
+            ok = False
+    if verdict != "DELIVERS":
+        body = next((c.get("body") or "" for c in comments if c.get("id") == gov["id"]), "")
+        if m := dm._ASKED_RE.search(body):
+            extra.append(("Asked: " + _sanitize_gate_text(m.group(1))[:160], False))
+    if meta is not None:
+        try:
+            now = dm.basis_from_body(
+                meta.get("body"),
+                linked=lambda: dm.linked_issues(target, pr, timeout=t),
+                repo=target,
+            )
+        except dm.Refused as exc:
+            now, why = None, _sanitize_gate_text(str(exc))[:160]
+        if now is None:
+            extra.append((f"the PR's basis cannot be derived now ({why}): re-read", True))
+        elif now != f["basis"]:
+            extra.append((f"basis changed since the check (now {now[:120]})", True))
+    extra += dm.changes_since(
+        target, pr, f["basis"], f["head"], str(gov["stamp"] or ""), timeout=t
+    )
+    if sel["later_unusable"]:
+        problem = _sanitize_gate_text(sel["later_unusable"][-1]["problem"])[:120]
+        extra.append((f"a later owner block is unusable: '{problem}'", True))
+    if unread or any(voids for _text, voids in extra):
+        ok = False
+    text = lead + "".join(f"; {e}" for e, _voids in extra) + tail
+    return f"ok ({text})" if ok else f"advisory — {text}"
 
 
 #: How far back the no-change note walks over merge commits from the head.
@@ -5647,6 +6686,476 @@ def _stepped_merges_spare_review(
     return not (stepped & names)
 
 
+def _budget_commit_index(budget: dict) -> dict[str, tuple[str, list[str]]] | None:
+    """``{sha: (tree, parents)}`` for each budget commit whose tree and parents
+    were read, or None when a row is malformed. Shared by the no-change note and
+    the past-terminal walk, so both read the commit graph one way."""
+    known: dict[str, tuple[str, list[str]]] = {}
+    for c in budget.get("commits") or []:
+        if not isinstance(c, dict):
+            return None
+        sha, tree, parents = c.get("sha"), c.get("tree"), c.get("parents")
+        if isinstance(sha, str) and isinstance(tree, str) and tree and isinstance(parents, list):
+            known[sha.lower()] = (tree, [str(p).lower() for p in parents])
+    return known
+
+
+def _reaches_over_empty_commits(budget: dict, head: str, target: str) -> bool:
+    """Whether ``head`` reaches ``target`` through single-parent commits that
+    each have their parent's tree (empty commits), read from the budget's own
+    commit graph only. A merge, a commit that changed a file, or a commit whose
+    tree or parents were not read ends the walk: False. A tree comparison alone
+    is not enough (a head rebuilt on a newer base can carry the same tree and
+    squash to different content), hence the walk."""
+    known = _budget_commit_index(budget)
+    if not known:
+        return False
+    current = head.lower()
+    target = target.lower()
+    for _ in range(len(known) + 1):
+        if current == target:
+            return True
+        info = known.get(current)
+        if info is None or len(info[1]) != 1:
+            return False
+        parent = info[1][0]
+        parent_info = known.get(parent)
+        if parent_info is None or parent_info[0] != info[0]:
+            return False
+        current = parent
+    return False
+
+
+def _terminal_budget(pr_num: str, repo: str | None) -> dict:
+    """The review budget the past-terminal row judges. ``_TEST_TERMINAL_BUDGET``
+    (a JSON object) stands in for it, so merge and report tests make no live
+    GraphQL call. Anything that fails is an unknown budget, never a raise."""
+    seam = os.environ.get("_TEST_TERMINAL_BUDGET")
+    if seam is not None:
+        try:
+            got = json.loads(seam)
+        except ValueError:
+            got = None
+        return got if isinstance(got, dict) else {"status": "unknown", "errors": ["test_seam"]}
+    target = repo or _derive_repo_from_cwd(os.getcwd())
+    if not target or _review_budget is None:
+        return {"status": "unknown", "errors": ["no repository or evaluator"]}
+    try:
+        return _review_budget.evaluate_pr(target, pr_num, timeout_for=_gh_timeout)
+    except Exception:  # noqa: BLE001 - an unreadable budget is a block, never a crash.
+        return {"status": "unknown", "errors": ["lookup failed"]}
+
+
+def _check_past_terminal(
+    pr_num: str, repo: str | None, head: str | None, budget: dict | None = None
+) -> tuple[bool, str]:
+    """``(should_block, message)``: the past-terminal merge check (owner rulings
+    3f6ad6fb and cc17ee20, 2026-11-25). BLOCKING, shared by the merge arm and the
+    ``terminal-head`` row of ``--check-pr``, so the two cannot disagree.
+
+    - The budget unreadable: block, at any round count, since unknown cannot tell
+      below terminal from past it.
+    - Below terminal: pass.
+    - Past terminal: pass only when ``head`` (the merge's ``--match-head-commit``)
+      is the terminal head, or is the budget's current head and reaches the
+      terminal head over empty commits only. Otherwise block: the owner merges
+      with a bang command, or the PR is sent back. No sigil waives it."""
+    if budget is None:
+        budget = _terminal_budget(pr_num, repo)
+    owner_route = (
+        f"the owner merges with a bang command (`! gh pr merge {pr_num} ...`), "
+        "or the PR is sent back"
+    )
+    if budget.get("status") != "ok":
+        errors = ", ".join(str(e) for e in budget.get("errors") or []) or "evidence unknown"
+        return True, (
+            f"the review budget is unreadable ({errors}); an agent merge needs a readable "
+            f"budget at any round count. Retry, or {owner_route}."
+        )
+    state = budget.get("terminal_state")
+    if state == "below":
+        return False, "below terminal"
+    lane_limit = (
+        _review_budget.GATE_DISCOVERY_ROUND_LIMIT
+        if budget.get("gate_surface")
+        else _review_budget.STANDING_REVIEWED_HEAD_LIMIT
+    )
+    terminal = budget.get("terminal_head")
+    if state != "past" or not isinstance(terminal, str) or not terminal:
+        why = budget.get("terminal_error") or f"terminal state {state!r}"
+        return True, (
+            f"past round {lane_limit} the terminal head cannot be placed ({why}); "
+            f"merge or send back is the owner's call — {owner_route}."
+        )
+    terminal = terminal.lower()
+    merging = (head or "").strip().lower()
+    if merging and merging == terminal:
+        return False, f"past terminal, merging at the terminal head {terminal[:12]}"
+    current = str(budget.get("current_head") or "").lower()
+    if merging and merging == current and _reaches_over_empty_commits(budget, merging, terminal):
+        return False, (
+            f"past terminal, head {merging[:12]} reaches the terminal head "
+            f"{terminal[:12]} over empty commits only"
+        )
+    return True, (
+        f"past round {lane_limit} the PR moved off its terminal head {terminal}; "
+        f"merge or send back is the owner's call — {owner_route}."
+    )
+
+
+# ── Past-terminal route friction (owner ruling 3f6ad6fb, 2026-11-25) ──────────
+# The guarantee is the merge check above; these denies only make the common
+# routes that move a past-terminal head, or open a round on it, fail early.
+# VERDICT: deny, on a POSITIVE match only (an owner-approved escalation after a
+# measured incident). AUDIENCE: the agent. BACKGROUND: a dispatched session is
+# denied the same way (its pushes were already denied outright). Every lookup
+# that fails returns "no match", so unknown evidence keeps today's behaviour
+# (plan note R-S4); only the merge check blocks on it.
+_CODEX_MENTION_RE = re.compile(r"(?<![\w@])@codex\b", re.IGNORECASE)
+_API_PR_THREAD_RE = re.compile(r"/?repos/([^/\s]+/[^/\s]+)/(?:issues|pulls)/(\d+)/(?:comments|reviews)/?\Z")
+_API_COMMENT_RE = re.compile(r"/?repos/[^/\s]+/[^/\s]+/(?:issues|pulls)/comments/(\d+)/?\Z")
+# GraphQL mutations that delete, edit or hide a PR comment or a whole review (the
+# review names mirror builder_guard's list). A match is denied while the repo has any
+# open PR: resolving the target node to its PR would need the node id out of the
+# query or its variables, and this is the simpler of the two rules. Matched only in
+# a document that is a mutation, outside its strings and comments
+# (``gh_merge._graphql_code``).
+_GRAPHQL_COMMENT_REWRITE_RE = re.compile(
+    r"\b(?:deleteIssueComment|updateIssueComment|minimizeComment"
+    r"|deletePullRequestReviewComment|updatePullRequestReviewComment"
+    r"|updatePullRequestReview)\b"
+)
+_GRAPHQL_MUTATION_RE = re.compile(r"\bmutation\b")
+# A whole review (REST): deleting one removes it and its comments, and lowers the
+# round count, as deleting a comment does.
+_API_REVIEW_RE = re.compile(r"/?repos/([^/\s]+/[^/\s]+)/pulls/(\d+)/reviews/\d+/?\Z")
+
+
+def _graphql_rewrites_comment(query: str) -> bool:
+    code = _graphql_code(query)
+    return bool(_GRAPHQL_MUTATION_RE.search(code) and _GRAPHQL_COMMENT_REWRITE_RE.search(code))
+
+
+def _off_terminal_head(budget: dict) -> bool:
+    """For an ``@codex`` request: the PR head is not literally the terminal head.
+    Unlike the merge check there is no empty-commit allowance, because a review
+    at any other sha opens a round."""
+    current = str(budget.get("current_head") or "").lower()
+    return current != str(budget.get("terminal_head") or "").lower()
+
+
+def _owner_command(raw: str, cwd: str | None) -> str:
+    """The command the owner reruns. A deny aborts the whole Bash call, so a
+    ``cd`` earlier in it never ran: name the directory the segment ran in. The
+    command text is kept as typed, so a caller passes the directory BEFORE any
+    ``git -C`` (the push path's ``shell_cwd``), and that ``-C`` applies once."""
+    raw = raw.strip()
+    return f"cd {shlex.quote(cwd)} && {raw}" if cwd else raw
+
+
+def _past_terminal(budget) -> bool:
+    """A READABLE budget (``status: ok``) that is past terminal."""
+    return (
+        isinstance(budget, dict)
+        and budget.get("status") == "ok"
+        and budget.get("terminal_state") == "past"
+    )
+
+
+def _past_terminal_route_text(
+    what: str, pr_num: str, budget: dict, raw: str, cwd: str | None = None
+) -> str:
+    terminal = str(budget.get("terminal_head") or "")[:12]
+    return (
+        f"BLOCKED: {what} on PR #{pr_num}, which is past its terminal review round "
+        f"(terminal head {terminal}). Past terminal there are two choices: merge at the "
+        "terminal head with the remaining issues filed, or send the PR back. Anything "
+        f"else is the owner's call: the owner can run `! {_owner_command(raw, cwd)}` (a "
+        "bang command runs no hook)."
+    )
+
+
+def _push_dest_branches(argv: list[str], cur: str | None) -> list[str]:
+    """The branches a ``git push`` writes or deletes on the remote, from argv: the
+    DESTINATION of each refspec (``HEAD``/``@`` read as the current branch), or the
+    current branch for a push with no refspec (R-S1). A ``+`` force refspec is not a
+    positional; a force push to the public repo is blocked before this is asked.
+    Stated residual: ``--all``/``--mirror``, ``push.default=upstream`` to a
+    differently-named branch and configured push refspecs are read as the current
+    branch only (or nothing), so they keep today's behaviour."""
+    specs = _push_positionals(argv)[1:]
+    if not specs:
+        return [cur] if cur and "--tags" not in argv else []
+    out = []
+    for spec in specs:
+        src, sep, dst = spec.partition(":")
+        name = dst if sep else src
+        name = (cur or "") if name in ("HEAD", "@") else name.removeprefix("refs/heads/")
+        if name and not name.startswith("refs/") and name not in ("main", "master"):
+            out.append(name)
+    return out
+
+
+def _open_prs_for_branch(
+    branch: str, cwd: str | None, push_urls: set[str]
+) -> list[tuple[str, str]]:
+    """``[(number, OWNER/REPO)]`` of the open same-repository PRs headed by
+    ``branch``, in the repo gh resolves at ``cwd``; empty on any failure. As in
+    ``_open_pr_count_for_branch``, a PR counts only when every push URL names its
+    repository (read from the PR's own URL, so it costs no second call): gh may
+    resolve a different repo than the one the push reaches. A response that fills
+    the ``--limit`` window is a truncated read: unknown, so empty (best effort).
+    Stated residual: a FORK PR (``isCrossRepository``) is never matched, so a push
+    to a fork's head branch keeps today's behaviour. Seam
+    ``_TEST_GH_BRANCH_PRS``: a JSON object mapping a branch to ``gh pr list --json
+    number,url,isCrossRepository`` rows."""
+    raw = os.environ.get("_TEST_GH_BRANCH_PRS")
+    try:
+        if raw is not None:
+            rows = json.loads(raw).get(branch, [])
+        else:
+            got = subprocess.run(
+                ["gh", "pr", "list", "--head", branch, "--state", "open", "--json",
+                 "number,url,isCrossRepository", "--limit", str(_PR_LIST_WINDOW)],
+                capture_output=True, text=True, timeout=_gh_timeout(10.0), cwd=cwd or None,
+            )
+            rows = json.loads(got.stdout) if got.returncode == 0 else []
+    except Exception:  # noqa: BLE001 - friction: an unanswerable lookup matches nothing
+        return []
+    if not isinstance(rows, list) or len(rows) >= _PR_LIST_WINDOW:
+        return []
+    out = []
+    for row in rows:
+        url = _PR_URL_RE.match(str(row.get("url") or "")) if isinstance(row, dict) else None
+        if (
+            url
+            and row.get("isCrossRepository") is False
+            and _urls_name_repo(push_urls, f"https://github.com/{url.group(1)}")
+        ):
+            out.append((url.group(2), url.group(1)))
+    return out
+
+
+def _past_terminal_push_deny(
+    seg, cur: str | None, remote: str | None, cwd: str | None, shell_cwd: str | None = None
+) -> str | None:
+    """The refusal for a ``git push`` whose destination is the head branch of a
+    past-terminal PR, or None. One PR lookup per destination branch, and one budget
+    read only when that branch heads an open PR. A destination proven off origin,
+    a branch with no open PR, a failed lookup, an unreadable budget and a dry run
+    (it moves nothing) are None. ``shell_cwd`` is the directory before any
+    ``git -C``: the owner reruns the command as typed, so its ``-C`` applies once."""
+    if _push_is_dry_run(seg) or not _push_dest_meets_origin(remote, cwd, False):
+        return None
+    urls = _push_dest_urls(remote, cwd=cwd) if remote else set()
+    for branch in _push_dest_branches(seg.argv, cur):
+        for pr_num, repo in _open_prs_for_branch(branch, cwd, urls):
+            budget = _terminal_budget(pr_num, repo)
+            if _past_terminal(budget):
+                what = f"this push moves the head of '{branch}'"
+                return _past_terminal_route_text(what, pr_num, budget, seg.raw, shell_cwd or cwd)
+    return None
+
+
+def _pr_is_open(kind: str, ident: str, repo: str | None, cwd: str | None) -> bool:
+    """Whether ``ident`` is an OPEN pull request (``kind`` "pr"; "" is the current
+    branch's), a comment on one (``kind`` "comment"; ``ident`` is the endpoint), or
+    (``kind`` "repo") whether the repo has any open PR. False on any failed read:
+    best effort, by owner ruling. Seam ``_TEST_GH_PR_STATE``: a JSON object mapping
+    ``"pr:<n>"``, ``"comment:<id>"`` or ``"repo:"`` to ``OPEN``/``CLOSED``/``ISSUE``."""
+    raw = os.environ.get("_TEST_GH_PR_STATE")
+    if raw is not None:
+        key = ident if kind != "comment" else (_API_COMMENT_RE.match(ident) or [None, ""])[1]
+        try:
+            return str(json.loads(raw).get(f"{kind}:{key}") or "").upper() == "OPEN"
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _route_gh(*args: str) -> str:
+        got = subprocess.run(
+            ["gh", *args], capture_output=True, text=True, timeout=_gh_timeout(8), cwd=cwd or None
+        )
+        return got.stdout.strip() if got.returncode == 0 else ""
+
+    try:
+        if kind == "pr":
+            target = [ident] if ident else []
+            return _route_gh("pr", "view", *target, *_repo_args(repo), "--json", "state", "--jq", ".state") == "OPEN"
+        if kind == "repo":
+            got = _route_gh("pr", "list", *_repo_args(repo), "--state", "open", "--limit", "1",
+                     "--json", "number", "--jq", "length")
+            return got.isdigit() and int(got) > 0
+        parent = _route_gh("api", ident.lstrip("/"), "--jq", ".issue_url // .pull_request_url")
+        parent = parent.removeprefix("https://api.github.com/")
+        if not parent.startswith("repos/"):
+            return False
+        jq = 'if (.pull_request != null or .head != null) then .state else "issue" end'
+        return _route_gh("api", parent, "--jq", jq) == "open"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _route_target(seg, verb: str) -> tuple[str | None, str | None] | None:
+    """``(pr_number, explicit_repo)`` of a ``gh pr|issue comment``, ``gh pr review``
+    or ``gh pr update-branch`` segment: its first bare word after ``verb`` (a number,
+    ``#N`` or a PR URL); a None number means no target (the current branch's PR).
+    None when the target or the repo cannot be read literally (an expansion such as
+    ``"$N"``, a branch name, an unmodelled flag): no match, never a judgement of some
+    other PR (best effort, owner ruling)."""
+    argv = seg.argv
+    if verb == "comment":
+        tok, bad = _comment_positional(argv)
+        if bad or _unresolvable_identity(argv) is not None:
+            return None
+        words = [tok] if tok else []
+    else:
+        words, skip = [], False
+        for tok in argv[argv.index(verb) + 1:] if verb in argv else []:
+            if skip or tok in ("-b", "--body", "-F", "--body-file", "-R", "--repo"):
+                skip = not skip
+                continue
+            if not tok.startswith("-"):
+                words.append(tok)
+    repo = _comment_repo(argv)
+    if repo is not None and ("$" in repo or "`" in repo):
+        return None
+    if not words:
+        return None, repo
+    num, url = _PR_NUMBER_RE.match(words[0]), _PR_URL_RE.match(words[0])
+    if not (num or url):
+        return None
+    return (num.group(1), repo) if num else (url.group(2), repo or url.group(1))
+
+
+def _past_terminal_route_deny(segs, cmd: str, payload: dict) -> str | None:
+    """The refusal for a route that opens a round on, moves, or rewrites the record
+    of a pull request, or None:
+
+    - ``gh pr update-branch N`` on a past-terminal PR (it moves the head);
+    - an ``@codex`` mention (``gh pr|issue comment N``, ``gh api …/issues/N/comments``,
+      ``gh pr review N``) on a past-terminal PR whose head is off the terminal head.
+      At the terminal head it opens no round and is unchanged (F-B3). An issue
+      number reads as an unknown budget, so it is never matched (R-S3). A
+      ``gh pr comment`` that ``_check_codex_round_escalation`` treats as a review
+      request is left to it, so it costs one budget read, not two;
+    - F-S2: an agent's delete or edit of a comment on ANY open PR
+      (``--delete-last``/``--edit-last``, ``gh api -X DELETE|PATCH
+      …/{issues,pulls}/comments/<id>``): deleting a reviewer's comment lowers the
+      round count, and a pin lives in a comment. A bare comment id costs two API
+      reads to find its PR; a failed read allows (best effort, owner ruling). The
+      GraphQL comment mutations (``_GRAPHQL_COMMENT_REWRITE_RE``) are denied while the
+      repo has any open PR, one read.
+
+    A target or repo that cannot be read literally is no match (``_route_target``).
+    With no PR number the current branch's PR is resolved, and with no explicit repo
+    the repo is derived, from the command's own resolved cwd only, as the
+    review-request gate does; with no such cwd the route is not judged, never
+    against the hook's own directory. An absolute ``https://api.github.com/`` URL
+    is read as its path."""
+    for seg in segs:
+        inv = gh_command(seg.argv) if seg.exe == "gh" else None
+        if inv is None or gh_requests_help(seg.argv):
+            continue
+        cwd = _effective_cwd(cmd, payload, seg=seg)
+        cwd = cwd if isinstance(cwd, str) else None
+        verb = (inv.group, inv.subcommand)
+        api = gh_api_request(seg.argv) if inv.group == "api" else None
+        target: tuple[str | None, str | None] | None = (None, None)
+        body = None
+        if verb in (("pr", "comment"), ("issue", "comment")):
+            target = _route_target(seg, "comment")
+            if target is None:
+                continue  # an unresolvable identity is no match (best effort)
+            # Each flag on its own: gh_bool keeps only the LAST value it reads, so a
+            # `--delete-last=false` would otherwise cancel an `--edit-last`.
+            flags = any(
+                gh_bool(gh_option_values(seg.argv, frozenset({name})), frozenset({name}))
+                for name in ("--delete-last", "--edit-last")
+            )
+            if flags:
+                num, repo = target
+                if (num or cwd) and (repo or cwd) and _pr_is_open("pr", num or "", repo, cwd):
+                    return _comment_rewrite_text(seg.raw, cwd)
+            elif (
+                verb == ("pr", "comment")
+                and target[0]
+                and _comment_review_request(seg.argv)[2] is not False
+            ):
+                continue  # a numbered review request: _check_codex_round_escalation judges it
+            body = _comment_body(seg.argv)[0]
+        elif api is not None and api.endpoint:
+            endpoint = api.endpoint.removeprefix("https://api.github.com/")
+            literal = "{" not in endpoint and ":owner" not in endpoint
+            if endpoint.lstrip("/") == "graphql":
+                queries = [v for k, v in api.fields if k == "query"]
+                if (
+                    any(_graphql_rewrites_comment(q) for q in queries)
+                    and cwd
+                    and _pr_is_open("repo", "", None, cwd)
+                ):
+                    return _comment_rewrite_text(seg.raw, cwd)
+                continue
+            if api.method in ("DELETE", "PATCH") and _API_COMMENT_RE.match(endpoint):
+                if (literal or cwd) and _pr_is_open("comment", endpoint, None, cwd):
+                    return _comment_rewrite_text(seg.raw, cwd)
+                continue
+            review = _API_REVIEW_RE.match(endpoint)
+            # An edit only: GitHub deletes only a PENDING review, which counts no
+            # round, so denying a review delete would protect nothing.
+            if review and api.method in ("PUT", "PATCH"):
+                repo = review.group(1) if literal else None
+                if (repo or cwd) and _pr_is_open("pr", review.group(2), repo, cwd):
+                    return _comment_rewrite_text(seg.raw, cwd)
+                continue
+            thread = _API_PR_THREAD_RE.match(endpoint)
+            if not (thread and api.method == "POST"):
+                continue
+            target = (thread.group(2), thread.group(1) if literal else None)
+            files = {v for _, v in gh_option_values(seg.argv, frozenset({"-F", "--field"})) if v}
+            body = " ".join(
+                v
+                for k, v in api.fields
+                if k == "body" and not (v.startswith("@") and f"{k}={v}" in files)
+            )
+        elif verb in (("pr", "review"), ("pr", "update-branch")):
+            target = _route_target(seg, inv.subcommand)
+            if target is None:
+                continue
+            if verb == ("pr", "review"):
+                tail = ["comment", *seg.argv[seg.argv.index("review") + 1:]]
+                body = _comment_body(tail)[0]
+        update = verb == ("pr", "update-branch")
+        if not update and not (body and _CODEX_MENTION_RE.search(body)):
+            continue
+        num, repo = target
+        if num is None and not repo and cwd:
+            num = _resolve_pr_number("", cwd=cwd)
+        if not repo and cwd:
+            repo = _derive_repo_from_cwd(cwd)
+        if not num or not repo:
+            continue
+        budget = _terminal_budget(num, repo)
+        if not _past_terminal(budget):
+            continue
+        if update:
+            what = "this update-branch moves the head"
+            return _past_terminal_route_text(what, num, budget, seg.raw, cwd)
+        if _off_terminal_head(budget):
+            what = "this @codex mention opens a round"
+            return _past_terminal_route_text(what, num, budget, seg.raw, cwd)
+    return None
+
+
+def _comment_rewrite_text(raw: str, cwd: str | None = None) -> str:
+    return (
+        "BLOCKED: this command deletes or edits a comment on an open pull request. "
+        "Deleting a reviewer's comment lowers the review round count, and a pinned "
+        "head lives in a comment, so an agent does neither on an open PR. Post a new "
+        f"comment instead; the owner can run `! {_owner_command(raw, cwd)}` (a bang "
+        "command runs no hook)."
+    )
+
+
 def _no_change_note(
     pr_num: str, repo: str | None, budget: dict, *, clock: Callable[[], float] = time.monotonic
 ) -> str | None:
@@ -5692,13 +7201,9 @@ def _no_change_note(
         return None
     stop_at = clock() + _NO_CHANGE_BUDGET_S
 
-    known: dict[str, tuple[str, list[str]]] = {}
-    for c in budget.get("commits") or []:
-        if not isinstance(c, dict):
-            return None
-        sha, tree, parents = c.get("sha"), c.get("tree"), c.get("parents")
-        if isinstance(sha, str) and isinstance(tree, str) and tree and isinstance(parents, list):
-            known[sha.lower()] = (tree, [str(p).lower() for p in parents])
+    known = _budget_commit_index(budget)
+    if known is None:
+        return None
 
     def lookup(sha: str) -> tuple[str, str, list[str]] | None:
         if sha in known:
@@ -5969,6 +7474,14 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
                 )
             except Exception as exc:  # noqa: BLE001 - unknown asks/denies; never crashes open.
                 result = {"status": "unknown", "errors": [f"evaluator_raised:{type(exc).__name__}"]}
+
+        # Past terminal with the head moved off the terminal head, the ask past the
+        # limit becomes a deny (owner ruling 3f6ad6fb), for a positive request only;
+        # at the terminal head it stays the ask below (F-B3).
+        if body_signal is True and _past_terminal(result) and _off_terminal_head(result):
+            what = "this review request opens a round"
+            seg_cwd = effective_cwd if isinstance(effective_cwd, str) else None
+            return "deny", _past_terminal_route_text(what, pr_num, result, seg.raw, seg_cwd)
 
         if result.get("status") == "ok" and result.get("confirmation_exempt"):
             marker = _review_budget.confirmation_marker(
@@ -6417,6 +7930,7 @@ _HOOK_SURFACE_FILES = (
             "scripts/review_deadline.py",  # aggregate hook timeout arithmetic
             "scripts/external_review.py",  # autonomous review-request boundary
             "scripts/premise_gate.py",  # issue premise rule issue_premise_gate imports
+            "scripts/delivery_marker.py",  # marker parser + select the delivery row imports
             ".claude/settings.json",  # hook wiring (inline blob + matchers)
             # scripts/-root hooks wired via .claude/hooks/genesis-hook (which
             # resolves bare names as scripts/<name>); scripts/hooks/* wirings are
@@ -10527,7 +12041,9 @@ def _stale_base_counts(path: str) -> bool:
     return not _is_doc_path(path)
 
 
-def _stale_base_note(pr_num: str, repo: str | None = None, head: str | None = None) -> str | None:
+def _stale_base_note(
+    pr_num: str, repo: str | None = None, head: str | None = None, past_terminal: bool = False
+) -> str | None:
     """A NOTE when the PR's newest CI run predates base commits touching its code.
 
     WHY: a ``pull_request`` run tests the PR merged onto its base AS IT STOOD when
@@ -10651,14 +12167,23 @@ def _stale_base_note(pr_num: str, repo: str | None = None, head: str | None = No
     if unread and overlaps:
         lines.append(f"{len(unread)} of {len(paths)} code path(s) were not checked.")
     update = " ".join(["gh pr update-branch", pr_num, *_repo_args(repo)])
-    lines += [
+    lines.append(
         "Weigh it before merging: do those changes interact with this PR's? Most "
-        "overlaps merge cleanly.",
-        f"If they may, update the branch ({update}, or a merge or rebase) so CI runs "
-        f"on the current base.",
-        "That moves the head, so the review gate then needs a review of the new head.",
-        "Re-running the old run does not help: a re-run tests the same merge commit.",
-    ]
+        "overlaps merge cleanly."
+    )
+    if past_terminal:
+        # F-S5: past terminal an agent's update is denied (it moves the head).
+        lines.append(
+            "This PR is past its terminal review round, so do not update the branch: "
+            f"if they may, send it back, or the owner runs `! {update}`."
+        )
+    else:
+        lines += [
+            f"If they may, update the branch ({update}, or a merge or rebase) so CI "
+            f"runs on the current base.",
+            "That moves the head, so the review gate then needs a review of the new head.",
+        ]
+    lines.append("Re-running the old run does not help: a re-run tests the same merge commit.")
     return "\n".join(lines)
 
 
@@ -11536,11 +13061,10 @@ def _rework_blocks(body: str) -> list[tuple[str, object, str]]:
             inline = tokens[i + 1]
             blocks.append(("para", tuple(items), _rework_inline_text(inline)))
             i += 2
-        elif t in ("fence", "code_block", "hr"):
+        elif t in ("fence", "code_block", "hr") or (
+            t == "html_block" and re.sub(r"<!--.*?-->", "", tok.content, flags=re.DOTALL).strip()
+        ):
             blocks.append(("other", tuple(items), ""))
-        elif t == "html_block":
-            if re.sub(r"<!--.*?-->", "", tok.content, flags=re.DOTALL).strip():
-                blocks.append(("other", tuple(items), ""))
         i += 1
     return blocks
 
@@ -15871,6 +17395,14 @@ def _run_merge_and_push_gates() -> int:
         if _merge_deadline is None:
             _merge_deadline = time.monotonic() + _MERGE_GATE_BUDGET_S
 
+        # ── Past-terminal route friction, and comment rewrites on open PRs ──
+        # Before the round gate, so its deny wins over that gate's ask. See
+        # `_past_terminal_route_deny`; dispatched sessions are denied the same way.
+        route_deny = _past_terminal_route_deny(segs, cmd, payload)
+        if route_deny is not None:
+            print(route_deny, file=sys.stderr)
+            return 2
+
         # ── Codex round-authorization gate (`gh pr comment … @codex review`) ──
         # Review rounds (heads that drew findings; before the round-rule cutover,
         # heads Codex reviewed) decide when standing authorization ends. A dispatched session cannot
@@ -16100,6 +17632,16 @@ def _run_merge_and_push_gates() -> int:
                 # this only relaxes RE-approval of an already-approved branch).
                 cur = _current_branch(cwd=pcwd)
                 push_remote = _effective_push_remote(push_segs[0], cur, cwd=pcwd)
+                # Past terminal, a push onto the PR's head branch is denied, in any
+                # spelling (`_past_terminal_push_deny`). Dispatched sessions were
+                # denied above, so they are denied the same way.
+                _shell = _effective_cwd(cmd, payload, seg=push_segs[0], apply_dash_c=False)
+                terminal_deny = None if pcwd_unknown else _past_terminal_push_deny(
+                    push_segs[0], cur, push_remote, pcwd, _shell if isinstance(_shell, str) else None
+                )
+                if terminal_deny is not None:
+                    print(terminal_deny, file=sys.stderr)
+                    return 2
                 if (
                     not pcwd_unknown
                     and cur
@@ -16606,6 +18148,11 @@ def _run_merge_and_push_gates() -> int:
                 # has_trailing_override — which is why enumerating that helper's
                 # call sites missed the one sigil SKILL.md documents as logged.
                 force_override = merge_seg.override
+                # Per-finding owner acceptance of floor findings (#4933).
+                floor_accept_present = has_trailing_override(merge_seg.raw, "floor-accept")
+                floor_accept_ids, floor_accept_bad = trailing_sigil_ids(
+                    merge_seg.raw, "floor-accept"
+                )
                 for _sigil, _present, _waives in (
                     ("ci-override", ci_override, "ci-status"),
                     ("stale-review-override", stale_override, "codex-freshness+base-invariant"),
@@ -16617,6 +18164,7 @@ def _run_merge_and_push_gates() -> int:
                         "codex-freshness",
                     ),
                     ("rework-override", rework_override, "rework-contract"),
+                    ("floor-accept", floor_accept_present, "floor-findings"),
                 ):
                     if _present:
                         # `repo` is BLANK on one path, deliberately: a legacy
@@ -16729,7 +18277,11 @@ def _run_merge_and_push_gates() -> int:
                 # recompute right after the binding (commits 15 + body 6, each
                 # clamped by `_gh_timeout` to what is left): a drained budget
                 # there BLOCKS ("could not be recomputed"), never allows, and a
-                # merge without --body-file pays none of it.
+                # merge without --body-file pays none of it. Every merge then
+                # pays the past-terminal budget read (`_check_past_terminal`,
+                # one `evaluate_pr`, each gh call clamped by `_gh_timeout` to
+                # what is left): a drained budget there reads as unknown and
+                # BLOCKS, so this read is not counted in the 62s above.
                 # A timing-out fail-closed gate returns BLOCK immediately, so
                 # the additive worst case needs every call slow-but-successful.
                 mergeable = _check_mergeable(pr_num, repo=merge_repo)
@@ -17079,6 +18631,23 @@ def _run_merge_and_push_gates() -> int:
                         print(f"BLOCKED: PR #{pr_num} — {body_msg}", file=sys.stderr)
                         return 2
 
+                # Past-terminal head check (owner rulings 3f6ad6fb and cc17ee20,
+                # 2026-11-25). Every route that moves a head converges here, so the
+                # merge is bound to the terminal head past round 4 (the gate lane's
+                # confirmed head), and an unreadable budget blocks at any count.
+                # It judges the command's own --match-head-commit, which GitHub
+                # enforces atomically. No sigil waives it: the owner's route is a
+                # bang-command merge, which runs no hook. One budget read, clamped
+                # to the shared deadline by `_gh_timeout`; a drained deadline reads
+                # as unknown and blocks.
+                term_block, term_msg = _check_past_terminal(pr_num, merge_repo, merge_head)
+                if term_block:
+                    print(
+                        f"BLOCKED: PR #{pr_num} — {_sanitize_gate_text(term_msg)}",
+                        file=sys.stderr,
+                    )
+                    return 2
+
                 # Unresolved review findings (review body) — AFTER freshness +
                 # binding (see the ordering note above). Waived by
                 # # review-override (the FINDINGS sigil — not the stale one).
@@ -17106,11 +18675,39 @@ def _run_merge_and_push_gates() -> int:
                 # endpoint, separate check. Weighted score: P1=1.0, P2=0.5;
                 # blocks at the LANE's threshold (critical 1.0 / standard 2.0 /
                 # light 3.0), with any P1 blocking in every lane via the floor.
+                if floor_accept_bad:
+                    print(
+                        f"NOTE: PR #{pr_num} — '# floor-accept' needs the exact form "
+                        f"floor-accept=<id>[,<id>] with no spaces; this one waives nothing.",
+                        file=sys.stderr,
+                    )
+                floor_accept_used: set[int] = set()
+                floor_kwargs: dict = {}
+                if floor_accept_ids:
+                    floor_kwargs = {
+                        "floor_accept": floor_accept_ids,
+                        "floor_accept_used": floor_accept_used,
+                    }
                 should_block, inline_msg = _check_inline_review_findings(
                     pr_num,
                     force=force_override,
                     repo=merge_repo,
+                    # The head the merge is bound to; under a stale-review-override
+                    # with no binding, the fix check reads the current head itself.
+                    head=verified_head or merge_head or None,
+                    **floor_kwargs,
                 )
+                if floor_accept_used:
+                    _ids = "+".join(str(i) for i in sorted(floor_accept_used))
+                    _waived = f"floor-findings:used:{_ids}"
+                    _amend_note(
+                        "floor-accept",
+                        waived=_waived
+                        if len(_waived) <= 64
+                        else f"floor-findings:used:n{len(floor_accept_used)}",
+                    )
+                elif floor_accept_present:
+                    _amend_note("floor-accept", waived="floor-findings:unused")
                 if should_block:
                     print(
                         f"BLOCKED: PR #{pr_num} — inline review gate did not pass.",
@@ -17623,7 +19220,26 @@ def _print_gate_detail(msg: str) -> None:
         print("  " + line)
 
 
-def check_pr_report(pr_num: str, repo: str | None = None) -> int:
+def _parse_check_pr_floor_accept(argv: list[str]) -> frozenset[int] | None:
+    """A ``--check-pr`` run's ``--floor-accept <id>[,<id>]``; None when it is malformed."""
+    import argparse
+
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--floor-accept", action="append", default=[])
+    try:
+        values = parser.parse_known_args(argv)[0].floor_accept
+    except SystemExit:
+        return None
+    if not values:
+        return frozenset()
+    if len(values) > 1 or re.fullmatch(r"[0-9]{1,20}(?:,[0-9]{1,20})*", values[0]) is None:
+        return None
+    return frozenset(int(i) for i in values[0].split(","))
+
+
+def check_pr_report(
+    pr_num: str, repo: str | None = None, floor_accept: frozenset[int] = frozenset()
+) -> int:
     """CANONICAL pre-merge report: run the SAME checks the merge gate enforces.
 
     This exists so sessions never hand-roll the review check with ad-hoc
@@ -17737,9 +19353,29 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
         # gate disagree on exactly one gate.
         _print_gate_detail(msg)
     failures += 1 if blocked else 0
-    # Advisory: never touches `failures` (see `_rounds_row`).
+    # Advisory: never touches `failures` (see `_rounds_row`); the blocking half of
+    # the budget is the `terminal-head` row just below.
     _budget_seen: list[dict] = []
-    print(f"rounds         : {_rounds_row(pr_num, repo, budget_out=_budget_seen)}")
+    _budget_read: list[dict] = []
+    print(
+        "rounds         : "
+        f"{_rounds_row(pr_num, repo, budget_out=_budget_seen, read_out=_budget_read)}"
+    )
+    # BLOCKING, the same function the merge arm runs, judged at the head the
+    # merge-with line binds. It judges the rounds row's own read, unreadable
+    # included, so the two rows never show different budgets.
+    _term_budget = _budget_read[0] if _budget_read else None
+    _term_head = verified_head or (_term_budget or {}).get("current_head")
+    blocked, msg = _check_past_terminal(pr_num, repo, _term_head, budget=_term_budget)
+    print(
+        "terminal-head  : "
+        + ("BLOCK — " if blocked else "ok (")
+        + _sanitize_gate_text(msg).splitlines()[0]
+        + ("" if blocked else ")")
+    )
+    if blocked:
+        _print_gate_detail(msg)
+    failures += 1 if blocked else 0
     # Advisory too, and printed only when it fires: a push since the last review
     # that changed no file (see `_no_change_note`). It reuses the budget above.
     if _budget_seen:
@@ -17749,6 +19385,10 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
             _note = None
         if _note:
             print(_note)
+    # Advisory: never touches `failures` (see `_delivery_row`). It judges the head the
+    # rounds row read, so the two rows describe one head.
+    _row_head = _budget_seen[0].get("current_head") if _budget_seen else None
+    print(f"delivery       : {_delivery_row(pr_num, repo, _row_head)}")
     # Scheduled Claude review at HEAD — the SAME always-fail-closed gate the merge arm
     # enforces (shared function). A missing/stale/unreadable scheduled review is a
     # FAILURE line, never a false all-clear — the report must not diverge from enforcement.
@@ -17814,7 +19454,13 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     # VERDICT, not on the text, which is what makes an informational tail safe here
     # while a verdict flip would not be.
     uncounted: list[dict[str, int]] = []
-    blocked, msg = _check_inline_review_findings(pr_num, repo=repo, uncounted_out=uncounted)
+    floor_used: set[int] = set()
+    floor_kwargs: dict = (
+        {"floor_accept": floor_accept, "floor_accept_used": floor_used} if floor_accept else {}
+    )
+    blocked, msg = _check_inline_review_findings(
+        pr_num, repo=repo, uncounted_out=uncounted, head=verified_head or None, **floor_kwargs
+    )
     inline_state = (
         "BLOCK — " + msg.splitlines()[0]
         if blocked
@@ -17828,7 +19474,9 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     # owner ruling 2026-10-28) — ADVISORY: a stderr NOTE only, never a row in the
     # verdict, and never run by the merge arm.
     try:
-        stale_note = _stale_base_note(pr_num, repo=repo, head=verified_head)
+        stale_note = _stale_base_note(
+            pr_num, repo=repo, head=verified_head, past_terminal=_past_terminal(_term_budget)
+        )
     except Exception:  # noqa: BLE001 - an advisory NOTE never takes the report down.
         stale_note = None
     if stale_note:
@@ -17899,6 +19547,8 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
                 f"line below merges without the Squashed-From trailer.",
                 file=sys.stderr,
             )
+        if floor_used:
+            merge_cmd += "  # floor-accept=" + ",".join(str(i) for i in sorted(floor_used))
         print("merge-with     : " + merge_cmd)
     print(
         "verdict        :",
@@ -17920,5 +19570,12 @@ if __name__ == "__main__":
                 file=sys.stderr,
             )
             sys.exit(2)
-        sys.exit(check_pr_report(sys.argv[2], repo=_repo))
+        _floor_accept = _parse_check_pr_floor_accept(sys.argv[3:])
+        if _floor_accept is None:
+            print(
+                "ERROR: --floor-accept takes one value, <id>[,<id>] in decimal with no spaces.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        sys.exit(check_pr_report(sys.argv[2], repo=_repo, floor_accept=_floor_accept))
     run_guard(_main_with_note, "git_push_guard")

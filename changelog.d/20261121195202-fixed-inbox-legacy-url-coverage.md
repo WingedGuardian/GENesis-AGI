@@ -1,0 +1,1 @@
+- Inbox coverage reports now count links absent from readable legacy inputs as never encountered when no other retained evidence makes their history uncertain.

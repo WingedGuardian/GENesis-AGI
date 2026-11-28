@@ -148,10 +148,23 @@ else, that asks a different question.
 
 ## The method
 
+A premise check of a PR built from a spec (its body carries a `Spec:` line)
+reads the spec and its `## Amendments`, not only the PR: the spec is the
+statement of what was asked.
+
 **1. Extract the premises.** State the claims the change DEPENDS ON, as the author
 would state them — from the PR body, the plan file, the commit messages. Usually
 two to four. A premise is load-bearing: if it were false, would the change still be
-worth making? If yes, it is context, not a premise.
+worth making? If yes, it is context, not a premise. Where the plan or issue answers
+the premise form, its answers are claims too: step 3 tests item 5, and step 5 tests item 7.
+
+Each premise belongs to a **layer**: the **problem** (items 1 to 5: is this real,
+and what would fixing it look like) or the **change** (items 6 to 9: is this the
+right fix). Name it on the claim line (the output, below). Item 2's citation is
+always one of the problem-layer claims: open the doc, test, ruling or comment it
+names and read it, never take the citation's word for it. When it says `nowhere`,
+the claim is that the change is a proposal: check that the PR does not present it
+as a fix.
 
 **2. Record what you expect BEFORE checking.** One line. This is the control on
 your own reading: a session that starts out believing the PR is doomed will find it
@@ -167,6 +180,12 @@ Do them one at a time. The pull is to check the first, find it sound, and let th
 carry the rest; premises fail individually and the second one is where it usually
 happens.
 
+**Test item 5 as one of them.** Can the acceptance line fail? Name an outcome that
+would fail it. Then run the named wrong fix against it: the acceptance must fail
+that fix. Where the answer is `Wrong fix: none, because ...`, test that reason. An acceptance nothing could fail, or one the wrong fix passes, is a
+finding, because it cannot tell the change apart from the fix the issue warned
+against.
+
 **4. Ask the EFFECT question, explicitly:** *what does the caller do differently
 because of this output?* Verifying that a value ARRIVES is not verifying that
 anything CHANGES. That gap is the single most common thing this check catches and a
@@ -175,7 +194,15 @@ consumer on the far end does nothing with it (or, worse, drops it at a second ga
 nobody enumerated).
 
 **5. Then the COMPARATIVE question**, which is the half a validity check leaves out:
-given the premises that hold, is this the BEST available shape? Look specifically
+given the premises that hold, is this the BEST available shape? **Start from the
+author's item 7.** Confirm or refute each alternative it names, with evidence, as
+for any premise. Search from scratch only when it says "none found" (or the form is
+absent), and then say what you searched. In a review round that follows a round
+with a `fix-now`, the previous round's reflection carries an `Alternative:` line
+(owed from `review_reflection.ALTERNATIVE_CUTOVER_ISO`; an older one may lack it)
+(what already does or decides the thing its fix builds, or `none found: searched
+<what>`): judge that fix against it the same way, confirming or refuting it, and
+treat a "none found" as a search to repeat, not a finding. Either way, look specifically
 for:
 - an existing **chokepoint** the change re-implements or bypasses (the common one —
   a skipped helper is a call-site defect, not a missing feature, and the fix is to
@@ -239,8 +266,8 @@ absolute. Being a rework is not itself a reason to stay unsplit.
 ```
 Design-premise: <SOUND | SOUND-BUT-INFERIOR | BROKEN>[ — <qualifier>]
 Expected before checking: <one line>
-P1 <TRUE | FALSE | UNPROVEN> — <claim> · <evidence> · <confidence>% · falsified by <x>
-P2 <TRUE | FALSE | UNPROVEN> — …
+P1 <TRUE | FALSE | UNPROVEN> (<problem | change>) — <claim> · <evidence> · <confidence>% · falsified by <x>
+P2 <TRUE | FALSE | UNPROVEN> (<problem | change>) — …
 Effect: <what the caller does differently — or "nothing", which is the finding>
 Better shape: <none found | the alternative, named>
 PR-shape: <OK (N counted lines, band, one concern) | SPLIT — PR1 <concern>, PR2 <concern> …, in dependency order>
@@ -262,6 +289,14 @@ check that the reflection restates what you concluded. The rules:
   and the claim: `P1 TRUE — …`. A short qualifier may follow the verdict in
   parentheses (`P3 FALSE (partially) — …`); the verdict word is still the one read.
   A claim line with its verdict at the end is refused.
+- That qualifier carries the claim's **layer** (step 1): `P1 TRUE (problem) — …`,
+  `P2 FALSE (change) — …`. The parser reads ONE parenthesis: to add a qualifier,
+  put it after the layer inside the same one, `P3 FALSE (change, partially) — …`.
+  A second parenthesis refuses the whole block. When the verdict is not SOUND,
+  its qualifier names the layer that failed:
+  `Design-premise: SOUND-BUT-INFERIOR — change layer`. The effect-nil case
+  (below) keeps its own wording: every claim holds there, so no layer failed. Both are
+  free text the parser already accepts, and nothing reads the layer by code.
 - The `Expected before checking:` line is required: one line, directly under the
   verdict line. If you restate your block in a summary, the Expected line may sit
   in either one, as long as that block also has claim lines. The claim lines follow it. One line per claim: do not wrap a claim

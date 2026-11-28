@@ -87,10 +87,9 @@ class ContentDrafter:
         """Load VOICE.md as default system prompt for unguided drafts."""
         from pathlib import Path
 
-        path = Path(__file__).resolve().parent.parent / "identity" / "VOICE.md"
-        if path.exists():
-            return path.read_text(encoding="utf-8")
-        return None
+        from genesis.identity.paths import read_identity
+
+        return read_identity("VOICE.md", Path(__file__).resolve().parent.parent / "identity")
 
     @staticmethod
     def _build_prompt(request: DraftRequest) -> str:

@@ -28,7 +28,17 @@ Applies to any PR whose diff touches the enforcement-hook surface (`scripts/revi
   `hooks.asks.review_request: off`, a transient read failure on a lone review
   request becomes a note instead of an ask (a dispatched session is still
   refused; the commit gate still asks). The round-2 merge-or-abandon decision
-  (rule 4 below) is doctrine; no gate makes it.
+  (rule 4 below) is doctrine; no gate makes it. The merge gate does bind where it
+  lands: past the limit an agent merges only at the lane's terminal head (the
+  earliest confirmation marker's head still in the PR that the primary reviewer reviewed after the
+  marker, else the round-2 head by
+  `opened_at`), or at a head that adds only empty commits to it, and an unreadable
+  budget blocks every agent merge (`git_push_guard.py` `_check_past_terminal`, the
+  `terminal-head` row of `--check-pr`). Any other head is the owner's bang-command
+  merge or a send-back. Past that limit the push guard also denies, foreground and
+  dispatched alike, a push onto the PR's branch, `gh pr update-branch`, and an
+  `@codex` mention off the terminal head (`_past_terminal_route_deny`,
+  `_past_terminal_push_deny`); an unreadable budget leaves these as they were.
 
   **Scope: any PR whose diff touches the enforcement-hook surface** —
   `HOOK_SURFACE_PREFIXES` + `HOOK_SURFACE_FILES` in `scripts/review_budget.py`.
