@@ -243,6 +243,101 @@ class TestCollectServiceStatus:
         assert result["pid"] is None
         assert result["pid_alive"] is False
 
+    @pytest.mark.parametrize(
+        ("unit", "label", "lock_name"),
+        [
+            ("genesis-server.service", "Server", "genesis-server.lock"),
+            ("genesis-bridge.service", "Bridge", "bridge.lock"),
+        ],
+    )
+    @pytest.mark.parametrize("pid_text", ["not-a-pid", "", str(2**31), str(2**63)])
+    def test_invalid_lock_pid_keeps_service_section(
+        self, tmp_path, unit, label, lock_name, pid_text,
+    ):
+        """#5096: unreadable lock PIDs must not hide the service rows."""
+        result = self._collect_with(
+            tmp_path, unit, label, main_pid=1234, locks={lock_name: pid_text},
+        )
+        assert result["pid"] is None
+        assert result["pid_alive"] is False
+        assert result["service_label"] == label
+        assert result["service_unit"] == unit
+        assert result["active_state"] == "active"
+
+    @pytest.mark.parametrize(
+        ("unit", "label", "lock_name"),
+        [
+            ("genesis-server.service", "Server", "genesis-server.lock"),
+            ("genesis-bridge.service", "Bridge", "bridge.lock"),
+        ],
+    )
+    def test_valid_lock_pid_is_alive_for_both_units(
+        self, tmp_path, unit, label, lock_name,
+    ):
+        """#5096: a valid owned PID still reports alive and matches MainPID."""
+        import os
+
+        me = os.getpid()
+        result = self._collect_with(
+            tmp_path, unit, label, main_pid=me, locks={lock_name: str(me)},
+        )
+        assert result["pid"] == me
+        assert result["pid_alive"] is True
+        assert result["main_pid"] == str(me)
+        assert result["service_label"] == label
+        assert result["service_unit"] == unit
+
+    @pytest.mark.parametrize("pid_text", [str(2**31), str(2**63), "not-a-pid"])
+    def test_invalid_lock_pid_keeps_health_sections(self, tmp_path, pid_text):
+        """#5096: the health response keeps every service section, not just bridge."""
+        for name in ("genesis-server.lock", "bridge.lock"):
+            (tmp_path / name).write_text(pid_text)
+
+        with (
+            patch("genesis.observability.service_status._PID_DIR", tmp_path),
+            patch("genesis.observability.service_status._WATCHDOG_STATE",
+                  tmp_path / "watchdog_state.json"),
+            patch("genesis.observability.service_status.query_systemd_unit",
+                  return_value={"ActiveState": "active", "SubState": "running",
+                                "MainPID": "1234"}),
+            patch("genesis.observability.service_status._detect_genesis_service",
+                  return_value=("genesis-server.service", "Server")),
+        ):
+            result = collect_service_status()
+        assert result["bridge"]["pid"] is None
+        assert result["bridge"]["pid_alive"] is False
+        assert result["bridge"]["service_label"] == "Server"
+        assert "watchdog_timer" in result
+        assert "watchdog" in result
+        assert "tmp_watchgod" in result
+
+    def test_valid_lock_pid_keeps_health_sections(self, tmp_path):
+        """#5096: a valid owned PID still fills every service section."""
+        import os
+
+        me = os.getpid()
+        for name in ("genesis-server.lock", "bridge.lock"):
+            (tmp_path / name).write_text(str(me))
+
+        with (
+            patch("genesis.observability.service_status._PID_DIR", tmp_path),
+            patch("genesis.observability.service_status._WATCHDOG_STATE",
+                  tmp_path / "watchdog_state.json"),
+            patch("genesis.observability.service_status.query_systemd_unit",
+                  return_value={"ActiveState": "active", "SubState": "running",
+                                "MainPID": str(me)}),
+            patch("genesis.observability.service_status._detect_genesis_service",
+                  return_value=("genesis-server.service", "Server")),
+        ):
+            result = collect_service_status()
+        assert result["bridge"]["pid"] == me
+        assert result["bridge"]["pid_alive"] is True
+        assert result["bridge"]["main_pid"] == str(me)
+        assert result["bridge"]["service_label"] == "Server"
+        assert "watchdog_timer" in result
+        assert "watchdog" in result
+        assert "tmp_watchgod" in result
+
     def test_watchdog_in_backoff(self, tmp_path):
         state_file = tmp_path / "watchdog_state.json"
         state_file.write_text(json.dumps({
