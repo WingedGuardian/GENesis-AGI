@@ -1,0 +1,1 @@
+- New read-only script `scripts/lesson_backlog_report.py` reports on the draft lessons in the lesson store: each draft's nearest earlier lesson, topics of near-duplicate lessons, the drafts each live lesson would absorb, and the share of drafts with no close neighbour. It writes markdown and a per-draft CSV to `~/.genesis/output/` and changes no row.
