@@ -93,13 +93,13 @@ names, in its approval question, the slot it will create and leave behind
 (`.claude/docs/background-sessions.md` carries this for the sessions that
 launch).
 
-**Hold every closing verdict.** A closed record is permanent, and the tool
-checks a document's form, not whether it covers every claim the PR made:
-MEASURED 2026-11-08, 9 of 9 documents it accepted were incomplete. Until an
-independent completeness check exists (#4180), a validator never records a
-closing verdict (`pass-mechanical`, `pass-with-measured-gaps`, a dry run that
-says it "CLOSES the row") on its own judgment. It records open verdicts as
-usual, and saves a closing document as
+**Hold every closing verdict.** A closed record is permanent. MEASURED
+2026-11-08, 9 of 9 documents the earlier writer accepted were incomplete. The
+writer now requires an independent completeness receipt (#4180). Route the
+concerns and send any derived closing verdict (`pass-mechanical` or
+`pass-with-measured-gaps`) for independent review, including a verdict printed
+with a preview refusal. Record open verdicts as usual and save a closing
+document as
 `~/.genesis/output/pr-verifications/awaiting-review/<owner>-<repo>-<N>.json`
 instead. The sealed Codex validator cannot write there (its writable roots are
 `~/tmp/validator`, `~/.genesis/output/validator-runs` and `prv-*` outputs), so
@@ -357,8 +357,9 @@ loop's end.
    - **An open verdict** (`fail-intent`, `cannot-verify`, `not-yet-done`): record
      it for real now. It closes nothing; with tracking still pending the tool
      stores the measurement, keeps the row open and exits 4.
-   - **A closing verdict** (`pass-mechanical`, `pass-with-measured-gaps`, the dry
-     run saying it "CLOSES the row"): do NOT record it. Save the document as
+   - **A closing verdict** (`pass-mechanical` or `pass-with-measured-gaps`):
+     do NOT record it. A refused preview can print `Derived verdict` and exit 2
+     when the receipt is still missing. Save the document as
      `~/.genesis/output/pr-verifications/awaiting-review/<owner>-<repo>-<N>.json`
      now, as "Hold every closing verdict" (in "Rules for every validator") says.
 5. **Route.** For each concern, file or reuse its issue through
@@ -366,7 +367,11 @@ loop's end.
    before retrying) and add the receipt to the document's `tracking`. Then, for
    an open verdict, record again until `pr_verification.py` stops exiting 4 and
    run `.venv/bin/python scripts/validator_checkpoint.py checkpoint --repo <repo> --pr <N> --db-path <the record: line's path>`;
-   for a closing verdict, dry-run again until it exits 0 and re-save the file.
+   for a closing verdict, preview again after routing. A missing completeness
+   receipt is expected before review. Resolve any pending route or other close
+   refusal before handing off the routed file. The receipt binds the final
+   evidence, including `tracking`. After review and before an authorized
+   close, dry-run with the current receipt and require exit 0 and "CLOSES the row".
 6. **Report and stop where due:**
    - an open `fail-intent`: tell the owner in the session, or once with
      `outreach_send` if they are not attached. **Never end a pass on a
@@ -750,7 +755,8 @@ deterministic rule could catch only a few (measured 2026-11-14).
   before arm in its measurement; a claim citing tests from two or more test
   modules (two claims folded into one?); an `accepted_limit` resting on a pass
   count. Once the verdict is derived, the CLI prints them as `pr_verification:
-  check:` lines (dry run, open record or close), and MCP returns them as `prompts`. They change no verdict and are not stored, so
+  check:` lines (dry run, open record or close), and MCP returns them as `prompts`
+  in successful responses. They change no verdict and are not stored, so
   **answer each one on the dry run, before the real close**: fix the document, or
   judge that it does not apply. A close is permanent.
 
@@ -762,11 +768,13 @@ before the reviewer sees the candidate. Stage B audits that retained inventory,
 every claim/gap/control, and every file disposition against the evidence. Retain
 the actual fresh-context execution; JSON alone does not prove independence.
 
-The current P2 release can parse and check this optional receipt. It does not
-yet enforce completeness in either close writer, authorize a validator launch,
-or release HOLD. A successful offline `check` establishes binding to the supplied
-packet, not fresh GitHub state or a complete semantic judgment. The shared close
-gate and its installed qualification are separate work. Historical documents
+The CLI and MCP require the receipt for any result that would close an
+obligation with complete tracking. Both verify it against a fresh PR source
+snapshot and then refresh tracking before deciding whether to close. A
+refused preview exposes the derived verdict and leaves the row untouched. A
+successful offline `check` establishes binding to the supplied packet. Keep
+installed qualification and the owner's explicit HOLD release as
+separate steps. Historical documents
 without the field still parse; omit malformed/incomplete output when recording
 a legitimate open attempt and retain the raw review separately.
 

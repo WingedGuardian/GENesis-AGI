@@ -5,9 +5,9 @@ provider, register an external client's transcript, change settings or release
 HOLD. Use the execution surface and spending authority already granted by the
 user. Prepare concrete artifacts before asking for authority that is missing.
 
-The current P2 implementation parses optional receipts and checks them offline.
-Neither existing close writer enforces this report yet. Treat every passing
-fixture, prepared packet and successful check within that boundary.
+Both close writers require a current receipt when a result would close an
+obligation and tracking is complete. Check the actual CLI and MCP generations
+before using that enforcement on an install.
 
 ## Prepare inputs
 
@@ -152,7 +152,6 @@ pilots and strict prospective qualification must establish usefulness before
 HOLD release. A synthetic unit-test report proves only structural behavior.
 
 Refresh each actual writer generation through its authorized lifecycle before
-using a new schema. P2 is advisory. Shared CLI/MCP enforcement, fresh source
-acquisition at close, installed verification and the user's explicit release
-remain separate gates. Legitimate open/tracking-pending measurements retain
+using the receipt. Verify both installed writers against fresh source snapshots
+before the user's explicit release. Legitimate open/tracking-pending measurements retain
 their existing policy; omit malformed optional output rather than losing them.

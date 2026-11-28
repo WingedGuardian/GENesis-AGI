@@ -9,6 +9,7 @@ from pathlib import Path
 import aiosqlite
 import pytest
 
+from tests.fixtures.verification_sources import simple_receipt, use_real_receipt_assessment
 from tests.test_scripts.test_pr_verification_closer import (
     EVENT_GAP,
     NOW,
@@ -21,6 +22,7 @@ from tests.test_scripts.test_pr_verification_closer import (
     _row,
     _run,
     _seed,
+    _with_tracking,
 )
 from tests.test_scripts.test_pr_verification_closer import (
     _close_before_the_fixture_dates as _close_before_the_fixture_dates,
@@ -28,6 +30,8 @@ from tests.test_scripts.test_pr_verification_closer import (
 from tests.test_scripts.test_pr_verification_closer import (
     _no_real_github as _no_real_github,
 )
+from tests.test_scripts.test_validator_checkpoint import call as checkpoint
+from tests.test_scripts.test_verification_readers import _w
 
 DONE = {"repo": REPO, "result": "done", "note": "7 of 7 weekly runs present"}
 FAILED = {"repo": REPO, "result": "failed", "note": "the run after the trigger is missing"}
@@ -134,6 +138,31 @@ def test_a_dry_run_lists_the_rechecks_it_would_store(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "rechecks : 1 to store" in out and "--index 0  2026-11-02" in out
     assert _row(db)["rechecks"] is None, "nothing written"
+
+
+def test_a_receipt_bearing_close_flows_through_backlog_and_recheck(tmp_path, capsys, monkeypatch):
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    use_real_receipt_assessment(monkeypatch)
+    gap = EVENT_GAP | {"trigger": "the next weekly run"}
+    doc = simple_receipt(_with_tracking(_doc(gaps=[gap])))
+    assert _run(tmp_path, doc, route=False) == 0
+    stored = _row(db)
+    assert stored["status"] == "closed"
+    assert json.loads(stored["evidence"])["completeness"]["evidence_sha256"] == doc["completeness"]["evidence_sha256"]
+    capsys.readouterr()
+    assert checkpoint(db, "--pause") == 0
+    report = json.loads(capsys.readouterr().out)["rows"][0]
+    assert report["review_status"] == "stored_bindings_verified"
+    assert report["source_freshness"] == "not_checked"
+    _w._print_verification_backlog(str(db))
+    backlog = capsys.readouterr().out
+    assert f"OPEN  {REPO}#7" not in backlog
+    assert "Rechecks due" in backlog and "the next weekly run" in backlog and "--index 0" in backlog
+    assert _recheck(tmp_path, DONE) == 0
+    after = _row(db)
+    assert after["status"] == "closed" and after["evidence"] == stored["evidence"]
+    assert json.loads(after["rechecks"])[0]["results"][0]["note"] == DONE["note"]
 
 
 def test_a_non_closing_outcome_stores_no_recheck(tmp_path):

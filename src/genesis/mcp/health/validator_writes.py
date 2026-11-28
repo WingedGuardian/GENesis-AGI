@@ -14,7 +14,11 @@ from pydantic import StrictInt
 from genesis.db.connection import connect_aiosqlite_rw
 from genesis.db.crud import follow_ups
 from genesis.mcp.health import mcp
-from genesis.session_awareness.pr_recording import check_merge_commit, gh_pr_metadata
+from genesis.session_awareness.pr_recording import (
+    assess_recording,
+    check_merge_commit,
+    gh_pr_metadata,
+)
 from genesis.util.tasks import tracked_task
 
 logger = logging.getLogger(__name__)
@@ -148,8 +152,6 @@ async def record_verification(
     from genesis.session_awareness.pr_evidence import (
         MAX_EVIDENCE_BYTES,
         Refusal,
-        check_e2e_coverage,
-        check_event_dates,
         completeness_prompts,
         decide,
         parse_evidence,
@@ -193,16 +195,14 @@ async def record_verification(
         mismatch = check_merge_commit(doc.merge_commit, actual.merge_commit)
         if mismatch:
             raise ToolError(mismatch)
-        from genesis.session_awareness.pr_tracking import assess_tracking
-
-        tracking = await assess_tracking(doc, db=db)
+        tracking, refusal = await assess_recording(
+            doc, decision, db=db, merge_commit=actual.merge_commit, today=_today
+        )
+        if refusal:
+            if preview:
+                raise ToolError(f"Derived verdict: {decision.verdict} (close refused)\n{refusal.message}")
+            raise ToolError(refusal.message)
         closing = decision.closing and tracking.complete
-        coverage = check_e2e_coverage(doc, actual.body) if closing else None
-        if coverage:
-            raise ToolError(coverage.message)
-        dated = check_event_dates(doc, closing, _today())
-        if dated:
-            raise ToolError(dated.message)
         rechecks = rechecks_for(doc) if closing else []
         if rechecks and not await crud._rechecks_column_available(db):
             raise ToolError("Rechecks are owed but their column is unavailable; run the migration first")
@@ -214,6 +214,9 @@ async def record_verification(
             "measurement_would_close": decision.closing,
             "tracking_complete": tracking.complete,
             "tracking": tracking.as_dict(),
+            "completeness": "verified" if closing else (
+                "tracking_pending" if decision.closing else "not_required"
+            ),
             "dry_run": preview,
             "server_dry_run_only": forced,
             "recorded": False,

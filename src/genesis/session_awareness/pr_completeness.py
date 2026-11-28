@@ -6,8 +6,11 @@ or that its judgments are true. Retained execution and qualification own that.
 
 from __future__ import annotations
 
+import re
+from array import array
 from dataclasses import dataclass, fields
 from datetime import datetime
+from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal
 
@@ -224,6 +227,9 @@ class CompletenessAssessment:
     status: Literal["missing", "stale", "failed", "inconsistent", "verified"]
 
 
+_MISSING_REVIEW = CompletenessAssessment(False, "independent completeness review is missing", "missing")
+
+
 def evidence_sha256(doc: EvidenceDocument) -> str:
     return digest(canonical_json(doc.model_dump(mode="json", exclude={"completeness"})).encode())
 
@@ -241,45 +247,68 @@ def source_binding(snapshot: PrSourceSnapshot) -> SourceBinding:
 
 def _references(references, snapshot):
     files = {entry["filename"]: entry for entry in snapshot.files}
-    body_lines = snapshot.body.split("\n")
-    diff_lines = snapshot.diff.split("\n")
+    sources = {"body": snapshot.body, "diff": snapshot.diff}
+    offsets = {}
+    for kind, text in sources.items():
+        # Compact offsets keep even a diff with many short lines bounded.
+        positions = array("I", [0])
+        positions.extend(match.end() for match in re.finditer("\n", text))
+        offsets[kind] = positions
+    hunks = {}
+    for match in re.finditer(r"^@@[^\n]*", snapshot.diff, re.MULTILINE):
+        hunks.setdefault(match.group(), match.start())
+
+    @cache
+    def quote_matches(kind, quote, start, stop):
+        return sources[kind].find(quote, start, stop) != -1
+
     for reference in references:
         if isinstance(reference, BlobSource):
             if reference.path not in files or reference.sha != files[reference.path]["sha"]:
                 raise SourceError("source blob reference is not in the file census")
             continue
-        lines = body_lines if reference.kind == "body" else diff_lines
+        positions = offsets[reference.kind]
         end = reference.end or reference.start
-        if not reference.start <= end <= len(lines):
+        if not reference.start <= end <= len(positions):
             raise SourceError("source reference line range is invalid")
-        if reference.quote not in "\n".join(lines[reference.start - 1 : end]):
+        text = sources[reference.kind]
+        stop = positions[end] - 1 if end < len(positions) else len(text)
+        if not quote_matches(reference.kind, reference.quote, positions[reference.start - 1], stop):
             raise SourceError("source reference quote does not match its exact lines")
         if isinstance(reference, DiffSource):
             if reference.path not in files:
                 raise SourceError("diff reference path is absent from the census")
             if reference.hunk is not None and (
-                not reference.hunk.startswith("@@") or reference.hunk not in lines[:end]
+                hunks.get(reference.hunk, len(text)) >= stop
             ):
                 raise SourceError("diff reference hunk is absent")
         # Path/hunk attribution and statement meaning remain reviewer judgments;
         # this is coordinate/quote validation, not a second Git path parser.
 
 
-def validate_inventory(inventory: ReviewInventory, snapshot: PrSourceSnapshot) -> None:
-    if inventory.source != source_binding(snapshot):
-        raise SourceError("inventory source binding does not match the packet")
+def _validate_inventory_structure(inventory: ReviewInventory) -> None:
     ids = [entry.id for entry in inventory.items]
     paths = [entry.path for entry in inventory.files]
     if len(ids) != len(set(ids)) or len(paths) != len(set(paths)):
         raise SourceError("inventory has duplicate item IDs or file dispositions")
-    if set(paths) != {entry["filename"] for entry in snapshot.files}:
-        raise SourceError("inventory file dispositions do not cover the complete census")
     for entry in inventory.files:
         if len(entry.items) != len(set(entry.items)) or not set(entry.items) <= set(ids):
             raise SourceError("file disposition has duplicate or unknown inventory items")
+
+
+def _validate_inventory_sources(inventory: ReviewInventory, snapshot: PrSourceSnapshot) -> None:
+    if {entry.path for entry in inventory.files} != {entry["filename"] for entry in snapshot.files}:
+        raise SourceError("inventory file dispositions do not cover the complete census")
     _references((reference for entry in inventory.items for reference in entry.sources), snapshot)
     if inventory.e2e_steps != e2e_steps(snapshot.body):
         raise SourceError("inventory E2E steps differ from the source declaration identities")
+
+
+def validate_inventory(inventory: ReviewInventory, snapshot: PrSourceSnapshot) -> None:
+    if inventory.source != source_binding(snapshot):
+        raise SourceError("inventory source binding does not match the packet")
+    _validate_inventory_structure(inventory)
+    _validate_inventory_sources(inventory, snapshot)
 
 
 def _check_reviews(review, doc):
@@ -332,26 +361,23 @@ def _closing_e2e_refusal(doc: EvidenceDocument, snapshot: PrSourceSnapshot) -> s
     )
 
 
-def assess_completeness(
-    doc: EvidenceDocument, snapshot: PrSourceSnapshot
-) -> CompletenessAssessment:
+def assess_stored_completeness(doc: EvidenceDocument) -> CompletenessAssessment:
+    """Check the retained receipt without claiming that its sources are current."""
     review = doc.completeness
     if review is None:
-        return CompletenessAssessment(
-            False, "independent completeness review is missing", "missing"
-        )
+        return _MISSING_REVIEW
     from genesis.session_awareness.pr_recording import check_merge_commit
 
     try:
-        if (doc.repo, doc.pr) != (snapshot.repo, snapshot.pr) or check_merge_commit(
-            doc.merge_commit, snapshot.merge_commit
+        source = review.inventory.source
+        if (doc.repo, doc.pr) != (source.repo, source.pr) or check_merge_commit(
+            doc.merge_commit, source.merge_commit
         ):
             return CompletenessAssessment(
                 False, "evidence merge identity differs from sources", "stale"
             )
         if (
-            review.inventory.source != source_binding(snapshot)
-            or review.inventory_sha256 != inventory_sha256(review.inventory)
+            review.inventory_sha256 != inventory_sha256(review.inventory)
             or review.evidence_sha256 != evidence_sha256(doc)
         ):
             return CompletenessAssessment(
@@ -361,7 +387,7 @@ def assess_completeness(
             return CompletenessAssessment(
                 False, "independent review is incomplete or has unresolved findings", "failed"
             )
-        validate_inventory(review.inventory, snapshot)
+        _validate_inventory_structure(review.inventory)
         review.validate_indices(doc)
         ids = {entry.id for entry in review.inventory.items}
         mapped = [entry.item for entry in review.coverage]
@@ -375,6 +401,36 @@ def assess_completeness(
             ):
                 raise SourceError(f"every evidence {name} entry needs a source inventory mapping")
         _check_reviews(review, doc)
+    except SourceError as exc:
+        return CompletenessAssessment(False, str(exc), "inconsistent")
+    except (ValueError, TypeError, KeyError, UnicodeError):
+        return CompletenessAssessment(
+            False, "review structure or source references are inconsistent", "inconsistent"
+        )
+    return CompletenessAssessment(True, "stored evidence and report bindings verified", "verified")
+
+
+def assess_completeness(
+    doc: EvidenceDocument, snapshot: PrSourceSnapshot
+) -> CompletenessAssessment:
+    review = doc.completeness
+    if review is None:
+        return _MISSING_REVIEW
+    from genesis.session_awareness.pr_recording import check_merge_commit
+
+    try:
+        if (doc.repo, doc.pr) != (snapshot.repo, snapshot.pr) or check_merge_commit(
+            doc.merge_commit, snapshot.merge_commit
+        ):
+            return CompletenessAssessment(False, "evidence merge identity differs from sources", "stale")
+        if review.inventory.source != source_binding(snapshot):
+            return CompletenessAssessment(
+                False, "review source, inventory or evidence digest is stale", "stale"
+            )
+        stored = assess_stored_completeness(doc)
+        if not stored.valid:
+            return stored
+        _validate_inventory_sources(review.inventory, snapshot)
         refusal = _closing_e2e_refusal(doc, snapshot)
         if refusal is not None:
             return CompletenessAssessment(False, refusal, "inconsistent")

@@ -3547,9 +3547,10 @@ verified: 41c7343b3 2026-11-15
   and shared CLI recording helpers, with independent PR and actual merge-commit
   checks before previews or writes. CLI and MCP use one empty-safe attempt-note
   formatter and require explicit `e2e` claim/gap mappings for every declared plan
-  before a closing result. Both fetch the PR body with its merge SHA and refuse
-  uncovered or stale declarations, including previews; old evidence still parses
-  and reasoned `E2E: none` declarations need no mapping. The shared source parser
+  before a closing result. Both check the merge SHA first and use a single fresh
+  source snapshot for the close-time E2E and completeness checks, including
+  previews. Old evidence still parses and reasoned `E2E: none` declarations need
+  no mapping. The shared source parser
   also supplies the existing script facade (verified: 2026-11-06).
   Both writers also refuse a closing verdict while an event-gated gap's date has
   come, and print or return advisory completeness prompts (`completeness_prompts`)
@@ -3562,8 +3563,10 @@ verified: 41c7343b3 2026-11-15
   refusal bounds: `docs/reference/verification-review.md`.
   Typed `pr_completeness.CompletenessReview` receipts and the read-only `check`
   command bind a retained independent inventory and evidence to that packet.
-  P2 parses/checks receipts; it does not yet enforce either close writer. Offline
-  checks do not establish live source freshness or reviewer independence.
+  Both close writers require the current receipt before a close or would-close
+  preview. Open and tracking-pending attempts retain their existing path.
+  Checkpoint reports stored receipt binding independently of routing and leaves
+  source freshness unchecked. Retained reviewer execution is separate evidence.
   Fixture lookup injection stays outside the public MCP schema. Its
   server-side calibration gate forces preview until operator opt-in, including
   attempt notes. Real writes use a separate admitted existing-only connection;

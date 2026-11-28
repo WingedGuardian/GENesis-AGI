@@ -171,7 +171,11 @@ async def test_stdio_lookup_is_in_the_child(tmp_path, recording):
     async with client(fixture, "health") as mcp:
         tool = next(t for t in await mcp.list_tools() if t.name == "pr_verification_close")
         assert set(tool.inputSchema["properties"]) == {"evidence_json", "pr", "park", "note", "verdict", "dry_run"}
-        result = (await mcp.call_tool("pr_verification_close", {"pr": 7, "evidence_json": json.dumps(_doc())})).data
+        from tests.fixtures.verification_sources import simple_receipt
+
+        result = (await mcp.call_tool("pr_verification_close", {
+            "pr": 7, "evidence_json": json.dumps(simple_receipt(_doc())),
+        })).data
         assert result["recorded"] is recording
     receipt = tmp_path / "merge-lookups.jsonl"
     assert receipt.is_file(), "No child-local merge lookup receipt"

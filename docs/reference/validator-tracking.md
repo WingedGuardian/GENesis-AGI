@@ -13,9 +13,9 @@ Use this contract in batch prompts, including bare CLI clients:
 
 > Read CLAUDE.md and the validating-merges skill. Keep this client's existing
 > authorization boundaries. Preflight actual public/private tools, select and log
-> the explicit PR set, then measure one row at a time. Persist each valid
-> measurement before filing; unresolved routing is pending, not a reason to lose
-> evidence. Classify each concern, search/reuse or file its public task, verify
+> the explicit PR set, then measure one row at a time. Record open verdicts before
+> filing and retain closing candidates for independent review. Classify each
+> concern, search/reuse or file its public task, verify
 > live readback and meaning, and record structured tracking. Whole private tasks
 > require concrete unavoidable disclosure harm. Checkpoint each row and batch.
 > On user pause stop selecting work immediately, preserve evidence and report a
@@ -49,11 +49,16 @@ before selecting work; respect server-forced preview and native guard denials.
 
 ## Persist, route, verify
 
-Write valid evidence immediately through the authorized CLI or MCP writer.
+Record open verdicts through the authorized CLI or MCP writer. Save and route
+closing candidates before independent review as the validating-merges skill
+describes.
 Until routing is complete the measurement stays OPEN with its actual verdict.
 CLI exit 4 means the measurement was recorded (or previewed) but routing is
 pending; read the row before retrying. MCP reports `recorded`, `tracking_complete`,
-`tracking` and `would_close` separately. A preview records nothing.
+`tracking` and `would_close` separately. Both writers refresh routing after a
+would-close measurement passes the source and receipt checks. A receipt that
+becomes ineligible keeps the row open through the same pending path. A preview
+records nothing.
 
 The strict evidence document adds `tracking`, one entry per target:
 
@@ -113,6 +118,12 @@ pause, never certifies completion. Neither command is a session lifecycle hook o
 a Stop-hook trap. The shared writers enforce completion; the workflow requires
 the checkpoint before claiming a batch handled. A client that never submits its
 measurement is not covered by a writer gate.
+
+Each row reports `review_status` alongside its routing result. A valid stored
+receipt gives `stored_bindings_verified`. A closed record with evidence that
+predates receipts gives `historical_unreviewed`. The checkpoint sets
+`source_freshness` to `not_checked`, including when it checks public tracking
+receipts online. The writers check fresh PR sources on a would-close decision.
 
 ## Historical audit
 

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import private_module
+from tests.fixtures.verification_sources import simple_receipt
 from tests.test_scripts.test_pr_verification_closer import _doc, _row, _seed
 
 _tool = private_module("validator_checkpoint_under_test", Path(__file__).resolve().parents[2] / "scripts/validator_checkpoint.py")
@@ -25,6 +26,39 @@ def seed_evidence(tmp_path, doc, *, closed=False):
 def call(path, *extra, command="checkpoint"):
     return _tool.main([command, "--repo", "owner/repo", "--db-path", str(path),
                        *( ["--pr", "7"] if command == "checkpoint" else []), *extra])
+
+
+@pytest.mark.parametrize(("case", "closed", "expected"), [
+    ("missing", False, "missing"),
+    ("missing", True, "historical_unreviewed"),
+    ("stale", True, "stale"),
+    ("failed", False, "failed"),
+    ("invalid", True, "invalid"),
+    ("verified", True, "stored_bindings_verified"),
+])
+def test_checkpoints_report_receipt_binding_without_fetching_sources(
+    tmp_path, capsys, monkeypatch, case, closed, expected
+):
+    from genesis.session_awareness import pr_verification_sources
+
+    monkeypatch.setattr(pr_verification_sources, "acquire_sources", lambda *a: pytest.fail("opened full sources"))
+    doc = _doc()
+    if case != "missing":
+        doc = simple_receipt(doc)
+    if case == "stale":
+        doc["claims"][0]["measurement"] = "different measurement"
+    elif case == "failed":
+        doc["completeness"]["complete"] = False
+    elif case == "invalid":
+        doc["completeness"] = {"invalid receipt": True}
+    path = seed_evidence(tmp_path, doc, closed=closed)
+    before = _row(path)
+    assert call(path, "--pause") == 0
+    report = json.loads(capsys.readouterr().out)["rows"][0]
+    assert report["review_status"] == expected
+    assert report["source_freshness"] == "not_checked"
+    assert report["complete"] is (case != "invalid")
+    assert _row(path) == before
 
 
 @pytest.mark.parametrize("closed", [False, True])

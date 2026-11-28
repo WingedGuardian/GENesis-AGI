@@ -13,6 +13,15 @@ from genesis.db.crud import pr_verifications
 from genesis.db.schema import create_all_tables, seed_data
 from genesis.mcp.external_profiles import ExternalProfileMiddleware
 from genesis.session_awareness.pr_recording import PrMetadata
+from tests.fixtures.verification_sources import (
+    CLOSE_CASES,
+    reviewed_close,
+    simple_receipt,
+    stub_legacy_writer_review,
+    tracking_closes_during_acquisition,
+    use_real_receipt_assessment,
+    writer_source,
+)
 from tests.test_scripts.test_pr_verification_closer import MERGE_SHA, _doc, _doc_for, _with_tracking
 
 
@@ -53,6 +62,7 @@ async def recording(tmp_path, monkeypatch):
     monkeypatch.setattr(codex_validator_config, "_base_path", lambda: config)
     monkeypatch.setattr(follow_up_tools, "_get_db", lambda: shared)
     monkeypatch.setattr(validator_writes, "gh_pr_metadata", lambda repo, pr: PrMetadata(MERGE_SHA, ""))
+    stub_legacy_writer_review(monkeypatch)
     from genesis.session_awareness import pr_tracking
     monkeypatch.setattr(pr_tracking, "public_receipt", lambda *a: "synthetic task covers concern")
     try:
@@ -98,11 +108,15 @@ async def test_unlinked_finding_records_measurement_but_reports_pending(recordin
 
 async def test_pending_tracking_retains_measurement_before_close_only_e2e_gate(recording, monkeypatch):
     from genesis.mcp.health import validator_writes
+    from genesis.session_awareness import pr_verification_sources
+
     path, _, config = recording
     config.with_suffix(".local.yaml").write_text("dry_run_only: false")
     monkeypatch.setattr(validator_writes, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, "E2E: run timer"))
+    monkeypatch.setattr(pr_verification_sources, "acquire_sources", lambda *a: pytest.fail("opened full sources"))
     result = await call(_doc(findings=[dict(summary="timer defect", disposition="unfiled")]), route=False)
     assert result["recorded"] and not result["would_close"]
+    assert result["measurement_would_close"] and result["completeness"] == "tracking_pending"
     assert row(path)["verdict"] == "pass-mechanical"
 
 
@@ -152,12 +166,14 @@ async def test_private_receipt_reads_actual_eligible_follow_up(recording, inacti
 @pytest.mark.parametrize("covered", [False, True])
 async def test_mcp_enforces_e2e_mapping_before_preview_or_write(recording, monkeypatch, preview, covered):
     from genesis.mcp.health import validator_writes
+    from genesis.session_awareness import pr_verification_sources
 
     path, _, config = recording
     config.with_suffix(".local.yaml").write_text("dry_run_only: false")
     before = row(path)
     step = "restart the timer and measure its next run"
     monkeypatch.setattr(validator_writes, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, "E2E: " + step))
+    monkeypatch.setattr(pr_verification_sources, "acquire_sources", lambda *a: writer_source(*a, "E2E: " + step))
     doc = _doc(e2e=[{"step": step, "claim": 0}]) if covered else _doc()
     if covered:
         result = await call(doc, dry_run=preview)
@@ -172,13 +188,16 @@ async def test_mcp_enforces_e2e_mapping_before_preview_or_write(recording, monke
 
 async def test_missing_mapping_does_not_prevent_recording_an_incomplete_attempt(recording, monkeypatch):
     from genesis.mcp.health import validator_writes
+    from genesis.session_awareness import pr_verification_sources
 
     path, _, config = recording
     config.with_suffix(".local.yaml").write_text("dry_run_only: false")
     monkeypatch.setattr(validator_writes, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, "E2E: run the timer"))
+    monkeypatch.setattr(pr_verification_sources, "acquire_sources", lambda *a: pytest.fail("opened full sources"))
     doc = _doc(gaps=[{"kind": "not_yet_done", "detail": "not run", "command": "run timer"}])
     result = await call(doc)
     assert result["verdict"] == "not-yet-done" and result["recorded"]
+    assert result["completeness"] == "not_required" and not result["measurement_would_close"]
     assert row(path)["status"] == "open"
 
 
@@ -200,13 +219,16 @@ async def test_the_result_echoes_the_documents_no_progress(recording, monkeypatc
     assert preview["recorded"] is False and preview["no_progress"] is bool(declared)
 
 
-async def test_existing_mcp_close_stores_rechecks_without_a_new_caller_argument(recording):
+async def test_existing_mcp_close_stores_rechecks_without_a_new_caller_argument(recording, monkeypatch):
     path, _, config = recording
     config.with_suffix(".local.yaml").write_text("dry_run_only: false")
     gap = {"kind": "event_gated", "detail": "Synthetic future run",
            "trigger": "2030-01-02", "recheck": "echo synthetic"}
-    result = await call(_doc(gaps=[gap]))
+    use_real_receipt_assessment(monkeypatch)
+    doc = simple_receipt(_with_tracking(_doc(gaps=[gap])))
+    result = await call(doc, route=False)
     assert result["recorded"] is True
+    assert result["completeness"] == "verified"
     stored = row(path)
     assert stored["status"] == "closed"
     assert json.loads(stored["rechecks"]) == [
@@ -307,7 +329,8 @@ async def test_a_clean_document_returns_no_prompts(recording):
     assert result["prompts"] == []
 
 
-async def test_a_close_with_a_date_gate_already_come_is_refused(recording, monkeypatch):
+@pytest.mark.parametrize("receipt", [False, True])
+async def test_a_close_with_a_date_gate_already_come_is_refused(recording, monkeypatch, receipt):
     from datetime import date
 
     from genesis.mcp.health import validator_writes
@@ -319,33 +342,77 @@ async def test_a_close_with_a_date_gate_already_come_is_refused(recording, monke
         "trigger": "2026-11-14",
         "recheck": "gh run list",
     }
+    path, _, _ = recording
+    before = row(path)
+    doc = _with_tracking(_doc(gaps=[gate]))
+    if receipt:
+        doc = simple_receipt(doc)
+    use_real_receipt_assessment(monkeypatch)
     with pytest.raises(ToolError, match=r"gaps/0 \(trigger 2026-11-14\)"):
-        await call(_doc(gaps=[gate]), dry_run=True)
+        await call(doc, route=False, dry_run=True)
+    assert row(path) == before
 
 
-@pytest.mark.parametrize("review_complete", [False, True])
-async def test_p2_receipt_is_stored_without_claiming_close_enforcement(recording, tmp_path, monkeypatch, review_complete):
-    from dataclasses import replace
-
+@pytest.mark.parametrize("case", CLOSE_CASES)
+@pytest.mark.parametrize("mode", ["write", "explicit-preview", "forced-preview"])
+async def test_close_requires_an_independent_receipt(recording, tmp_path, monkeypatch, case, mode):
     from genesis.mcp.health import validator_writes
-    from genesis.session_awareness.pr_completeness import source_binding
-    from tests.test_session_awareness.test_pr_completeness import refresh, reviewed
 
     path, _, config = recording
     source_dir = tmp_path / "source"
     source_dir.mkdir()
-    doc, source = reviewed(source_dir)
-    source = replace(source, merge_commit=MERGE_SHA)
-    doc["merge_commit"] = MERGE_SHA
-    doc["completeness"]["inventory"]["source"] = source_binding(source).model_dump(mode="json")
-    doc["completeness"]["complete"] = review_complete
-    refresh(doc)
-    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    doc, source = reviewed_close(source_dir, monkeypatch, case)
+    if mode != "forced-preview":
+        config.with_suffix(".local.yaml").write_text("dry_run_only: false")
     monkeypatch.setattr(validator_writes, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, source.body))
-    assert (await call(doc, route=False))["recorded"] is True
+    before = row(path)
+    flags = {"dry_run": mode == "explicit-preview", "route": False}
+    if reason := CLOSE_CASES[case]:
+        with pytest.raises(ToolError, match=reason) as refused:
+            await call(doc, **flags)
+        if mode != "write" and case == "missing":
+            assert "Derived verdict: pass-mechanical (close refused)" in str(refused.value)
+        assert row(path) == before
+        return
+    result = await call(doc, **flags)
+    assert result["completeness"] == "verified" and result["would_close"]
+    assert result["server_dry_run_only"] is (mode == "forced-preview")
+    assert result["recorded"] is (mode == "write")
     stored = row(path)
+    if mode != "write":
+        assert stored == before
+        return
     assert stored["status"] == "closed"
     receipt = json.loads(stored["evidence"])["completeness"]
-    assert receipt["complete"] is review_complete
+    assert receipt["complete"] is True
     assert receipt["evidence_sha256"] == doc["completeness"]["evidence_sha256"]
     assert receipt["review_execution_ref"] == "fixture-only:no-model-ran"
+    with pytest.raises(ToolError, match="no OPEN row"):
+        await call(doc, **flags)
+    assert row(path) == stored
+
+
+@pytest.mark.parametrize("mode", ["write", "explicit-preview", "forced-preview"])
+async def test_tracking_closed_during_source_acquisition(recording, monkeypatch, mode):
+    path, _, config = recording
+    if mode != "forced-preview":
+        config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    before = row(path)
+    doc = simple_receipt(_with_tracking(_doc(
+        findings=[{"summary": "reachable timer defect", "disposition": "filed"}],
+    )))
+    reads = tracking_closes_during_acquisition(monkeypatch)
+    result = await call(doc, route=False, dry_run=mode == "explicit-preview")
+    assert reads == ["tracking", "sources", "tracking"]
+    assert result["recorded"] is (mode == "write")
+    assert result["measurement_would_close"] and not result["would_close"]
+    assert result["completeness"] == "tracking_pending"
+    assert "public task closed while acquiring PR sources" in result["tracking"]["pending"][0]
+    stored = row(path)
+    if mode != "write":
+        assert stored == before
+        return
+    assert stored["status"] == "open"
+    assert stored["verdict"] == "pass-mechanical"
+    assert stored["attempt_count"] == before["attempt_count"] + 1
+    assert json.loads(stored["evidence"])["findings"] == doc["findings"]

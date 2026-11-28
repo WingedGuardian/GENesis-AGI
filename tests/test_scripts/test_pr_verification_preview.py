@@ -8,10 +8,12 @@ import sqlite3
 import subprocess
 import sys
 import threading
+from pathlib import Path
 
 import aiosqlite
 import pytest
 
+from tests.fixtures.verification_sources import simple_receipt
 from tests.test_scripts.test_pr_verification_closer import MERGE_SHA, _doc_for, _prv, _seed
 
 
@@ -50,7 +52,8 @@ def test_actual_cli_preview_preserves_committed_wal(tmp_path, verdict):
     _commit_only_to_wal(path, "UPDATE pr_verifications SET pr_number=8")
     before = _bytes(path)
     evidence = tmp_path / "evidence.json"
-    evidence.write_text(json.dumps(_doc_for(verdict, pr=8)))
+    doc = _doc_for(verdict, pr=8)
+    evidence.write_text(json.dumps(simple_receipt(doc) if verdict == "pass-mechanical" else doc))
     binary = tmp_path / "bin"
     binary.mkdir()
     gh = binary / "gh"
@@ -67,10 +70,20 @@ def test_actual_cli_preview_preserves_committed_wal(tmp_path, verdict):
         GENESIS_HOME=str(tmp_path / "private-home"),
         PATH=str(binary) + os.pathsep + os.environ["PATH"],
     )
+    script = _prv.__file__
+    root = str(Path(script).resolve().parents[1])
     command = [
         sys.executable,
         "-I",
-        str(_prv.__file__),
+        "-c",
+        "import runpy,sys; "
+        "sys.path[:0]=[sys.argv[1]+'/src',sys.argv[1]]; "
+        "from genesis.session_awareness import pr_verification_sources; "
+        "from tests.fixtures.verification_sources import writer_source; "
+        "pr_verification_sources.acquire_sources=writer_source; "
+        "sys.argv=sys.argv[2:]; runpy.run_path(sys.argv[0],run_name='__main__')",
+        root,
+        script,
         "close",
         "--pr",
         "8",

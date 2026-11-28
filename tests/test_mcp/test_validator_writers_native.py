@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import private_module
+from tests.fixtures.verification_sources import simple_receipt
 from tests.test_hooks.native_codex import (
     configure,
     fixture_provider,
@@ -57,7 +58,7 @@ async def test_native_validator_writer_dispatch(tmp_path, monkeypatch, client, c
     arguments = ({"content": "Owner-directed synthetic native measurement", "source": "native fixture",
                   "confidence": 0.95, "memory_class": "fact", "wing": "dev_workflow", "room": "validation",
                   "collection": case if memory and profile == "validator" else "episodic_memory"}
-                 if memory else {"pr": 7, "evidence_json": json.dumps(_doc())}
+                 if memory else {"pr": 7, "evidence_json": json.dumps(simple_receipt(_doc()))}
                  if case in {"preview", "record"} else
                  {"content": "Synthetic native private finding", "reason": "Synthetic native evidence",
                   "work_state": "ready", "strategy": "user_input_needed", "request_key": "native-finding"})
@@ -84,6 +85,7 @@ async def test_native_validator_writer_dispatch(tmp_path, monkeypatch, client, c
     sources = {"writer/" + str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
                for p in [ROOT / "scripts/genesis_mcp_server.py", Path(__file__),
                          ROOT / "tests/test_mcp/validator_stdio_fixture.py", ROOT / "tests/test_hooks/native_codex.py",
+                         ROOT / "tests/fixtures/verification_sources.py",
                          *sorted((ROOT / "src/genesis").rglob("*.py"))]}
     sources.update({"adapter/" + str(p.relative_to(runtime)): hashlib.sha256(p.read_bytes()).hexdigest()
                     for p in runtime.rglob("*") if p.is_file() and ".venv" not in p.parts})

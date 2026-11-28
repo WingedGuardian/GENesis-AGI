@@ -34,10 +34,16 @@ system excludes both, preserving existing NULL behavior.
 `park`, `note`, `verdict` expectation and `dry_run`. Duplicate JSON keys, strict
 model errors, PR mismatch and verdict-policy refusals precede DB work. Both raw
 UTF-8 and canonical evidence are capped at256KiB. The verdict is derived;
-passing measurements close an OPEN obligation only after shared structured
-tracking checks complete. Pending routing stores the measurement and actual
-verdict on an OPEN row, even when it passed; `tracking_complete` and `would_close`
-expose the distinction. `prompts` lists the completeness questions to answer before
+passing measurements close an OPEN obligation only after tracking completes
+and the shared close check verifies the completeness receipt against current
+PR sources and confirms the routing again. Pending routing stores the measured
+verdict on an OPEN row, including when a previously eligible route goes stale
+during source acquisition. `tracking_complete` and `would_close`
+expose the distinction. `completeness` is `verified` on a close or would-close
+preview, `tracking_pending` when routing blocks a passing measurement, and
+`not_required` on other open attempts. When the close gate refuses a preview,
+including a server-forced one, the tool error identifies the derived verdict
+and the refusal reason. `prompts` lists the completeness questions to answer before
 a close; a close (closing verdict, complete tracking) with an event-gated date already come is refused
 (validating-merges, "Completeness checks"). Other decisions record a nonclosing attempt with the
 same note prefixes as the CLI. See `validator-tracking.md` for preflight,
@@ -47,9 +53,11 @@ after an uncertain response, re-read stored evidence/count before retrying.
 
 Both preview and recording check the document's merge commit against the PR's
 actual GitHub merge, using the same lookup and prefix check as the CLI. A failed
-lookup or mismatch refuses before any ledger mutation. The production lookup
-requires GitHub access even for preview; owned qualification injects a callable
-inside its actual stdio child instead. This internal seam is not an MCP argument.
+lookup or mismatch refuses before any ledger mutation. A closing decision
+then fetches the full source snapshot. E2E and receipt checks use that same
+snapshot. These lookups require GitHub access even for a would-close preview.
+Owned qualification supplies both reads inside its actual stdio child. The tool
+arguments remain the same.
 CLI and MCP share one note formatter: absent notes never become literal `None`,
 and an empty parked note has no trailing separator. Public evidence/note policy
 still applies before formatting.

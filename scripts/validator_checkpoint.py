@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from pydantic import TypeAdapter, ValidationError  # noqa: E402
 
+from genesis.session_awareness.pr_completeness import assess_stored_completeness  # noqa: E402
 from genesis.session_awareness.pr_evidence import (  # noqa: E402
     MAX_EVIDENCE_BYTES,
     EvidenceError,
@@ -89,7 +90,10 @@ async def audit(db, repo: str, prs: list[int] | None, *, offline: bool = False) 
             (repo, pr),
         ) as cur:
             row = await cur.fetchone()
-        item = {"repo": repo, "pr": pr, "complete": False}
+        item = {
+            "repo": repo, "pr": pr, "complete": False,
+            "review_status": "missing", "source_freshness": "not_checked",
+        }
         if row is None:
             results.append(item | {"pending": ["No verification row exists"]})
             continue
@@ -112,8 +116,15 @@ async def audit(db, repo: str, prs: list[int] | None, *, offline: bool = False) 
                 raise ValueError("evidence does not belong to this row")
         except (ValueError, TypeError, RecursionError, EvidenceError):
             # Never dump private evidence, schema inputs or exception messages.
+            if row[2] is not None:
+                item["review_status"] = "invalid"
             results.append(item | {"pending": ["Missing, malformed or mismatched historical evidence; manual classification required"]})
             continue
+        if doc.completeness is None and row[0] == "closed":
+            item["review_status"] = "historical_unreviewed"
+        else:
+            assessment = assess_stored_completeness(doc)
+            item["review_status"] = "stored_bindings_verified" if assessment.valid else assessment.status
         report = (await assess_tracking(doc, db=db, read_public=_offline if offline else None)).as_dict()
         if legacy is not None:
             report |= {"complete": False, "legacy_scope_limits": legacy[1],
