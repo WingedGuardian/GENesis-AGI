@@ -21,7 +21,6 @@ if TYPE_CHECKING:
     from genesis.channels.telegram.transport.update_dedupe import TelegramUpdateDedupe
     from genesis.channels.voice import VoiceDeliveryHelper
 
-from genesis.cc.model_names import display_name, effort_label
 
 log = logging.getLogger(__name__)
 
@@ -134,17 +133,14 @@ class HandlerContext:
                 # home run's rate limit, and the final header must name the peer.
                 running = (event.raw or {}).get("model")
                 if isinstance(running, str) and running:
-                    streamer.set_running_model(display_name(running))
+                    streamer.set_running_model(running)
                 return
             if streamer and event.event_type == "session_opened":
                 # This run opens a CC session (fresh, or a stale resume retried
                 # fresh). Telegram sessions do not write their own header, so the
                 # relay shows one here; init then names the model that ran.
                 raw = event.raw or {}
-                streamer.show_header(
-                    display_name(str(raw.get("model") or "")),
-                    effort_label(str(raw.get("effort") or "")),
-                )
+                streamer.show_header(str(raw.get("model") or ""), str(raw.get("effort") or ""))
                 await streamer.flush()
                 return
             # A subagent's lines (the Agent tool) are not this turn's narration:

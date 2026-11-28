@@ -13,7 +13,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from genesis.cc.exceptions import CCError
-from genesis.cc.model_names import effort_label
+from genesis.cc.model_names import effort_label, header_text
 from genesis.cc.types import ChannelType
 from genesis.channels import stt
 from genesis.channels.telegram._handler_helpers import (
@@ -138,9 +138,10 @@ async def _make_streamer(ctx: HandlerContext, msg, user, tid) -> DraftStreamer:
 
     Seeds the streamer with a model/effort prefix and flushes immediately
     so the user sees what model they're talking to before inference starts.
-    Shows the prefix when >1h has elapsed since the user's last message in
-    this private chat (coming back cold). A reply that opens a CC session gets
-    it too, from the ``session_opened`` event (``HandlerContext.make_on_event``).
+    Shows the prefix when >1h has elapsed since the last inbound message in this
+    chat and topic (coming back cold), in direct, group and topic chats alike. A
+    reply that opens a CC session gets it too, from the ``session_opened`` event
+    (``HandlerContext.make_on_event``).
 
     Where drafts cannot be sent (a group or topic chat, drafts turned off, no
     bot) the streamer is built DISABLED rather than skipped: it sends nothing,
@@ -152,17 +153,21 @@ async def _make_streamer(ctx: HandlerContext, msg, user, tid) -> DraftStreamer:
     # Determine whether to show model/effort prefix based on message gap
     prefix = ""
     effort = ""
-    if ctx.db and msg.chat.type == "private":
+    if ctx.db:
         try:
             from genesis.db.crud import cc_sessions
 
-            # Check time since last inbound message in this chat
+            # Time since the last inbound message in this chat and topic (a group's
+            # topics are separate conversations; NULL is the chat outside topics).
+            # The current message is excluded by id, not by OFFSET: text stores it
+            # before this runs, voice and media only after.
             show_prefix = False
             row = await ctx.db.execute(
                 """SELECT timestamp FROM telegram_messages
-                   WHERE chat_id = ? AND direction = 'inbound'
-                   ORDER BY timestamp DESC LIMIT 1 OFFSET 1""",
-                (msg.chat.id,),
+                   WHERE chat_id = ? AND thread_id IS ? AND direction = 'inbound'
+                     AND message_id != ?
+                   ORDER BY timestamp DESC LIMIT 1""",
+                (msg.chat.id, int(tid) if tid else None, msg.message_id),
             )
             prev = await row.fetchone()
             if prev is None:
@@ -186,9 +191,9 @@ async def _make_streamer(ctx: HandlerContext, msg, user, tid) -> DraftStreamer:
                     thread_id=tid,
                 )
                 if session:
-                    model = (session.get("model") or "sonnet").title()
+                    model = session.get("model") or "sonnet"
                     effort = effort_label(session.get("effort") or "medium")
-                    prefix = f"[{model} / {effort}]"
+                    prefix = header_text(model, effort)
         except Exception:
             log.debug("Could not resolve model/effort prefix", exc_info=True)
 

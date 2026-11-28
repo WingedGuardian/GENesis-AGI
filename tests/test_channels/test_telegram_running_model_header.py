@@ -190,7 +190,7 @@ async def test_without_drafts_the_final_reply_still_gets_the_header(chat_type, d
     """Group and topic chats, and drafts turned off, send no drafts. The session is
     still told not to write a header, so the relay must still print one."""
     ctx = _ctx_for_gap(None, drafts=drafts)
-    msg = SimpleNamespace(chat=SimpleNamespace(type=chat_type, id=-5), message_thread_id=9)
+    msg = SimpleNamespace(message_id=42, chat=SimpleNamespace(type=chat_type, id=-5), message_thread_id=9)
     s = await _handler_messages._make_streamer(ctx, msg, SimpleNamespace(id=7), "9")
     assert not s.enabled
     on_event = _on_event(s)
@@ -215,7 +215,7 @@ async def test_the_gap_rule(monkeypatch, seconds_ago, expected):
         AsyncMock(return_value={"model": "opus", "effort": "high"}),
     )
     prev = (datetime.now(UTC) - timedelta(seconds=seconds_ago)).isoformat()
-    msg = SimpleNamespace(chat=SimpleNamespace(type="private", id=1), message_thread_id=None)
+    msg = SimpleNamespace(message_id=42, chat=SimpleNamespace(type="private", id=1), message_thread_id=None)
     s = await _handler_messages._make_streamer(_ctx_for_gap(prev), msg, SimpleNamespace(id=7), None)
     assert s._prefix == expected
 
@@ -315,3 +315,103 @@ async def test_one_init_names_the_model_and_starts_a_new_progress_attempt():
     await on_event(StreamEvent(event_type="init", raw={"model": "claude-sonnet-5-5"}))
     assert s._prefix == "[Sonnet 5.5 / High]"
     assert progress.pending() == ""  # the new attempt starts with an empty ledger
+
+
+# ── Effort only where the model uses it (#4869 review, round 4) ──────────────
+
+
+@pytest.mark.asyncio
+async def test_a_haiku_run_header_names_no_effort():
+    """The invoker never passes Haiku an effort setting, so its header shows none,
+    whether it comes from session_opened or from the init event."""
+    s = _streamer(prefix="", effort="")
+    on_event = _on_event(s)
+    await on_event(StreamEvent(event_type="session_opened", raw={"model": "haiku", "effort": "high"}))
+    assert s._prefix == "[Haiku]"
+    await on_event(StreamEvent(event_type="init", raw={"model": "claude-haiku-4-5"}))
+    assert s._prefix == "[Haiku 4.5]"
+
+
+@pytest.mark.asyncio
+async def test_a_run_handed_to_haiku_drops_the_effort_and_a_later_model_regains_it():
+    s = _streamer(prefix="[Sonnet / High]", effort="High")
+    on_event = _on_event(s)
+    await on_event(StreamEvent(event_type="init", raw={"model": "claude-haiku-4-5"}))
+    assert s._prefix == "[Haiku 4.5]"
+    await on_event(StreamEvent(event_type="init", raw={"model": "claude-opus-5-5"}))
+    assert s._prefix == "[Opus 5.5 / High]"
+
+
+@pytest.mark.asyncio
+async def test_the_gap_prefix_for_a_haiku_session_names_no_effort(monkeypatch):
+    from datetime import UTC, datetime, timedelta
+
+    from genesis.db.crud import cc_sessions
+
+    monkeypatch.setattr(
+        cc_sessions, "get_active_foreground", AsyncMock(return_value={"model": "haiku", "effort": "high"})
+    )
+    prev = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    msg = SimpleNamespace(message_id=42, chat=SimpleNamespace(type="private", id=1), message_thread_id=None)
+    s = await _handler_messages._make_streamer(_ctx_for_gap(prev), msg, SimpleNamespace(id=7), None)
+    assert s._prefix == "[Haiku]"
+
+
+# ── The gap rule in group and topic chats (#4869 review, round 4) ────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("chat_type", "tid"), [("group", None), ("supergroup", "9")])
+async def test_the_gap_rule_applies_in_groups_and_topics(monkeypatch, chat_type, tid):
+    """After an hour of silence in this chat and topic, a group or topic reply
+    carries the header too; the lookup is scoped to the chat and the topic."""
+    from datetime import UTC, datetime, timedelta
+
+    from genesis.db.crud import cc_sessions
+
+    monkeypatch.setattr(
+        cc_sessions, "get_active_foreground", AsyncMock(return_value={"model": "opus", "effort": "high"})
+    )
+    prev = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    ctx = _ctx_for_gap(prev)
+    msg = SimpleNamespace(message_id=42, chat=SimpleNamespace(type=chat_type, id=-5), message_thread_id=int(tid) if tid else None
+    )
+    s = await _handler_messages._make_streamer(ctx, msg, SimpleNamespace(id=7), tid)
+    assert s._prefix == "[Opus / High]"
+    sql, params = ctx.db.execute.await_args.args
+    assert "thread_id IS ?" in sql
+    assert params == (-5, int(tid) if tid else None, 42)
+
+
+
+@pytest.mark.asyncio
+async def test_the_gap_rule_ignores_the_current_message_whenever_it_is_stored(monkeypatch):
+    """Voice and media store the inbound message only after the streamer is built,
+    text before it. On a real table, a message two minutes ago means no header,
+    whether or not the current one is stored yet (#4869 review)."""
+    from datetime import UTC, datetime, timedelta
+
+    import aiosqlite
+
+    from genesis.db.crud import cc_sessions
+
+    monkeypatch.setattr(
+        cc_sessions, "get_active_foreground", AsyncMock(return_value={"model": "opus", "effort": "high"})
+    )
+    now = datetime.now(UTC)
+    async with aiosqlite.connect(":memory:") as db:
+        await db.execute(
+            "CREATE TABLE telegram_messages (chat_id INTEGER, message_id INTEGER, thread_id INTEGER,"
+            " direction TEXT, timestamp TEXT)"
+        )
+        rows = [(1, 1, None, "inbound", (now - timedelta(hours=3)).isoformat()),
+                (1, 2, None, "inbound", (now - timedelta(minutes=2)).isoformat())]
+        await db.executemany("INSERT INTO telegram_messages VALUES (?, ?, ?, ?, ?)", rows)
+        ctx = _ctx_for_gap(None)
+        ctx.db = db
+        msg = SimpleNamespace(message_id=3, chat=SimpleNamespace(type="private", id=1), message_thread_id=None)
+        s = await _handler_messages._make_streamer(ctx, msg, SimpleNamespace(id=7), None)
+        assert s._prefix == ""  # voice: the current message is not stored yet
+        await db.execute("INSERT INTO telegram_messages VALUES (1, 3, NULL, 'inbound', ?)", (now.isoformat(),))
+        s = await _handler_messages._make_streamer(ctx, msg, SimpleNamespace(id=7), None)
+        assert s._prefix == ""  # text: it is

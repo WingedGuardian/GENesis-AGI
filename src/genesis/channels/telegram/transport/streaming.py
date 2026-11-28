@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 import telegram
 
+from genesis.cc.model_names import effort_label, header_text
 from genesis.channels.telegram.transport.send import send_with_client_heal
 
 if TYPE_CHECKING:
@@ -134,16 +135,18 @@ class DraftStreamer:
         """
         self._enabled = False
 
-    def set_running_model(self, model_label: str) -> None:
+    def set_running_model(self, model_id: str) -> None:
         """Name the model Claude Code reports it is running in the prefix (#4850).
 
         The prefix is built from the session row before the turn starts; the row
-        can name a different model than the one that answers.
+        can name a different model than the one that answers. The effort is
+        rechecked for that model (``header_text``): a run handed to a model that
+        takes no effort setting shows none.
         """
-        if self._prefix and model_label and self._prefix_effort:
-            self._prefix = f"[{model_label} / {self._prefix_effort}]"
+        if self._prefix and model_id:
+            self._prefix = header_text(model_id, self._prefix_effort) or self._prefix
 
-    def show_header(self, model_label: str, effort: str) -> None:
+    def show_header(self, model_id: str, effort: str) -> None:
         """Set the prefix for a run that opens a CC session or hands to a peer.
 
         It REPLACES any prefix already set (the gap rule's, read from the session
@@ -151,9 +154,10 @@ class DraftStreamer:
         reply still carries one header. ``set_running_model`` then retitles it
         from the init event.
         """
-        if model_label and effort:
-            self._prefix = f"[{model_label} / {effort}]"
-            self._prefix_effort = effort
+        text = header_text(model_id, effort)
+        if text:
+            self._prefix = text
+            self._prefix_effort = effort_label(effort)
 
     @property
     def any_draft_sent(self) -> bool:

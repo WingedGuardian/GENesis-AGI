@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 
-from genesis.cc.types import VALID_MODEL_NAMES
+from genesis.cc.types import VALID_MODEL_NAMES, model_name_supports_effort
 
 _CLAUDE_ID = re.compile(
     r"^claude-(?P<family>[a-z]+)-(?P<major>\d+)(?:-(?P<minor>\d{1,2}))?(?:-\d{8})?$"
@@ -31,3 +31,14 @@ def effort_label(effort: str) -> str:
     """Display form of an effort level for a header: ``xhigh`` -> ``xHigh``."""
     value = (effort or "").strip().lower()
     return "xHigh" if value == "xhigh" else value.title()
+
+
+def header_text(model_id: str, effort: str) -> str:
+    """The relay's reply header: ``[Opus 5.5 / High]``, or ``[Haiku 4.5]`` for a
+    model that takes no effort setting (the invoker never passes it one), so the
+    header names only what the run used. Empty when there is no model name."""
+    label = display_name(model_id)
+    if not label:
+        return ""
+    shown = effort_label(effort) if model_name_supports_effort(model_id) else ""
+    return f"[{label} / {shown}]" if shown else f"[{label}]"
