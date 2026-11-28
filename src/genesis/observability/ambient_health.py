@@ -50,6 +50,9 @@ class AmbientRemoteConfig:
     host_user: str
     ssh_key: str = _DEFAULT_KEY
     health_path: str = _DEFAULT_HEALTH_PATH
+    # Where the edge keeps its transcripts, if it keeps any (#4856). No default:
+    # the edge_transcripts tool is "not configured" without it.
+    transcripts_dir: str | None = None
 
 
 class AmbientRemoteConfigError(Exception):
@@ -92,6 +95,7 @@ def load_ambient_remote_config() -> AmbientRemoteConfig | None:
         host_user=str(host_user),
         ssh_key=str(data.get("ssh_key", _DEFAULT_KEY)),
         health_path=str(data.get("health_path", _DEFAULT_HEALTH_PATH)),
+        transcripts_dir=str(data["transcripts_dir"]) if data.get("transcripts_dir") else None,
     )
 
 
