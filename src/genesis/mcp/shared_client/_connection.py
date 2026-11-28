@@ -13,6 +13,7 @@ from mcp.shared.exceptions import MCPError
 from mcp.shared.jsonrpc_dispatcher import JSONRPCDispatcher
 from mcp_types import CONNECTION_CLOSED, INTERNAL_ERROR, INVALID_REQUEST, PARSE_ERROR
 
+from genesis.mcp.database_target import TARGET_ENDPOINT, prepare_target_params
 from genesis.mcp.plan_bookmark_context import (
     PENDING_ENDPOINT,
     PENDING_VERSION,
@@ -20,6 +21,8 @@ from genesis.mcp.plan_bookmark_context import (
     prepare_pending_params,
 )
 from genesis.mcp.shared_paths import forwarder_url, prepare_params
+
+from ._target import target_status
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +70,8 @@ class _Negotiation:
 
 
 class RemotePeer:
-    def __init__(self, group, settings, header_factory, *, expected_catalog_revision=None, pending_file=None):
+    def __init__(self, group, settings, header_factory, *, expected_catalog_revision=None, pending_file=None,
+                 memory_target=None):
         self.group, self.settings, self.header_factory = group, settings, header_factory
         self.url = forwarder_url(settings.http.url)
         self.current, self.front, self.initialization, self.version = None, None, None, None
@@ -81,6 +85,11 @@ class RemotePeer:
                              if pending_file is not None else None)
         if self.pending_file is not None:
             self.url = settings.http.origin + PENDING_ENDPOINT
+        if memory_target is not None and (settings.http.service != "memory" or self.pending_file is None):
+            raise ValueError("Database targets require a memory peer with pending input")
+        self.memory_target = memory_target
+        if memory_target is not None:
+            self.url = settings.http.origin + TARGET_ENDPOINT
 
     def arm_initialize(self):
         if self.negotiation is not None and not self.negotiation.done.is_set():
@@ -170,9 +179,12 @@ class RemotePeer:
                 event_hooks={"response": [observe_response]},
             ) as client:
                 if self.expected_catalog_revision is not None or self.pending_file is not None:
-                    response = await client.get(self.settings.http.origin + "/status")
-                    response.raise_for_status()
-                    status = response.json()
+                    if self.memory_target is not None:
+                        status = await target_status(client, self.settings.http.origin, self.memory_target)
+                    else:
+                        response = await client.get(self.settings.http.origin + "/status")
+                        response.raise_for_status()
+                        status = response.json()
                     if (not isinstance(status, dict)
                             or status.get("service") != self.settings.http.service
                             or status.get("enabled") is not True
@@ -232,6 +244,8 @@ class RemotePeer:
         generation, gate = None, self.negotiation if method == "initialize" else None
         try:
             params = prepare_params(self.settings.http.service, method, params)
+            if self.memory_target is not None:
+                params = prepare_target_params(method, params, self.memory_target)
             if self.pending_file is not None:
                 params = prepare_pending_params(method, params, self.pending_file)
             if method != "initialize":

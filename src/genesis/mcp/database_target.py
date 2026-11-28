@@ -25,3 +25,15 @@ def require_database_target(metadata, expected):
             or type(value["version"]) is not int or value["version"] != TARGET_VERSION
             or not isinstance(value["target"], str) or expected is None or value["target"] != expected):
         raise SharedPathError("Shared memory database target unavailable or incompatible; restart this client")
+
+
+def prepare_target_params(method, params, target):
+    """Bind each forwarded call without accepting a client target override."""
+    if method != "tools/call" or not isinstance(params, dict):
+        return params
+    metadata = params.get("_meta")
+    if metadata is not None and (not isinstance(metadata, dict) or TARGET_META in metadata):
+        raise SharedPathError("Database target metadata is reserved for the forwarder")
+    return {**params, "_meta": {**(metadata or {}), TARGET_META: {
+        "version": TARGET_VERSION, "target": target,
+    }}}

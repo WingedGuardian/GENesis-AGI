@@ -192,7 +192,7 @@ async def test_all_memory_floor_bodies_and_local_write_visibility(tmp_path, serv
         wire = [row for row in receipt(local) if row["event"] == "http-request" and (row["body"] or {}).get("method") == "tools/call"]
         assert [row["body"]["params"]["name"] for row in wire] == [name for name, _, _ in calls] + [
             "observation_query", "memory_recall", "observation_query", "observation_query", "observation_query"]
-        assert all(row["path"] == "/mcp/v2" for row in wire)
+        assert all(row["path"] == "/mcp/v3" for row in wire)
         assert all(row["body"]["params"]["_meta"]["genesis/planBookmarkPending"]["path"] == str(pending) for row in wire)
         assert [row["event"] for row in receipt(remote)].count("synthetic-extraction") == 1
         assert [row["event"] for row in receipt(local)].count("synthetic-extraction") == 1
@@ -243,7 +243,7 @@ async def backend(install, errors, env):
 
 
 @pytest.mark.parametrize("service", ["memory"])
-async def test_ordinary_memory_read_uses_same_backend_v2_with_absent_marker(tmp_path, service, shared_install):
+async def test_ordinary_memory_read_uses_same_backend_v3_with_absent_marker(tmp_path, service, shared_install):
     injection = tmp_path / "injection"
     injection.mkdir()
     (injection / "sitecustomize.py").write_text(
@@ -272,10 +272,15 @@ async def test_ordinary_memory_read_uses_same_backend_v2_with_absent_marker(tmp_
             assert await asyncio.wait_for(child.wait(), 30) == 0
             receipts = [json.loads(line) for line in Path(env["LOCAL_MEMORY_TEST_REPORT"]).read_text().splitlines()]
             wire = [row for row in receipts if row["event"] == "http-request" and (row["body"] or {}).get("method") == "tools/call"]
-            assert len(wire) == 1 and wire[0]["path"] == "/mcp/v2", "ordinary memory floor did not use the shared v2 backend"
+            assert len(wire) == 1 and wire[0]["path"] == "/mcp/v3", "ordinary memory floor did not use the target-bound backend"
             assert wire[0]["body"]["id"] == 3
             metadata = wire[0]["body"]["params"]["_meta"]
             assert metadata["fixture.local"] == {"kept": True}
+            from genesis.mcp.database_target import database_target
+
+            assert metadata["genesis/databaseTarget"] == {
+                "version": 1, "target": database_target(shared_install.env["GENESIS_DB_PATH"]),
+            }
             assert metadata["genesis/planBookmarkPending"] == {"version": 1, "path": str(pending)}
             assert [row["pending_enabled"] for row in receipts if row["event"] == "memory-init"] == [True]
             assert not [row for row in receipts if row["event"] == "body-guard"]

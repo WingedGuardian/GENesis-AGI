@@ -136,7 +136,7 @@ class _LocalPeer:
 
 
 @asynccontextmanager
-async def local_peer(group, settings, header_factory, server, stage):
+async def local_peer(group, settings, header_factory, server, stage, *, memory_target=None):
     caller = caller_context()
     service = settings.http.service
     if ((service, stage) not in LOCAL_FRONTEND_STAGES or caller.profile is not None
@@ -144,7 +144,8 @@ async def local_peer(group, settings, header_factory, server, stage):
         raise ValueError("Unsupported local frontend")
     catalog = await Catalog.capture(server, service)
     remote = RemotePeer(group, settings, header_factory, expected_catalog_revision=catalog.revision(caller),
-                        pending_file=Path.home() / ".genesis/plan_bookmark_pending.json" if service == "memory" else None)
+                        pending_file=Path.home() / ".genesis/plan_bookmark_pending.json" if service == "memory" else None,
+                        memory_target=memory_target)
     peer = _LocalPeer(remote)
     routes = _Routes(peer, catalog)
 

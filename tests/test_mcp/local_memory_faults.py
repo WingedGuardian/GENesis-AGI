@@ -41,10 +41,15 @@ def install():
         import httpx2
 
         original_send = httpx2.AsyncClient.send
+        status_reads = 0
 
         async def send(client, request, *args, **kwargs):
+            nonlocal status_reads
             response = await original_send(client, request, *args, **kwargs)
             if request.url.path == "/status":
+                status_reads += 1
+                if status_reads == 1 and os.environ.get("LOCAL_MEMORY_TEST_FAULT_AFTER_PREFLIGHT") == "1":
+                    return response
                 body = response.json()
                 if fault == "feature":
                     body.pop("plan_bookmark_pending_version")

@@ -38,19 +38,19 @@ class _PipeTextOutput:
 
 
 @asynccontextmanager
-async def _peer_owner(owners, settings, header_factory, local_server, stage):
+async def _peer_owner(owners, settings, header_factory, local_server, stage, memory_target=None):
     if local_server is None and stage is None:
-        yield RemotePeer(owners, settings, header_factory)
+        yield RemotePeer(owners, settings, header_factory, memory_target=memory_target)
     else:
         if local_server is None or stage is None:
             raise ValueError("Local server and stage are required together")
         from ._local import local_peer
 
-        async with local_peer(owners, settings, header_factory, local_server, stage) as peer:
+        async with local_peer(owners, settings, header_factory, local_server, stage, memory_target=memory_target) as peer:
             yield peer
 
 
-async def serve(settings, header_factory, *, local_server=None, stage=None, module_owner=None):
+async def serve(settings, header_factory, *, local_server=None, stage=None, module_owner=None, memory_target=None):
     ready, output, peer = anyio.Event(), None, None
 
     async def refuse():
@@ -98,7 +98,7 @@ async def serve(settings, header_factory, *, local_server=None, stage=None, modu
             async with stdio_server(stdin=RawInput(), stdout=_PipeTextOutput(output_fd)) as (incoming, outgoing):
                 output = outgoing
                 async with anyio.create_task_group() as owners:
-                    async with _peer_owner(owners, settings, header_factory, local_server, stage) as peer:
+                    async with _peer_owner(owners, settings, header_factory, local_server, stage, memory_target) as peer:
                         peer.front = JSONRPCDispatcher(incoming, outgoing)
                         if hasattr(peer, "remote"):
                             peer.remote.front = peer.front

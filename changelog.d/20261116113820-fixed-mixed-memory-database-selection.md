@@ -1,0 +1,1 @@
+- Preserve an ordinary memory session's selected database when shared routing is enabled: incompatible initial backends keep ordinary execution, while matching backends bind every shared read to that database and refuse incompatible replacements without replay.
