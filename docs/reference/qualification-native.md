@@ -91,3 +91,12 @@ histories separately, with the combined session liability disclosed.
 Mock HTTP and deterministic storage fixtures prove integration only. Real
 model quality, qualification, promotion and activation require their own evidence
 and decisions.
+
+## Native Pro transport
+
+The explicit `deepseek_native_pro_v1` marker pairs the qualification-only
+`deepseek-v4-pro` alias with the exact first-party response model and Pro
+tariff. Configuration for this alias belongs to an explicitly admitted
+screen. The current `study-run` command still admits the original full Flash
+population. The Pro transport uses the same non-thinking controls, endpoint,
+serial observer and native expense evidence as Flash.

@@ -9,6 +9,7 @@ from .evidence import Incomplete, canonical, digest, load_json
 
 ALIAS = MODEL = "deepseek-flash"
 KIND = "deepseek_native_v1"
+KINDS = {ALIAS: KIND, native_expense.PRO: native_expense.PRO_KIND}
 ENDPOINT = "https://api.deepseek.com"
 COMPLETION_URL = ENDPOINT + "/chat/completions"
 NAMESPACE = "deepseek"
@@ -20,8 +21,8 @@ FORBIDDEN_IDENTITY = {"backend_model", "receipt_model", "receipt_provider", "rec
 
 def resolve(alias, config=None):
     cfg = (config or pinned.routing()).providers.get(alias)
-    if (alias != ALIAS or cfg is None or cfg.provider_type != "deepseek"
-            or cfg.model_id != MODEL or cfg.base_url not in (None, ENDPOINT) or cfg.params):
+    if (alias not in KINDS or cfg is None or cfg.provider_type != "deepseek"
+            or cfg.model_id != alias or cfg.base_url not in (None, ENDPOINT) or cfg.params):
         raise Incomplete("native qualification requires the explicit first-party DeepSeek alias")
     return cfg
 
@@ -46,7 +47,7 @@ def validate_params(params):
 
 def request_body(model, params, contract, messages):
     validate_params(params)
-    if model != MODEL:
+    if model not in KINDS:
         raise Incomplete("invalid native request model")
     # Normalize both delegate controls and the expected wire explicitly.
     return load_json(canonical({"model": model, "messages": messages, **params[route(contract)],
@@ -55,7 +56,10 @@ def request_body(model, params, contract, messages):
 
 def validate_binding(binding, cfg, params):
     """Validate native transport identity without fabricating gateway fields."""
-    expected = {"transport_kind": KIND, "model": cfg.model_id, "params": validate_params(params),
+    kind = KINDS.get(cfg.model_id)
+    if kind is None:
+        raise Incomplete("invalid native binding model")
+    expected = {"transport_kind": kind, "model": cfg.model_id, "params": validate_params(params),
                 "endpoint": ENDPOINT, "generation_namespace": NAMESPACE,
                 "credential_mode": "shared_existing", "cost_basis": native_expense.BASIS}
     if (not isinstance(binding, dict) or FORBIDDEN_IDENTITY & binding.keys()
@@ -67,12 +71,14 @@ def validate_binding(binding, cfg, params):
         raise Incomplete("native transport differs from the frozen campaign binding")
     # Local schema adaptation only: the binding stores the API base; expense
     # authority validates a scheduled completion URL. Never persist a fake wire.
-    native_expense.validate_spec({**binding, "upstream": NAMESPACE, "endpoint": COMPLETION_URL})
+    native_expense.validate_spec({**binding, "alias": cfg.model_id, "upstream": NAMESPACE,
+                                  "endpoint": COMPLETION_URL})
 
 
 def validate_attempt(spec, binding):
     native_expense.validate_spec(spec)
-    expected = {"alias": ALIAS, "transport_kind": KIND, "generation_namespace": NAMESPACE,
+    alias = binding["model"]
+    expected = {"alias": alias, "transport_kind": KINDS.get(alias), "generation_namespace": NAMESPACE,
                 **{key: binding[key] for key in (
                     "model", "credential_mode", "credential_fingerprint",
                     "provider_identity_evidence", "cost_basis", "native_tariff")}}

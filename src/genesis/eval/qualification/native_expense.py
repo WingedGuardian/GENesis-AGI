@@ -9,6 +9,8 @@ from .evidence import Incomplete, digest, load_json
 
 BASIS = "native_tariff_v1"
 ENDPOINT = "https://api.deepseek.com/chat/completions"
+PRO = "deepseek-v4-pro"
+PRO_KIND = "deepseek_native_pro_v1"
 COUNTERS = {"prompt_tokens", "completion_tokens", "total_tokens",
             "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"}
 RATES = ("prompt_cache_hit", "prompt_cache_miss", "completion")
@@ -21,7 +23,10 @@ def _closed(value, keys):
 
 def validate_spec(spec: dict) -> None:
     """Validate the frozen, self-contained native tariff authority."""
-    if (spec.get("cost_basis") != BASIS or spec.get("model") != "deepseek-flash"
+    model, kind = spec.get("model"), spec.get("transport_kind")
+    legacy_flash = model == "deepseek-flash" and kind != PRO_KIND
+    screen_pro = model == PRO and kind == PRO_KIND and spec.get("alias") == PRO
+    if (spec.get("cost_basis") != BASIS or not (legacy_flash or screen_pro)
             or spec.get("upstream") != "deepseek" or spec.get("endpoint") != ENDPOINT
             or spec.get("generation_namespace") != "deepseek"):
         raise Incomplete("invalid native expense basis")
