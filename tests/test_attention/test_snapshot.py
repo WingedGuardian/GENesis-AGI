@@ -2,8 +2,11 @@
 import shlex
 from pathlib import Path
 
+import pytest
+
 from genesis.attention.snapshot import (
     _SNAPSHOT_SSH_TIMEOUT_S,
+    SnapshotError,
     _backup_py,
     _remote_backup_arg,
     _scp_cmd,
@@ -18,7 +21,25 @@ def _cfg() -> AmbientRemoteConfig:
 
 def test_ssh_base_has_batchmode_and_target():
     b = _ssh_base(_cfg())
-    assert b[0] == "ssh" and "BatchMode=yes" in b and "edge@192.0.2.1" in b
+    assert b[0] == "ssh" and "BatchMode=yes" in b
+    assert b[-2:] == ["--", "edge@192.0.2.1"], "ssh must see the destination as an operand"
+
+
+@pytest.mark.parametrize(
+    ("user", "host"),
+    [
+        ("-oProxyCommand=touch /tmp/pwned", "192.0.2.1"),
+        ("edge", "-oProxyCommand=touch /tmp/pwned"),
+        ("edge user", "192.0.2.1"),
+        ("edge", "192.0.2.1\n"),
+        ("edge\t", "192.0.2.1"),
+        ("edge\x7f", "192.0.2.1"),
+    ],
+)
+def test_ssh_base_refuses_option_like_or_unsafe_destination(user, host):
+    cfg = AmbientRemoteConfig(host_ip=host, host_user=user, ssh_key="~/.ssh/id_ed25519")
+    with pytest.raises(SnapshotError, match="host_user/host_ip"):
+        _ssh_base(cfg)
 
 
 def test_backup_py_is_readonly_and_expands_home():
