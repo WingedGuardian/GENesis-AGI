@@ -36,11 +36,14 @@ model errors, PR mismatch and verdict-policy refusals precede DB work. Both raw
 UTF-8 and canonical evidence are capped at256KiB. The verdict is derived;
 passing measurements close an OPEN obligation only after tracking completes
 and the shared close check verifies the completeness receipt against current
-PR sources. Pending routing stores the measurement and actual
-verdict on an OPEN row, even when it passed; `tracking_complete` and `would_close`
+PR sources and confirms the routing again. Pending routing stores the measured
+verdict on an OPEN row, including when a previously eligible route goes stale
+during source acquisition. `tracking_complete` and `would_close`
 expose the distinction. `completeness` is `verified` on a close or would-close
 preview, `tracking_pending` when routing blocks a passing measurement, and
-`not_required` on other open attempts. `prompts` lists the completeness questions to answer before
+`not_required` on other open attempts. When the close gate refuses a preview,
+including a server-forced one, the tool error identifies the derived verdict
+and the refusal reason. `prompts` lists the completeness questions to answer before
 a close; a close (closing verdict, complete tracking) with an event-gated date already come is refused
 (validating-merges, "Completeness checks"). Other decisions record a nonclosing attempt with the
 same note prefixes as the CLI. See `validator-tracking.md` for preflight,

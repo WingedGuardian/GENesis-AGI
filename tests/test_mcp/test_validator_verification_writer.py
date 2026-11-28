@@ -18,6 +18,7 @@ from tests.fixtures.verification_sources import (
     reviewed_close,
     simple_receipt,
     stub_legacy_writer_review,
+    tracking_closes_during_acquisition,
     use_real_receipt_assessment,
     writer_source,
 )
@@ -328,7 +329,8 @@ async def test_a_clean_document_returns_no_prompts(recording):
     assert result["prompts"] == []
 
 
-async def test_a_close_with_a_date_gate_already_come_is_refused(recording, monkeypatch):
+@pytest.mark.parametrize("receipt", [False, True])
+async def test_a_close_with_a_date_gate_already_come_is_refused(recording, monkeypatch, receipt):
     from datetime import date
 
     from genesis.mcp.health import validator_writes
@@ -340,8 +342,15 @@ async def test_a_close_with_a_date_gate_already_come_is_refused(recording, monke
         "trigger": "2026-11-14",
         "recheck": "gh run list",
     }
+    path, _, _ = recording
+    before = row(path)
+    doc = _with_tracking(_doc(gaps=[gate]))
+    if receipt:
+        doc = simple_receipt(doc)
+    use_real_receipt_assessment(monkeypatch)
     with pytest.raises(ToolError, match=r"gaps/0 \(trigger 2026-11-14\)"):
-        await call(_doc(gaps=[gate]), dry_run=True)
+        await call(doc, route=False, dry_run=True)
+    assert row(path) == before
 
 
 @pytest.mark.parametrize("case", CLOSE_CASES)
@@ -359,8 +368,10 @@ async def test_close_requires_an_independent_receipt(recording, tmp_path, monkey
     before = row(path)
     flags = {"dry_run": mode == "explicit-preview", "route": False}
     if reason := CLOSE_CASES[case]:
-        with pytest.raises(ToolError, match=reason):
+        with pytest.raises(ToolError, match=reason) as refused:
             await call(doc, **flags)
+        if mode != "write" and case == "missing":
+            assert "Derived verdict: pass-mechanical (close refused)" in str(refused.value)
         assert row(path) == before
         return
     result = await call(doc, **flags)
@@ -379,3 +390,29 @@ async def test_close_requires_an_independent_receipt(recording, tmp_path, monkey
     with pytest.raises(ToolError, match="no OPEN row"):
         await call(doc, **flags)
     assert row(path) == stored
+
+
+@pytest.mark.parametrize("mode", ["write", "explicit-preview", "forced-preview"])
+async def test_tracking_closed_during_source_acquisition(recording, monkeypatch, mode):
+    path, _, config = recording
+    if mode != "forced-preview":
+        config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    before = row(path)
+    doc = simple_receipt(_with_tracking(_doc(
+        findings=[{"summary": "reachable timer defect", "disposition": "filed"}],
+    )))
+    reads = tracking_closes_during_acquisition(monkeypatch)
+    result = await call(doc, route=False, dry_run=mode == "explicit-preview")
+    assert reads == ["tracking", "sources", "tracking"]
+    assert result["recorded"] is (mode == "write")
+    assert result["measurement_would_close"] and not result["would_close"]
+    assert result["completeness"] == "tracking_pending"
+    assert "public task closed while acquiring PR sources" in result["tracking"]["pending"][0]
+    stored = row(path)
+    if mode != "write":
+        assert stored == before
+        return
+    assert stored["status"] == "open"
+    assert stored["verdict"] == "pass-mechanical"
+    assert stored["attempt_count"] == before["attempt_count"] + 1
+    assert json.loads(stored["evidence"])["findings"] == doc["findings"]

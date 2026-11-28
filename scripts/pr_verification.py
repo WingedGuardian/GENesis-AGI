@@ -162,8 +162,8 @@ from genesis.session_awareness.pr_recording import (  # noqa: E402
     PrMetadata,
     _DuplicateKey,
     _no_duplicates,
+    assess_recording,
     attempt_note,
-    check_closing_evidence,
     check_merge_commit,
     gh_merge_commit,
     gh_pr_metadata,
@@ -363,14 +363,14 @@ async def _write(
                 print(f"pr_verification: {mismatch}", file=sys.stderr)
                 return 3
 
-            from genesis.session_awareness.pr_tracking import assess_tracking
-
-            tracking = await assess_tracking(doc, db=db)
-            closing = decision.closing and tracking.complete
-            if closing and (
-                refusal := await check_closing_evidence(doc, merge_commit=actual.merge_commit, today=_today)
-            ):
+            tracking, refusal = await assess_recording(
+                doc, decision, db=db, merge_commit=actual.merge_commit, today=_today
+            )
+            if refusal:
+                if dry_run:
+                    print(f"Derived verdict: {decision.verdict} (close refused)")
                 return _refuse(f"{refusal.message}\nNothing was written.", refusal.code)
+            closing = decision.closing and tracking.complete
             rechecks = rechecks_for(doc) if closing else []
             if rechecks:
                 schema_error = await _close_schema_refusal(db, rechecks)

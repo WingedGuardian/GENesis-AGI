@@ -15,7 +15,7 @@ from genesis.db.connection import connect_aiosqlite_rw
 from genesis.db.crud import follow_ups
 from genesis.mcp.health import mcp
 from genesis.session_awareness.pr_recording import (
-    check_closing_evidence,
+    assess_recording,
     check_merge_commit,
     gh_pr_metadata,
 )
@@ -195,14 +195,14 @@ async def record_verification(
         mismatch = check_merge_commit(doc.merge_commit, actual.merge_commit)
         if mismatch:
             raise ToolError(mismatch)
-        from genesis.session_awareness.pr_tracking import assess_tracking
-
-        tracking = await assess_tracking(doc, db=db)
-        closing = decision.closing and tracking.complete
-        if closing and (
-            refusal := await check_closing_evidence(doc, merge_commit=actual.merge_commit, today=_today)
-        ):
+        tracking, refusal = await assess_recording(
+            doc, decision, db=db, merge_commit=actual.merge_commit, today=_today
+        )
+        if refusal:
+            if preview:
+                raise ToolError(f"Derived verdict: {decision.verdict} (close refused)\n{refusal.message}")
             raise ToolError(refusal.message)
+        closing = decision.closing and tracking.complete
         rechecks = rechecks_for(doc) if closing else []
         if rechecks and not await crud._rechecks_column_available(db):
             raise ToolError("Rechecks are owed but their column is unavailable; run the migration first")

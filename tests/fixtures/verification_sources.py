@@ -69,6 +69,28 @@ def use_real_receipt_assessment(monkeypatch):
     monkeypatch.setattr(pr_completeness, "assess_completeness", assess)
 
 
+def tracking_closes_during_acquisition(monkeypatch):
+    from genesis.session_awareness import pr_tracking
+
+    reads = []
+
+    def acquire(repo, pr):
+        reads.append("sources")
+        return writer_source(repo, pr)
+
+    def read_public(url, repo):
+        after_sources = "sources" in reads
+        reads.append("tracking")
+        if after_sources:
+            raise LookupError("public task closed while acquiring PR sources")
+        return "synthetic task covers concern"
+
+    monkeypatch.setattr(pr_verification_sources, "acquire_sources", acquire)
+    monkeypatch.setattr(pr_tracking, "public_receipt", read_public)
+    use_real_receipt_assessment(monkeypatch)
+    return reads
+
+
 CLOSE_CASES = {
     "verified": None,
     "missing": "independent completeness review is missing",

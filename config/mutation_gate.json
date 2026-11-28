@@ -28,17 +28,17 @@
     {
       "label": "CLI verification close skips the receipt gate",
       "path": "scripts/pr_verification.py",
-      "anchor": "if closing and (\n                refusal := await check_closing_evidence",
-      "replacement": "if False and (\n                refusal := await check_closing_evidence",
+      "anchor": "if refusal:\n                if dry_run:",
+      "replacement": "if False:\n                if dry_run:",
       "validator": "python",
-      "test": "tests/test_scripts/test_pr_verification_closer.py::test_close_requires_an_independent_receipt[False-missing]",
+      "test": "tests/test_scripts/test_pr_verification_close_receipts.py::test_close_requires_an_independent_receipt[False-missing]",
       "why": "The CLI must refuse an otherwise valid close with no receipt, without changing the owned row."
     },
     {
       "label": "MCP verification close skips the receipt gate",
       "path": "src/genesis/mcp/health/validator_writes.py",
-      "anchor": "if closing and (\n            refusal := await check_closing_evidence",
-      "replacement": "if False and (\n            refusal := await check_closing_evidence",
+      "anchor": "if refusal:\n            if preview:",
+      "replacement": "if False:\n            if preview:",
       "validator": "python",
       "test": "tests/test_mcp/test_validator_verification_writer.py::test_close_requires_an_independent_receipt[write-missing]",
       "why": "The registered MCP tool must refuse an otherwise valid close with no receipt, without changing the owned row."

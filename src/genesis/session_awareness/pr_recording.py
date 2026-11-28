@@ -19,6 +19,7 @@ from genesis.session_awareness.pr_evidence import (
     check_e2e_coverage,
     check_event_dates,
 )
+from genesis.session_awareness.pr_tracking import TrackingReport, assess_tracking
 
 
 def resolve_repo(open_repos: list[str], pr_number: int, repo: str) -> str:
@@ -136,8 +137,8 @@ def check_merge_commit(claimed: str, actual: str) -> str | None:
     )
 
 
-async def check_closing_evidence(
-    doc: EvidenceDocument, *, merge_commit: str, today: Callable[[], date]
+async def _check_closing_evidence(
+    doc: EvidenceDocument, merge_commit: str, today: Callable[[], date]
 ) -> Refusal | None:
     """Check both writers' closing evidence against one current source snapshot."""
     from genesis.session_awareness.pr_completeness import assess_completeness
@@ -154,8 +155,23 @@ async def check_closing_evidence(
     if refusal:
         return refusal
     assessment = await asyncio.to_thread(assess_completeness, doc, snapshot)
-    if dated := check_event_dates(doc, True, today()):
-        return dated
     if not assessment.valid:
-        return Refusal(2, assessment.reason)
+        # Surface measurement already due before asking for review of the evidence.
+        return check_event_dates(doc, True, today()) or Refusal(2, assessment.reason)
     return None
+
+
+async def assess_recording(
+    doc: EvidenceDocument, decision: Decision, *, db, merge_commit: str, today: Callable[[], date]
+) -> tuple[TrackingReport, Refusal | None]:
+    """Apply the same routing and close gates to both writers, including previews."""
+    tracking = await assess_tracking(doc, db=db)
+    if not decision.closing or not tracking.complete:
+        return tracking, None
+    if refusal := await _check_closing_evidence(doc, merge_commit, today):
+        return tracking, refusal
+
+    # A task can close or expire during source acquisition. Preserve its measurement
+    # as an open attempt if the route no longer qualifies.
+    tracking = await assess_tracking(doc, db=db)
+    return tracking, check_event_dates(doc, tracking.complete, today())

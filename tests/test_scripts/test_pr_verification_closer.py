@@ -40,9 +40,7 @@ import pytest
 from genesis.session_awareness.pr_recording import PrMetadata
 from tests.conftest import private_module
 from tests.fixtures.verification_sources import (
-    CLOSE_CASES,
     MERGE_SHA,
-    reviewed_close,
     simple_receipt,
     stub_legacy_writer_review,
     writer_source,
@@ -231,38 +229,6 @@ def _run(tmp_path: Path, doc: dict, *extra: str, pr: int = 7, route: bool = True
             *extra,
         ]
     )
-
-
-@pytest.mark.parametrize("case", CLOSE_CASES)
-@pytest.mark.parametrize("preview", [False, True])
-def test_close_requires_an_independent_receipt(tmp_path, monkeypatch, capsys, case, preview):
-    source_dir = tmp_path / "source"
-    source_dir.mkdir()
-    doc, source = reviewed_close(source_dir, monkeypatch, case)
-    monkeypatch.setattr(_prv, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, source.body))
-    db = tmp_path / "genesis.db"
-    _seed(db)
-    before = _row(db)
-    flags = ["--dry-run"] if preview else []
-    if reason := CLOSE_CASES[case]:
-        assert _run(tmp_path, doc, *flags, route=False) == 2
-        stderr = capsys.readouterr().err
-        assert reason in stderr and "Nothing was written" in stderr
-        assert _row(db) == before
-        return
-    assert _run(tmp_path, doc, *flags, route=False) == 0
-    stored = _row(db)
-    if preview:
-        assert "CLOSES the row" in capsys.readouterr().out
-        assert stored == before
-        return
-    assert stored["status"] == "closed"
-    receipt = json.loads(stored["evidence"])["completeness"]
-    assert receipt["complete"] is True
-    assert receipt["evidence_sha256"] == doc["completeness"]["evidence_sha256"]
-    assert receipt["review_execution_ref"] == "fixture-only:no-model-ran"
-    assert _run(tmp_path, doc, route=False) == 1
-    assert _row(db) == stored
 
 
 # ── print-schema ─────────────────────────────────────────────────────────
